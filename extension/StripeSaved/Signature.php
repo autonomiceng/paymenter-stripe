@@ -13,7 +13,7 @@ trait Signature
         $signatures = [];
         foreach (explode(',', $header) as $part) {
             [$key, $value] = array_pad(explode('=', trim($part), 2), 2, null);
-            if ($key === 't' && ctype_digit($value ?? '')) {
+            if ($key === 't' && preg_match('/^[0-9]+$/D', $value ?? '')) {
                 $timestamp = $value;
             } elseif ($key === 'v1' && is_string($value)) {
                 $signatures[] = $value;

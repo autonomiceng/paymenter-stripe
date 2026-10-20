@@ -19,13 +19,13 @@
         script.onload = () => {
 
             var stripe = Stripe(
-                "{{ $stripePublishableKey }}"
+                @js($stripePublishableKey)
             );
 
-            const type = '{{ $type }}';
+            const type = @js($type);
 
             const options = {
-                clientSecret: '{{ $intent->client_secret }}',
+                clientSecret: @js($intent->client_secret),
                 appearance: {
                     theme: 'night'
                 },
@@ -40,8 +40,8 @@
                 },
                 defaultValues: {
                     billingDetails: {
-                        name: "{{ auth()->user()->name }}",
-                        email: "{{ auth()->user()->email }}",
+                        name: @js(auth()->user()->name),
+                        email: @js(auth()->user()->email),
                     }
                 }
             }
@@ -57,16 +57,18 @@
                 event.preventDefault();
                 setLoading(true);
                 
-                var error;
-
-                var {
-                    error
-                } = await stripe.confirmSetup({
-                    elements,
-                    confirmParams: {
-                        return_url: '{{ route('extensions.gateways.stripe-saved.setup-agreement') }}',
-                    },
-                });
+                try {
+                    const {error} = await stripe.confirmSetup({elements, confirmParams: {
+                        return_url: @js(route('extensions.gateways.stripe-saved.setup-agreement')),
+                    }});
+                    if (error) throw error;
+                } catch (error) {
+                    const message = document.getElementById('error-message');
+                    message.textContent = error.message || 'Could not save payment method.';
+                    message.classList.remove('hidden');
+                } finally {
+                    setLoading(false);
+                }
 
             });
 

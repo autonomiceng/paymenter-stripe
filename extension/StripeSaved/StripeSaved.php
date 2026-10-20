@@ -34,7 +34,7 @@ require_once __DIR__ . '/Checkout.php';
     description: 'Stripe Payment Element with saved methods and optional card saving.',
     version: '0.1.0',
     author: 'Autonomic Engineering',
-        icon: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgZmlsbD0iIzUzM0FGRCIvPjxwYXRoIGQ9Ik0xMjAgMzkyTDM5MiAzMzRWMTEyTDEyMCAxNz hWMzk yWiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg=='
+    icon: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgZmlsbD0iIzUzM0FGRCIvPjxwYXRoIGQ9Ik0xMjAgMzkyTDM5MiAzMzRWMTEyTDEyMCAxNz hWMzk yWiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg=='
 )]
 class StripeSaved extends Gateway
 {
@@ -47,9 +47,13 @@ class StripeSaved extends Gateway
         require __DIR__ . '/routes.php';
         // Register webhook route
         View::addNamespace('gateways.stripe-saved', __DIR__ . '/resources/views');
+        // Core boots disabled gateways too. Let the bundled listener own legacy subscriptions.
+        if (\App\Models\Gateway::where('extension', 'Stripe')->exists()) {
+            return;
+        }
 
         Event::listen(Updated::class, function (Updated $event) {
-            if ($event->service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$event->service->subscription_id) {
+            if (!$this->gatewayEnabled() || $event->service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$event->service->subscription_id) {
                 // If the service is not a stripe subscription, skip
                 return;
             }
@@ -71,7 +75,7 @@ class StripeSaved extends Gateway
 
         Event::listen(Created::class, function (Created $event) {
             $service = $event->cancellation->service;
-            if ($service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$service->subscription_id) {
+            if (!$this->gatewayEnabled() || $service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$service->subscription_id) {
                 // If the service is not a stripe subscription, skip
                 return;
             }
@@ -203,7 +207,7 @@ class StripeSaved extends Gateway
                 if (!isset($paymentIntent->metadata->invoice_id)) {
                     break;
                 }
-                ExtensionHelper::addProcessingPayment($paymentIntent->metadata->invoice_id, 'StripeSaved', $paymentIntent->amount / 100, null, $paymentIntent->id);
+                $this->recordIntentPayment($paymentIntent, 'processing');
                 break;
                 // Normal payment
             case 'payment_intent.succeeded':
@@ -211,7 +215,7 @@ class StripeSaved extends Gateway
                 if (!isset($paymentIntent->metadata->invoice_id)) {
                     break;
                 }
-                ExtensionHelper::addPayment($paymentIntent->metadata->invoice_id, 'StripeSaved', $paymentIntent->amount / 100, null, $paymentIntent->id);
+                $this->recordIntentPayment($paymentIntent, 'succeeded');
                 $this->savePaidMethod($paymentIntent);
                 break;
             case 'payment_intent.payment_failed':
@@ -219,7 +223,7 @@ class StripeSaved extends Gateway
                 if (!isset($paymentIntent->metadata->invoice_id)) {
                     break;
                 }
-                ExtensionHelper::addFailedPayment($paymentIntent->metadata->invoice_id, 'StripeSaved', $paymentIntent->amount / 100, null, $paymentIntent->id);
+                $this->recordIntentPayment($paymentIntent, 'failed');
                 break;
             case 'charge.updated':
                 $charge = $event->data->object; // contains a StripeCharge

@@ -6,7 +6,7 @@
 
     </div>
     <label class="mt-4 block">
-        <input type="checkbox" id="save-card" />
+        <input type="checkbox" id="save-card" disabled />
         Save this card for future payments
     </label>
     <p class="text-sm">Saving a card does not enable Auto Pay.</p>
@@ -53,6 +53,16 @@
             // Set up Stripe.js and Elements to use in checkout form, passing the client secret obtained in a previous step
             const elements = stripe.elements(options);
             const paymentElement = elements.create('payment', paymentElementOptions);
+            let canSave = false;
+            let loading = false;
+            const saveCard = document.getElementById('save-card');
+            // https://docs.stripe.com/js/element/events/on_change?type=paymentElement
+            paymentElement.on('change', (event) => {
+                canSave = ['card', 'link'].includes(event.value?.type);
+                saveCard.disabled = loading || !canSave;
+                if (!canSave) saveCard.checked = false;
+            });
+
             paymentElement.mount('#payment-element');
 
             const form = document.getElementById('payment-form');
@@ -68,7 +78,7 @@
                         headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
                             'X-CSRF-TOKEN': @js(csrf_token())},
                         body: JSON.stringify({intent: @js($intent->id),
-                            save: document.getElementById('save-card').checked}),
+                            save: canSave && saveCard.checked}),
                     });
                     if (!result.ok) throw new Error('Could not update your payment preferences. Try again.');
                     // https://docs.stripe.com/js/elements_object/fetch_updates
@@ -99,7 +109,9 @@
 
             // Show a spinner on payment submission
             function setLoading(isLoading) {
-                document.getElementById("save-card").disabled = isLoading;
+                loading = isLoading;
+                document.getElementById("payment-element").inert = isLoading;
+                saveCard.disabled = isLoading || !canSave;
                 if (isLoading) {
                     // Disable the button and show a spinner
                     document.querySelector("#submit").disabled = true;

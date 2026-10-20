@@ -77,6 +77,21 @@ trait Checkout
         return response()->json(['ok' => true]);
     }
 
+    private function recordIntentPayment($intent, $status)
+    {
+        DB::transaction(function () use ($intent, $status) {
+            $invoice = Invoice::where('id', $intent->metadata->invoice_id)->lockForUpdate()->firstOrFail();
+            if ($status !== 'succeeded' && $invoice->transactions()->where('transaction_id', $intent->id)
+                ->where('status', 'succeeded')->exists()) {
+                return; // Delayed failure/processing events must never downgrade settled money.
+            }
+            $helper = match ($status) {
+                'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',
+            };
+            ExtensionHelper::{$helper}($invoice, 'StripeSaved', $intent->amount / 100, null, $intent->id);
+        });
+    }
+
     private function savePaidMethod($intent)
     {
         if (($intent->setup_future_usage ?? null) !== 'off_session'
@@ -94,9 +109,6 @@ trait Checkout
             return; // The checkout opt-in authorizes saving a card or Link only.
         }
         $this->assertMethodCustomer($invoice->user, $method);
-        // Explicit opt-in permits redisplay; do not expose legacy unspecified-consent methods.
-        // https://docs.stripe.com/api/payment_methods/update#update_payment_method-allow_redisplay
-        $this->request('post', '/payment_methods/' . $method->id, ['allow_redisplay' => 'always']);
         $this->persistAgreement($invoice->user, $method);
     }
 
@@ -111,6 +123,9 @@ trait Checkout
     private function persistAgreement($user, $method)
     {
         $this->assertMethodCustomer($user, $method);
+        // Explicit checkout opt-in or account setup authorizes future redisplay.
+        // https://docs.stripe.com/api/payment_methods/update#update_payment_method-allow_redisplay
+        $this->request('post', '/payment_methods/' . $method->id, ['allow_redisplay' => 'always']);
         $data = $this->getPaymentDetails($method);
         // Native updateOrCreate has no unique index: serialize webhook/redirect retries.
         DB::transaction(function () use ($user, $method, $data) {
