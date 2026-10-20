@@ -27,6 +27,7 @@ use Illuminate\Support\Facades\View;
 use Str;
 
 require_once __DIR__ . '/Signature.php';
+require_once __DIR__ . '/Checkout.php';
 
 #[ExtensionMeta(
     name: 'Stripe Saved Methods',
@@ -37,7 +38,7 @@ require_once __DIR__ . '/Signature.php';
 )]
 class StripeSaved extends Gateway
 {
-    use Signature;
+    use Signature, Checkout;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -180,42 +181,6 @@ class StripeSaved extends Gateway
         ])->asForm()->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object();
     }
 
-    public function pay($invoice, $total)
-    {
-        $intentData = [
-            'description' => __('invoices.payment_for_invoice', ['number' => $invoice->number ?? $invoice->id]),
-            'amount' => $total * 100,
-            'currency' => $invoice->currency_code,
-            'automatic_payment_methods' => ['enabled' => 'true'],
-            'metadata' => ['invoice_id' => $invoice->id],
-        ];
-
-        // Do not fall back to an anonymous intent: saved methods require this customer.
-        $customer = $this->createOrGetStripeCustomer($invoice->user, (bool) $this->config('stripe_create_customers'));
-        $intentData['customer'] = $customer->id;
-        $intent = $this->request('post', '/payment_intents', $intentData);
-        // API assumptions must be verified against the pinned Basil version in a sandbox.
-        // https://docs.stripe.com/api/customer_sessions/create
-        // Removal is disabled: native agreements may still reference a removed method.
-        $session = $this->request('post', '/customer_sessions', [
-            'customer' => $customer->id,
-            'components' => ['payment_element' => [
-                'enabled' => 'true',
-                'features' => [
-                    'payment_method_redisplay' => 'enabled',
-                    'payment_method_save' => 'disabled',
-                    'payment_method_remove' => 'disabled',
-                ],
-            ]],
-        ]);
-
-        return view('gateways.stripe-saved::pay', [
-            'invoice' => $invoice, 'total' => $total, 'intent' => $intent,
-            'customerSessionSecret' => $session->client_secret,
-            'stripePublishableKey' => $this->config('stripe_publishable_key'),
-        ]);
-    }
-
     public function webhook(Request $request)
     {
         if (!$this->isValidSignature($request->getContent(), $request->header('Stripe-Signature'), $this->config('stripe_webhook_secret'))) {
@@ -240,6 +205,7 @@ class StripeSaved extends Gateway
                     break;
                 }
                 ExtensionHelper::addPayment($paymentIntent->metadata->invoice_id, 'StripeSaved', $paymentIntent->amount / 100, null, $paymentIntent->id);
+                $this->savePaidMethod($paymentIntent);
                 break;
             case 'payment_intent.payment_failed':
                 $paymentIntent = $event->data->object; // contains a StripePaymentIntent
@@ -682,17 +648,7 @@ class StripeSaved extends Gateway
         // Get the actual payment method that will be used for future charges
         $actualPaymentMethod = $this->getActualPaymentMethod($setupIntent);
 
-        $data = $this->getPaymentDetails($actualPaymentMethod);
-
-        // Save billing agreement
-        ExtensionHelper::makeBillingAgreement(
-            $user,
-            'StripeSaved',
-            $data['name'],
-            $actualPaymentMethod->id,
-            $data['type'],
-            $data['expiry'],
-        );
+        $this->persistAgreement($user, $actualPaymentMethod);
     }
 
     private function getActualPaymentMethod($setupIntent)

@@ -5,6 +5,11 @@
     <div id="payment-element">
 
     </div>
+    <label class="mt-4 block">
+        <input type="checkbox" id="save-card" />
+        Save this card for future payments
+    </label>
+    <p class="text-sm">Saving a card does not enable Auto Pay.</p>
     <button id="submit"
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
         Pay
@@ -56,31 +61,28 @@
                 event.preventDefault();
                 setLoading(true);
                 
-                var error;
-
-                var {
-                    error
-                } = await stripe.confirmPayment({
-                    //`Elements` instance that was used to create the Payment Element
-                    elements,
-                    confirmParams: {
-                        return_url: '{{ route('invoices.show', $invoice) }}?checkPayment=true',
-                    },
-                });
-
-
-                // This point will only be reached if there is an immediate error when
-                // confirming the payment. Otherwise, your customer will be redirected to
-                // your `return_url`. For some payment methods like iDEAL, your customer will
-                // be redirected to an intermediate site first to authorize the payment, then
-                // redirected to the `return_url`.
-                if (error.type === "card_error" || error.type === "validation_error") {
-                    showMessage(error.message);
-                } else {
-                    showMessage("An unexpected error occurred.");
+                try {
+                    // The authenticated, CSRF-protected endpoint binds consent to this intent.
+                    const result = await fetch(@js(route('extensions.gateways.stripe-saved.consent')), {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
+                            'X-CSRF-TOKEN': @js(csrf_token())},
+                        body: JSON.stringify({intent: @js($intent->id),
+                            save: document.getElementById('save-card').checked}),
+                    });
+                    if (!result.ok) throw new Error('Could not update your payment preferences. Try again.');
+                    // https://docs.stripe.com/js/elements_object/fetch_updates
+                    const update = await elements.fetchUpdates();
+                    if (update.error) throw update.error;
+                    const {error} = await stripe.confirmPayment({elements, confirmParams: {
+                        return_url: @js(route('invoices.show', $invoice) . '?checkPayment=true'),
+                    }});
+                    if (error) showMessage(error.message || 'Could not confirm payment.');
+                } catch (error) {
+                    showMessage(error.message || 'Could not confirm payment.');
+                } finally {
+                    setLoading(false);
                 }
-
-                setLoading(false);
             });
 
             function showMessage(messageText) {
@@ -97,6 +99,7 @@
 
             // Show a spinner on payment submission
             function setLoading(isLoading) {
+                document.getElementById("save-card").disabled = isLoading;
                 if (isLoading) {
                     // Disable the button and show a spinner
                     document.querySelector("#submit").disabled = true;
