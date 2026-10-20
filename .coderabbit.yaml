@@ -1,0 +1,41 @@
+# CodeRabbit configuration. Schema: https://coderabbit.ai/integrations/schema.v2.json
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+tone_instructions: "Be direct and specific. Use plain, industry-standard language. Point to the exact line and suggest a concrete fix."
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+    # Pull requests are stacked: each one targets the branch below it, not only main.
+    base_branches:
+      - ".*"
+  path_filters:
+    - "!dist/**"
+    - "!**/*.zip"
+  path_instructions:
+    - path: "**"
+      instructions: |
+        This is a public open-source repository. Flag anything that should not be public:
+        credentials, tokens, private keys, real hostnames, IP addresses, server paths,
+        database names, personal email addresses, or customer data. Examples and test data
+        must use example.com, documentation IP ranges, and placeholder values.
+    - path: "extension/**"
+      instructions: |
+        Paymenter payment gateway (Laravel/PHP). Check for double application of payments,
+        downgrading settled payments, amount/currency mismatches, and missing idempotency.
+        Verify webhook signatures against the raw body and enforce timestamp freshness.
+        Require explicit consent before saving payment methods. Prevent cross-customer
+        exposure or use of saved methods and payment intents. Keep secrets out of logs
+        and views; expose checkout client secrets only to the authorized invoice owner.
+        Check authentication, ownership and CSRF protection on state-changing routes;
+        only the signature-verified webhook should be exempt from CSRF.
+    - path: "tests/**"
+      instructions: |
+        Check that tests assert real behavior and cover failure paths, not only the happy path.
+chat:
+  auto_reply: true
