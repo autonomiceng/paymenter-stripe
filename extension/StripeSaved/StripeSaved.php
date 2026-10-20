@@ -190,20 +190,30 @@ class StripeSaved extends Gateway
             'metadata' => ['invoice_id' => $invoice->id],
         ];
 
-        try {
-            $includeDetails = (bool) $this->config('stripe_create_customers');
-            $customer = $this->createOrGetStripeCustomer($invoice->user, $includeDetails);
-            if (!empty($customer->id)) {
-                $intentData['customer'] = $customer->id;
-            }
-        } catch (Exception $e) {
-            // ignore customer creation errors and continue without customer
-        }
-
+        // Do not fall back to an anonymous intent: saved methods require this customer.
+        $customer = $this->createOrGetStripeCustomer($invoice->user, (bool) $this->config('stripe_create_customers'));
+        $intentData['customer'] = $customer->id;
         $intent = $this->request('post', '/payment_intents', $intentData);
+        // API assumptions must be verified against the pinned Basil version in a sandbox.
+        // https://docs.stripe.com/api/customer_sessions/create
+        // Removal is disabled: native agreements may still reference a removed method.
+        $session = $this->request('post', '/customer_sessions', [
+            'customer' => $customer->id,
+            'components' => ['payment_element' => [
+                'enabled' => 'true',
+                'features' => [
+                    'payment_method_redisplay' => 'enabled',
+                    'payment_method_save' => 'disabled',
+                    'payment_method_remove' => 'disabled',
+                ],
+            ]],
+        ]);
 
-        // Pay the invoice using Stripe
-        return view('gateways.stripe-saved::pay', ['invoice' => $invoice, 'total' => $total, 'intent' => $intent, 'stripePublishableKey' => $this->config('stripe_publishable_key')]);
+        return view('gateways.stripe-saved::pay', [
+            'invoice' => $invoice, 'total' => $total, 'intent' => $intent,
+            'customerSessionSecret' => $session->client_secret,
+            'stripePublishableKey' => $this->config('stripe_publishable_key'),
+        ]);
     }
 
     public function webhook(Request $request)
