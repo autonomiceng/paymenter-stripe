@@ -13,6 +13,7 @@ trait Checkout
 {
     public function pay($invoice, $total)
     {
+        abort_unless($this->gatewayEnabled(), 409);
         abort_unless(Auth::id() == $invoice->user_id, 403);
         $intentData = [
             'description' => __('invoices.payment_for_invoice', ['number' => $invoice->number ?? $invoice->id]),
@@ -48,8 +49,14 @@ trait Checkout
         ]);
     }
 
+    private function gatewayEnabled(): bool
+    {
+        return (bool) \App\Models\Gateway::where('extension', 'StripeSaved')->first()?->enabled;
+    }
+
     public function consent(Request $request)
     {
+        abort_unless($this->gatewayEnabled(), 409);
         $request->validate([
             'intent' => 'required|string|regex:/^pi_[a-zA-Z0-9]+$/|max:255',
             'save' => 'required|boolean',

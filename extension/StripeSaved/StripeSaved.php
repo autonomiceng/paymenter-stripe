@@ -183,11 +183,18 @@ class StripeSaved extends Gateway
 
     public function webhook(Request $request)
     {
+        if (!$this->gatewayEnabled()) {
+            \Illuminate\Support\Facades\Log::info('StripeSaved webhook ignored: gateway disabled or missing');
+            return response()->json(['ignored' => true]);
+        }
         if (!$this->isValidSignature($request->getContent(), $request->header('Stripe-Signature'), $this->config('stripe_webhook_secret'))) {
             return response()->json(['error' => 'Invalid signature'], 400);
         }
 
         $event = json_decode($request->getContent());
+        if (!is_object($event) || !isset($event->type, $event->data->object)) {
+            return response()->json(['error' => 'Invalid event'], 400);
+        }
 
         // Handle the event
         switch ($event->type) {
@@ -288,7 +295,7 @@ class StripeSaved extends Gateway
                 // Not a event type we care about, just return 200
         }
 
-        http_response_code(200);
+        return response()->json(['received' => true]);
     }
 
     private function setupSubscription($setupIntent)
