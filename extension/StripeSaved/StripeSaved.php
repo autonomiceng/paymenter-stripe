@@ -671,7 +671,9 @@ class StripeSaved extends Gateway
 
     private function getPaymentDetails($paymentMethod)
     {
+        $linkEmail = $paymentMethod->link->email ?? $paymentMethod->billing_details->email ?? null;
         $name = match ($paymentMethod->type) {
+            'link' => $linkEmail ? 'Link · ' . $linkEmail : 'Link',
             'card' => match ($paymentMethod->card->brand) {
                 'amex' => 'American Express',
                 'diners' => 'Diners Club',
