@@ -1,6 +1,6 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\Stripe;
+namespace Paymenter\Extensions\Gateways\StripeSaved;
 
 use App\Attributes\ExtensionMeta;
 use App\Classes\Extension\Gateway;
@@ -26,23 +26,26 @@ use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\View;
 use Str;
 
+require_once __DIR__ . '/Signature.php';
+
 #[ExtensionMeta(
-    name: 'Stripe Gateway',
-    description: 'Accept payments via Stripe.',
-    version: '1.0.1',
-    author: 'Paymenter',
-    url: 'https://paymenter.org/docs/extensions/stripe',
-    icon: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgZmlsbD0iIzUzM0FGRCIvPjxwYXRoIGQ9Ik0xMjAgMzkyTDM5MiAzMzRWMTEyTDEyMCAxNz hWMzk yWiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg=='
+    name: 'Stripe Saved Methods',
+    description: 'Stripe Payment Element with saved methods and optional card saving.',
+    version: '0.1.0',
+    author: 'Autonomic Engineering',
+        icon: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgZmlsbD0iIzUzM0FGRCIvPjxwYXRoIGQ9Ik0xMjAgMzkyTDM5MiAzMzRWMTEyTDEyMCAxNz hWMzk yWiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg=='
 )]
-class Stripe extends Gateway
+class StripeSaved extends Gateway
 {
+    use Signature;
+
     private const API_VERSION = '2025-07-30.basil';
 
     public function boot()
     {
         require __DIR__ . '/routes.php';
         // Register webhook route
-        View::addNamespace('gateways.stripe', __DIR__ . '/resources/views');
+        View::addNamespace('gateways.stripe-saved', __DIR__ . '/resources/views');
 
         Event::listen(Updated::class, function (Updated $event) {
             if ($event->service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$event->service->subscription_id) {
@@ -129,14 +132,14 @@ class Stripe extends Gateway
         }
 
         // If the extension isn't enabled, try to boot it
-        if (!Route::has('extensions.gateways.stripe.webhook')) {
+        if (!Route::has('extensions.gateways.stripe-saved.webhook')) {
             require __DIR__ . '/routes.php';
         }
 
         // Check if webhook already exists
         $webhooks = $this->request('get', '/webhook_endpoints');
         foreach ($webhooks->data as $webhook) {
-            if ($webhook->url === route('extensions.gateways.stripe.webhook')) {
+            if ($webhook->url === route('extensions.gateways.stripe-saved.webhook')) {
                 // Delete webhook
                 $this->request('delete', '/webhook_endpoints/' . $webhook->id);
                 break;
@@ -145,7 +148,7 @@ class Stripe extends Gateway
 
         // Create webhook on stripe
         $webhook = $this->request('post', '/webhook_endpoints', [
-            'url' => route('extensions.gateways.stripe.webhook'),
+            'url' => route('extensions.gateways.stripe-saved.webhook'),
             'description' => 'Paymenter Stripe Webhook',
             'enabled_events' => [
                 'payment_intent.succeeded',
@@ -200,7 +203,7 @@ class Stripe extends Gateway
         $intent = $this->request('post', '/payment_intents', $intentData);
 
         // Pay the invoice using Stripe
-        return view('gateways.stripe::pay', ['invoice' => $invoice, 'total' => $total, 'intent' => $intent, 'stripePublishableKey' => $this->config('stripe_publishable_key')]);
+        return view('gateways.stripe-saved::pay', ['invoice' => $invoice, 'total' => $total, 'intent' => $intent, 'stripePublishableKey' => $this->config('stripe_publishable_key')]);
     }
 
     public function webhook(Request $request)
@@ -218,7 +221,7 @@ class Stripe extends Gateway
                 if (!isset($paymentIntent->metadata->invoice_id)) {
                     break;
                 }
-                ExtensionHelper::addProcessingPayment($paymentIntent->metadata->invoice_id, 'Stripe', $paymentIntent->amount / 100, null, $paymentIntent->id);
+                ExtensionHelper::addProcessingPayment($paymentIntent->metadata->invoice_id, 'StripeSaved', $paymentIntent->amount / 100, null, $paymentIntent->id);
                 break;
                 // Normal payment
             case 'payment_intent.succeeded':
@@ -226,14 +229,14 @@ class Stripe extends Gateway
                 if (!isset($paymentIntent->metadata->invoice_id)) {
                     break;
                 }
-                ExtensionHelper::addPayment($paymentIntent->metadata->invoice_id, 'Stripe', $paymentIntent->amount / 100, null, $paymentIntent->id);
+                ExtensionHelper::addPayment($paymentIntent->metadata->invoice_id, 'StripeSaved', $paymentIntent->amount / 100, null, $paymentIntent->id);
                 break;
             case 'payment_intent.payment_failed':
                 $paymentIntent = $event->data->object; // contains a StripePaymentIntent
                 if (!isset($paymentIntent->metadata->invoice_id)) {
                     break;
                 }
-                ExtensionHelper::addFailedPayment($paymentIntent->metadata->invoice_id, 'Stripe', $paymentIntent->amount / 100, null, $paymentIntent->id);
+                ExtensionHelper::addFailedPayment($paymentIntent->metadata->invoice_id, 'StripeSaved', $paymentIntent->amount / 100, null, $paymentIntent->id);
                 break;
             case 'charge.updated':
                 $charge = $event->data->object; // contains a StripeCharge
@@ -302,7 +305,7 @@ class Stripe extends Gateway
                         break;
                     }
 
-                    ExtensionHelper::addPayment($invoiceModel->id, 'Stripe', $invoice->amount_paid / 100, null, $paymentIntent->payment->payment_intent);
+                    ExtensionHelper::addPayment($invoiceModel->id, 'StripeSaved', $invoice->amount_paid / 100, null, $paymentIntent->payment->payment_intent);
                 }
                 break;
             default:
@@ -616,7 +619,7 @@ class Stripe extends Gateway
         ]);
 
         // Return the client secret to the frontend to complete the setup
-        return view('gateways.stripe::billing-agreement', ['intent' => $setupIntent, 'type' => 'setup', 'stripePublishableKey' => $this->config('stripe_publishable_key')]);
+        return view('gateways.stripe-saved::billing-agreement', ['intent' => $setupIntent, 'type' => 'setup', 'stripePublishableKey' => $this->config('stripe_publishable_key')]);
     }
 
     public function cancelBillingAgreement(BillingAgreement $billingAgreement): bool
@@ -674,7 +677,7 @@ class Stripe extends Gateway
         // Save billing agreement
         ExtensionHelper::makeBillingAgreement(
             $user,
-            'Stripe',
+            'StripeSaved',
             $data['name'],
             $actualPaymentMethod->id,
             $data['type'],
@@ -782,40 +785,4 @@ class Stripe extends Gateway
         return true;
     }
 
-    // Function to split and decode the Stripe-Signature header
-    private function getHeaderValues($sig_header)
-    {
-        $parts = explode(',', $sig_header);
-        $timestamp = null;
-        $signature = null;
-
-        foreach ($parts as $part) {
-            if (strpos($part, 't=') === 0) {
-                $timestamp = substr($part, 2);
-            } elseif (strpos($part, 'v1=') === 0) {
-                $signature = substr($part, 3);
-            }
-        }
-
-        return [$timestamp, $signature];
-    }
-
-    // Validate the signature
-    private function isValidSignature($payload, $sig_header, $secret)
-    {
-        [$timestamp, $signature] = $this->getHeaderValues($sig_header);
-
-        if (empty($timestamp) || empty($signature) || empty($secret)) {
-            return false;
-        }
-
-        // Create the signed payload string
-        $signed_payload = $timestamp . '.' . $payload;
-
-        // Compute the expected signature
-        $expected_signature = hash_hmac('sha256', $signed_payload, $secret);
-
-        // Compare the expected signature to the actual signature
-        return hash_equals($expected_signature, $signature);
-    }
 }

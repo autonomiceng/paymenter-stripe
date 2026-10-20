@@ -64,7 +64,7 @@
                 } = await stripe.confirmSetup({
                     elements,
                     confirmParams: {
-                        return_url: '{{ route('extensions.gateways.stripe.setup-agreement') }}',
+                        return_url: '{{ route('extensions.gateways.stripe-saved.setup-agreement') }}',
                     },
                 });
 
