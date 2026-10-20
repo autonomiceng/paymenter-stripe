@@ -136,7 +136,8 @@ check(invoke($gateway, 'isValidSignature', $valid->body, $valid->signature . ',v
 check(!invoke($gateway, 'isValidSignature', $valid->body, $valid->signature, ''), 'Empty secret rejected');
 $invalid = eventRequest($intent);
 $invalid->body = '{}';
-$invalid->signature = 't=' . time() . ',v1=' . hash_hmac('sha256', time() . '.{}', 'whsec_test');
+$invalidTime = time();
+$invalid->signature = 't=' . $invalidTime . ',v1=' . hash_hmac('sha256', $invalidTime . '.{}', 'whsec_test');
 check($gateway->webhook($invalid)['status'] === 400, 'Signed invalid event shape rejected');
 Gateway::$enabled = false;
 $before = count(Http::$calls);
