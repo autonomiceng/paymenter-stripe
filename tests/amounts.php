@@ -21,7 +21,7 @@ Gateway::$enabled = true;
 Http::$handler = function ($verb, $path, $data) {
     return match (true) {
         $path === '/customers/cus_owner' => ['id' => 'cus_owner'],
-        $path === '/payment_intents' => ['client_secret' => 'pi_secret'],
+        $path === '/payment_intents' => ['id' => 'pi_amount', 'client_secret' => 'pi_secret'],
         $path === '/customer_sessions' => ['client_secret' => 'cuss_secret'],
         $path === '/subscriptions/sub_test' => ['schedule' => null, 'items' => ['data' => [
             ['id' => 'si_test', 'price' => ['product' => 'prod_test']]]]],
@@ -29,6 +29,7 @@ Http::$handler = function ($verb, $path, $data) {
         default => throw new RuntimeException('Unexpected amount test request: ' . $path),
     };
 };
+$user->props->values = [];
 $gateway->pay($invoice, 0.29);
 check(Http::$calls[count(Http::$calls) - 2][2]['amount'] === 29, 'Checkout sends integer cents');
 $service = new Service;
@@ -36,6 +37,7 @@ $gateway->updateSubscription($service);
 check(end(Http::$calls)[2]['price_data']['unit_amount'] === 5997, 'Subscription update retains quantity > 1');
 $gateway->charge($invoice, '19.99', new BillingAgreement);
 check(end(Http::$calls)[2]['amount'] === 1999, 'Off-session charge sends integer cents');
+$user->props->values = [];
 $invoice->currency_code = 'JPY';
 $gateway->pay($invoice, 123);
 check(Http::$calls[count(Http::$calls) - 2][2]['amount'] === 123, 'JPY checkout sends yen');

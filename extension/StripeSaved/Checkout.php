@@ -4,6 +4,7 @@ namespace Paymenter\Extensions\Gateways\StripeSaved;
 
 use App\Helpers\ExtensionHelper;
 use App\Models\Invoice;
+use App\Models\InvoiceTransaction;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -26,7 +27,7 @@ trait Checkout
         // Do not fall back to an anonymous intent: saved methods require this customer.
         $customer = $this->createOrGetStripeCustomer($invoice->user, (bool) $this->config('stripe_create_customers'));
         $intentData['customer'] = $customer->id;
-        $intent = $this->request('post', '/payment_intents', $intentData);
+        $intent = $this->checkoutIntent($invoice, $intentData);
         // API assumptions must be verified against the pinned Basil version in a sandbox.
         // https://docs.stripe.com/api/customer_sessions/create
         // Removal is disabled: native agreements may still reference a removed method.
@@ -66,8 +67,13 @@ trait Checkout
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
         abort_unless(Auth::id() == $invoice->user_id && $customer && $intent->customer === $customer
             && ($intent->metadata->stripe_saved_gateway ?? null) === '1', 403);
-        abort_unless(in_array($intent->status, ['requires_payment_method', 'requires_confirmation']), 409);
         $save = $request->boolean('save');
+        if ($intent->status === 'requires_action') {
+            // Resume 3DS without changing the consent already used for confirmation.
+            abort_unless($save === (($intent->metadata->stripe_saved_consent ?? null) === '1'), 409);
+            return response()->json(['ok' => true]);
+        }
+        abort_unless(in_array($intent->status, ['requires_payment_method', 'requires_confirmation']), 409);
         // https://docs.stripe.com/api/payment_intents/update#update_payment_intent-setup_future_usage
         $this->request('post', '/payment_intents/' . $intent->id, [
             'setup_future_usage' => $save ? 'off_session' : '',
@@ -79,11 +85,19 @@ trait Checkout
 
     private function recordIntentPayment($intent, $status)
     {
-        DB::transaction(function () use ($intent, $status) {
+        $userId = Invoice::findOrFail($intent->metadata->invoice_id)->user_id;
+        DB::transaction(function () use ($intent, $status, $userId) {
+            User::where('id', $userId)->lockForUpdate()->firstOrFail();
             $invoice = Invoice::where('id', $intent->metadata->invoice_id)->lockForUpdate()->firstOrFail();
-            if ($status !== 'succeeded' && $invoice->transactions()->where('transaction_id', $intent->id)
-                ->where('status', 'succeeded')->exists()) {
-                return; // Delayed failure/processing events must never downgrade settled money.
+            if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->lockForUpdate()->first()) return;
+            if (!empty($intent->customer) && $intent->customer !== $invoice->user->properties()->where('key', 'stripe_id')->first()?->value) {
+                \Illuminate\Support\Facades\Log::warning('StripeSaved payment customer mismatch', ['invoice_id' => $invoice->id]);
+                return;
+            }
+            if ($status === 'succeeded' && $invoice->status === 'paid') return;
+            if (strtolower($invoice->currency_code) !== strtolower($intent->currency ?? '')) {
+                \Illuminate\Support\Facades\Log::warning('StripeSaved payment currency mismatch', ['invoice_id' => $invoice->id]);
+                return;
             }
             $helper = match ($status) {
                 'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',

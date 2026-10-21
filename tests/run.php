@@ -149,4 +149,6 @@ require __DIR__ . '/adoption.php';
 require __DIR__ . '/adoption-store.php';
 require __DIR__ . '/views.php';
 require __DIR__ . '/amounts.php';
+require __DIR__ . '/handlers.php';
+require __DIR__ . '/retries.php';
 echo "PASS: $count offline assertions\n";

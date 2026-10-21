@@ -13,8 +13,27 @@ Tests execute the gateway with PHP-only model, lock and HTTP fakes; unexpected
 HTTP requests fail. No Stripe or application server is contacted. They verify
 customer binding, consent, intent updates, agreement retry keys/locking, labels,
 signatures, disabled handling and monotonic successful payments. Amounts use
-integer minor units with half-up rounding and Stripe zero-decimal currencies;
-subscription price updates preserve service quantity. Fakes do not
+integer minor units with half-up rounding and Stripe zero-decimal currencies
+(including the UGX/ISK whole-unit, two-decimal API compatibility representation);
+subscription price updates preserve service quantity. Setup subscriptions skip services
+already linked to Stripe, repair an interrupted listener marker write, and persist immutable schedule payloads and SetupIntent/service
+retry keys before remote creation. Completed schedule IDs survive local write failures;
+unresolved attempts older than 23 hours require reconciliation, not another schedule.
+Subscription invoice creation binds a single pending related invoice in Stripe metadata
+before finalizing/paying, recovering the current immutable binding on retries; ambiguous creation and unbound success events require manual
+reconciliation. Success requires that exact pending related invoice and matching
+currency; split payments require manual reconciliation. Both delivery paths serialize settlement on the customer and use locking current
+reads to skip a successful transaction globally, so one PaymentIntent cannot settle two local invoices. A resumed
+3DS attempt shows and preserves its existing consent without changing payment preferences.
+
+Checkout renders persist a retry key and PaymentIntent ID in native user properties
+before and after creation. Reopening retrieves the same unfinished intent. A changed
+invoice payload, finished/cancelled intent, or unresolved creation older than 23 hours
+returns 409; reconcile the stored `stripe_saved_checkout_<invoice-id>` property
+against Stripe before clearing it for a new attempt. Never clear an unresolved or
+settled payment to retry. Reconcile `stripe_saved_subscription_<service-id>`
+in the same way before removing an unresolved schedule attempt. This intentionally requires operator reconciliation rather
+than creating a second charge after Stripe's idempotency retention window. Fakes do not
 prove real database isolation, native uploader/route behavior or Stripe.js/API
 compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
 
@@ -22,6 +41,8 @@ compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
   duplicate subscription listeners even when bundled Stripe is disabled.
 - Check CustomerSession feature names on pinned Basil, restricted-key access,
   `customerSessionClientSecret`, saved-card selection and Link email display.
+- Verify setup cannot save without the opt-in, recorded terms/user/time survive
+  redirect and webhook retries, and setup errors permit retry.
 - Verify own-customer isolation, legacy unspecified-redisplay exclusions and
   account setup redisplay. Test card, wallet and Link with saving checked/clear.
 - Confirm clearing future usage with `''` and `elements.fetchUpdates()` refresh
