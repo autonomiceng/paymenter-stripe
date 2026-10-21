@@ -17,7 +17,7 @@ trait Checkout
         abort_unless(Auth::id() == $invoice->user_id, 403);
         $intentData = [
             'description' => __('invoices.payment_for_invoice', ['number' => $invoice->number ?? $invoice->id]),
-            'amount' => $total * 100,
+            'amount' => $this->toMinorUnits($total, $invoice->currency_code),
             'currency' => $invoice->currency_code,
             'automatic_payment_methods' => ['enabled' => 'true'],
             'metadata' => ['invoice_id' => $invoice->id, 'stripe_saved_gateway' => '1'],
@@ -88,7 +88,7 @@ trait Checkout
             $helper = match ($status) {
                 'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',
             };
-            ExtensionHelper::{$helper}($invoice, 'StripeSaved', $intent->amount / 100, null, $intent->id);
+            ExtensionHelper::{$helper}($invoice, 'StripeSaved', $this->fromMinorUnits($intent->amount, $intent->currency), null, $intent->id);
         });
     }
 

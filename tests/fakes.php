@@ -37,6 +37,7 @@ namespace App\Models {
         public $email = 'user@example.test';
         public function __construct(public Properties $props) {}
         public function properties() { return $this->props; }
+        public function __get($key) { return $this->props; }
         public static function where($key, $id) { return new Query(self::$row); }
         public static function findOrFail($id) { return self::$row; }
     }
@@ -64,7 +65,19 @@ namespace App\Models {
         public static $bundled = true;
         public static function where($key, $value) { if (self::$rows !== null) return new \AdoptionCollection(self::$rows[$value] ?? []); return new Query($value === 'Stripe' ? (self::$bundled ? (object) ['enabled' => false] : null) : (object) ['enabled' => self::$enabled]); }
     }
-    class BillingAgreement {}
+    class Service {
+        public const STATUS_CANCELLED = 'cancelled';
+        public $id = 41, $subscription_id = 'sub_test', $price = '19.99', $quantity = 3;
+        public $currency, $plan, $product;
+        public array $dirty = ['price'];
+        public function __construct() {
+            $this->currency = (object) ['code' => 'usd'];
+            $this->plan = (object) ['billing_unit' => 'month', 'billing_period' => 1];
+            $this->product = (object) ['id' => 8, 'name' => 'Test product'];
+        }
+        public function isDirty($field) { return in_array($field, $this->dirty); }
+    }
+    class BillingAgreement { public $external_reference = 'pm_test', $id = 4; }
     class Extension {}
     class InvoiceTransaction {}
 }

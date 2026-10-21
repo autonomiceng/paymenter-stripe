@@ -12,7 +12,9 @@ python3 tools/build_release.py --output dist/StripeSaved-0.1.0.zip
 Tests execute the gateway with PHP-only model, lock and HTTP fakes; unexpected
 HTTP requests fail. No Stripe or application server is contacted. They verify
 customer binding, consent, intent updates, agreement retry keys/locking, labels,
-signatures, disabled handling and monotonic successful payments. Fakes do not
+signatures, disabled handling and monotonic successful payments. Amounts use
+integer minor units with half-up rounding and Stripe zero-decimal currencies;
+subscription price updates preserve service quantity. Fakes do not
 prove real database isolation, native uploader/route behavior or Stripe.js/API
 compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
 

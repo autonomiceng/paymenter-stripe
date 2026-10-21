@@ -28,6 +28,7 @@ use Str;
 
 require_once __DIR__ . '/Signature.php';
 require_once __DIR__ . '/Checkout.php';
+require_once __DIR__ . '/Amounts.php';
 
 #[ExtensionMeta(
     name: 'Stripe Saved Methods',
@@ -38,7 +39,7 @@ require_once __DIR__ . '/Checkout.php';
 )]
 class StripeSaved extends Gateway
 {
-    use Signature, Checkout;
+    use Signature, Checkout, Amounts;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -239,7 +240,7 @@ class StripeSaved extends Gateway
                 $fee = 0;
                 if ($charge->balance_transaction) {
                     $balanceTransaction = $this->request('get', '/balance_transactions/' . $charge->balance_transaction);
-                    $fee = $balanceTransaction->fee / 100;
+                    $fee = $this->fromMinorUnits($balanceTransaction->fee, $balanceTransaction->currency);
                 }
                 ExtensionHelper::addPaymentFee($charge->payment_intent, $fee);
 
@@ -296,7 +297,7 @@ class StripeSaved extends Gateway
                         break;
                     }
 
-                    ExtensionHelper::addPayment($invoiceModel->id, 'StripeSaved', $invoice->amount_paid / 100, null, $paymentIntent->payment->payment_intent);
+                    ExtensionHelper::addPayment($invoiceModel->id, 'StripeSaved', $this->fromMinorUnits($invoice->amount_paid, $invoice->currency), null, $paymentIntent->payment->payment_intent);
                 }
                 break;
             default:
@@ -353,7 +354,7 @@ class StripeSaved extends Gateway
                             'price_data' => [
                                 'currency' => $invoice->currency_code,
                                 'product' => $stripeProduct->id,
-                                'unit_amount' => $item->price * 100,
+                                'unit_amount' => $this->toMinorUnits($item->price, $invoice->currency_code),
                                 'recurring' => [
                                     'interval' => $service->plan->billing_unit,
                                     'interval_count' => $service->plan->billing_period,
@@ -375,7 +376,7 @@ class StripeSaved extends Gateway
                         'price_data' => [
                             'currency' => $invoice->currency_code,
                             'product' => $stripeProduct->id,
-                            'unit_amount' => ($service->price * $service->quantity) * 100,
+                            'unit_amount' => $this->toMinorUnits($service->price * $service->quantity, $invoice->currency_code),
                             'recurring' => [
                                 'interval' => $service->plan->billing_unit,
                                 'interval_count' => $service->plan->billing_period,
@@ -439,7 +440,7 @@ class StripeSaved extends Gateway
                 $key = count($phases) - 1;
                 $phases[$key]['items'][0]->price_data = [
                     'currency' => $service->currency->code,
-                    'unit_amount' => $service->price * 100,
+                    'unit_amount' => $this->toMinorUnits($service->price * $service->quantity, $service->currency->code),
                     'product' => $stripeProduct->id,
                     'recurring' => [
                         'interval' => $service->plan->billing_unit,
@@ -463,7 +464,7 @@ class StripeSaved extends Gateway
                 $this->request('post', '/subscription_items/' . $item->id, [
                     'price_data' => [
                         'currency' => $service->currency->code,
-                        'unit_amount' => $service->price * 100,
+                        'unit_amount' => $this->toMinorUnits($service->price * $service->quantity, $service->currency->code),
                         'product' => $item->price->product,
                         'recurring' => [
                             'interval' => $service->plan->billing_unit,
@@ -494,7 +495,7 @@ class StripeSaved extends Gateway
                 $this->request('post', '/subscription_items/' . $item->id, [
                     'price_data' => [
                         'currency' => $service->currency->code,
-                        'unit_amount' => $service->price * 100,
+                        'unit_amount' => $this->toMinorUnits($service->price * $service->quantity, $service->currency->code),
                         'product' => $item->price->product,
                         'recurring' => [
                             'interval' => $service->plan->billing_unit,
@@ -746,7 +747,7 @@ class StripeSaved extends Gateway
         // Create payment intent
         try {
             $intent = $this->request('post', '/payment_intents', [
-                'amount' => $amount * 100,
+                'amount' => $this->toMinorUnits($amount, $invoice->currency_code),
                 'currency' => $invoice->currency_code,
                 'customer' => $customer->id,
                 'payment_method' => $billingAgreement->external_reference,
