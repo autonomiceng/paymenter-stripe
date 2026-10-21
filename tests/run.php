@@ -147,4 +147,5 @@ check(Log::$lines === ['StripeSaved webhook ignored: gateway disabled or missing
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 409');
 require __DIR__ . '/adoption.php';
 require __DIR__ . '/adoption-store.php';
+require __DIR__ . '/views.php';
 echo "PASS: $count offline assertions\n";

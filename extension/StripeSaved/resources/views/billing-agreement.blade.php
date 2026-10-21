@@ -1,7 +1,5 @@
-<form id="payment-form" class="mt-2 text-white">
-    <div id="error-message" class="hidden text-red-500 mb-2">
-
-    </div>
+<form id="payment-form" class="mt-2">
+    <div id="error-message" role="alert" class="text-red-600 dark:text-red-400"></div>
     <div id="payment-element">
 
     </div>
@@ -12,6 +10,7 @@
 </form>
 @script
 <script>
+    @include('gateways.stripe-saved::stripe-theme')
     const script = document.createElement('script');
         script.src = 'https://js.stripe.com/v3/';
         script.async = true;
@@ -24,11 +23,10 @@
 
             const type = @js($type);
 
+            const form = document.getElementById('payment-form');
             const options = {
                 clientSecret: @js($intent->client_secret),
-                appearance: {
-                    theme: 'night'
-                },
+                appearance: stripeAppearance(form),
             };
 
             const paymentElementOptions = {
@@ -49,12 +47,16 @@
             // Set up Stripe.js and Elements to use in checkout form, passing the client secret obtained in a previous step
             const elements = stripe.elements(options);
             const paymentElement = elements.create('payment', paymentElementOptions);
+            const message = document.getElementById('error-message');
+            let loading = false;
+            // The alert region stays mounted so screen readers announce new text.
+            paymentElement.on('change', () => { if (!loading) message.replaceChildren(); });
             paymentElement.mount('#payment-element');
-
-            const form = document.getElementById('payment-form');
+            const stopThemeSync = syncStripeTheme(form, elements);
 
             form.addEventListener('submit', async (event) => {
                 event.preventDefault();
+                message.replaceChildren();
                 setLoading(true);
                 
                 try {
@@ -63,9 +65,10 @@
                     }});
                     if (error) throw error;
                 } catch (error) {
-                    const message = document.getElementById('error-message');
-                    message.textContent = error.message || 'Could not save payment method.';
-                    message.classList.remove('hidden');
+                    const text = document.createElement('p');
+                    text.className = 'mb-2';
+                    text.textContent = error.message || 'Could not save payment method.';
+                    message.replaceChildren(text);
                 } finally {
                     setLoading(false);
                 }
@@ -74,6 +77,7 @@
 
             // Show a spinner on payment submission
             function setLoading(isLoading) {
+                loading = isLoading;
                 if (isLoading) {
                     // Disable the button and show a spinner
                     document.querySelector("#submit").disabled = true;
@@ -86,6 +90,7 @@
 
             $wire.on('invoice.payment.cancelled', () => {
                 // destroy the payment element
+                stopThemeSync();
                 paymentElement.destroy();
             });
         };

@@ -1,7 +1,5 @@
-<form id="payment-form" class="mt-2 text-white">
-    <div id="error-message" class="hidden text-red-500 mb-2">
-
-    </div>
+<form id="payment-form" class="mt-2">
+    <div id="error-message" role="alert" class="text-red-600 dark:text-red-400"></div>
     <div id="payment-element">
 
     </div>
@@ -17,6 +15,7 @@
 </form>
 @script
 <script>
+    @include('gateways.stripe-saved::stripe-theme')
     const script = document.createElement('script');
         script.src = 'https://js.stripe.com/v3/';
         script.async = true;
@@ -27,12 +26,11 @@
                 @js($stripePublishableKey)
             );
 
+            const form = document.getElementById('payment-form');
             const options = {
                 clientSecret: @js($intent->client_secret),
                 customerSessionClientSecret: @js($customerSessionSecret),
-                appearance: {
-                    theme: 'night'
-                },
+                appearance: stripeAppearance(form),
             };
 
             const paymentElementOptions = {
@@ -58,17 +56,19 @@
             const saveCard = document.getElementById('save-card');
             // https://docs.stripe.com/js/element/events/on_change?type=paymentElement
             paymentElement.on('change', (event) => {
+                if (!loading) clearMessage();
                 canSave = ['card', 'link'].includes(event.value?.type);
                 saveCard.disabled = loading || !canSave;
                 if (!canSave) saveCard.checked = false;
             });
 
+            saveCard.addEventListener('change', clearMessage);
             paymentElement.mount('#payment-element');
-
-            const form = document.getElementById('payment-form');
+            const stopThemeSync = syncStripeTheme(form, elements);
 
             form.addEventListener('submit', async (event) => {
                 event.preventDefault();
+                clearMessage();
                 setLoading(true);
                 
                 try {
@@ -95,16 +95,17 @@
                 }
             });
 
+            // The alert region stays mounted so screen readers announce new text; it keeps the
+            // error until the customer edits the form or submits again.
             function showMessage(messageText) {
-                const messageContainer = document.querySelector("#error-message");
+                const message = document.createElement('p');
+                message.className = 'mb-2';
+                message.textContent = messageText;
+                document.getElementById('error-message').replaceChildren(message);
+            }
 
-                messageContainer.classList.remove("hidden");
-                messageContainer.textContent = messageText;
-
-                setTimeout(function() {
-                    messageContainer.classList.add("hidden");
-                    messageContainer.textContent = "";
-                }, 4000);
+            function clearMessage() {
+                document.getElementById('error-message').replaceChildren();
             }
 
             // Show a spinner on payment submission
@@ -124,6 +125,7 @@
 
             $wire.on('invoice.payment.cancelled', () => {
                 // destroy the payment element
+                stopThemeSync();
                 paymentElement.destroy();
             });
         };
