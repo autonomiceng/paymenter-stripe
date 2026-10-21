@@ -210,6 +210,13 @@ class StripeSaved extends Gateway
             $customer = $this->request('get', '/customers/' . $stripeCustomerId->value);
         }
 
+        if (($setupIntent->customer ?? null) !== $customer->id) {
+            \Illuminate\Support\Facades\Log::warning('StripeSaved subscription setup customer mismatch', ['invoice_id' => $invoice->id]);
+            return;
+        }
+        $method = $this->request('get', '/payment_methods/' . $setupIntent->payment_method);
+        if (!$this->methodCustomerMatches($user, $method)) return;
+
         // Make payment method default
         $paymentMethod = $this->request('post', '/customers/' . $customer->id, [
             'invoice_settings' => ['default_payment_method' => $setupIntent->payment_method],
@@ -570,8 +577,7 @@ class StripeSaved extends Gateway
         // Get the actual payment method that will be used for future charges
         $actualPaymentMethod = $this->getActualPaymentMethod($setupIntent);
 
-        $this->persistAgreement($user, $actualPaymentMethod);
-        return true;
+        return $this->persistAgreement($user, $actualPaymentMethod);
     }
 
     private function getActualPaymentMethod($setupIntent)

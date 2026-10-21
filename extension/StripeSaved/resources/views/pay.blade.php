@@ -38,9 +38,11 @@
             const form = document.getElementById('payment-form');
             const options = {
                 clientSecret: @js($intent->client_secret),
-                customerSessionClientSecret: @js($customerSessionSecret),
                 appearance: stripeAppearance(form),
             };
+
+            const customerSessionSecret = @js($customerSessionSecret);
+            if (customerSessionSecret) options.customerSessionClientSecret = customerSessionSecret;
 
             const paymentElementOptions = {
                 layout: {

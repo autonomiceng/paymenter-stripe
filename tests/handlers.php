@@ -39,11 +39,12 @@ $service->properties->values['has_stripe_subscription'] = '1';
 $before = count(Http::$calls);
 $gateway->cancelSubscription($service);
 check(count(Http::$calls) === $before, 'Empty subscription id stops cancellation even with marker');
-$setup = (object) ['id' => 'seti_subscription', 'payment_method' => 'pm_test', 'metadata' => (object) ['invoice_id' => 12]];
+$setup = (object) ['id' => 'seti_subscription', 'customer' => 'cus_owner', 'payment_method' => 'pm_test', 'metadata' => (object) ['invoice_id' => 12]];
 $invoice->items = [(object) ['reference_type' => Service::class, 'reference' => $service, 'price' => '20.99']];
 Http::$handler = function ($verb, $path, $data) {
     return match ($path) {
         '/customers/cus_owner' => ['id' => 'cus_owner'],
+        '/payment_methods/pm_test' => ['id' => 'pm_test', 'customer' => 'cus_owner'],
         '/products/search' => ['data' => [['id' => 'prod_test']]],
         '/subscription_schedules' => ['subscription' => 'sub_created'],
         default => throw new RuntimeException('Unexpected setup request: ' . $path),
@@ -137,6 +138,7 @@ Http::$handler = function ($verb, $path) {
         '/subscriptions/sub_test' => ['schedule' => 'sched_test'],
         '/subscription_schedules/sched_test' => ['phases' => [
             ['items' => [(object) []], 'start_date' => 1, 'end_date' => 2]]],
+        '/payment_methods/pm_test' => ['id' => 'pm_test', 'customer' => 'cus_owner'],
         '/products/search' => ['data' => [['id' => 'prod_test']]],
         default => throw new RuntimeException('Unexpected update request: ' . $path),
     };

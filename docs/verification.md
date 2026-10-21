@@ -64,3 +64,10 @@ compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
   events, no automatic service assignment, and unchanged Auto Pay.
 - Reject bad/stale signatures; disable the fork and confirm 200/no effects.
   Rehearse migration and legacy subscription billing/cancellation end to end.
+
+Customer setup failures stop checkout with a plain retry message. A rejected Customer
+Session request logs only the invoice ID and HTTP status; checkout still accepts a
+new payment method without saved-method redisplay. Permanent saved-method customer
+mismatches are logged and acknowledged after settlement. Transient request and local
+persistence failures remain retryable; retries preserve one payment and one agreement.
+Verify Customer Session failure and recovery in the sandbox as well as normal redisplay.

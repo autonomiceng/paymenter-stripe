@@ -11,6 +11,19 @@ namespace Illuminate\Console {
     }
     class Application { public static $callbacks = []; public static function starting($callback) { self::$callbacks[] = $callback; } }
 }
+namespace App\Exceptions { class DisplayException extends \RuntimeException {} }
+namespace Illuminate\Http\Client {
+    class RequestException extends \RuntimeException {
+        public $response;
+        public function __construct($status) {
+            parent::__construct('sensitive request payload');
+            $this->response = new class($status) {
+                public function __construct(private $code) {}
+                public function status() { return $this->code; }
+            };
+        }
+    }
+}
 namespace App\Events\Service { class Updated { public function __construct(public $service) {} } }
 namespace App\Events\ServiceCancellation { class Created { public function __construct(public $cancellation) {} } }
 namespace App\Attributes { #[\Attribute] class ExtensionMeta { public function __construct(...$args) {} } }
@@ -122,6 +135,7 @@ namespace App\Models {
 namespace App\Helpers {
     class ExtensionHelper {
         public static $agreements = [];
+        public static $agreementFailure = false;
         public static $payments = [];
         public static $applications = 0;
         public static $fees = [];
@@ -129,6 +143,7 @@ namespace App\Helpers {
         public static function makeBillingAgreement($user, $gateway, $name, $id, $type, $expiry) {
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Agreement lock missing');
             self::$agreements[$id] = compact('name', 'gateway', 'type', 'expiry');
+            if (self::$agreementFailure) { self::$agreementFailure = false; throw new \RuntimeException('Interrupted agreement response'); }
         }
         // Native helper updateOrCreate is keyed by invoice + transaction_id under an invoice lock.
         public static function addPayment($invoice, $gateway, $amount, $fee, $id, $status = 'succeeded') {

@@ -38,3 +38,6 @@ $payView = file_get_contents($views . 'pay.blade.php');
 check(str_contains($payView, "@checked($" . "intent->status === 'requires_action'")
     && str_contains($payView, 'save: resuming ? savedConsent :')
     && str_contains($payView, 'saveCard.disabled = resuming ||'), '3DS resume visibly preserves its recorded save choice');
+
+check(str_contains($payView, 'if (customerSessionSecret) options.customerSessionClientSecret = customerSessionSecret;'),
+    'Checkout only includes a Customer Session secret when available');

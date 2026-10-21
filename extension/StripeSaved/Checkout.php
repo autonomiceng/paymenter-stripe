@@ -3,6 +3,8 @@
 namespace Paymenter\Extensions\Gateways\StripeSaved;
 
 use App\Helpers\ExtensionHelper;
+use App\Exceptions\DisplayException;
+use Illuminate\Http\Client\RequestException;
 use App\Models\Invoice;
 use App\Models\InvoiceTransaction;
 use App\Models\User;
@@ -25,27 +27,41 @@ trait Checkout
         ];
 
         // Do not fall back to an anonymous intent: saved methods require this customer.
-        $customer = $this->createOrGetStripeCustomer($invoice->user, (bool) $this->config('stripe_create_customers'));
+        try {
+            $customer = $this->createOrGetStripeCustomer($invoice->user, (bool) $this->config('stripe_create_customers'));
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::warning('StripeSaved customer setup failed', [
+                'invoice_id' => $invoice->id, 'error' => get_class($e),
+            ]);
+            throw new DisplayException('Could not prepare your payment. Please try again.');
+        }
         $intentData['customer'] = $customer->id;
         $intent = $this->checkoutIntent($invoice, $intentData);
         // API assumptions must be verified against the pinned Basil version in a sandbox.
         // https://docs.stripe.com/api/customer_sessions/create
         // Removal is disabled: native agreements may still reference a removed method.
-        $session = $this->request('post', '/customer_sessions', [
-            'customer' => $customer->id,
-            'components' => ['payment_element' => [
-                'enabled' => 'true',
-                'features' => [
-                    'payment_method_redisplay' => 'enabled',
-                    'payment_method_save' => 'disabled',
-                    'payment_method_remove' => 'disabled',
-                ],
-            ]],
-        ]);
+        $session = null;
+        try {
+            $session = $this->request('post', '/customer_sessions', [
+                'customer' => $customer->id,
+                'components' => ['payment_element' => [
+                    'enabled' => 'true',
+                    'features' => [
+                        'payment_method_redisplay' => 'enabled',
+                        'payment_method_save' => 'disabled',
+                        'payment_method_remove' => 'disabled',
+                    ],
+                ]],
+            ]);
+        } catch (RequestException $e) {
+            \Illuminate\Support\Facades\Log::warning('StripeSaved customer session unavailable', [
+                'invoice_id' => $invoice->id, 'http_status' => $e->response->status(),
+            ]);
+        }
 
         return view('gateways.stripe-saved::pay', [
             'invoice' => $invoice, 'total' => $total, 'intent' => $intent,
-            'customerSessionSecret' => $session->client_secret,
+            'customerSessionSecret' => $session?->client_secret,
             'stripePublishableKey' => $this->config('stripe_publishable_key'),
         ]);
     }
@@ -116,27 +132,29 @@ trait Checkout
         $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
         if (!$customer || ($intent->customer ?? null) !== $customer || empty($intent->payment_method)) {
-            throw new \RuntimeException('Saved payment customer mismatch');
+            \Illuminate\Support\Facades\Log::warning('StripeSaved saved method customer mismatch', ['invoice_id' => $invoice->id]);
+            return;
         }
         $method = $this->request('get', '/payment_methods/' . $intent->payment_method);
         if (!in_array($method->type, ['card', 'link'])) {
             return; // The checkout opt-in authorizes saving a card or Link only.
         }
-        $this->assertMethodCustomer($invoice->user, $method);
         $this->persistAgreement($invoice->user, $method);
     }
 
-    private function assertMethodCustomer($user, $method)
+    private function methodCustomerMatches($user, $method): bool
     {
         $customer = $user->properties()->where('key', 'stripe_id')->first()?->value;
         if (!$customer || ($method->customer ?? null) !== $customer) {
-            throw new \RuntimeException('Saved payment customer mismatch');
+            \Illuminate\Support\Facades\Log::warning('StripeSaved saved method customer mismatch', ['user_id' => $user->id]);
+            return false;
         }
+        return true;
     }
 
     private function persistAgreement($user, $method)
     {
-        $this->assertMethodCustomer($user, $method);
+        if (!$this->methodCustomerMatches($user, $method)) return false;
         // Explicit checkout opt-in or account setup authorizes future redisplay.
         // https://docs.stripe.com/api/payment_methods/update#update_payment_method-allow_redisplay
         $this->request('post', '/payment_methods/' . $method->id, ['allow_redisplay' => 'always']);
@@ -146,6 +164,7 @@ trait Checkout
             User::where('id', $user->id)->lockForUpdate()->firstOrFail();
             ExtensionHelper::makeBillingAgreement($user, 'StripeSaved', $data['name'],
                 $method->id, $data['type'], $data['expiry']);
-        }); // Never assign a service billing_agreement_id or enable Auto Pay.
+        });
+        return true; // Never assign a service billing_agreement_id or enable Auto Pay.
     }
 }
