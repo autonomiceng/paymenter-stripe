@@ -44,6 +44,10 @@ class StripeSaved extends Gateway
 
     public function boot()
     {
+        if (app()->runningInConsole()) {
+            require_once __DIR__ . '/AdoptBundledCommand.php';
+            \Illuminate\Console\Application::starting(fn ($artisan) => $artisan->resolve(AdoptBundledCommand::class));
+        }
         require __DIR__ . '/routes.php';
         // Register webhook route
         View::addNamespace('gateways.stripe-saved', __DIR__ . '/resources/views');

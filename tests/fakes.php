@@ -1,5 +1,16 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
+namespace Illuminate\Console {
+    class Command {
+        const SUCCESS = 0, FAILURE = 1;
+        public array $options = [], $output = [];
+        public function option($key) { return $this->options[$key] ?? null; }
+        public function line($message) { $this->output[] = $message; }
+        public function info($message) { $this->line($message); }
+        public function error($message) { $this->line($message); }
+    }
+    class Application { public static $callbacks = []; public static function starting($callback) { self::$callbacks[] = $callback; } }
+}
 namespace App\Attributes { #[\Attribute] class ExtensionMeta { public function __construct(...$args) {} } }
 namespace App\Classes\Extension {
     class Gateway {
@@ -48,9 +59,10 @@ namespace App\Models {
         }
     }
     class Gateway {
+        public static $rows = null;
         public static $enabled = true;
         public static $bundled = true;
-        public static function where($key, $value) { return new Query($value === 'Stripe' ? (self::$bundled ? (object) ['enabled' => false] : null) : (object) ['enabled' => self::$enabled]); }
+        public static function where($key, $value) { if (self::$rows !== null) return new \AdoptionCollection(self::$rows[$value] ?? []); return new Query($value === 'Stripe' ? (self::$bundled ? (object) ['enabled' => false] : null) : (object) ['enabled' => self::$enabled]); }
     }
     class BillingAgreement {}
     class Extension {}
@@ -95,9 +107,14 @@ namespace Illuminate\Support\Facades {
     class Event { public static $listeners = []; public static function listen($type, $callback) { self::$listeners[] = $callback; } }
     class Auth { public static $id = 7; public static function id() { return self::$id; } }
     class DB {
+        public static $tables = [], $locks = [], $updates = [];
+        public static function table($name) { return new \AdoptionQuery($name); }
         public static $locked = false;
         public static function transaction($callback) {
-            try { return $callback(); } finally { self::$locked = false; }
+            $before = self::$tables;
+            self::$locked = true;
+            try { return $callback(); } catch (\Throwable $e) { self::$tables = $before; throw $e; }
+            finally { self::$locked = false; }
         }
     }
     class Log { public static $lines = []; public static function info($message) { self::$lines[] = $message; } }
@@ -106,6 +123,7 @@ namespace Illuminate\Support\Facades {
         public static $handler;
         public static function withHeaders($headers) { return new self; }
         public function asForm() { return $this; }
+        public function timeout($seconds) { return $this; }
         public function __call($verb, $args) {
             [$url, $data] = $args;
             $path = substr($url, strlen('https://api.stripe.com/v1'));
@@ -114,6 +132,7 @@ namespace Illuminate\Support\Facades {
             return new class($value) {
                 public function __construct(private $value) {}
                 public function throw() { return $this; }
+                public function json() { return (array) $this->value; }
                 public function object() { return json_decode(json_encode($this->value)); }
             };
         }
@@ -126,6 +145,8 @@ namespace Carbon {
     }
 }
 namespace {
+    function storage_path($path) { return $GLOBALS['adoptionStorage'] . '/' . $path; }
+    function app() { return new class { public function runningInConsole() { return true; } }; }
     function abort($status, $message = '') { throw new \RuntimeException('HTTP ' . $status); }
     function abort_unless($condition, $status) { if (!$condition) throw new \RuntimeException('HTTP ' . $status); }
     function __($key, $values = []) { return $key; }
