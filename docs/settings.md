@@ -35,7 +35,7 @@ Link labels use Stripe's Link email, then its billing email, and otherwise
 `Link`; no account-email substitution or invented card digits. Cards retain the
 upstream brand, last four and expiry labels.
 
-The disabled or missing fork acknowledges webhooks with 200 and a constant log
-message, without inspecting payloads or calling Stripe. Enabled webhooks require
+A disabled or missing fork validates the signature, then answers 503 with a constant
+log message, without parsing payloads or calling Stripe; Stripe retries the event. Enabled webhooks require
 raw-body HMAC validation and timestamps within five minutes. Keep server time
 synchronized. Successful transactions cannot be downgraded by delayed events.

@@ -23,12 +23,13 @@ trait Webhooks
 
     public function webhook(Request $request)
     {
-        if (!$this->gatewayEnabled()) {
-            \Illuminate\Support\Facades\Log::info('StripeSaved webhook ignored: gateway disabled or missing');
-            return response()->json(['ignored' => true]);
-        }
         if (!$this->isValidSignature($request->getContent(), $request->header('Stripe-Signature'), $this->config('stripe_webhook_secret'))) {
             return response()->json(['error' => 'Invalid signature'], 400);
+        }
+        // Non-2xx so Stripe keeps retrying; a 200 here would discard the event.
+        if (!$this->gatewayEnabled()) {
+            \Illuminate\Support\Facades\Log::info('StripeSaved webhook deferred: gateway disabled or missing');
+            return response()->json(['error' => 'Gateway disabled'], 503);
         }
 
         $event = json_decode($request->getContent());

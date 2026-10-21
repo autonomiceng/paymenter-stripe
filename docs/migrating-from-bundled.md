@@ -81,7 +81,7 @@ extension rows and the bundled source files, even after disabling the gateway.
    both commands for that manifest; neither offers a continuation override.
 4. Make the rollback decision before allowing new activity. Disable bundled Stripe
    in Paymenter; ensure the fork gateway is **enabled before enabling its endpoint**.
-   A disabled fork acknowledges events with 200 and discards them. In **Stripe
+   A disabled fork answers signed events with 503; Stripe retries them. In **Stripe
    Dashboard**, keep the old endpoint disabled and enable only the fork endpoint.
    Do not edit signing keys/settings after the plan snapshot. Finish or expire old
    checkout sessions. Never actively deliver to both endpoints; preserve both rows.

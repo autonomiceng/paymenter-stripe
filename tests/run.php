@@ -146,9 +146,11 @@ $invalid->signature = 't=' . $invalidTime . ',v1=' . hash_hmac('sha256', $invali
 check($gateway->webhook($invalid)['status'] === 400, 'Signed invalid event shape rejected');
 Gateway::$enabled = false;
 $before = count(Http::$calls);
-check($gateway->webhook($valid)['data']['ignored'], 'Disabled webhook acknowledged');
+$invalid->signature = 't=' . $invalidTime . ',v1=forged';
+check($gateway->webhook($invalid)['status'] === 400 && Log::$lines === [], 'Disabled webhook rejects a forged signature');
+check($gateway->webhook($valid)['status'] === 503, 'Disabled webhook is not acknowledged, so Stripe retries');
 check(count(Http::$calls) === $before, 'Disabled webhook makes no HTTP requests');
-check(Log::$lines === ['StripeSaved webhook ignored: gateway disabled or missing'], 'Disabled log contains no payload or secrets');
+check(Log::$lines === ['StripeSaved webhook deferred: gateway disabled or missing'], 'Disabled log contains no payload or secrets');
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 409');
 require __DIR__ . '/adoption.php';
 require __DIR__ . '/adoption-store.php';
