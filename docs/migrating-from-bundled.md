@@ -1,42 +1,124 @@
 # Migrate from bundled Stripe
 
-No converter is provided. Plan and review the database changes in an isolated
-copy first. Use the same Stripe account and test/live mode: `stripe_id` remains
-the shared user property, and upstream Stripe metadata keys keep their meaning.
+Rehearse in an isolated Paymenter/Stripe test-mode copy before live use. Back up
+and verify a restore first. Stripe keeps cards on the shared customer (`stripe_id`);
+this command changes Paymenter ownership. Auto Pay stays on the same card; services
+on active duplicates move to the kept agreement.
+Use the same Stripe account and test/live mode. Subscription migration is not included.
 
 **Never delete or uninstall the bundled Stripe extension row.** In Paymenter
 1.5.9 migration `2025_09_27_182553_create_billing_agreements_table.php`,
 `billing_agreements.gateway_id` references `extensions` with `cascadeOnDelete`.
-Deleting that row deletes every saved-card agreement attached to it. Keep the
-row even after disabling the gateway. Do not remove the bundled source files.
+Deleting that row deletes every saved-card agreement attached to it. Keep both
+extension rows and the bundled source files, even after disabling the gateway.
 
-1. Back up the database; record both gateway IDs, agreement counts and service
-   references. Pause checkout and automated collection during the cutover.
-2. Install/configure the fork with the same Stripe account. Verify its endpoint
-   and signing secret in a sandbox, then enable the fork for the cutover.
-3. In a reviewed database transaction, repoint existing agreements' `gateway_id`
-   from the bundled row ID to the fork ID, preserving agreement IDs, method
-   references, service references and properties. Include soft-deleted rows in
-   the audit. Reconcile any already-created fork agreement with the same user
-   and method ID before updating; do not create duplicate active agreements.
-4. Disable bundled Stripe in Paymenter. Disable its old webhook endpoint **in
-   Stripe**, then move event delivery to the fork endpoint. Clear or finish old
-   checkout sessions. Never deliver events actively to both endpoints.
-5. Verify saved-method setup, opt-in/out payments, agreement counts, service
-   references, event retries and unchanged Auto Pay settings; resume collection.
+1. Back up the database and record gateway IDs, counts and service references.
+   Pause checkout, account payment-method setup, scheduler, queue workers and
+   automated collection; drain in-flight work. Stop webhook delivery in Stripe
+   Dashboard for both endpoints during the database cutover. Laravel maintenance
+   mode alone does not pause workers or incoming webhook work. Paymenter 1.5.9
+   exposes no unified collection-pause state; `--confirm-paused` attests this checklist.
+2. Install/configure and enable the fork while checkout/collection remain paused.
+   Verify its endpoint/signing secret in a sandbox before taking the plan snapshot.
+   Keep both endpoints disabled during the database and redisplay steps.
+   Each gateway needs its configured secret, publishable and webhook signing keys.
+   Every invocation requires exactly one `GET /v1/account` with each secret key;
+   restricted keys must permit that read. The fork key also needs payment-method
+   write permission for optional redisplay. There is no bypass. Account IDs and key
+   test/live modes must match. The command never changes webhook configuration.
+3. From the Paymenter root, as its application user, review a dry run:
 
-The bundled webhook does not check `enabled`. Paymenter boots even disabled
-gateways, so its old route still processes events after disabling the row. Native
-payment helpers deduplicate identical PaymentIntent IDs per invoice, but two
-handlers can overwrite transaction ownership or repeat subscription effects.
-The fork's enabled check cannot protect the old handler; stopping old delivery
-is essential. Late failure/processing events sent to the old handler can still
-regress a successful transaction.
+   ```sh
+   php artisan stripe-saved:adopt-bundled --confirm-paused
+   php artisan stripe-saved:adopt-bundled --confirm-paused --apply --plan='<digest>'
+   ```
 
-When a bundled Stripe row exists, the fork leaves legacy subscription lifecycle
-listeners to the bundled gateway, avoiding duplicate update/cancel calls. Without
-that row the fork registers its listeners, guarded by its enabled state. Existing
-Stripe subscriptions need a dedicated sandbox cutover test, including billing
-and cancellation, before changing delivery. This release adds no subscription
-converter. Rollback must restore agreement ownership and endpoint delivery while
-checkout/collection are paused, preserving both extension rows.
+   The first command prints counts, agreement IDs, changed service IDs, canonical duplicate IDs,
+   inactive states and a SHA-256 plan digest. It performs no database writes or Stripe
+   writes. Copy that digest into the second command. Any drift in the reviewed scope
+   refuses apply: rerun the dry run and review again. All agreements on both gateways,
+   including soft-deleted rows, referenced services, agreement properties and gateway
+   settings are locked and checked in one transaction. Gateway enable/name changes
+   are outside the ownership plan; gateway identity/removal and settings are checked.
+
+   All bundled agreements move to the fork. Duplicate user/method pairs retain the
+   oldest active ID referenced by services, otherwise the oldest active ID (or oldest
+   referenced/remaining ID if all are deleted). Other active duplicates become
+   soft-deleted with a deterministic `2000-01-01 00:00:00` audit marker; their
+   rows, external references and properties remain. Active service
+   references consolidate on the canonical ID. References to previously deleted
+   agreements stay inactive on their original IDs, preserving removed Auto Pay.
+   Cross-user duplicates and non-`pm_` references require manual review and refuse.
+   The upstream schema makes external references unique; reconciliation also handles
+   imported/customized databases that permit duplicates. No extension/agreement is deleted.
+
+   Apply writes a private JSON rollback manifest before any database update to
+   `storage/app/stripe-saved-adoption/<manifest>.json`, synchronizing file and directory
+   entries before commit. Keep this directory on durable local storage, backed up and
+   accessible only to the application user. It contains row snapshots; do not publish
+   it. A per-directory lock excludes simultaneous command runs. If interrupted, keep
+   collection paused and inspect the manifest against the database; do not blindly
+   reapply. A manifest from a failed transaction cannot pass the after-state check.
+   Optionally enable one-time redisplay while still paused, before endpoint delivery or other fork activity:
+
+   ```sh
+   php artisan stripe-saved:adopt-bundled --confirm-paused --redisplay='<manifest>.json' --confirm-setup-consent
+   ```
+
+   Paymenter v1.5.9 `extensions/Gateways/Stripe/Stripe.php::setupBillingAgreement()`
+   creates these agreements from explicit customer SetupIntent setup,
+   which is the consent basis for redisplay. Attest that the imported active agreements
+   came from that flow and your customer-facing terms cover later presentation; do not
+   attest for unknown imports or inferred consent. This step sets `allow_redisplay=always`
+   only for originally active adopted methods, including consolidated duplicates.
+   Deleted methods are excluded. It makes no Stripe reads beyond the two account reads.
+   Attempts are spaced at least 250 ms apart; a private `.redisplay` outcome file records
+   `ok` or `retry` per method. Rerun the same command to retry failures, with successful
+   methods skipped. The setter is idempotent if interrupted before recording success.
+   A failure returns a nonzero status without undoing ownership: off-session charging
+   still works. Both redisplay and rollback require the exact manifest after-state. Changing
+   gateway settings, creating an agreement, or renewing a referenced service blocks
+   both commands for that manifest; neither offers a continuation override.
+4. Make the rollback decision before allowing new activity. Disable bundled Stripe
+   in Paymenter; ensure the fork gateway is **enabled before enabling its endpoint**.
+   A disabled fork acknowledges events with 200 and discards them. In **Stripe
+   Dashboard**, keep the old endpoint disabled and enable only the fork endpoint.
+   Do not edit signing keys/settings after the plan snapshot. Finish or expire old
+   checkout sessions. Never actively deliver to both endpoints; preserve both rows.
+   Record the delivery-stop interval, list all Stripe events created during it and
+   reconcile/resend required events to the enabled fork endpoint. Do not assume
+   disabled endpoints receive a backlog. Check each invoice/transaction before resend.
+5. Verify saved setup, opt-in/out payments, counts, service references, event retries,
+   missed-event reconciliation, saved-card redisplay and Auto Pay, then resume
+   collection. These checks can change scoped rows and close exact manifest rollback.
+
+For rollback, pause/drain the same writers and disable fork webhook delivery first.
+Finish or expire fork checkout sessions; keep both endpoints stopped during restore:
+
+```sh
+php artisan stripe-saved:adopt-bundled --confirm-paused --rollback='<manifest>.json'
+```
+
+This restores original gateway ownership, duplicate deleted states and service
+references in one locked transaction, only if all scoped rows/settings still match
+its recorded after-state. Any drift (including renewal updates to a referenced service)
+refuses rollback. There is no override or reviewed-continuation mode: use a
+separately reviewed recovery/backup procedure instead, accounting for settled payments. It never reverses
+Stripe redisplay, charges, invoices or webhook changes. Disable the fork gateway, enable the bundled gateway **before** enabling its sole
+webhook endpoint, then reconcile/resend missed events manually before resuming. Preserve both extension rows.
+
+The bundled webhook does not check `enabled`. Paymenter boots even disabled gateways,
+so the old route still processes events. Native payment helpers deduplicate identical
+PaymentIntent IDs per invoice, but two handlers can overwrite transaction ownership or
+repeat subscription effects. Late failure/processing events at the old handler can
+regress a successful transaction. Stopping old delivery is essential.
+
+When a bundled row exists, the fork leaves legacy subscription listeners to it, avoiding
+duplicate update/cancel calls. Without that row the fork registers listeners guarded by
+its enabled state. Existing Stripe subscriptions need dedicated sandbox billing and
+cancellation tests before delivery changes. No subscription converter is provided.
+
+The extension uses its `boot()` hook and Laravel Console Application's starting
+callback to register `stripe-saved:adopt-bundled`, following the local Paymenter
+1.5.9 source lifecycle. No tinker or core application changes are required. Native
+command discovery is unverified; test it in the installed sandbox before release.

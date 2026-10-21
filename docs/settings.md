@@ -19,13 +19,15 @@ submission clears it. The save control is available only when the Element
 reports a card or Link selection; changing to another method clears the opt-in. Stripe's own saving control is disabled to keep this one
 consent path. Successful opted-in card/Link payments create/update one native
 agreement per user, gateway and payment-method ID, serialized by user-row lock.
-Account payment-method setup also authorizes saving and redisplay. No path
-assigns an agreement to services or enables Auto Pay.
+Account payment-method setup also authorizes saving and redisplay. Customer setup
+and checkout never assign an agreement to services or enable Auto Pay.
 
 Only methods Stripe permits to redisplay appear. This fork sets
 `allow_redisplay=always` after explicit checkout consent or account setup. Legacy
 methods with unspecified consent may remain hidden: customers should reauthorize
-in **Account > Payment methods**; no bulk consent conversion is included.
+in **Account > Payment methods**. The optional [migration redisplay step](migrating-from-bundled.md)
+covers only adopted bundled methods with attested explicit setup consent; it does
+not infer consent for other legacy imports.
 Removal in the Payment Element is disabled because native agreements may still
 reference a method. Remove methods through Paymenter's account interface.
 

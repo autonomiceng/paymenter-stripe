@@ -145,4 +145,6 @@ check($gateway->webhook($valid)['data']['ignored'], 'Disabled webhook acknowledg
 check(count(Http::$calls) === $before, 'Disabled webhook makes no HTTP requests');
 check(Log::$lines === ['StripeSaved webhook ignored: gateway disabled or missing'], 'Disabled log contains no payload or secrets');
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 409');
+require __DIR__ . '/adoption.php';
+require __DIR__ . '/adoption-store.php';
 echo "PASS: $count offline assertions\n";
