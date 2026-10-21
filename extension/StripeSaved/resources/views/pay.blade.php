@@ -5,9 +5,9 @@
     </div>
     <label class="mt-4 block">
         <input type="checkbox" id="save-card" @checked($intent->status === 'requires_action' && ($intent->metadata->stripe_saved_consent ?? null) === '1') disabled />
-        Save this card for future payments
+        Save this card or Link for future payments
     </label>
-    <p class="text-sm">Saving a card does not enable Auto Pay.</p>
+    <p class="text-sm">Saving does not enable Auto Pay.</p>
     <button id="submit" disabled
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
         Pay

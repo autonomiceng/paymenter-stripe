@@ -40,7 +40,7 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
         $path === '/customer_sessions' => ['client_secret' => 'cuss_test_secret'],
         $path === '/payment_intents/pi_test' && $verb === 'get' => $intent,
         $path === '/payment_intents/pi_test' && $verb === 'post' => (function () use (&$intent, $data) {
-            $intent->setup_future_usage = $data['setup_future_usage'];
+            $intent->payment_method_options = json_decode(json_encode($data['payment_method_options']));
             $intent->metadata->stripe_saved_consent = $data['metadata']['stripe_saved_consent'];
             return $intent;
         })(),
@@ -83,11 +83,11 @@ $intent->metadata->stripe_saved_gateway = '0';
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 403');
 $intent->metadata->stripe_saved_gateway = '1';
 $gateway->consent(new Request(['intent' => 'pi_test', 'save' => false]));
-check($intent->setup_future_usage === '' && $intent->metadata->stripe_saved_consent === '0', 'Unchecked clears future usage');
+check($intent->payment_method_options->card->setup_future_usage === '' && $intent->payment_method_options->link->setup_future_usage === '' && $intent->metadata->stripe_saved_consent === '0', 'Unchecked clears future usage');
 $gateway->webhook(eventRequest($intent));
 check(ExtensionHelper::$agreements === [], 'Unchecked never creates agreement');
 $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true]));
-check($intent->setup_future_usage === 'off_session' && $intent->metadata->stripe_saved_consent === '1', 'Explicit consent enables future usage');
+check($intent->payment_method_options->card->setup_future_usage === 'off_session' && $intent->payment_method_options->link->setup_future_usage === 'off_session' && $intent->metadata->stripe_saved_consent === '1', 'Explicit consent enables future usage');
 $gateway->webhook(eventRequest($intent));
 $gateway->webhook(eventRequest($intent));
 check(count(ExtensionHelper::$agreements) === 1, 'Retried success has one agreement per method');
@@ -159,4 +159,5 @@ require __DIR__ . '/retries.php';
 require __DIR__ . '/setup-consent.php';
 require __DIR__ . '/ownership.php';
 require __DIR__ . '/failures.php';
+require __DIR__ . '/method-consent.php';
 echo "PASS: $count offline assertions\n";

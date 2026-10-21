@@ -90,9 +90,12 @@ trait Checkout
             return response()->json(['ok' => true]);
         }
         abort_unless(in_array($intent->status, ['requires_payment_method', 'requires_confirmation']), 409);
-        // https://docs.stripe.com/api/payment_intents/update#update_payment_intent-setup_future_usage
+        // Basil accepts an empty string to unset each method-specific future usage.
         $this->request('post', '/payment_intents/' . $intent->id, [
-            'setup_future_usage' => $save ? 'off_session' : '',
+            'payment_method_options' => [
+                'card' => ['setup_future_usage' => $save ? 'off_session' : ''],
+                'link' => ['setup_future_usage' => $save ? 'off_session' : ''],
+            ],
             'metadata' => ['stripe_saved_consent' => $save ? '1' : '0'],
         ]);
 
@@ -124,8 +127,7 @@ trait Checkout
 
     private function savePaidMethod($intent)
     {
-        if (($intent->setup_future_usage ?? null) !== 'off_session'
-            || ($intent->metadata->stripe_saved_gateway ?? null) !== '1'
+        if (($intent->metadata->stripe_saved_gateway ?? null) !== '1'
             || ($intent->metadata->stripe_saved_consent ?? null) !== '1') {
             return;
         }
@@ -139,6 +141,7 @@ trait Checkout
         if (!in_array($method->type, ['card', 'link'])) {
             return; // The checkout opt-in authorizes saving a card or Link only.
         }
+        if (($intent->payment_method_options->{$method->type}->setup_future_usage ?? null) !== 'off_session') return;
         $this->persistAgreement($invoice->user, $method);
     }
 

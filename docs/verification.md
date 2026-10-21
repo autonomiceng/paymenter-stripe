@@ -71,3 +71,9 @@ new payment method without saved-method redisplay. Permanent saved-method custom
 mismatches are logged and acknowledged after settlement. Transient request and local
 persistence failures remain retryable; retries preserve one payment and one agreement.
 Verify Customer Session failure and recovery in the sandbox as well as normal redisplay.
+
+Checkout's opt-in covers card and Link only. Consent sets (or clears with `''`)
+`payment_method_options.card.setup_future_usage` and the matching Link option,
+never top-level future usage. Saving requires consent metadata and `off_session`
+for the actual method type. Bank debits are not saved by this checkout opt-in.
+Verify both method-specific options against pinned Basil before release.

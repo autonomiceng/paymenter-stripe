@@ -40,7 +40,7 @@ rejects(fn () => $gateway->pay($invoice, 20), 'Unexpected programming failure');
 $user->props->values = $oldProps;
 
 $paid = (object) ['id' => 'pi_save_retry', 'amount' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner',
-    'payment_method' => 'pm_retry', 'setup_future_usage' => 'off_session',
+    'payment_method' => 'pm_retry', 'payment_method_options' => (object) ['link' => (object) ['setup_future_usage' => 'off_session']],
     'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1', 'stripe_saved_consent' => '1']];
 $retryMethod = (object) ['id' => 'pm_retry', 'customer' => 'cus_other', 'type' => 'link', 'link' => (object) []];
 Http::$handler = fn () => $retryMethod;
@@ -61,13 +61,17 @@ $gateway->webhook(eventRequest($paid));
 $gateway->webhook(eventRequest($paid));
 check(ExtensionHelper::$applications === $before && isset(ExtensionHelper::$agreements['pm_retry']),
     'Saving retry persists one agreement without recording payment again');
+$retryMethod->id = 'pm_retry_local';
+$paid->payment_method = $retryMethod->id;
 $countBefore = count(ExtensionHelper::$agreements);
 ExtensionHelper::$agreementFailure = true;
 try { $gateway->webhook(eventRequest($paid)); throw new RuntimeException('Expected agreement failure'); }
 catch (RuntimeException $e) { check($e->getMessage() === 'Interrupted agreement response', 'Interrupted agreement persistence propagates for retry'); }
+check(!isset(ExtensionHelper::$agreements['pm_retry_local']), 'Interrupted first agreement creation rolls back');
 $gateway->webhook(eventRequest($paid));
-check(count(ExtensionHelper::$agreements) === $countBefore && ExtensionHelper::$applications === $before,
-    'Agreement retry after local completion creates no duplicate agreement or payment');
+$gateway->webhook(eventRequest($paid));
+check(count(ExtensionHelper::$agreements) === $countBefore + 1 && ExtensionHelper::$applications === $before,
+    'First-creation retry creates one agreement without recording payment again');
 // Account setup uses the same safe persistence guard, without swallowing request failures.
 check(invoke($gateway, 'persistAgreement', $user, (object) ['customer' => 'cus_other']) === false,
     'Setup agreement twin rejects permanent method mismatch safely');

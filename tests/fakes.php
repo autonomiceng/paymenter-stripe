@@ -182,8 +182,9 @@ namespace Illuminate\Support\Facades {
         public static $locked = false;
         public static function transaction($callback) {
             $before = self::$tables;
+            $agreements = \App\Helpers\ExtensionHelper::$agreements;
             self::$locked = true;
-            try { return $callback(); } catch (\Throwable $e) { self::$tables = $before; throw $e; }
+            try { return $callback(); } catch (\Throwable $e) { self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = $agreements; throw $e; }
             finally { self::$locked = false; }
         }
     }
