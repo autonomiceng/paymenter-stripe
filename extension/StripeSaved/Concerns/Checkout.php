@@ -1,6 +1,6 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\StripeSaved;
+namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
 
 use App\Helpers\ExtensionHelper;
 use App\Exceptions\DisplayException;

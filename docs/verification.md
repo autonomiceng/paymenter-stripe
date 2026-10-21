@@ -9,6 +9,8 @@ python3 tools/build_release.py --output dist/StripeSaved-0.1.0.zip
 (cd dist && sha256sum -c StripeSaved-0.1.0.zip.sha256)
 ```
 
+Upgrade through the native admin upload over an installed copy; root PHP files must declare only classes for Paymenter 1.5.9 `getExtensionType()`.
+
 Account setup displays an unchecked opt-in: “I agree to save this payment method
 and allow charges to it for my future invoices, including renewals, when I am not
 present.” It also states: “Saving does not turn on Auto Pay; you can choose it for
