@@ -19,11 +19,11 @@ final class AdoptBundledCommand extends Command
         $rollback = $this->option('rollback');
         $redisplay = $this->option('redisplay');
         if ($rollback) {
-            $this->line('Rollback checklist: stop fork delivery in Stripe Dashboard; after ownership restore disable fork gateway, enable bundled gateway, then enable only bundled endpoint. Reconcile missed events. Finish fork sessions; retain both rows.');
+            $this->line('Rollback checklist: stop fork delivery in Stripe Dashboard; rollback restores bundled gateway and ownership, then enable only bundled endpoint. The fork hides while bundled is active. Reconcile missed events. Finish fork sessions; retain both rows.');
         } elseif ($redisplay) {
             $this->line('Redisplay checklist: keep both endpoints stopped and writers paused; exact manifest after-state required. No webhook changes are made.');
         } else {
-            $this->line('Cutover checklist: stop both endpoints in Stripe Dashboard; finish old sessions; retain both rows. After adoption and optional redisplay, disable bundled gateway, enable fork gateway BEFORE only fork delivery; reconcile missed events.');
+            $this->line('Cutover checklist: stop both endpoints in Stripe Dashboard; finish old sessions; retain both rows. After adoption and optional redisplay, use admin Delete on bundled gateway (soft delete); enable fork gateway BEFORE only fork delivery; reconcile missed events.');
         }
         try {
             if (!$this->option('confirm-paused')) throw new AdoptionRefusal('Requires --confirm-paused after the checklist');
@@ -35,7 +35,7 @@ final class AdoptBundledCommand extends Command
             $adoption = new Adoption($store);
             if ($rollback) {
                 $adoption->rollback($store->load($rollback));
-                $this->info('Ownership restored; redisplay is not reversed. Disable fork gateway, enable bundled gateway, then enable only bundled endpoint in Stripe Dashboard. Reconcile missed events before resuming.');
+                $this->info('Bundled gateway and ownership restored; redisplay is not reversed. The fork hides while bundled is active. Enable only bundled endpoint in Stripe Dashboard. Reconcile missed events before resuming.');
             } elseif ($redisplay) {
                 $outcomes = $adoption->redisplay($store->load($redisplay), $redisplay);
                 $this->line(json_encode($outcomes, JSON_THROW_ON_ERROR));

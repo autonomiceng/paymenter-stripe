@@ -14,7 +14,7 @@ trait Webhooks
         $subscriptionMetadata = $object->parent->subscription_details->metadata ?? null;
         if (($metadata->stripe_saved_gateway ?? null) === '1'
             || ($subscriptionMetadata->stripe_saved_gateway ?? null) === '1'
-            || !\App\Models\Gateway::where('extension', 'Stripe')->first()?->enabled) return true;
+            || $this->bundledInactive()) return true;
         \Illuminate\Support\Facades\Log::info('StripeSaved webhook ignored: bundled gateway owns unmarked event', [
             'event_type' => $type, 'invoice_id' => $metadata->invoice_id ?? $metadata->stripe_saved_invoice_id ?? null,
         ]);

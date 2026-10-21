@@ -14,6 +14,7 @@ class AdoptionCollection implements IteratorAggregate
 }
 class AdoptionQuery
 {
+    public static ?string $failTable = null;
     private array $filters = [];
     private bool $locked = false;
     public function __construct(private string $table) {}
@@ -31,6 +32,7 @@ class AdoptionQuery
     public function update($changes): int
     {
         check(DB::$locked, 'Adapter updates in transaction');
+        if (self::$failTable === $this->table) throw new RuntimeException('Simulated restore failure');
         $count = 0;
         foreach (DB::$tables[$this->table] as &$row) {
             if (!$this->matches($row)) continue;
@@ -72,6 +74,42 @@ check((fileperms($adoptionStorage . '/app/stripe-saved-adoption/' . $result['man
 rejects(fn () => new AdoptionStore, 'Another adoption command is running');
 $engine->rollback($manifest);
 check(DB::$tables === $original, 'Production updates restore exact raw tables');
+$engine->run($plan['digest']);
+DB::$tables['extensions'][0]['deleted_at'] = '2026-01-01 00:00:00';
+$retired = DB::$tables;
+foreach ([['extensions', 0, 'type', 'other'], ['extensions', 0, 'extension', 'Other'],
+    ['extensions', 1, 'extension', 'Other'], ['billing_agreements', 10, 'name', 'drift'],
+    ['billing_agreements', 10, 'gateway_id', 1], ['billing_agreements', 10, 'deleted_at', '2026-01-01'],
+    ['services', 20, 'other', 'drift'], ['properties', 0, 'value', 'drift']] as [$table, $id, $column, $value]) {
+    DB::$tables[$table][$id][$column] = $value;
+    $drifted = DB::$tables;
+    rejects(fn () => $engine->rollback($manifest), 'Rollback drift; restore from reviewed backup instead');
+    check(DB::$tables === $drifted, 'Retirement does not permit other drift: ' . $table . '.' . $column);
+    DB::$tables = $retired;
+}
+DB::$tables['settings'][] = ['id' => 1, 'settingable_id' => 1, 'settingable_type' => \App\Models\Gateway::class, 'key' => 'drift', 'value' => 'drift'];
+rejects(fn () => $engine->rollback($manifest), 'Rollback drift; restore from reviewed backup instead');
+DB::$tables = $retired;
+DB::$tables['billing_agreements'][99] = array_replace(DB::$tables['billing_agreements'][10], ['id' => 99]);
+rejects(fn () => $engine->rollback($manifest), 'Rollback drift; restore from reviewed backup instead');
+DB::$tables = $retired;
+DB::$tables['extensions'][1]['deleted_at'] = '2026-01-01 00:00:00';
+rejects(fn () => $engine->rollback($manifest), 'Gateway row removed');
+DB::$tables = $retired;
+AdoptionQuery::$failTable = 'billing_agreements';
+rejects(fn () => $engine->rollback($manifest), 'Simulated restore failure');
+check(DB::$tables === $retired, 'Failed ownership restore rolls bundled resurrection back in the same transaction');
+AdoptionQuery::$failTable = null;
+$engine->rollback($manifest);
+check(DB::$tables === $original, 'Rollback restores native-retired bundled row and original ownership atomically');
+foreach ([0, 1] as $row) {
+    DB::$tables['extensions'][$row]['deleted_at'] = '2026-01-01 00:00:00';
+    $deleted = DB::$tables;
+    $updates = count(DB::$updates);
+    rejects(fn () => $engine->run($plan['digest']), 'Gateway row removed');
+    check(DB::$tables === $deleted && count(DB::$updates) === $updates, 'Apply refuses soft-deleted gateway without writes: ' . $row);
+    DB::$tables = $original;
+}
 $store->saveOutcomes($result['manifest'], ['pm_10' => 'retry']);
 check($store->outcomes($result['manifest']) === ['pm_10' => 'retry'], 'Atomic outcome file round trip');
 rejects(fn () => $store->load('../escape'), 'Use a manifest basename from storage');
@@ -98,9 +136,10 @@ $command->options = ['confirm-paused' => true, 'redisplay' => $match[1], 'confir
 check($command->handle() === 0, 'CLI independently redisplays adopted active methods');
 check(count(array_filter($command->output, fn ($line) => str_starts_with($line, 'Redisplay checklist:'))) > 0, 'Redisplay prints its own paused delivery checklist');
 DB::$tables['extensions'][0]['enabled'] = false;
+DB::$tables['extensions'][0]['deleted_at'] = '2026-01-01 00:00:00';
 $command->options = ['confirm-paused' => true, 'rollback' => $match[1]];
-check($command->handle() === 0, 'CLI rollback permits manual gateway enablement cutover');
-check(count(array_filter($command->output, fn ($line) => str_starts_with($line, 'Rollback checklist:') && str_contains($line, 'enable bundled gateway'))) > 0, 'Rollback prints reverse delivery and gateway checklist');
+check($command->handle() === 0 && DB::$tables['extensions'][0]['deleted_at'] === null, 'CLI rollback finds and restores soft-deleted bundled gateway');
+check(count(array_filter($command->output, fn ($line) => str_starts_with($line, 'Rollback checklist:') && str_contains($line, 'restores bundled gateway'))) > 0, 'Rollback prints native gateway restoration and reverse delivery checklist');
 DB::$tables['extensions'][0]['enabled'] = true;
 check(DB::$tables === $original, 'CLI apply and rollback preserve all rows and properties');
 \App\Models\Gateway::$rows['StripeSaved'] = [];

@@ -84,9 +84,31 @@ namespace App\Models {
     class Gateway {
         public static $rows = null;
         public static $enabled = true;
+        public static $present = true, $deleted = false;
         public static $bundled = true;
         public static $bundledEnabled = false;
-        public static function where($key, $value) { if (self::$rows !== null) return new \AdoptionCollection(self::$rows[$value] ?? []); return new Query($value === 'Stripe' ? (self::$bundled ? (object) ['enabled' => self::$bundledEnabled] : null) : (object) ['enabled' => self::$enabled]); }
+        public static $bundledDeleted = false;
+        public static function withTrashed() { return new class {
+            public function where($key, $value) { return Gateway::query($value, true); }
+        }; }
+        public static function where($key, $value) { return self::query($value); }
+        public static function query($value, $withTrashed = false) {
+            if (self::$rows !== null) {
+                $rows = self::$rows[$value] ?? [];
+                if (!$withTrashed) $rows = array_filter($rows, function ($row) {
+                    foreach (\Illuminate\Support\Facades\DB::$tables['extensions'] as $raw) {
+                        if ($raw['id'] === $row->id) return $raw['deleted_at'] === null;
+                    }
+                    return false;
+                });
+                return new \AdoptionCollection($rows);
+            }
+            $bundled = $value === 'Stripe';
+            $present = $bundled ? self::$bundled : self::$present;
+            $deleted = $bundled ? self::$bundledDeleted : self::$deleted;
+            return new Query($present && ($withTrashed || !$deleted)
+                ? (object) ['enabled' => $bundled ? self::$bundledEnabled : self::$enabled] : null);
+        }
     }
     class Service {
         public const STATUS_CANCELLED = 'cancelled';

@@ -32,7 +32,8 @@ final class AdoptionStore
     {
         $config = $this->gateways = [];
         foreach (['Stripe', 'StripeSaved'] as $extension) {
-            $rows = Gateway::where('extension', $extension)->get();
+            // Rollback must still find the bundled row after native admin Delete (soft delete).
+            $rows = Gateway::withTrashed()->where('extension', $extension)->get();
             if ($rows->count() !== 1) throw new AdoptionRefusal('Exactly one installed row per gateway required');
             $gateway = $rows->first();
             $this->gateways[] = $gateway;
@@ -54,13 +55,15 @@ final class AdoptionStore
         return $rows;
     }
 
-    public function snapshot(): array
+    public function snapshot(bool $allowRetiredBundled = false): array
     {
         $ids = array_map(fn ($g) => $g->id, $this->gateways);
         $extensions = $this->rows('extensions', fn ($q) => $q->whereIn('id', $ids));
         if (count($extensions) !== 2) throw new AdoptionRefusal('Gateway rows changed');
         foreach ($extensions as &$extension) {
-            if ($extension['deleted_at'] !== null) throw new AdoptionRefusal('Gateway row removed');
+            if ($extension['deleted_at'] !== null && (!$allowRetiredBundled || $extension['id'] != $ids[0])) {
+                throw new AdoptionRefusal('Gateway row removed');
+            }
             $extension = array_intersect_key($extension, array_flip(['id', 'type', 'extension', 'deleted_at']));
         }
         unset($extension);
@@ -77,7 +80,8 @@ final class AdoptionStore
 
     public function replace(array $before, array $after): void
     {
-        foreach (['agreements' => ['billing_agreements', ['gateway_id', 'deleted_at']],
+        foreach (['extensions' => ['extensions', ['deleted_at']],
+            'agreements' => ['billing_agreements', ['gateway_id', 'deleted_at']],
             'services' => ['services', ['billing_agreement_id']]] as $key => [$table, $columns]) {
             foreach ($after[$key] as $id => $row) {
                 $changes = [];

@@ -58,7 +58,7 @@ class StripeSaved extends Gateway
         // Register webhook route
         View::addNamespace('gateways.stripe-saved', __DIR__ . '/resources/views');
         // Core boots disabled gateways too. Let the bundled listener own legacy subscriptions.
-        if (\App\Models\Gateway::where('extension', 'Stripe')->exists()) {
+        if (!$this->bundledInactive(requireAbsent: true)) {
             return;
         }
 
@@ -96,6 +96,18 @@ class StripeSaved extends Gateway
                 \Illuminate\Support\Facades\Log::warning('StripeSaved subscription sync failed', ['service_id' => $service->id]);
             }
         });
+    }
+
+    private function bundledInactive(bool $requireAbsent = false): bool
+    {
+        // Soft-deleted rows are excluded by the native model scope. Disabled rows still boot listeners.
+        $bundled = \App\Models\Gateway::where('extension', 'Stripe')->first();
+        return !$bundled || (!$requireAbsent && !$bundled->enabled);
+    }
+
+    public function canUseGateway($total, $currency, $type, $items): bool
+    {
+        return $this->gatewayEnabled() && $this->bundledInactive();
     }
 
     public function getConfig($values = [])

@@ -99,10 +99,15 @@ final class Adoption
     {
         $identity = $this->preflight();
         $this->store->transaction(function () use ($plan, $identity) {
-            if ($identity !== $plan['identity'] || $this->store->snapshot() !== $plan['after']) {
+            $current = $this->store->snapshot(allowRetiredBundled: true);
+            $expected = $plan['after'];
+            // Native retirement is the sole allowed difference in the recorded scope.
+            $bundled = $expected['bundled'];
+            $expected['extensions'][$bundled]['deleted_at'] = $current['extensions'][$bundled]['deleted_at'];
+            if ($identity !== $plan['identity'] || $current !== $expected) {
                 throw new AdoptionRefusal('Rollback drift; restore from reviewed backup instead');
             }
-            $this->store->replace($plan['after'], $plan['before']);
+            $this->store->replace($current, $plan['before']);
         });
     }
 

@@ -13,7 +13,9 @@ class AdoptionFake
     public function __construct()
     {
         $this->config = array_fill(0, 2, ['secret' => 'rk_' . 'test_fixture', 'public' => 'pk_' . 'test_fixture', 'webhook' => 'fixture']);
-        $this->state = ['bundled' => 1, 'fork' => 2, 'extensions' => [1, 2],
+        $this->state = ['bundled' => 1, 'fork' => 2, 'extensions' => [
+                1 => ['id' => 1, 'type' => 'gateway', 'extension' => 'Stripe', 'deleted_at' => null],
+                2 => ['id' => 2, 'type' => 'gateway', 'extension' => 'StripeSaved', 'deleted_at' => null]],
             'configuration' => Adoption::digest($this->config), 'settingsHash' => 'settings', 'propertiesHash' => 'properties',
             'agreements' => [10 => $this->row(10, 1), 11 => $this->row(11, 1, '2020-01-01 00:00:00'),
                 12 => $this->row(12, 1), 13 => $this->row(13, 2), 14 => $this->row(14, 2)],
@@ -34,7 +36,7 @@ class AdoptionFake
         try { return $callback(); } catch (Throwable $e) { $this->state = $original; throw $e; }
         finally { $this->locked = false; }
     }
-    public function snapshot(): array { check($this->locked, 'Snapshot under transaction and row locks'); return $this->state; }
+    public function snapshot(bool $allowRetiredBundled = false): array { check($this->locked, 'Snapshot under transaction and row locks'); return $this->state; }
     public function replace($before, $after): void
     {
         check($this->locked && $before === $this->state, 'Writes under locks against exact state');
@@ -95,6 +97,9 @@ $f->state['agreements'][10]['name'] = 'drift';
 $drift = $f->state;
 rejects(fn () => $a->rollback($plan), 'Rollback drift; restore from reviewed backup instead');
 check($f->state === $drift, 'Rollback drift refusal is atomic');
+$f = new AdoptionFake; $a = new Adoption($f); $plan = $a->run(); $a->run($plan['digest']);
+$f->accounts = ['acct_changed', 'acct_changed'];
+rejects(fn () => $a->rollback($plan), 'Rollback drift; restore from reviewed backup instead');
 $f = new AdoptionFake; $a = new Adoption($f); $f->accounts[1] = 'acct_other';
 rejects(fn () => $a->run(), 'Stripe account mismatch');
 $f->accounts[1] = 'acct_fixture'; $f->config[1] = ['secret' => 'rk_' . 'live_fixture', 'public' => 'pk_' . 'live_fixture', 'webhook' => 'fixture'];
