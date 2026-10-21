@@ -155,6 +155,32 @@ rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' =>
 $before = count(Http::$calls);
 rejects(fn () => $gateway->pay($invoice, 20), 'HTTP 409');
 check(count(Http::$calls) === $before, 'Disabled checkout rejects before any HTTP request');
+$oldHandler = Http::$handler;
+$disabledSetupId = 'seti_abcdefghijklmnopqrstuvwxyz';
+$disabledSetupIntent = (object) ['id' => $disabledSetupId, 'status' => 'succeeded', 'customer' => 'cus_owner',
+    'payment_method' => 'pm_disabled', 'latest_attempt' => null,
+    'metadata' => (object) ['user_id' => '7', 'is_billing_agreement' => '1',
+        'stripe_saved_setup_consent' => 'off_session_v1', 'stripe_saved_setup_consent_at' => '1700000000',
+        'stripe_saved_setup_consent_user' => '7']];
+Http::$handler = function ($verb, $path) use ($disabledSetupIntent, $disabledSetupId) {
+    if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
+    if ($path === '/setup_intents') return ['id' => 'seti_created'];
+    if ($path === '/setup_intents/' . $disabledSetupId) return $disabledSetupIntent;
+    if ($path === '/payment_methods/pm_disabled') return ['id' => 'pm_disabled', 'type' => 'card',
+        'customer' => 'cus_owner', 'card' => ['brand' => 'visa', 'last4' => '4242', 'exp_year' => 2030, 'exp_month' => 5]];
+    throw new RuntimeException('Unexpected disabled setup request: ' . $path);
+};
+$before = count(Http::$calls);
+rejects(fn () => $gateway->createBillingAgreement($user), 'HTTP 409');
+check(count(Http::$calls) === $before, 'Disabled agreement creation makes no HTTP requests');
+$before = count(Http::$calls);
+rejects(fn () => $gateway->setupAgreement(new Request(['setup_intent' => $disabledSetupId])), 'HTTP 409');
+check(count(Http::$calls) === $before, 'Disabled setup redirect makes no HTTP requests');
+$disabledSetupIntent->status = 'requires_payment_method';
+$before = count(Http::$calls);
+rejects(fn () => $gateway->setupConsent(new Request(['intent' => $disabledSetupId, 'consent' => true])), 'HTTP 409');
+check(count(Http::$calls) === $before, 'Disabled setup consent makes no HTTP requests');
+Http::$handler = $oldHandler;
 require __DIR__ . '/subscription-listeners.php';
 require __DIR__ . '/adoption.php';
 require __DIR__ . '/adoption-store.php';
