@@ -12,3 +12,7 @@ Route::get('/extensions/stripe-saved/setup-agreement', [StripeSaved::class, 'set
 Route::post('/extensions/stripe-saved/consent', [StripeSaved::class, 'consent'])
     ->middleware(['web', 'auth'])
     ->name('extensions.gateways.stripe-saved.consent');
+
+Route::post('/extensions/stripe-saved/setup-consent', [StripeSaved::class, 'setupConsent'])
+    ->middleware(['web', 'auth'])
+    ->name('extensions.gateways.stripe-saved.setup-consent');

@@ -47,7 +47,10 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
         $path === '/payment_methods/' . $method->id => $method,
         $path === '/setup_intents/seti_test' => ['id' => 'seti_test', 'status' => 'succeeded',
             'payment_method' => $method->id, 'latest_attempt' => null,
-            'metadata' => ['user_id' => 7, 'is_billing_agreement' => '1']],
+            'customer' => 'cus_owner',
+            'metadata' => ['user_id' => 7, 'is_billing_agreement' => '1',
+                'stripe_saved_setup_consent' => 'off_session_v1', 'stripe_saved_setup_consent_at' => '1700000000',
+                'stripe_saved_setup_consent_user' => '7']],
         default => throw new RuntimeException('Unexpected HTTP request: ' . $path),
     };
 };
@@ -55,7 +58,7 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
 $gateway->boot();
 check(Event::$listeners === [], 'Bundled row retains subscription callbacks even when disabled');
 check(Route::$routes === ['/extensions/stripe-saved/webhook', '/extensions/stripe-saved/setup-agreement',
-    '/extensions/stripe-saved/consent'], 'Distinct routes are still registered');
+    '/extensions/stripe-saved/consent', '/extensions/stripe-saved/setup-consent'], 'Distinct routes are still registered');
 Gateway::$bundled = false;
 $gateway->boot();
 check(count(Event::$listeners) === 2, 'Standalone fork registers legacy subscription callbacks');
@@ -151,4 +154,5 @@ require __DIR__ . '/views.php';
 require __DIR__ . '/amounts.php';
 require __DIR__ . '/handlers.php';
 require __DIR__ . '/retries.php';
+require __DIR__ . '/setup-consent.php';
 echo "PASS: $count offline assertions\n";

@@ -32,6 +32,7 @@ require_once __DIR__ . '/Amounts.php';
 require_once __DIR__ . '/SubscriptionAttempt.php';
 require_once __DIR__ . '/SubscriptionPayments.php';
 require_once __DIR__ . '/CheckoutIntent.php';
+require_once __DIR__ . '/SetupConsent.php';
 
 #[ExtensionMeta(
     name: 'Stripe Saved Methods',
@@ -42,7 +43,7 @@ require_once __DIR__ . '/CheckoutIntent.php';
 )]
 class StripeSaved extends Gateway
 {
-    use Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent;
+    use Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -590,6 +591,8 @@ class StripeSaved extends Gateway
 
     public function createBillingAgreement($user)
     {
+        abort_unless($this->gatewayEnabled(), 409);
+        abort_unless(Auth::id() == $user->id, 403);
         // Create or fetch a Stripe customer for this user, use detailed info based on setting
         $includeDetails = (bool) $this->config('stripe_create_customers');
         $customer = $this->createOrGetStripeCustomer($user, $includeDetails);
@@ -620,6 +623,7 @@ class StripeSaved extends Gateway
 
     public function setupAgreement(Request $request)
     {
+        abort_unless($this->gatewayEnabled(), 409);
         $request->validate([
             'setup_intent' => 'required|string|regex:/^seti_[a-zA-Z0-9]{24,}$/|max:255',
         ]);
@@ -637,7 +641,7 @@ class StripeSaved extends Gateway
             abort(403, 'Unauthorized');
         }
 
-        $this->setupBillingAgreement($setupIntent);
+        abort_unless($this->setupBillingAgreement($setupIntent), 409);
 
         return redirect()->route('account.payment-methods')->with('notification', [
             'type' => 'success',
@@ -647,17 +651,25 @@ class StripeSaved extends Gateway
 
     private function setupBillingAgreement($setupIntent)
     {
-        $user = User::findOrFail($setupIntent->metadata->user_id);
-
         // Get setup intent with expanded data
         $setupIntent = $this->request('get', '/setup_intents/' . $setupIntent->id, [
             'expand' => ['latest_attempt'],
         ]);
 
+        if (($setupIntent->metadata->is_billing_agreement ?? null) !== '1'
+            || ($setupIntent->metadata->stripe_saved_setup_consent ?? null) !== 'off_session_v1'
+            || empty($setupIntent->metadata->stripe_saved_setup_consent_at)
+            || ($setupIntent->metadata->stripe_saved_setup_consent_user ?? null) != ($setupIntent->metadata->user_id ?? null)
+            || $setupIntent->status !== 'succeeded') return false;
+        $user = User::findOrFail($setupIntent->metadata->user_id);
+        $customer = $user->properties()->where('key', 'stripe_id')->first()?->value;
+        if (!$customer || ($setupIntent->customer ?? null) !== $customer) return false;
+
         // Get the actual payment method that will be used for future charges
         $actualPaymentMethod = $this->getActualPaymentMethod($setupIntent);
 
         $this->persistAgreement($user, $actualPaymentMethod);
+        return true;
     }
 
     private function getActualPaymentMethod($setupIntent)

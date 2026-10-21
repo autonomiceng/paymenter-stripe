@@ -20,3 +20,21 @@ check(str_contains($theme, '[data-theme="dark"], [data-theme="light"], .dark, .l
 check(str_contains($theme, "matchMedia('(prefers-color-scheme: dark)')"), 'OS colour scheme is the last fallback');
 check(str_contains($theme, 'elements.update({appearance})'), 'Open forms update without remounting');
 check(!preg_match('/#[0-9a-f]{3,6}\b|colorPrimary/i', $theme), 'No brand colours are hard-coded');
+foreach (['pay', 'billing-agreement'] as $name) {
+    $view = file_get_contents($views . $name . '.blade.php');
+    check(str_contains($view, 'Js::from(auth()->user()->name)') && str_contains($view, 'Js::from(auth()->user()->email)'), "$name: customer details use script-safe values");
+    check(str_contains($view, '<button id="submit" disabled'), "$name: submission starts disabled");
+    check(str_contains($view, "paymentElement.on('ready'") && str_contains($view, "script.onerror = initializationError"), "$name: readiness gates submission and script failure shows an error");
+    check(strpos($view, "form.addEventListener('submit'") < strpos($view, "paymentElement.mount("), "$name: submit handler is installed before mounting");
+}
+$setupView = file_get_contents($views . 'billing-agreement.blade.php');
+check(str_contains($setupView, 'id="setup-consent" required disabled') && str_contains($setupView, 'I agree to save this payment method and allow charges to it for my future invoices, including renewals, when I am not present.')
+    && str_contains($setupView, 'Saving does not turn on Auto Pay; you can choose it for a service later.'), 'Setup has an explicit future off-session opt-in');
+check(strpos($setupView, 'setup-consent\')') < strpos($setupView, 'stripe.confirmSetup'), 'Setup records consent before confirmation');
+check(str_contains($setupView, 'if (error) throw error;') && str_contains($setupView, 'message.replaceChildren(text);')
+    && str_contains($setupView, 'finally {') && str_contains($setupView, 'setLoading(false);'), 'Setup errors remain in alert and unlock retry');
+
+$payView = file_get_contents($views . 'pay.blade.php');
+check(str_contains($payView, "@checked($" . "intent->status === 'requires_action'")
+    && str_contains($payView, 'save: resuming ? savedConsent :')
+    && str_contains($payView, 'saveCard.disabled = resuming ||'), '3DS resume visibly preserves its recorded save choice');

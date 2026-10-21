@@ -9,6 +9,18 @@ python3 tools/build_release.py --output dist/StripeSaved-0.1.0.zip
 (cd dist && sha256sum -c StripeSaved-0.1.0.zip.sha256)
 ```
 
+Account setup displays an unchecked opt-in: “I agree to save this payment method
+and allow charges to it for my future invoices, including renewals, when I am not
+present.” It also states: “Saving does not turn on Auto Pay; you can choose it for
+a service later.” Before confirmation, the
+authenticated CSRF-protected setup-consent endpoint checks the SetupIntent's user,
+customer, purpose and unfinished status, then records `off_session_v1`, authenticated
+user ID and server acceptance time in Stripe metadata. Webhook and redirect both
+require that record and matching customer before persisting an agreement. Existing
+agreements are unchanged; unconsented in-flight setups must restart with the opt-in.
+Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
+ready; initialization and confirmation errors remain in the alert for retry.
+
 Tests execute the gateway with PHP-only model, lock and HTTP fakes; unexpected
 HTTP requests fail. No Stripe or application server is contacted. They verify
 customer binding, consent, intent updates, agreement retry keys/locking, labels,
