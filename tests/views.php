@@ -5,6 +5,24 @@ $views = __DIR__ . '/../extension/StripeSaved/resources/views/';
 $theme = file_get_contents($views . 'stripe-theme.blade.php');
 foreach (['pay', 'billing-agreement'] as $name) {
     $view = file_get_contents($views . $name . '.blade.php');
+    $script = substr($view, strpos($view, '<script>') + strlen('<script>'));
+    $entry = strpos($script, 'async function initializePaymentForm() {');
+    check($entry !== false && !preg_match('/\b(?:getElementById|querySelector(?:All)?)\s*\(/', substr($script, 0, $entry)),
+        "$name: no DOM lookup runs before deferred initialization");
+    check(preg_match('/\n}\s*initializePaymentForm\(\);\s*<\/script>/', $script) === 1,
+        "$name: only the deferred entry point runs after its definition");
+    $wait = substr($script, $entry, strpos($script, 'let ready = false;') - $entry);
+    check(str_contains($wait, 'const deadline = performance.now() + 5000;')
+        && str_contains($wait, 'if (performance.now() >= deadline) return resolve(null);')
+        && str_contains($wait, 'requestAnimationFrame(findForm);')
+        && str_contains($wait, 'findForm();'), "$name: form lookup checks now and waits at most five seconds");
+    check(str_contains($wait, 'const paymentForm = await new Promise(')
+        && str_contains($wait, "if (!paymentForm) {")
+        && str_contains($wait, "console.error('StripeSaved: payment form did not appear within 5 seconds.');")
+        && str_contains($wait, 'return;'), "$name: missing form logs once and stops initialization");
+    check(str_contains($view, "if (submit) submit.disabled = true;")
+        && str_contains($view, "if (message) message.textContent = 'Could not load the payment form. Reload to try again.';"),
+        "$name: initialization errors tolerate missing button and alert");
     check(!str_contains($view, 'setTimeout'), "$name: payment errors are never hidden on a timer");
     check(str_contains($view, '<div id="error-message" role="alert"'), "$name: errors are announced and stay mounted");
     check(preg_match('/preventDefault\(\);\s+(clearMessage\(\)|message\.replaceChildren\(\));\s+setLoading\(true\)/', $view) === 1,

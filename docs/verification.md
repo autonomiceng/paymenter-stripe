@@ -22,6 +22,7 @@ require that record and matching customer before persisting an agreement. Existi
 agreements are unchanged; unconsented in-flight setups must restart with the opt-in.
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.
+Browser-check both pay and setup views inside the theme's teleported modal (default theme `x-teleport="body"`).
 
 Tests execute the gateway with PHP-only model, lock and HTTP fakes; unexpected
 HTTP requests fail. No Stripe or application server is contacted. They verify

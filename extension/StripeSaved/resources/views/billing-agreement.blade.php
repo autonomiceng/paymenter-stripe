@@ -16,13 +16,30 @@
 @script
 <script>
     @include('gateways.stripe-saved::stripe-theme')
+async function initializePaymentForm() {
+    // Livewire effects run before Alpine teleports the modal into body.
+    const paymentForm = await new Promise((resolve) => {
+        const deadline = performance.now() + 5000;
+        function findForm() {
+            const form = document.getElementById('payment-form');
+            if (form) return resolve(form);
+            if (performance.now() >= deadline) return resolve(null);
+            requestAnimationFrame(findForm);
+        }
+        findForm();
+    });
+    if (!paymentForm) {
+        console.error('StripeSaved: payment form did not appear within 5 seconds.');
+        return;
+    }
     let ready = false;
-    const paymentForm = document.getElementById('payment-form');
     paymentForm.addEventListener('submit', (event) => event.preventDefault());
     function initializationError() {
         ready = false;
-        document.getElementById('submit').disabled = true;
-        document.getElementById('error-message').textContent = 'Could not load the payment form. Reload to try again.';
+        const submit = paymentForm.querySelector('#submit');
+        const message = paymentForm.querySelector('#error-message');
+        if (submit) submit.disabled = true;
+        if (message) message.textContent = 'Could not load the payment form. Reload to try again.';
     }
     const script = document.createElement('script');
         script.src = 'https://js.stripe.com/v3/';
@@ -124,5 +141,7 @@
             } catch (error) { initializationError(); }
         };
         document.body.appendChild(script);
+}
+initializePaymentForm();
 </script>
 @endscript
