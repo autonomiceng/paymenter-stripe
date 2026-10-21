@@ -122,3 +122,11 @@ The extension uses its `boot()` hook and Laravel Console Application's starting
 callback to register `stripe-saved:adopt-bundled`, following the local Paymenter
 1.5.9 source lifecycle. No tinker or core application changes are required. Native
 command discovery is unverified; test it in the installed sandbox before release.
+
+The fork marks its PaymentIntents, SetupIntents and subscription schedules/phases
+with `stripe_saved_gateway=1`. While bundled Stripe is enabled, the fork acknowledges
+unmarked intent and subscription events without effects and logs only the event type
+and local invoice ID. After bundled Stripe is disabled (or absent), the fork accepts
+unmarked events so in-flight bundled payments can settle after cutover. Fee updates
+require a transaction already owned by the fork; they never change bundled transactions.
+Keep the old endpoint stopped: these guards cannot stop the bundled handler itself.

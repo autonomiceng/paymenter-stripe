@@ -114,7 +114,7 @@ check(count(Http::$calls) === $before, 'Future usage without consent metadata ca
 
 $method = (object) ['id' => 'pm_link', 'type' => 'link', 'customer' => 'cus_owner',
     'link' => (object) ['email' => 'saved@example.test']];
-$setup = (object) ['id' => 'seti_test', 'metadata' => (object) ['user_id' => 7, 'is_billing_agreement' => '1']];
+$setup = (object) ['id' => 'seti_test', 'metadata' => (object) ['user_id' => 7, 'is_billing_agreement' => '1', 'stripe_saved_gateway' => '1']];
 $gateway->webhook(eventRequest($setup, type: 'setup_intent.succeeded'));
 $gateway->setupAgreement(new Request(['setup_intent' => 'seti_test']));
 check(count(ExtensionHelper::$agreements) === 2, 'Setup webhook plus redirect retry creates one agreement');
@@ -155,4 +155,5 @@ require __DIR__ . '/amounts.php';
 require __DIR__ . '/handlers.php';
 require __DIR__ . '/retries.php';
 require __DIR__ . '/setup-consent.php';
+require __DIR__ . '/ownership.php';
 echo "PASS: $count offline assertions\n";

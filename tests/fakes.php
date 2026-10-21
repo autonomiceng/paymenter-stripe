@@ -72,7 +72,8 @@ namespace App\Models {
         public static $rows = null;
         public static $enabled = true;
         public static $bundled = true;
-        public static function where($key, $value) { if (self::$rows !== null) return new \AdoptionCollection(self::$rows[$value] ?? []); return new Query($value === 'Stripe' ? (self::$bundled ? (object) ['enabled' => false] : null) : (object) ['enabled' => self::$enabled]); }
+        public static $bundledEnabled = false;
+        public static function where($key, $value) { if (self::$rows !== null) return new \AdoptionCollection(self::$rows[$value] ?? []); return new Query($value === 'Stripe' ? (self::$bundled ? (object) ['enabled' => self::$bundledEnabled] : null) : (object) ['enabled' => self::$enabled]); }
     }
     class Service {
         public const STATUS_CANCELLED = 'cancelled';
@@ -109,7 +110,7 @@ namespace App\Models {
             public function first() {
                 if ($this->status && !$this->currentRead) throw new \RuntimeException('Settlement guard must use a current read');
                 foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
-                if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return (object) $row;
+                if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return (object) [...$row, 'gateway' => (object) ['extension' => $row['gateway']]];
             } return null; }
             public function where($key, $value) { if ($key === 'status') $this->status = $value; return $this; }
             public function exists() { foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
@@ -171,7 +172,7 @@ namespace Illuminate\Support\Facades {
             finally { self::$locked = false; }
         }
     }
-    class Log { public static $lines = [], $warnings = []; public static function info($message) { self::$lines[] = $message; } public static function warning($message, $context = []) { self::$warnings[] = [$message, $context]; } }
+    class Log { public static $lines = [], $contexts = [], $warnings = []; public static function info($message, $context = []) { self::$lines[] = $message; self::$contexts[] = $context; } public static function warning($message, $context = []) { self::$warnings[] = [$message, $context]; } }
     class Http {
         public static $calls = [];
         public static $handler;
