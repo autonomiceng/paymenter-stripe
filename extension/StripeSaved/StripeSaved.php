@@ -63,11 +63,11 @@ class StripeSaved extends Gateway
         }
 
         Event::listen(Updated::class, function (Updated $event) {
-            if (!$this->gatewayEnabled() || $event->service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$event->service->subscription_id) {
+            if ($event->service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$event->service->subscription_id) {
                 // If the service is not a stripe subscription, skip
                 return;
             }
-            if ($event->service->isDirty('price') || $event->service->isDirty('expires_at')) {
+            if ($this->gatewayEnabled() && ($event->service->isDirty('price') || $event->service->isDirty('expires_at'))) {
                 try {
                     $this->updateSubscription($event->service);
                 } catch (Exception $e) {
@@ -86,7 +86,7 @@ class StripeSaved extends Gateway
 
         Event::listen(Created::class, function (Created $event) {
             $service = $event->cancellation->service;
-            if (!$this->gatewayEnabled() || $service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$service->subscription_id) {
+            if ($service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$service->subscription_id) {
                 // If the service is not a stripe subscription, skip
                 return;
             }

@@ -125,8 +125,10 @@ repeat subscription effects. Late failure/processing events at the old handler c
 regress a successful transaction. Stopping old delivery is essential.
 
 When a non-deleted bundled row exists (even `enabled=0`), the fork leaves legacy subscription listeners to it, avoiding
-duplicate update/cancel calls. With that row soft-deleted or absent the fork registers listeners guarded by
-its enabled state. Existing Stripe subscriptions need dedicated sandbox billing and
+duplicate update/cancel calls. With that row soft-deleted or absent the fork registers listeners;
+price/expiry sync requires the fork to be enabled, while existing subscriptions can still be cancelled when disabled.
+Cancel or migrate fork subscriptions before deleting the fork gateway, because a deleted gateway is not booted.
+Existing Stripe subscriptions need dedicated sandbox billing and
 cancellation tests before delivery changes. No subscription converter is provided.
 
 The extension uses its `boot()` hook and Laravel Console Application's starting

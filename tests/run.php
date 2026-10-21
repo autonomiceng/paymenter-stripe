@@ -152,6 +152,10 @@ check($gateway->webhook($valid)['status'] === 503, 'Disabled webhook is not ackn
 check(count(Http::$calls) === $before, 'Disabled webhook makes no HTTP requests');
 check(Log::$lines === ['StripeSaved webhook deferred: gateway disabled or missing'], 'Disabled log contains no payload or secrets');
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 409');
+$before = count(Http::$calls);
+rejects(fn () => $gateway->pay($invoice, 20), 'HTTP 409');
+check(count(Http::$calls) === $before, 'Disabled checkout rejects before any HTTP request');
+require __DIR__ . '/subscription-listeners.php';
 require __DIR__ . '/adoption.php';
 require __DIR__ . '/adoption-store.php';
 require __DIR__ . '/views.php';
