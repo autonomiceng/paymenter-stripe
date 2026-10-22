@@ -19,7 +19,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $invoice->currency_code = 'usd';
     $invoice->status = 'paid';
     $settled = (object) ['id' => 'pi_late_success', 'status' => 'succeeded', 'customer' => 'cus_owner',
-        'amount' => 2000, 'currency' => 'usd',
+        'amount' => 2000, 'amount_received' => 2000, 'currency' => 'usd',
         'metadata' => (object) ['invoice_id' => $invoice->id, 'stripe_saved_gateway' => '1']];
     $before = ExtensionHelper::$applications;
     $warnings = count(Log::$warnings);
@@ -92,7 +92,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $gateway->webhook(eventRequest($settled));
     check(count(Audit::$rows) === $records + 1, 'Staff record persistence recovers once on retry');
     // A later valid payment has its own cycle, even after another payment was refused.
-    unset($settled->amount_received);
+    $settled->amount_received = 500;
     $settled->id = 'pi_after_review';
     $settled->currency = 'USD';
     $settled->amount = 500;

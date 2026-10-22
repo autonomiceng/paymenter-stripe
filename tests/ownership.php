@@ -8,7 +8,7 @@ Gateway::$enabled = Gateway::$bundledEnabled = true;
 $invoice->status = 'pending';
 $invoice->currency_code = 'usd';
 $user->props->customer = 'cus_owner';
-$owned = (object) ['id' => 'pi_ownership', 'amount' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner',
+$owned = (object) ['id' => 'pi_ownership', 'amount' => 2000, 'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner',
     'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
 $before = ExtensionHelper::$applications;
 check($gateway->webhook(eventRequest($owned))['status'] === 200 && ExtensionHelper::$applications === $before + 1,

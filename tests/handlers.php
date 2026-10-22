@@ -77,8 +77,11 @@ $stripeInvoice = (object) ['id' => 'in_test', 'currency' => 'usd', 'amount_paid'
     'metadata' => (object) ['stripe_saved_invoice_id' => 12],
     'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) ['subscription' => 'sub_test', 'metadata' => (object) ['stripe_saved_gateway' => '1']]]];
 $paymentRows = [];
-Http::$handler = function ($verb, $path, $data) use (&$paymentRows) {
+Http::$handler = function ($verb, $path, $data) use (&$paymentRows, $stripeInvoice) {
     if ($path === '/invoice_payments') return ['data' => $paymentRows];
+    if ($verb === 'get' && str_starts_with($path, '/payment_intents/')) return [
+        'id' => substr($path, strlen('/payment_intents/')), 'status' => 'succeeded', 'customer' => 'cus_owner',
+        'amount' => 2500, 'amount_received' => 1999, 'currency' => $stripeInvoice->currency];
     throw new RuntimeException('Unexpected payment request: ' . $path);
 };
 $deliver = fn ($object) => $gateway->webhook(eventRequest($object, type: 'invoice.payment_succeeded'));
@@ -89,9 +92,12 @@ $service->invoiceRows = [];
 check($deliver($stripeInvoice)['status'] === 200, 'No matching invoice is a 2xx no-op');
 $service->invoiceRows = [(object) ['invoice' => $invoice, 'created_at' => 1]];
 $invoice->status = 'paid';
+$paymentRows[0]->payment->payment_intent = 'pi_subscription_late';
 $before = ExtensionHelper::$applications;
 $deliver($stripeInvoice);
-check(ExtensionHelper::$applications === $before, 'Paid invoice receives no payment');
+check(ExtensionHelper::$applications === $before + 1 && $invoice->status === 'paid', 'Paid bound subscription invoice retains its late payment');
+$before = ExtensionHelper::$applications;
+$paymentRows[0]->payment->payment_intent = 'pi_subscription';
 $invoice->status = 'pending';
 $stripeInvoice->currency = 'eur';
 $deliver($stripeInvoice);
@@ -104,7 +110,7 @@ check(array_slice(\Illuminate\Support\Facades\DB::$modelLocks, 0, 4) === [\App\M
 check(ExtensionHelper::$payments['12:pi_subscription']['amount'] === 19.99, 'Subscription invoice records major units');
 $before = ExtensionHelper::$applications;
 $deliver($stripeInvoice);
-$paymentIntent = (object) ['id' => 'pi_subscription', 'amount' => 1999, 'currency' => 'usd', 'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
+$paymentIntent = (object) ['id' => 'pi_subscription', 'amount' => 1999, 'amount_received' => 1999, 'currency' => 'usd', 'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
 $gateway->webhook(eventRequest($paymentIntent));
 check(ExtensionHelper::$applications === $before, 'Subscription then PaymentIntent delivery cannot reapply payment');
 $paymentIntent->id = 'pi_first';
@@ -129,7 +135,7 @@ $invoice->status = 'pending';
 $invoice->currency_code = 'JPY';
 $paymentIntent->id = 'pi_yen';
 $paymentIntent->currency = 'jpy';
-$paymentIntent->amount = 123;
+$paymentIntent->amount = $paymentIntent->amount_received = 123;
 $gateway->webhook(eventRequest($paymentIntent));
 check(ExtensionHelper::$payments['12:pi_yen']['amount'] === 123.0, 'JPY webhook records yen without dividing by 100');
 Http::$handler = fn () => ['fee' => 5, 'currency' => 'jpy'];

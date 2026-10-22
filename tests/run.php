@@ -29,7 +29,7 @@ $user = User::$row = new User(new Properties('cus_owner'));
 $invoice = Invoice::$row = new Invoice($user);
 $gateway = new StripeSaved(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
 $intent = (object) ['id' => 'pi_test', 'customer' => 'cus_owner', 'status' => 'requires_payment_method',
-    'client_secret' => 'pi_test_secret', 'currency' => 'usd', 'amount' => 2000, 'payment_method' => 'pm_test',
+    'client_secret' => 'pi_test_secret', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 2000, 'payment_method' => 'pm_test',
     'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
 $method = (object) ['id' => 'pm_test', 'customer' => 'cus_owner', 'type' => 'card',
     'card' => (object) ['brand' => 'visa', 'last4' => '4242', 'exp_year' => 2030, 'exp_month' => 5]];
@@ -192,6 +192,7 @@ require __DIR__ . '/adoption.php';
 require __DIR__ . '/adoption-store.php';
 require __DIR__ . '/views.php';
 require __DIR__ . '/amounts.php';
+require __DIR__ . '/settlement-regressions.php';
 require __DIR__ . '/handlers.php';
 require __DIR__ . '/retries.php';
 require __DIR__ . '/setup-consent.php';

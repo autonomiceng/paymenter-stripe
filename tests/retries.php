@@ -11,7 +11,13 @@ $secondInvoice = clone $invoice;
 $secondInvoice->id = 13;
 Invoice::$rows = [12 => $invoice, 13 => $secondInvoice];
 $service->invoiceRows = [(object) ['invoice' => $invoice, 'created_at' => 1], (object) ['invoice' => $secondInvoice, 'created_at' => 2]];
-Http::$handler = fn () => ['data' => [['payment' => ['type' => 'payment_intent', 'payment_intent' => 'pi_bound']]]];
+Http::$handler = function ($verb, $path) {
+    if ($verb === 'get' && $path === '/invoices/in_test') return ['metadata' => []];
+    if ($path === '/invoice_payments') return ['data' => [['payment' => ['type' => 'payment_intent', 'payment_intent' => 'pi_bound']]]];
+    if ($path === '/payment_intents/pi_bound') return ['id' => 'pi_bound', 'status' => 'succeeded',
+        'amount' => 2500, 'amount_received' => 1999, 'currency' => 'usd', 'customer' => 'cus_owner'];
+    throw new RuntimeException('Unexpected bound subscription request: ' . $path);
+};
 $stripeInvoice->metadata = (object) [];
 $before = ExtensionHelper::$applications;
 $deliver($stripeInvoice);

@@ -51,7 +51,7 @@ Http::$handler = function ($verb, $path) {
 rejects(fn () => $gateway->pay($invoice, 20), 'Unexpected programming failure');
 $user->props->values = $oldProps;
 
-$paid = (object) ['id' => 'pi_save_retry', 'amount' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner',
+$paid = (object) ['id' => 'pi_save_retry', 'amount' => 2000, 'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner',
     'payment_method' => 'pm_retry', 'payment_method_options' => (object) ['link' => (object) ['setup_future_usage' => 'off_session']],
     'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1', 'stripe_saved_consent' => '1']];
 $retryMethod = (object) ['id' => 'pm_retry', 'customer' => 'cus_other', 'type' => 'link', 'link' => (object) []];
