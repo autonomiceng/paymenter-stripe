@@ -11,6 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
         with:
+          # The upgrade test rebuilds the previous release from history.
+          fetch-depth: 0
           persist-credentials: false
       - uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # v2.36.0
         with:
