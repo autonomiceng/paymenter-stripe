@@ -2,7 +2,7 @@
 
 namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
 
-use App\Models\{Invoice, InvoiceTransaction, Service};
+use App\Models\{Invoice, InvoiceTransaction, Service, User};
 use Illuminate\Support\Facades\{DB, Log};
 
 trait SubscriptionPayments
@@ -55,7 +55,12 @@ trait SubscriptionPayments
         }
         $paymentId = $paymentIds[0];
         DB::transaction(function () use ($stripeInvoice, $subscriptionId, $paymentId) {
+            $ownerId = Service::where('subscription_id', $subscriptionId)->first()?->user_id;
+            if (!$ownerId) return;
+            // Match PaymentIntent settlement: serialize on the customer before other rows.
+            User::where('id', $ownerId)->lockForUpdate()->firstOrFail();
             $service = Service::where('subscription_id', $subscriptionId)->lockForUpdate()->first();
+            if ($service) abort_unless($service->user_id === $ownerId, 409);
             if (!$service || InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first()) return;
             $invoiceId = $stripeInvoice->metadata->stripe_saved_invoice_id ?? null;
             $invoice = $invoiceId ? ($this->pendingSubscriptionInvoices($service)[$invoiceId] ?? null) : null;

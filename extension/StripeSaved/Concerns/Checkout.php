@@ -4,7 +4,7 @@ namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
 
 use App\Helpers\ExtensionHelper;
 use App\Exceptions\DisplayException;
-use Illuminate\Http\Client\RequestException;
+use Illuminate\Http\Client\{ConnectionException, RequestException};
 use App\Models\Invoice;
 use App\Models\InvoiceTransaction;
 use App\Models\User;
@@ -53,9 +53,9 @@ trait Checkout
                     ],
                 ]],
             ]);
-        } catch (RequestException $e) {
+        } catch (RequestException | ConnectionException $e) {
             \Illuminate\Support\Facades\Log::warning('StripeSaved customer session unavailable', [
-                'invoice_id' => $invoice->id, 'http_status' => $e->response->status(),
+                'invoice_id' => $invoice->id, 'http_status' => $e instanceof RequestException ? $e->response->status() : null,
             ]);
         }
 

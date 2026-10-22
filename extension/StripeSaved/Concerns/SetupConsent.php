@@ -22,6 +22,12 @@ trait SetupConsent
         abort_unless(($intent->metadata->user_id ?? null) == Auth::id()
             && ($intent->metadata->is_billing_agreement ?? null) === '1'
             && $customer && ($intent->customer ?? null) === $customer, 403);
+        if ($intent->status === 'requires_action') {
+            abort_unless(($intent->metadata->stripe_saved_setup_consent ?? null) === 'off_session_v1'
+                && !empty($intent->metadata->stripe_saved_setup_consent_at)
+                && ($intent->metadata->stripe_saved_setup_consent_user ?? null) == Auth::id(), 409);
+            return response()->json(['ok' => true]);
+        }
         abort_unless(in_array($intent->status, ['requires_payment_method', 'requires_confirmation']), 409);
         // Record the versioned terms and authenticated acceptance before confirmation.
         $this->request('post', '/setup_intents/' . $intent->id, ['metadata' => [

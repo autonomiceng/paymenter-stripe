@@ -18,8 +18,9 @@ trait SubscriptionAttempt
             $stored = $user->properties()->where('key', $property)->first()?->value;
             if ($stored) {
                 $attempt = json_decode($stored, true, flags: JSON_THROW_ON_ERROR);
-                abort_unless($attempt['key'] === $key, 409);
-                return $attempt;
+                if ($attempt['key'] === $key) return $attempt;
+                // A resolved attempt belongs to the previous subscription lifecycle.
+                abort_unless(isset($attempt['subscription']), 409);
             }
             $attempt = ['key' => $key, 'data' => $data, 'created' => time()];
             $user->properties()->updateOrCreate(['key' => $property], ['value' => json_encode($attempt, JSON_THROW_ON_ERROR)]);
