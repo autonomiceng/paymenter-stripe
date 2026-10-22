@@ -91,8 +91,9 @@ trait Checkout
             return response()->json(['ok' => true]);
         }
         abort_unless(in_array($intent->status, ['requires_payment_method', 'requires_confirmation']), 409);
-        // Basil accepts an empty string to unset each method-specific future usage.
+        // Clear legacy top-level usage; consent applies only to card and Link.
         $this->request('post', '/payment_intents/' . $intent->id, [
+            'setup_future_usage' => '',
             'payment_method_options' => [
                 'card' => ['setup_future_usage' => $save ? 'off_session' : ''],
                 'link' => ['setup_future_usage' => $save ? 'off_session' : ''],

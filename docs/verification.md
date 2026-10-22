@@ -77,6 +77,31 @@ Verify Customer Session failure and recovery in the sandbox as well as normal re
 
 Checkout's opt-in covers card and Link only. Consent sets (or clears with `''`)
 `payment_method_options.card.setup_future_usage` and the matching Link option,
-never top-level future usage. Saving requires consent metadata and `off_session`
-for the actual method type. Bank debits are not saved by this checkout opt-in.
+and clears top-level future usage left by earlier versions. Saving requires
+consent metadata and `off_session` for the actual method type. Bank debits are not saved by this checkout opt-in.
 Verify both method-specific options against pinned Basil before release.
+
+A successful checkout charge on an already paid invoice is recorded as another
+native successful transaction. The invoice stays paid. Paymenter 1.5.9 keeps the
+extra amount in the invoice transactions; it does not automatically create credit.
+Staff should review the transaction ID in Stripe and either refund the extra
+charge there or add the agreed credit under the user's **Credits** page in
+Paymenter. No refund or credit is created automatically.
+
+A successful charge refused for a customer or currency mismatch is not applied to
+the invoice. A record in Paymenter's native invoice **Audit Log** retains the
+PaymentIntent ID, invoice ID, received amount in Stripe minor units, currency and
+reason. Open the invoice's **Audit Log** action, or **System > Audits**, to read
+the `stripe_saved_payment_review` entry and reconcile the charge in Stripe before
+refunding or crediting the correct customer. These records use the native audit
+table, with no retention limit in Paymenter 1.5.9's default audit configuration.
+Retries reuse the same record. Failure to store it leaves the webhook retryable.
+These records contain no customer details or client secrets. Verify the native
+page and concurrent delivery behavior in the sandbox.
+
+An existing Stripe customer is replaced only when Stripe returns `deleted: true`
+or HTTP 404 with `resource_missing`. Other lookup failures stop the operation and
+preserve `stripe_id`. Before confirmation, consent updates also clear legacy
+top-level `setup_future_usage` with an empty form value. During authentication,
+consent changes still return 409 and resuming performs no update. Include an
+unfinished intent from the earlier release in the sandbox consent checks.
