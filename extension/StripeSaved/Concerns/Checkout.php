@@ -127,7 +127,8 @@ trait Checkout
             $helper = match ($status) {
                 'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',
             };
-            ExtensionHelper::{$helper}($invoice, 'StripeSaved', $this->fromMinorUnits($intent->amount, $intent->currency), null, $intent->id);
+            $amount = $status === 'succeeded' ? $intent->amount_received : $intent->amount;
+            ExtensionHelper::{$helper}($invoice, 'StripeSaved', $this->fromMinorUnits($amount, $intent->currency), null, $intent->id);
         });
     }
 
@@ -141,7 +142,7 @@ trait Checkout
             'old_values' => [],
             'new_values' => [
                 'payment_intent_id' => $intent->id,
-                'amount_minor' => $intent->amount_received ?? $intent->amount,
+                'amount_minor' => $intent->amount_received,
                 'currency' => $intent->currency ?? '', 'reason' => $reason,
                 'resolution' => 'Payment was not applied. Review the charge in Stripe for a refund or record the correct customer credit in Paymenter.',
             ],
