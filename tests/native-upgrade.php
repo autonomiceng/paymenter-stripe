@@ -9,7 +9,11 @@ $uploadProcess = function (array $command): array {
 };
 $uploadDirectory = sys_get_temp_dir() . '/stripe-saved-upload-' . bin2hex(random_bytes(8));
 mkdir($uploadDirectory, 0700);
+// Untracked files in the release sources (e.g. a stray .env) must never be packaged.
+$untrackedProbes = [__DIR__ . '/../extension/StripeSaved/.env-release-probe-' . bin2hex(random_bytes(4)),
+    __DIR__ . '/../docs/untracked-release-probe-' . bin2hex(random_bytes(4)) . '.md'];
 try {
+    foreach ($untrackedProbes as $probe) file_put_contents($probe, "untracked\n");
     // Exercise the release builder too: both copies come from the actual native ZIP.
     [$status, $output] = $uploadProcess(['python3', __DIR__ . '/../tools/build_release.py',
         '--output', $uploadDirectory . '/StripeSaved.zip']);
@@ -18,6 +22,10 @@ try {
         'import sys, zipfile; archive = zipfile.ZipFile(sys.argv[1]); [archive.extractall(path) for path in sys.argv[2:]]',
         $uploadDirectory . '/StripeSaved.zip', $uploadDirectory . '/installed', $uploadDirectory . '/extracted']);
     check($status === 0, 'Native ZIP extracts into independent installed and uploaded copies: ' . $output);
+    foreach ($untrackedProbes as $probe) {
+        $entry = $uploadDirectory . '/extracted/StripeSaved/' . (str_contains($probe, '/docs/') ? 'docs/' : '') . basename($probe);
+        check(!file_exists($entry), 'Native ZIP omits untracked ' . basename($probe));
+    }
     foreach (['installed/StripeSaved', 'absent'] as $installedCopy) {
         [$status, $output] = $uploadProcess([PHP_BINARY, '-n', __DIR__ . '/native-upload-probe.php',
             $uploadDirectory . '/' . $installedCopy, $uploadDirectory . '/extracted/StripeSaved']);
@@ -25,6 +33,7 @@ try {
             'Native upload detects gateway with ' . $installedCopy . ': ' . $output);
     }
 } finally {
+    foreach ($untrackedProbes as $probe) if (is_file($probe)) unlink($probe);
     $files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($uploadDirectory,
         FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
     foreach ($files as $file) {
