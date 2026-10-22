@@ -7,10 +7,12 @@ use Illuminate\Support\Facades\{DB, Log};
 
 trait SubscriptionPayments
 {
-    private function pendingSubscriptionInvoices(Service $service): array
+    private function subscriptionInvoices(Service $service, bool $pendingOnly = true): array
     {
         $invoices = [];
-        foreach ($service->invoiceItems()->whereHas('invoice', fn ($query) => $query->where('status', 'pending'))->get() as $item) {
+        $items = $service->invoiceItems();
+        if ($pendingOnly) $items->whereHas('invoice', fn ($query) => $query->where('status', 'pending'));
+        foreach ($items->get() as $item) {
             $invoices[$item->invoice->id] = $item->invoice;
         }
         return $invoices;
@@ -22,7 +24,7 @@ trait SubscriptionPayments
             Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
             // Event snapshots are immutable: recover the current remote binding on every retry.
             $current = $this->request('get', '/invoices/' . $stripeInvoice->id);
-            $invoices = $this->pendingSubscriptionInvoices($service);
+            $invoices = $this->subscriptionInvoices($service);
             $bound = $current->metadata->stripe_saved_invoice_id ?? null;
             $invoice = $bound ? ($invoices[$bound] ?? null) : (count($invoices) === 1 ? reset($invoices) : null);
             if (!$invoice || strtolower($invoice->currency_code) !== strtolower($stripeInvoice->currency ?? '')) {
@@ -63,20 +65,30 @@ trait SubscriptionPayments
             if ($service) abort_unless($service->user_id === $ownerId, 409);
             if (!$service || InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first()) return;
             $invoiceId = $stripeInvoice->metadata->stripe_saved_invoice_id ?? null;
-            $invoice = $invoiceId ? ($this->pendingSubscriptionInvoices($service)[$invoiceId] ?? null) : null;
+            $invoice = $invoiceId ? ($this->subscriptionInvoices($service, pendingOnly: false)[$invoiceId] ?? null) : null;
             if (!$invoice) {
                 Log::warning('StripeSaved subscription invoice needs reconciliation', ['service_id' => $service->id]);
                 return;
             }
             $invoice = Invoice::where('id', $invoice->id)->lockForUpdate()->first();
-            if (!$invoice || $invoice->status !== 'pending') return;
+            if (!$invoice) return;
+            abort_unless($invoice->user_id === $ownerId, 409);
+            $intent = $this->request('get', '/payment_intents/' . $paymentId);
+            abort_unless($intent->id === $paymentId && $intent->status === 'succeeded', 409);
+            // Subscription metadata owns the local binding, not PaymentIntent metadata.
+            $intent->metadata = (object) ['invoice_id' => $invoice->id];
+            if (!in_array($invoice->status, ['pending', 'paid'], true)) {
+                Log::warning('StripeSaved subscription invoice needs reconciliation', ['service_id' => $service->id]);
+                $this->recordRefusedPayment($invoice, $intent, 'invoice not pending');
+                return;
+            }
             if (strtolower($invoice->currency_code) !== strtolower($stripeInvoice->currency ?? '')) {
                 Log::warning('StripeSaved subscription payment currency mismatch', ['service_id' => $service->id]);
+                $this->recordRefusedPayment($invoice, $intent, 'currency mismatch');
                 return;
             }
             // Use the same locked transaction path as PaymentIntent events, so either delivery order is safe.
-            $this->recordIntentPayment((object) ['id' => $paymentId, 'amount' => $stripeInvoice->amount_paid,
-                'currency' => $stripeInvoice->currency, 'metadata' => (object) ['invoice_id' => $invoice->id]], 'succeeded');
+            $this->recordIntentPayment($intent, 'succeeded');
         });
     }
 }
