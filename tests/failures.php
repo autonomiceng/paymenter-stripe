@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 use App\Helpers\ExtensionHelper;
 use App\Models\Gateway;
-use Illuminate\Http\Client\RequestException;
+use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Support\Facades\{Http, Log};
 
 Gateway::$enabled = true;
@@ -30,6 +30,18 @@ check($view['data']['customerSessionSecret'] === null && $view['data']['intent']
     'Session request failure still renders a customer-bound intent for a new method');
 check(end(Log::$warnings) === ['StripeSaved customer session unavailable', ['invoice_id' => 12, 'http_status' => 503]],
     'Session failure logs no request payload or secrets');
+$user->props->values = [];
+Http::$handler = function ($verb, $path) {
+    if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
+    if ($path === '/payment_intents') return ['id' => 'pi_connection', 'status' => 'requires_payment_method'];
+    if ($path === '/customer_sessions') throw new ConnectionException('private connection error');
+    throw new RuntimeException('Unexpected request: ' . $path);
+};
+$view = $gateway->pay($invoice, 20);
+check($view['data']['customerSessionSecret'] === null && $view['data']['intent']->id === 'pi_connection',
+    'Customer Session connection failure still renders checkout');
+check(end(Log::$warnings) === ['StripeSaved customer session unavailable', ['invoice_id' => 12, 'http_status' => null]],
+    'Connection failure logs invoice and absent status without exception payload');
 $user->props->values = [];
 Http::$handler = function ($verb, $path) {
     if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
@@ -80,5 +92,20 @@ Http::$handler = fn () => ['id' => 'cus_owner'];
 $before = count(Http::$calls);
 invoke($gateway, 'setupSubscription', $subscriptionSetup);
 check(count(Http::$calls) === $before + 1, 'Subscription setup twin rejects wrong customer before mutations');
+$subscriptionSetup->customer = 'cus_owner';
+$subscriptionSetup->payment_method = 'pm_foreign';
+Http::$handler = function ($verb, $path) {
+    if ($verb !== 'get') throw new RuntimeException('Foreign method must not mutate Stripe');
+    return match ($path) {
+        '/customers/cus_owner' => ['id' => 'cus_owner'],
+        '/payment_methods/pm_foreign' => ['id' => 'pm_foreign', 'customer' => 'cus_other'],
+        default => throw new RuntimeException('Unexpected ownership request: ' . $path),
+    };
+};
+$before = count(Http::$calls);
+invoke($gateway, 'setupSubscription', $subscriptionSetup);
+check(array_column(array_slice(Http::$calls, $before), 1) === ['/customers/cus_owner', '/payment_methods/pm_foreign']
+    && array_column(array_slice(Http::$calls, $before), 0) === ['get', 'get'],
+    'Subscription setup refuses another customer method before customer update or schedule creation');
 Http::$handler = $oldHandler;
 Gateway::$enabled = false;

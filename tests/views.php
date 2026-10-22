@@ -5,13 +5,17 @@ $views = __DIR__ . '/../extension/StripeSaved/resources/views/';
 $theme = file_get_contents($views . 'stripe-theme.blade.php');
 foreach (['pay', 'billing-agreement'] as $name) {
     $view = file_get_contents($views . $name . '.blade.php');
-    $script = substr($view, strpos($view, '<script>') + strlen('<script>'));
+    $scriptPosition = strpos($view, '<script>');
+    check($scriptPosition !== false, "$name: payment script exists");
+    $script = substr($view, $scriptPosition + strlen('<script>'));
     $entry = strpos($script, 'async function initializePaymentForm() {');
     check($entry !== false && !preg_match('/\b(?:getElementById|querySelector(?:All)?)\s*\(/', substr($script, 0, $entry)),
         "$name: no DOM lookup runs before deferred initialization");
     check(preg_match('/\n}\s*initializePaymentForm\(\);\s*<\/script>/', $script) === 1,
         "$name: only the deferred entry point runs after its definition");
-    $wait = substr($script, $entry, strpos($script, 'let ready = false;') - $entry);
+    $readyPosition = strpos($script, 'let ready = false;');
+    check($readyPosition !== false && $entry < $readyPosition, "$name: readiness follows initialization");
+    $wait = substr($script, $entry, $readyPosition - $entry);
     check(str_contains($wait, 'const deadline = performance.now() + 5000;')
         && str_contains($wait, 'if (performance.now() >= deadline) return resolve(null);')
         && str_contains($wait, 'requestAnimationFrame(findForm);')
@@ -43,12 +47,16 @@ foreach (['pay', 'billing-agreement'] as $name) {
     check(str_contains($view, 'Js::from(auth()->user()->name)') && str_contains($view, 'Js::from(auth()->user()->email)'), "$name: customer details use script-safe values");
     check(str_contains($view, '<button id="submit" disabled'), "$name: submission starts disabled");
     check(str_contains($view, "paymentElement.on('ready'") && str_contains($view, "script.onerror = initializationError"), "$name: readiness gates submission and script failure shows an error");
-    check(strpos($view, "form.addEventListener('submit'") < strpos($view, "paymentElement.mount("), "$name: submit handler is installed before mounting");
+    $handlerPosition = strpos($view, "form.addEventListener('submit'");
+    $mountPosition = strpos($view, "paymentElement.mount(");
+    check($handlerPosition !== false && $mountPosition !== false && $handlerPosition < $mountPosition, "$name: submit handler is installed before mounting");
 }
 $setupView = file_get_contents($views . 'billing-agreement.blade.php');
 check(str_contains($setupView, 'id="setup-consent" required disabled') && str_contains($setupView, 'I agree to save this payment method and allow charges to it for my future invoices, including renewals, when I am not present.')
     && str_contains($setupView, 'Saving does not turn on Auto Pay; you can choose it for a service later.'), 'Setup has an explicit future off-session opt-in');
-check(strpos($setupView, 'setup-consent\')') < strpos($setupView, 'stripe.confirmSetup'), 'Setup records consent before confirmation');
+$consentPosition = strpos($setupView, 'setup-consent\')');
+$confirmPosition = strpos($setupView, 'stripe.confirmSetup');
+check($consentPosition !== false && $confirmPosition !== false && $consentPosition < $confirmPosition, 'Setup records consent before confirmation');
 check(str_contains($setupView, 'if (error) throw error;') && str_contains($setupView, 'message.replaceChildren(text);')
     && str_contains($setupView, 'finally {') && str_contains($setupView, 'setLoading(false);'), 'Setup errors remain in alert and unlock retry');
 
@@ -59,3 +67,10 @@ check(str_contains($payView, "@checked($" . "intent->status === 'requires_action
 
 check(str_contains($payView, 'if (customerSessionSecret) options.customerSessionClientSecret = customerSessionSecret;'),
     'Checkout only includes a Customer Session secret when available');
+
+$syncPosition = strpos($theme, 'function syncStripeTheme');
+check($syncPosition !== false, 'Theme synchronization function exists');
+$syncTheme = substr($theme, $syncPosition);
+check(str_contains($syncTheme, 'for (let node = form; node; node = node.parentElement)')
+    && str_contains($syncTheme, "observer.observe(node, {attributes: true, attributeFilter: ['class', 'data-theme', 'style']})"),
+    'Theme observer follows every ancestor read by stripeAppearance');

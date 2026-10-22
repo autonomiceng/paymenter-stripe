@@ -16,8 +16,8 @@ foreach (['enabled', 'disabled', 'absent', 'deleted'] as $forkState) {
         Gateway::$bundledDeleted = $bundledState === 'deleted';
         check($gateway->canUseGateway(20, 'USD', 'invoice', []) === ($forkState === 'enabled' && $bundledState !== 'active'),
             'Checkout ownership: fork ' . $forkState . ', bundled ' . $bundledState);
-        check(invoke($gateway, 'ownsWebhookObject', (object) [], 'payment_intent.succeeded') === ($bundledState !== 'active'),
-            'Unmarked webhook ownership follows bundled inactivity: ' . $bundledState);
+        check(invoke($gateway, 'ownsWebhookObject', (object) [], 'payment_intent.succeeded') === in_array($bundledState, ['absent', 'deleted']),
+            'Unmarked webhook ownership requires bundled retirement: ' . $bundledState);
         Event::$listeners = [];
         $gateway->boot();
         check(count(Event::$listeners) === (in_array($bundledState, ['absent', 'deleted']) ? 2 : 0),

@@ -31,12 +31,36 @@ foreach (['invoice.created', 'invoice.payment_succeeded', 'subscription_schedule
 }
 check(invoke($gateway, 'ownsWebhookObject', (object) ['parent' => (object) ['subscription_details' => (object) [
     'metadata' => (object) ['stripe_saved_gateway' => '1']]]], 'invoice.created'), 'Subscription phase metadata identifies fork invoice');
+$markedSchedule = (object) ['id' => 'sched_marked', 'subscription' => 'sub_marked',
+    'metadata' => (object) ['stripe_saved_gateway' => '1']];
+$oldSubscription = $service->subscription_id;
+$service->subscription_id = 'sub_marked';
+$markedResult = $gateway->webhook(eventRequest($markedSchedule, type: 'subscription_schedule.canceled'));
+check($markedResult['data']['received'] === true && !isset($markedResult['data']['ignored']) && $service->subscription_id === null,
+    'Valid marked subscription webhook passes ownership and cancels the linked service');
+$service->subscription_id = $oldSubscription;
 Gateway::$bundledEnabled = false;
+$before = ExtensionHelper::$applications;
+$disabledResult = $gateway->webhook(eventRequest($owned));
+check(($disabledResult['data']['ignored'] ?? false) === true && ExtensionHelper::$applications === $before,
+    'Disabled but present bundled row still owns unmarked intents');
+foreach (['invoice.created', 'invoice.payment_succeeded', 'subscription_schedule.canceled', 'setup_intent.succeeded'] as $type) {
+    check(($gateway->webhook(eventRequest((object) ['metadata' => (object) []], type: $type))['data']['ignored'] ?? false) === true,
+        'Disabled but present bundled row still owns unmarked event: ' . $type);
+}
+$owned->metadata->stripe_saved_gateway = '1';
+$owned->id = 'pi_marked_disabled_bundled';
+$gateway->webhook(eventRequest($owned));
+check(ExtensionHelper::$applications === $before + 1, 'Marked intent still settles with a disabled bundled row');
+unset($owned->metadata->stripe_saved_gateway);
+$owned->id = 'pi_bundled';
+Gateway::$bundledDeleted = true;
 $gateway->webhook(eventRequest($owned));
 $before = ExtensionHelper::$applications;
 $gateway->webhook(eventRequest($owned));
 check(isset(ExtensionHelper::$payments['12:pi_bundled']) && ExtensionHelper::$applications === $before,
     'Sole owner records an in-flight bundled intent exactly once');
+Gateway::$bundledDeleted = false;
 Gateway::$bundled = false;
 check(invoke($gateway, 'ownsWebhookObject', $owned, 'payment_intent.succeeded'), 'Missing bundled row permits in-flight intent');
 Gateway::$bundled = true;
