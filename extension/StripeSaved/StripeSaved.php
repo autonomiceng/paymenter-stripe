@@ -24,10 +24,24 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\View;
+use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Amounts;
+use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Checkout;
+use Paymenter\Extensions\Gateways\StripeSaved\Concerns\CheckoutIntent;
+use Paymenter\Extensions\Gateways\StripeSaved\Concerns\SetupConsent;
+use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Signature;
+use Paymenter\Extensions\Gateways\StripeSaved\Concerns\SubscriptionAttempt;
+use Paymenter\Extensions\Gateways\StripeSaved\Concerns\SubscriptionPayments;
+use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Webhooks;
 use Str;
 
-require_once __DIR__ . '/Signature.php';
-require_once __DIR__ . '/Checkout.php';
+require_once __DIR__ . '/Concerns/Signature.php';
+require_once __DIR__ . '/Concerns/Checkout.php';
+require_once __DIR__ . '/Concerns/Amounts.php';
+require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
+require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
+require_once __DIR__ . '/Concerns/CheckoutIntent.php';
+require_once __DIR__ . '/Concerns/SetupConsent.php';
+require_once __DIR__ . '/Concerns/Webhooks.php';
 
 #[ExtensionMeta(
     name: 'Stripe Saved Methods',
@@ -38,29 +52,34 @@ require_once __DIR__ . '/Checkout.php';
 )]
 class StripeSaved extends Gateway
 {
-    use Signature, Checkout;
+    use Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks;
 
     private const API_VERSION = '2025-07-30.basil';
 
     public function boot()
     {
+        if (app()->runningInConsole()) {
+            require_once __DIR__ . '/AdoptBundledCommand.php';
+            \Illuminate\Console\Application::starting(fn ($artisan) => $artisan->resolve(AdoptBundledCommand::class));
+        }
         require __DIR__ . '/routes.php';
         // Register webhook route
         View::addNamespace('gateways.stripe-saved', __DIR__ . '/resources/views');
         // Core boots disabled gateways too. Let the bundled listener own legacy subscriptions.
-        if (\App\Models\Gateway::where('extension', 'Stripe')->exists()) {
+        if (!$this->bundledInactive(requireAbsent: true)) {
             return;
         }
 
         Event::listen(Updated::class, function (Updated $event) {
-            if (!$this->gatewayEnabled() || $event->service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$event->service->subscription_id) {
+            if ($event->service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$event->service->subscription_id) {
                 // If the service is not a stripe subscription, skip
                 return;
             }
-            if ($event->service->isDirty('price') || $event->service->isDirty('expires_at')) {
+            if ($this->gatewayEnabled() && ($event->service->isDirty('price') || $event->service->isDirty('expires_at'))) {
                 try {
                     $this->updateSubscription($event->service);
                 } catch (Exception $e) {
+                    \Illuminate\Support\Facades\Log::warning('StripeSaved subscription sync failed', ['service_id' => $event->service->id]);
                 }
             }
             // Check if the service is canceled
@@ -68,23 +87,35 @@ class StripeSaved extends Gateway
                 try {
                     $this->cancelSubscription($event->service);
                 } catch (Exception $e) {
-                    // Ignore exception
+                    \Illuminate\Support\Facades\Log::warning('StripeSaved subscription sync failed', ['service_id' => $event->service->id]);
                 }
             }
         });
 
         Event::listen(Created::class, function (Created $event) {
             $service = $event->cancellation->service;
-            if (!$this->gatewayEnabled() || $service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$service->subscription_id) {
+            if ($service->properties->where('key', 'has_stripe_subscription')->first()?->value !== '1' || !$service->subscription_id) {
                 // If the service is not a stripe subscription, skip
                 return;
             }
             try {
                 $this->cancelSubscription($service);
             } catch (Exception $e) {
-                // Ignore exception
+                \Illuminate\Support\Facades\Log::warning('StripeSaved subscription sync failed', ['service_id' => $service->id]);
             }
         });
+    }
+
+    private function bundledInactive(bool $requireAbsent = false): bool
+    {
+        // Soft-deleted rows are excluded by the native model scope. Disabled rows still boot listeners.
+        $bundled = \App\Models\Gateway::where('extension', 'Stripe')->first();
+        return !$bundled || (!$requireAbsent && !$bundled->enabled);
+    }
+
+    public function canUseGateway($total, $currency, $type, $items): bool
+    {
+        return $this->gatewayEnabled() && $this->bundledInactive();
     }
 
     public function getConfig($values = [])
@@ -177,129 +208,14 @@ class StripeSaved extends Gateway
             ->send();
     }
 
-    private function request($method, $url, $data = [])
+    private function request($method, $url, $data = [], ?string $idempotencyKey = null)
     {
-        return Http::withHeaders([
+        $headers = [
             'Authorization' => 'Bearer ' . $this->config('stripe_secret_key'),
             'Stripe-Version' => self::API_VERSION,
-        ])->asForm()->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object();
-    }
-
-    public function webhook(Request $request)
-    {
-        if (!$this->gatewayEnabled()) {
-            \Illuminate\Support\Facades\Log::info('StripeSaved webhook ignored: gateway disabled or missing');
-            return response()->json(['ignored' => true]);
-        }
-        if (!$this->isValidSignature($request->getContent(), $request->header('Stripe-Signature'), $this->config('stripe_webhook_secret'))) {
-            return response()->json(['error' => 'Invalid signature'], 400);
-        }
-
-        $event = json_decode($request->getContent());
-        if (!is_object($event) || !isset($event->type, $event->data->object)) {
-            return response()->json(['error' => 'Invalid event'], 400);
-        }
-
-        // Handle the event
-        switch ($event->type) {
-            case 'payment_intent.processing':
-                $paymentIntent = $event->data->object; // contains a StripePaymentIntent
-                if (!isset($paymentIntent->metadata->invoice_id)) {
-                    break;
-                }
-                $this->recordIntentPayment($paymentIntent, 'processing');
-                break;
-                // Normal payment
-            case 'payment_intent.succeeded':
-                $paymentIntent = $event->data->object; // contains a StripePaymentIntent
-                if (!isset($paymentIntent->metadata->invoice_id)) {
-                    break;
-                }
-                $this->recordIntentPayment($paymentIntent, 'succeeded');
-                $this->savePaidMethod($paymentIntent);
-                break;
-            case 'payment_intent.payment_failed':
-                $paymentIntent = $event->data->object; // contains a StripePaymentIntent
-                if (!isset($paymentIntent->metadata->invoice_id)) {
-                    break;
-                }
-                $this->recordIntentPayment($paymentIntent, 'failed');
-                break;
-            case 'charge.updated':
-                $charge = $event->data->object; // contains a StripeCharge
-                $invoiceTransaction = InvoiceTransaction::where('transaction_id', $charge->payment_intent)->first();
-                if (!$invoiceTransaction) {
-                    break;
-                }
-                // Get fee from charge
-                $fee = 0;
-                if ($charge->balance_transaction) {
-                    $balanceTransaction = $this->request('get', '/balance_transactions/' . $charge->balance_transaction);
-                    $fee = $balanceTransaction->fee / 100;
-                }
-                ExtensionHelper::addPaymentFee($charge->payment_intent, $fee);
-
-                break;
-            case 'setup_intent.succeeded':
-                $setupIntent = $event->data->object; // contains a StripeSetupIntent
-                // If it's a billing agreement, call setupBillingAgreement
-                if (!isset($setupIntent->metadata->is_billing_agreement) || $setupIntent->metadata->is_billing_agreement !== '1') {
-                    $this->setupSubscription($setupIntent);
-                } else {
-                    $this->setupBillingAgreement($setupIntent);
-                }
-                break;
-            case 'subscription_schedule.canceled':
-                $subscriptionSchedule = $event->data->object; // contains a StripeSubscriptionSchedule
-                $service = Service::where('subscription_id', $subscriptionSchedule->id)->first();
-                if ($service) {
-                    $service->update(['subscription_id' => null]);
-                }
-                break;
-            case 'invoice.created':
-                $invoice = $event->data->object; // contains a StripeInvoice
-
-                if ($this->config('stripe_use_subscriptions') !== true) {
-                    break;
-                }
-
-                // Check if its draft and does exist in our database
-                if ($invoice->status === 'draft' && $invoice->parent->type === 'subscription_details') {
-                    $service = Service::where('subscription_id', $invoice->parent->subscription_details->subscription)->first();
-
-                    if ($service) {
-                        $this->request('post', '/invoices/' . $invoice->id . '/finalize');
-                        // Pay the invoice using Stripe
-                        $this->request('post', '/invoices/' . $invoice->id . '/pay');
-                    }
-                }
-                break;
-            case 'invoice.payment_succeeded':
-                // Mark invoice as paid
-                $invoice = $event->data->object; // contains a StripeInvoice
-
-                if ($invoice->parent->type !== 'subscription_details') {
-                    break;
-                }
-
-                $service = Service::where('subscription_id', $invoice->parent->subscription_details->subscription)->first();
-                if ($service) {
-                    $invoiceModel = $service->invoiceItems->sortByDesc('created_at')->first()->invoice;
-                    $paymentIntents = $this->request('get', '/invoice_payments', ['invoice' => $invoice->id]);
-                    $paymentIntent = collect($paymentIntents->data)->first();
-
-                    if ($paymentIntent->payment->type !== 'payment_intent') {
-                        break;
-                    }
-
-                    ExtensionHelper::addPayment($invoiceModel->id, 'StripeSaved', $invoice->amount_paid / 100, null, $paymentIntent->payment->payment_intent);
-                }
-                break;
-            default:
-                // Not a event type we care about, just return 200
-        }
-
-        return response()->json(['received' => true]);
+        ];
+        if ($idempotencyKey !== null) $headers['Idempotency-Key'] = $idempotencyKey;
+        return Http::withHeaders($headers)->asForm()->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object();
     }
 
     private function setupSubscription($setupIntent)
@@ -309,10 +225,17 @@ class StripeSaved extends Gateway
         $stripeCustomerId = $user->properties->where('key', 'stripe_id')->first();
         // Create customer if not exists
         if (!$stripeCustomerId) {
-            throw new Exception('Stripe customer not found', $user);
+            throw new \Exception('Stripe customer not found');
         } else {
             $customer = $this->request('get', '/customers/' . $stripeCustomerId->value);
         }
+
+        if (($setupIntent->customer ?? null) !== $customer->id) {
+            \Illuminate\Support\Facades\Log::warning('StripeSaved subscription setup customer mismatch', ['invoice_id' => $invoice->id]);
+            return;
+        }
+        $method = $this->request('get', '/payment_methods/' . $setupIntent->payment_method);
+        if (!$this->methodCustomerMatches($user, $method)) return;
 
         // Make payment method default
         $paymentMethod = $this->request('post', '/customers/' . $customer->id, [
@@ -325,6 +248,10 @@ class StripeSaved extends Gateway
                 continue;
             }
             $service = $item->reference;
+            if ($service->subscription_id) {
+                $service->properties()->updateOrCreate(['key' => 'has_stripe_subscription'], ['value' => true]);
+                continue;
+            }
             $product = $service->product;
 
             // Check if the service->product already exists in Stripe
@@ -349,7 +276,7 @@ class StripeSaved extends Gateway
                             'price_data' => [
                                 'currency' => $invoice->currency_code,
                                 'product' => $stripeProduct->id,
-                                'unit_amount' => $item->price * 100,
+                                'unit_amount' => $this->toMinorUnits($item->price, $invoice->currency_code),
                                 'recurring' => [
                                     'interval' => $service->plan->billing_unit,
                                     'interval_count' => $service->plan->billing_period,
@@ -360,7 +287,7 @@ class StripeSaved extends Gateway
                     ],
                     'iterations' => 1,
                     'metadata' => [
-                        'service_id' => $service->id,
+                        'service_id' => $service->id, 'stripe_saved_gateway' => '1',
                     ],
                     'proration_behavior' => 'none',
                 ];
@@ -371,7 +298,7 @@ class StripeSaved extends Gateway
                         'price_data' => [
                             'currency' => $invoice->currency_code,
                             'product' => $stripeProduct->id,
-                            'unit_amount' => ($service->price * $service->quantity) * 100,
+                            'unit_amount' => $this->toMinorUnits($service->price * $service->quantity, $invoice->currency_code),
                             'recurring' => [
                                 'interval' => $service->plan->billing_unit,
                                 'interval_count' => $service->plan->billing_period,
@@ -381,20 +308,20 @@ class StripeSaved extends Gateway
                     ],
                 ],
                 'metadata' => [
-                    'service_id' => $service->id,
+                    'service_id' => $service->id, 'stripe_saved_gateway' => '1',
                 ],
                 'proration_behavior' => 'none',
             ];
 
-            $subscription = $this->request('post', '/subscription_schedules', [
+            $subscriptionId = $this->subscriptionAttempt($user, $setupIntent, $service, [
                 'customer' => $customer->id,
-                'start_date' => now()->startOfDay()->timestamp,
+                'start_date' => 'now',
                 'phases' => $phases,
-                'metadata' => ['service_id' => $service->id],
+                'metadata' => ['service_id' => $service->id, 'stripe_saved_gateway' => '1'],
             ]);
 
             // Update service with subscription id
-            $service->update(['subscription_id' => $subscription->subscription]);
+            $service->update(['subscription_id' => $subscriptionId]);
             $service->properties()->updateOrCreate(['key' => 'has_stripe_subscription'], ['value' => true]);
         }
     }
@@ -435,7 +362,7 @@ class StripeSaved extends Gateway
                 $key = count($phases) - 1;
                 $phases[$key]['items'][0]->price_data = [
                     'currency' => $service->currency->code,
-                    'unit_amount' => $service->price * 100,
+                    'unit_amount' => $this->toMinorUnits($service->price * $service->quantity, $service->currency->code),
                     'product' => $stripeProduct->id,
                     'recurring' => [
                         'interval' => $service->plan->billing_unit,
@@ -459,7 +386,7 @@ class StripeSaved extends Gateway
                 $this->request('post', '/subscription_items/' . $item->id, [
                     'price_data' => [
                         'currency' => $service->currency->code,
-                        'unit_amount' => $service->price * 100,
+                        'unit_amount' => $this->toMinorUnits($service->price * $service->quantity, $service->currency->code),
                         'product' => $item->price->product,
                         'recurring' => [
                             'interval' => $service->plan->billing_unit,
@@ -490,7 +417,7 @@ class StripeSaved extends Gateway
                 $this->request('post', '/subscription_items/' . $item->id, [
                     'price_data' => [
                         'currency' => $service->currency->code,
-                        'unit_amount' => $service->price * 100,
+                        'unit_amount' => $this->toMinorUnits($service->price * $service->quantity, $service->currency->code),
                         'product' => $item->price->product,
                         'recurring' => [
                             'interval' => $service->plan->billing_unit,
@@ -510,7 +437,7 @@ class StripeSaved extends Gateway
 
     public function cancelSubscription(Service $service)
     {
-        if (!$service->subscription_id && !$service->properties->where('key', 'has_stripe_subscription')->first()) {
+        if (!$service->subscription_id) {
             return;
         }
         $this->request('delete', '/subscriptions/' . $service->subscription_id);
@@ -592,6 +519,8 @@ class StripeSaved extends Gateway
 
     public function createBillingAgreement($user)
     {
+        abort_unless($this->gatewayEnabled(), 409);
+        abort_unless(Auth::id() == $user->id, 403);
         // Create or fetch a Stripe customer for this user, use detailed info based on setting
         $includeDetails = (bool) $this->config('stripe_create_customers');
         $customer = $this->createOrGetStripeCustomer($user, $includeDetails);
@@ -600,6 +529,7 @@ class StripeSaved extends Gateway
             'metadata' => [
                 'user_id' => $user->id,
                 'is_billing_agreement' => '1',
+                'stripe_saved_gateway' => '1',
             ],
             'usage' => 'off_session',
             'customer' => $customer->id,
@@ -622,6 +552,7 @@ class StripeSaved extends Gateway
 
     public function setupAgreement(Request $request)
     {
+        abort_unless($this->gatewayEnabled(), 409);
         $request->validate([
             'setup_intent' => 'required|string|regex:/^seti_[a-zA-Z0-9]{24,}$/|max:255',
         ]);
@@ -639,7 +570,7 @@ class StripeSaved extends Gateway
             abort(403, 'Unauthorized');
         }
 
-        $this->setupBillingAgreement($setupIntent);
+        abort_unless($this->setupBillingAgreement($setupIntent), 409);
 
         return redirect()->route('account.payment-methods')->with('notification', [
             'type' => 'success',
@@ -649,17 +580,24 @@ class StripeSaved extends Gateway
 
     private function setupBillingAgreement($setupIntent)
     {
-        $user = User::findOrFail($setupIntent->metadata->user_id);
-
         // Get setup intent with expanded data
         $setupIntent = $this->request('get', '/setup_intents/' . $setupIntent->id, [
             'expand' => ['latest_attempt'],
         ]);
 
+        if (($setupIntent->metadata->is_billing_agreement ?? null) !== '1'
+            || ($setupIntent->metadata->stripe_saved_setup_consent ?? null) !== 'off_session_v1'
+            || empty($setupIntent->metadata->stripe_saved_setup_consent_at)
+            || ($setupIntent->metadata->stripe_saved_setup_consent_user ?? null) != ($setupIntent->metadata->user_id ?? null)
+            || $setupIntent->status !== 'succeeded') return false;
+        $user = User::findOrFail($setupIntent->metadata->user_id);
+        $customer = $user->properties()->where('key', 'stripe_id')->first()?->value;
+        if (!$customer || ($setupIntent->customer ?? null) !== $customer) return false;
+
         // Get the actual payment method that will be used for future charges
         $actualPaymentMethod = $this->getActualPaymentMethod($setupIntent);
 
-        $this->persistAgreement($user, $actualPaymentMethod);
+        return $this->persistAgreement($user, $actualPaymentMethod);
     }
 
     private function getActualPaymentMethod($setupIntent)
@@ -742,13 +680,13 @@ class StripeSaved extends Gateway
         // Create payment intent
         try {
             $intent = $this->request('post', '/payment_intents', [
-                'amount' => $amount * 100,
+                'amount' => $this->toMinorUnits($amount, $invoice->currency_code),
                 'currency' => $invoice->currency_code,
                 'customer' => $customer->id,
                 'payment_method' => $billingAgreement->external_reference,
                 'off_session' => 'true',
                 'confirm' => 'true',
-                'metadata' => ['invoice_id' => $invoice->id, 'billing_agreement_id' => $billingAgreement->id],
+                'metadata' => ['invoice_id' => $invoice->id, 'billing_agreement_id' => $billingAgreement->id, 'stripe_saved_gateway' => '1'],
             ]);
         } catch (Exception $e) {
             if ($e instanceof RequestException && $e->response->status() === 400) {

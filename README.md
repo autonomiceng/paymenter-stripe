@@ -15,15 +15,16 @@ Upstream provenance and file hashes are in [UPSTREAM.md](UPSTREAM.md).
 Paymenter copyright and MIT terms are preserved in [LICENSE](LICENSE).
 Modifications copyright (c) 2026 Autonomic Engineering.
 
-Stripe draws saved methods inside its Payment Element. An unchecked opt-in lets
-customers save a card during invoice payment; saving never enables Auto Pay.
+Stripe draws saved methods inside its Payment Element. An opt-in checkbox, unchecked by
+default, lets customers save a card during invoice payment; saving never enables Auto Pay.
 **Status: pre-release.** Not yet validated against Stripe; the Paymenter/Stripe
 sandbox checks are pending. Complete them before accepting live payments.
 
 - [Installation](docs/install.md) and reproducible native ZIP packaging.
 - [Settings and consent](docs/settings.md), including legacy redisplay limits.
 - [Migration from bundled Stripe](docs/migrating-from-bundled.md): preserve the
-  old extension row and move webhook delivery safely.
+  old extension row, adopt agreements with a reviewed dry-run command, and move
+  webhook delivery safely.
 - [Offline tests and sandbox verification](docs/verification.md).
 
 Run `php -n tests/run.php`; no downloads or network are required. Build with

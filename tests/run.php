@@ -29,7 +29,7 @@ $user = User::$row = new User(new Properties('cus_owner'));
 $invoice = Invoice::$row = new Invoice($user);
 $gateway = new StripeSaved(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
 $intent = (object) ['id' => 'pi_test', 'customer' => 'cus_owner', 'status' => 'requires_payment_method',
-    'client_secret' => 'pi_test_secret', 'amount' => 2000, 'payment_method' => 'pm_test',
+    'client_secret' => 'pi_test_secret', 'currency' => 'usd', 'amount' => 2000, 'payment_method' => 'pm_test',
     'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
 $method = (object) ['id' => 'pm_test', 'customer' => 'cus_owner', 'type' => 'card',
     'card' => (object) ['brand' => 'visa', 'last4' => '4242', 'exp_year' => 2030, 'exp_month' => 5]];
@@ -40,14 +40,17 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
         $path === '/customer_sessions' => ['client_secret' => 'cuss_test_secret'],
         $path === '/payment_intents/pi_test' && $verb === 'get' => $intent,
         $path === '/payment_intents/pi_test' && $verb === 'post' => (function () use (&$intent, $data) {
-            $intent->setup_future_usage = $data['setup_future_usage'];
+            $intent->payment_method_options = json_decode(json_encode($data['payment_method_options']));
             $intent->metadata->stripe_saved_consent = $data['metadata']['stripe_saved_consent'];
             return $intent;
         })(),
         $path === '/payment_methods/' . $method->id => $method,
         $path === '/setup_intents/seti_test' => ['id' => 'seti_test', 'status' => 'succeeded',
             'payment_method' => $method->id, 'latest_attempt' => null,
-            'metadata' => ['user_id' => 7, 'is_billing_agreement' => '1']],
+            'customer' => 'cus_owner',
+            'metadata' => ['user_id' => 7, 'is_billing_agreement' => '1',
+                'stripe_saved_setup_consent' => 'off_session_v1', 'stripe_saved_setup_consent_at' => '1700000000',
+                'stripe_saved_setup_consent_user' => '7']],
         default => throw new RuntimeException('Unexpected HTTP request: ' . $path),
     };
 };
@@ -55,7 +58,7 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
 $gateway->boot();
 check(Event::$listeners === [], 'Bundled row retains subscription callbacks even when disabled');
 check(Route::$routes === ['/extensions/stripe-saved/webhook', '/extensions/stripe-saved/setup-agreement',
-    '/extensions/stripe-saved/consent'], 'Distinct routes are still registered');
+    '/extensions/stripe-saved/consent', '/extensions/stripe-saved/setup-consent'], 'Distinct routes are still registered');
 Gateway::$bundled = false;
 $gateway->boot();
 check(count(Event::$listeners) === 2, 'Standalone fork registers legacy subscription callbacks');
@@ -80,11 +83,11 @@ $intent->metadata->stripe_saved_gateway = '0';
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 403');
 $intent->metadata->stripe_saved_gateway = '1';
 $gateway->consent(new Request(['intent' => 'pi_test', 'save' => false]));
-check($intent->setup_future_usage === '' && $intent->metadata->stripe_saved_consent === '0', 'Unchecked clears future usage');
+check($intent->payment_method_options->card->setup_future_usage === '' && $intent->payment_method_options->link->setup_future_usage === '' && $intent->metadata->stripe_saved_consent === '0', 'Unchecked clears future usage');
 $gateway->webhook(eventRequest($intent));
 check(ExtensionHelper::$agreements === [], 'Unchecked never creates agreement');
 $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true]));
-check($intent->setup_future_usage === 'off_session' && $intent->metadata->stripe_saved_consent === '1', 'Explicit consent enables future usage');
+check($intent->payment_method_options->card->setup_future_usage === 'off_session' && $intent->payment_method_options->link->setup_future_usage === 'off_session' && $intent->metadata->stripe_saved_consent === '1', 'Explicit consent enables future usage');
 $gateway->webhook(eventRequest($intent));
 $gateway->webhook(eventRequest($intent));
 check(count(ExtensionHelper::$agreements) === 1, 'Retried success has one agreement per method');
@@ -97,10 +100,12 @@ check(ExtensionHelper::$agreements['pm_test']['gateway'] === 'StripeSaved', 'Ind
 check(ExtensionHelper::$agreements['pm_test']['expiry'] === '2030-05-31', 'Card expiry preserved');
 check(end(Http::$calls)[2] === ['allow_redisplay' => 'always'], 'Redisplay opt-in reaches Stripe');
 $method->customer = 'cus_other';
-rejects(fn () => invoke($gateway, 'savePaidMethod', $intent), 'Saved payment customer mismatch');
+invoke($gateway, 'savePaidMethod', $intent);
+check(str_contains(end(Log::$warnings)[0], 'customer mismatch'), 'Permanent saving mismatch logs and returns');
 $method->customer = 'cus_owner';
 $intent->customer = 'cus_other';
-rejects(fn () => invoke($gateway, 'savePaidMethod', $intent), 'Saved payment customer mismatch');
+invoke($gateway, 'savePaidMethod', $intent);
+check(str_contains(end(Log::$warnings)[0], 'customer mismatch'), 'Permanent saving mismatch logs and returns');
 $intent->customer = 'cus_owner';
 $intent->status = 'succeeded';
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 409');
@@ -111,7 +116,7 @@ check(count(Http::$calls) === $before, 'Future usage without consent metadata ca
 
 $method = (object) ['id' => 'pm_link', 'type' => 'link', 'customer' => 'cus_owner',
     'link' => (object) ['email' => 'saved@example.test']];
-$setup = (object) ['id' => 'seti_test', 'metadata' => (object) ['user_id' => 7, 'is_billing_agreement' => '1']];
+$setup = (object) ['id' => 'seti_test', 'metadata' => (object) ['user_id' => 7, 'is_billing_agreement' => '1', 'stripe_saved_gateway' => '1']];
 $gateway->webhook(eventRequest($setup, type: 'setup_intent.succeeded'));
 $gateway->setupAgreement(new Request(['setup_intent' => 'seti_test']));
 check(count(ExtensionHelper::$agreements) === 2, 'Setup webhook plus redirect retry creates one agreement');
@@ -141,8 +146,52 @@ $invalid->signature = 't=' . $invalidTime . ',v1=' . hash_hmac('sha256', $invali
 check($gateway->webhook($invalid)['status'] === 400, 'Signed invalid event shape rejected');
 Gateway::$enabled = false;
 $before = count(Http::$calls);
-check($gateway->webhook($valid)['data']['ignored'], 'Disabled webhook acknowledged');
+$invalid->signature = 't=' . $invalidTime . ',v1=forged';
+check($gateway->webhook($invalid)['status'] === 400 && Log::$lines === [], 'Disabled webhook rejects a forged signature');
+check($gateway->webhook($valid)['status'] === 503, 'Disabled webhook is not acknowledged, so Stripe retries');
 check(count(Http::$calls) === $before, 'Disabled webhook makes no HTTP requests');
-check(Log::$lines === ['StripeSaved webhook ignored: gateway disabled or missing'], 'Disabled log contains no payload or secrets');
+check(Log::$lines === ['StripeSaved webhook deferred: gateway disabled or missing'], 'Disabled log contains no payload or secrets');
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 409');
+$before = count(Http::$calls);
+rejects(fn () => $gateway->pay($invoice, 20), 'HTTP 409');
+check(count(Http::$calls) === $before, 'Disabled checkout rejects before any HTTP request');
+$oldHandler = Http::$handler;
+$disabledSetupId = 'seti_abcdefghijklmnopqrstuvwxyz';
+$disabledSetupIntent = (object) ['id' => $disabledSetupId, 'status' => 'succeeded', 'customer' => 'cus_owner',
+    'payment_method' => 'pm_disabled', 'latest_attempt' => null,
+    'metadata' => (object) ['user_id' => '7', 'is_billing_agreement' => '1',
+        'stripe_saved_setup_consent' => 'off_session_v1', 'stripe_saved_setup_consent_at' => '1700000000',
+        'stripe_saved_setup_consent_user' => '7']];
+Http::$handler = function ($verb, $path) use ($disabledSetupIntent, $disabledSetupId) {
+    if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
+    if ($path === '/setup_intents') return ['id' => 'seti_created'];
+    if ($path === '/setup_intents/' . $disabledSetupId) return $disabledSetupIntent;
+    if ($path === '/payment_methods/pm_disabled') return ['id' => 'pm_disabled', 'type' => 'card',
+        'customer' => 'cus_owner', 'card' => ['brand' => 'visa', 'last4' => '4242', 'exp_year' => 2030, 'exp_month' => 5]];
+    throw new RuntimeException('Unexpected disabled setup request: ' . $path);
+};
+$before = count(Http::$calls);
+rejects(fn () => $gateway->createBillingAgreement($user), 'HTTP 409');
+check(count(Http::$calls) === $before, 'Disabled agreement creation makes no HTTP requests');
+$before = count(Http::$calls);
+rejects(fn () => $gateway->setupAgreement(new Request(['setup_intent' => $disabledSetupId])), 'HTTP 409');
+check(count(Http::$calls) === $before, 'Disabled setup redirect makes no HTTP requests');
+$disabledSetupIntent->status = 'requires_payment_method';
+$before = count(Http::$calls);
+rejects(fn () => $gateway->setupConsent(new Request(['intent' => $disabledSetupId, 'consent' => true])), 'HTTP 409');
+check(count(Http::$calls) === $before, 'Disabled setup consent makes no HTTP requests');
+Http::$handler = $oldHandler;
+require __DIR__ . '/subscription-listeners.php';
+require __DIR__ . '/adoption.php';
+require __DIR__ . '/adoption-store.php';
+require __DIR__ . '/views.php';
+require __DIR__ . '/amounts.php';
+require __DIR__ . '/handlers.php';
+require __DIR__ . '/retries.php';
+require __DIR__ . '/setup-consent.php';
+require __DIR__ . '/ownership.php';
+require __DIR__ . '/checkout-owner.php';
+require __DIR__ . '/failures.php';
+require __DIR__ . '/method-consent.php';
+require __DIR__ . '/native-upgrade.php';
 echo "PASS: $count offline assertions\n";

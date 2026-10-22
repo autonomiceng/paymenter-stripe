@@ -14,7 +14,11 @@ before accepting live payments; see [verification](verification.md).
    to the events automatically registered by the gateway; do not reuse the
    bundled endpoint's signing secret for a newly created Stripe endpoint.
 6. Follow [migration](migrating-from-bundled.md) before switching existing users.
+   The fork stays hidden at checkout while bundled Stripe is active. After adoption
+   apply and optional redisplay, use **Delete** on bundled **Stripe** in Paymenter's
+   admin gateway list (soft delete). Bundled disappears from checkout and its
+   webhook route stops booting; adoption rollback restores the bundled row.
 
 Both extensions can be installed together: class, routes, views and payment
-records use distinct gateway identities. Permit one gateway row per extension;
+records use distinct gateway identities. Create exactly one gateway row per extension;
 Paymenter's configuration lookup selects the first matching row.

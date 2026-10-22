@@ -4,21 +4,35 @@
 import argparse
 import hashlib
 from pathlib import Path
+import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+SOURCES = ('extension/StripeSaved', 'LICENSE', 'UPSTREAM.md', 'NOTICES.md', 'README.md', 'docs')
+
+
+def tracked_files():
+    # Package only git-tracked files: untracked .env or credential fixtures never ship.
+    listing = subprocess.run(['git', '-C', str(ROOT), 'ls-files', '-z', '--', *SOURCES],
+                             check=True, capture_output=True).stdout.decode()
+    paths = sorted(name for name in listing.split('\0') if name)
+    for name in paths:
+        path = ROOT / name
+        if path.is_symlink() or not path.is_file():
+            raise SystemExit(f'Refusing release entry {name}: not a regular tracked file')
+    return paths
 
 
 def build(output):
     output = Path(output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    entries = {str(p.relative_to(ROOT / 'extension')): p
-               for p in (ROOT / 'extension' / 'StripeSaved').rglob('*') if p.is_file()}
-    for name in ('LICENSE', 'UPSTREAM.md', 'NOTICES.md', 'README.md', 'docs'):
-        source = ROOT / name
-        for path in sorted(source.rglob('*')) if source.is_dir() else [source]:
-            if path.is_file():
-                entries['StripeSaved/' + str(path.relative_to(ROOT))] = path
+    entries = {}
+    for name in tracked_files():
+        path = ROOT / name
+        if name.startswith('extension/'):
+            entries[name.removeprefix('extension/')] = path
+        else:
+            entries['StripeSaved/' + name] = path
     with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for name, source in sorted(entries.items()):
             info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
