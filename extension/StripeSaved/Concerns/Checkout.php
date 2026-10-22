@@ -5,6 +5,7 @@ namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
 use App\Helpers\ExtensionHelper;
 use App\Exceptions\DisplayException;
 use Illuminate\Http\Client\{ConnectionException, RequestException};
+use App\Models\Audit;
 use App\Models\Invoice;
 use App\Models\InvoiceTransaction;
 use App\Models\User;
@@ -111,18 +112,39 @@ trait Checkout
             if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->lockForUpdate()->first()) return;
             if (!empty($intent->customer) && $intent->customer !== $invoice->user->properties()->where('key', 'stripe_id')->first()?->value) {
                 \Illuminate\Support\Facades\Log::warning('StripeSaved payment customer mismatch', ['invoice_id' => $invoice->id]);
+                if ($status === 'succeeded') $this->recordRefusedPayment($invoice, $intent, 'customer mismatch');
                 return;
             }
-            if ($status === 'succeeded' && $invoice->status === 'paid') return;
             if (strtolower($invoice->currency_code) !== strtolower($intent->currency ?? '')) {
                 \Illuminate\Support\Facades\Log::warning('StripeSaved payment currency mismatch', ['invoice_id' => $invoice->id]);
+                if ($status === 'succeeded') $this->recordRefusedPayment($invoice, $intent, 'currency mismatch');
                 return;
+            }
+            if ($status === 'succeeded' && $invoice->status === 'paid') {
+                \Illuminate\Support\Facades\Log::warning('StripeSaved payment received for paid invoice', ['invoice_id' => $invoice->id]);
             }
             $helper = match ($status) {
                 'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',
             };
             ExtensionHelper::{$helper}($invoice, 'StripeSaved', $this->fromMinorUnits($intent->amount, $intent->currency), null, $intent->id);
         });
+    }
+
+    private function recordRefusedPayment($invoice, $intent, string $reason): void
+    {
+        // The caller holds the user and invoice locks. Keep one staff record per PaymentIntent.
+        if (Audit::where('event', 'stripe_saved_payment_review')->where('new_values->payment_intent_id', $intent->id)->lockForUpdate()->first()) return;
+        Audit::create([
+            'event' => 'stripe_saved_payment_review',
+            'auditable_type' => $invoice->getMorphClass(), 'auditable_id' => $invoice->id,
+            'old_values' => [],
+            'new_values' => [
+                'payment_intent_id' => $intent->id,
+                'amount_minor' => $intent->amount_received ?? $intent->amount,
+                'currency' => $intent->currency ?? '', 'reason' => $reason,
+                'resolution' => 'Payment was not applied. Review the charge in Stripe for a refund or record the correct customer credit in Paymenter.',
+            ],
+        ]);
     }
 
     private function savePaidMethod($intent)
