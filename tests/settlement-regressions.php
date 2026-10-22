@@ -31,7 +31,10 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         if ($verb === 'get' && $path === '/invoice_payments') return ['data' => [
             ['status' => 'paid', 'amount_paid' => 1250,
                 'payment' => ['type' => 'payment_intent', 'payment_intent' => $intent->id]]]];
-        if ($verb === 'get' && $path === '/payment_intents/' . $intent->id) return $intent;
+        if ($verb === 'get' && $path === '/payment_intents/' . $intent->id) {
+            check(!DB::$locked, 'Subscription PaymentIntent lookup runs before the settlement transaction');
+            return $intent;
+        }
         throw new RuntimeException('Unexpected settlement request: ' . $path);
     };
     $deliver = fn () => $gateway->webhook(eventRequest($stripeInvoice, type: 'invoice.payment_succeeded'));
@@ -67,6 +70,9 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $calls = count(Http::$calls);
     $deliver();
     $deliver();
+    check(count(array_filter(array_slice(Http::$calls, $calls), fn ($call) => $call[0] === 'get'
+        && $call[1] === '/payment_intents/pi_subscription_paid')) === 2,
+        'Each subscription delivery fetches the settled PaymentIntent before checking local rows');
     check(ExtensionHelper::$applications === $before + 1 && $invoice->status === 'paid'
         && ExtensionHelper::$payments['112:pi_subscription_paid']['amount'] === 12.5,
         'Paid bound subscription invoice retains one successful charge with received units');
@@ -150,14 +156,22 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         if (str_starts_with($path, '/payment_intents/')) { $result = clone $result; $result->id = 'pi_different'; }
         return $result;
     };
+    $payments = ExtensionHelper::$payments;
+    $records = Audit::$rows;
+    $locks = count(DB::$modelLocks);
     rejects($deliver, 'HTTP 409');
+    check(ExtensionHelper::$payments === $payments && Audit::$rows === $records
+        && count(DB::$modelLocks) === $locks,
+        'A mismatched subscription intent is refused before row locks without payment or audit rows');
     Http::$handler = $handler;
-    foreach (['processing', 'requires_action', 'requires_capture', 'canceled'] as $status) {
+    foreach (['requires_payment_method', 'requires_confirmation', 'processing', 'requires_action', 'requires_capture', 'canceled'] as $status) {
         $intent->status = $status;
         $before = ExtensionHelper::$applications;
         $records = count(Audit::$rows);
+        $locks = count(DB::$modelLocks);
         rejects($deliver, 'HTTP 409');
-        check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records,
+        check(ExtensionHelper::$payments === $payments && count(DB::$modelLocks) === $locks
+            && ExtensionHelper::$applications === $before && count(Audit::$rows) === $records,
             'An unsettled subscription intent cannot be recorded as success: ' . $status);
     }
     $intent->status = 'succeeded';

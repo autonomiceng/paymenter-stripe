@@ -56,7 +56,9 @@ trait SubscriptionPayments
             return;
         }
         $paymentId = $paymentIds[0];
-        DB::transaction(function () use ($stripeInvoice, $subscriptionId, $paymentId) {
+        $intent = $this->request('get', '/payment_intents/' . $paymentId);
+        abort_unless($intent->id === $paymentId && $intent->status === 'succeeded', 409);
+        DB::transaction(function () use ($stripeInvoice, $subscriptionId, $paymentId, $intent) {
             $ownerId = Service::where('subscription_id', $subscriptionId)->first()?->user_id;
             if (!$ownerId) return;
             // Match PaymentIntent settlement: serialize on the customer before other rows.
@@ -73,8 +75,6 @@ trait SubscriptionPayments
             $invoice = Invoice::where('id', $invoice->id)->lockForUpdate()->first();
             if (!$invoice) return;
             abort_unless($invoice->user_id === $ownerId, 409);
-            $intent = $this->request('get', '/payment_intents/' . $paymentId);
-            abort_unless($intent->id === $paymentId && $intent->status === 'succeeded', 409);
             // Subscription metadata owns the local binding, not PaymentIntent metadata.
             $intent->metadata = (object) ['invoice_id' => $invoice->id];
             if (!in_array($invoice->status, ['pending', 'paid'], true)) {
