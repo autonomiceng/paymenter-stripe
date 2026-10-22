@@ -149,13 +149,48 @@ $invoice->currency_code = 'usd';
 Http::$handler = fn () => ['fee' => 100, 'currency' => 'jpy', 'exchange_rate' => 150];
 $gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_yen', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
 check(ExtensionHelper::$fees['pi_yen'] === 0.67, 'Settlement JPY fee converts back to invoice USD cents');
-foreach ([null, 0, -1, 'invalid', 'INF', 'NaN', '1e309'] as $invalidRate) {
-    Http::$handler = fn () => ['fee' => 100, 'currency' => 'jpy', 'exchange_rate' => $invalidRate];
-    $warnings = count(Log::$warnings);
-    $gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_yen', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
-    check(ExtensionHelper::$fees['pi_yen'] === 0 && count(Log::$warnings) === $warnings + 1
-        && end(Log::$warnings) === ['StripeSaved fee conversion unavailable', ['invoice_id' => 12]],
-        'Invalid or missing exchange rate records no fee and a safe warning: ' . var_export($invalidRate, true));
+foreach ([null, 0, -1, 'invalid', 'INF', 'NaN', '1e309'] as $rateIndex => $invalidRate) {
+    foreach ([false, true] as $hasFee) {
+        $feeIntent = (object) ['id' => 'pi_fee_' . $rateIndex . '_' . (int) $hasFee,
+            'amount' => 2000, 'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner',
+            'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
+        $applications = ExtensionHelper::$applications;
+        check($gateway->webhook(eventRequest($feeIntent))['status'] === 200
+            && ExtensionHelper::$applications === $applications + 1,
+            'Payment settles before fee conversion: ' . $feeIntent->id);
+        if ($hasFee) ExtensionHelper::$fees[$feeIntent->id] = 0.67;
+        $fees = ExtensionHelper::$fees;
+        $payment = ExtensionHelper::$payments['12:' . $feeIntent->id];
+        Http::$handler = function ($verb, $path) use ($invalidRate) {
+            if ($verb === 'get' && $path === '/balance_transactions/bt_test') {
+                return ['fee' => 100, 'currency' => 'jpy', 'exchange_rate' => $invalidRate];
+            }
+            throw new RuntimeException('Unexpected fee request: ' . $path);
+        };
+        for ($delivery = 0; $delivery < 2; ++$delivery) {
+            $warnings = count(Log::$warnings);
+            $result = $gateway->webhook(eventRequest((object) [
+                'payment_intent' => $feeIntent->id, 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
+            check($result['status'] === 200 && $result['data']['received'] === true,
+                'Unavailable fee conversion acknowledges each delivery: ' . $feeIntent->id);
+            check(ExtensionHelper::$fees === $fees,
+                'Unavailable fee conversion preserves existing or absent fee: ' . $feeIntent->id);
+            check(ExtensionHelper::$payments['12:' . $feeIntent->id] === $payment
+                && $payment === ['gateway' => 'StripeSaved', 'amount' => 20.0, 'status' => 'succeeded']
+                && ExtensionHelper::$applications === $applications + 1,
+                'Unavailable fee conversion preserves the settled payment: ' . $feeIntent->id);
+            check(count(Log::$warnings) === $warnings + 1
+                && end(Log::$warnings) === ['StripeSaved fee conversion unavailable', [
+                    'invoice_id' => 12, 'payment_intent_id' => $feeIntent->id,
+                    'invoice_currency' => 'usd', 'settlement_currency' => 'jpy']],
+                'Unavailable fee conversion logs payment and currencies without secrets: ' . $feeIntent->id);
+        }
+        Http::$handler = fn () => ['fee' => 100, 'currency' => 'jpy', 'exchange_rate' => 150];
+        $result = $gateway->webhook(eventRequest((object) [
+            'payment_intent' => $feeIntent->id, 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
+        check($result['status'] === 200 && ExtensionHelper::$fees[$feeIntent->id] === 0.67,
+            'A valid rate records the converted fee after unavailable conversion: ' . $feeIntent->id);
+    }
 }
 Http::$handler = function ($verb, $path) {
     return match ($path) {

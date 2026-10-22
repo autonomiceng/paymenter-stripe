@@ -94,7 +94,11 @@ trait Webhooks
                         } catch (\InvalidArgumentException $e) {
                             \Illuminate\Support\Facades\Log::warning('StripeSaved fee conversion unavailable', [
                                 'invoice_id' => $invoiceTransaction->invoice->id,
+                                'payment_intent_id' => $charge->payment_intent,
+                                'invoice_currency' => $invoiceCurrency,
+                                'settlement_currency' => $balanceTransaction->currency,
                             ]);
+                            break;
                         }
                     }
                 }
