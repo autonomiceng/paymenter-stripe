@@ -469,11 +469,13 @@ class StripeSaved extends Gateway
         if ($stripeCustomerId) {
             try {
                 $customer = $this->request('get', '/customers/' . $stripeCustomerId->value);
-                if (!isset($customer->deleted)) {
+                if (($customer->deleted ?? false) !== true) {
                     return $customer;
                 }
-            } catch (Exception $e) {
-                // continue and create a new customer
+            } catch (RequestException $e) {
+                if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') {
+                    throw $e;
+                }
             }
         }
 
