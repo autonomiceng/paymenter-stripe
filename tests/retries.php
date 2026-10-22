@@ -89,7 +89,7 @@ $service->subscription_id = 'sub_recovered';
 $service->properties->values['has_stripe_subscription'] = '1';
 Http::$handler = function ($verb, $path) {
     return match ($path) {
-        '/subscriptions/sub_recovered' => [],
+        '/subscriptions/sub_recovered' => ['id' => 'sub_recovered', 'status' => 'canceled'],
         '/customers/cus_owner' => ['id' => 'cus_owner'],
         '/payment_methods/pm_test' => ['id' => 'pm_test', 'customer' => 'cus_owner'],
         '/products/search' => ['data' => [['id' => 'prod_test']]],
