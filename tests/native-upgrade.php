@@ -13,15 +13,36 @@ mkdir($uploadDirectory, 0700);
 $untrackedProbes = [__DIR__ . '/../extension/StripeSaved/.env-release-probe-' . bin2hex(random_bytes(4)),
     __DIR__ . '/../docs/untracked-release-probe-' . bin2hex(random_bytes(4)) . '.md'];
 try {
-    foreach ($untrackedProbes as $probe) file_put_contents($probe, "untracked\n");
-    // Exercise the release builder too: both copies come from the actual native ZIP.
+    foreach ($untrackedProbes as $probe) {
+        check(file_put_contents($probe, "untracked\n") !== false, 'Created release omission probe: ' . basename($probe));
+    }
+    // 27c4cc0 relocated the root traits; install its parent as the prior release.
+    $priorRelease = '1d98099a94884137fc5fff7d63373146a5ecc65e';
+    [$status, $output] = $uploadProcess(['git', '-C', dirname(__DIR__), 'archive', '--format=tar',
+        '--output=' . $uploadDirectory . '/prior.tar', $priorRelease]);
+    check($status === 0, 'Prior release archives offline: ' . $output);
+    [$status, $output] = $uploadProcess(['python3', '-c',
+        'import sys, tarfile; tarfile.open(sys.argv[1]).extractall(sys.argv[2], filter="data")',
+        $uploadDirectory . '/prior.tar', $uploadDirectory . '/prior-source']);
+    check($status === 0, 'Prior release source extracts offline: ' . $output);
+    [$status, $output] = $uploadProcess(['python3', $uploadDirectory . '/prior-source/tools/build_release.py',
+        '--output', $uploadDirectory . '/prior.zip']);
+    check($status === 0, 'Prior release ZIP builds with its own builder: ' . $output);
+    [$status, $output] = $uploadProcess(['python3', '-c',
+        'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])',
+        $uploadDirectory . '/prior.zip', $uploadDirectory . '/installed']);
+    check($status === 0 && is_file($uploadDirectory . '/installed/StripeSaved/Checkout.php')
+        && !is_dir($uploadDirectory . '/installed/StripeSaved/Concerns'), 'Installed fixture uses prior root-trait layout: ' . $output);
+    [$status, $output] = $uploadProcess(['python3', __DIR__ . '/build-release.py']);
+    check($status === 0, 'Release entry safety regression tests: ' . $output);
+    // The uploaded candidate always comes from the current checkout.
     [$status, $output] = $uploadProcess(['python3', __DIR__ . '/../tools/build_release.py',
         '--output', $uploadDirectory . '/StripeSaved.zip']);
     check($status === 0, 'Native ZIP builds offline: ' . $output);
     [$status, $output] = $uploadProcess(['python3', '-c',
         'import sys, zipfile; archive = zipfile.ZipFile(sys.argv[1]); [archive.extractall(path) for path in sys.argv[2:]]',
-        $uploadDirectory . '/StripeSaved.zip', $uploadDirectory . '/installed', $uploadDirectory . '/extracted']);
-    check($status === 0, 'Native ZIP extracts into independent installed and uploaded copies: ' . $output);
+        $uploadDirectory . '/StripeSaved.zip', $uploadDirectory . '/extracted']);
+    check($status === 0, 'Current native ZIP extracts as the uploaded candidate: ' . $output);
     foreach ($untrackedProbes as $probe) {
         $entry = $uploadDirectory . '/extracted/StripeSaved/' . (str_contains($probe, '/docs/') ? 'docs/' : '') . basename($probe);
         check(!file_exists($entry), 'Native ZIP omits untracked ' . basename($probe));
