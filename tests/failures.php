@@ -33,13 +33,16 @@ check(end(Log::$warnings) === ['StripeSaved customer session unavailable', ['inv
 $user->props->values = [];
 Http::$handler = function ($verb, $path) {
     if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
-    if ($path === '/payment_intents') return ['id' => 'pi_connection', 'status' => 'requires_payment_method'];
+    if ($path === '/payment_intents') return ['id' => 'pi_connection', 'status' => 'requires_payment_method',
+        'client_secret' => 'pi_connection_secret'];
     if ($path === '/customer_sessions') throw new ConnectionException('private connection error');
     throw new RuntimeException('Unexpected request: ' . $path);
 };
 $view = $gateway->pay($invoice, 20);
 check($view['data']['customerSessionSecret'] === null && $view['data']['intent']->id === 'pi_connection',
     'Customer Session connection failure still renders checkout');
+check(($view['data']['intent']->client_secret ?? null) === 'pi_connection_secret',
+    'Customer Session connection failure passes the PaymentIntent client secret to checkout unchanged');
 check(end(Log::$warnings) === ['StripeSaved customer session unavailable', ['invoice_id' => 12, 'http_status' => null]],
     'Connection failure logs invoice and absent status without exception payload');
 $user->props->values = [];
