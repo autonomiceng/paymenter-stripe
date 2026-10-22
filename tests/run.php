@@ -198,6 +198,7 @@ require __DIR__ . '/setup-consent.php';
 require __DIR__ . '/ownership.php';
 require __DIR__ . '/checkout-owner.php';
 require __DIR__ . '/failures.php';
+require __DIR__ . '/payment-regressions.php';
 require __DIR__ . '/method-consent.php';
 require __DIR__ . '/native-upgrade.php';
 echo "PASS: $count offline assertions\n";

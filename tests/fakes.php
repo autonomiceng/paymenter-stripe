@@ -16,11 +16,16 @@ namespace Illuminate\Http\Client {
     class ConnectionException extends \RuntimeException {}
     class RequestException extends \RuntimeException {
         public $response;
-        public function __construct($status) {
+        public function __construct($status, $error = []) {
             parent::__construct('sensitive request payload');
-            $this->response = new class($status) {
-                public function __construct(private $code) {}
+            $this->response = new class($status, $error) {
+                public function __construct(private $code, private $error) {}
                 public function status() { return $this->code; }
+                public function json($key) {
+                    $value = $this->error;
+                    foreach (explode('.', $key) as $part) $value = $value[$part] ?? null;
+                    return $value;
+                }
             };
         }
     }
@@ -53,7 +58,10 @@ namespace App\Models {
                 public function delete() { unset($this->properties->values[$this->key]); }
             };
         }
-        public function updateOrCreate($key, $data) { $this->values[$key['key']] = $data['value']; }
+        public function updateOrCreate($key, $data) {
+            if ($key['key'] === 'stripe_id') $this->customer = $data['value'];
+            else $this->values[$key['key']] = $data['value'];
+        }
     }
     class User {
         public static $row;
@@ -75,6 +83,7 @@ namespace App\Models {
         public $currency_code = 'usd', $status = 'pending';
         public $items = [];
         public function __construct(public User $user) {}
+        public function getMorphClass() { return self::class; }
         public static function where($key, $id) { return new Query(self::$rows[$id] ?? (self::$row && self::$row->id == $id ? self::$row : null), Invoice::class); }
         public function transactions() { return new class {
             private $id;
@@ -142,6 +151,31 @@ namespace App\Models {
     }
     class BillingAgreement { public $external_reference = 'pm_test', $id = 4; }
     class Extension {}
+    class Audit {
+        public static $rows = [], $fail = false;
+        public static function where($key, $value) { return new class($key, $value) {
+            private $filters = [], $currentRead = false;
+            public function __construct($key, $value) { $this->where($key, $value); }
+            public function where($key, $value) { $this->filters[$key] = $value; return $this; }
+            public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = Audit::class; return $this; }
+            public function first() {
+                if (!$this->currentRead) throw new \RuntimeException('Review guard must use a current read');
+                foreach (Audit::$rows as $row) {
+                    foreach ($this->filters as $key => $value) {
+                        $actual = str_starts_with($key, 'new_values->') ? ($row['new_values'][substr($key, 12)] ?? null) : ($row[$key] ?? null);
+                        if ($actual !== $value) continue 2;
+                    }
+                    return (object) $row;
+                }
+                return null;
+            }
+        }; }
+        public static function create($row) {
+            if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Review record lock missing');
+            if (self::$fail) { self::$fail = false; throw new \RuntimeException('Review record unavailable'); }
+            self::$rows[] = $row;
+        }
+    }
     class InvoiceTransaction {
         public static function where($key, $value) { return new class($value) {
             private $status, $currentRead = false;

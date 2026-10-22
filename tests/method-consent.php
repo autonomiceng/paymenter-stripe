@@ -13,10 +13,11 @@ Http::$handler = fn () => $optIntent;
 foreach ([true, false] as $save) {
     $gateway->consent(new Request(['intent' => 'pi_options', 'save' => $save]));
     check(end(Http::$calls)[2] === [
+        'setup_future_usage' => '',
         'payment_method_options' => ['card' => ['setup_future_usage' => $save ? 'off_session' : ''],
             'link' => ['setup_future_usage' => $save ? 'off_session' : '']],
         'metadata' => ['stripe_saved_consent' => $save ? '1' : '0'],
-    ], $save ? 'Saving sets only card and Link future usage' : 'Clearing removes only card and Link future usage');
+    ], $save ? 'Saving sets card and Link usage and clears legacy usage' : 'Clearing removes legacy, card and Link usage');
 }
 $optIntent->status = 'requires_action';
 $optIntent->metadata->stripe_saved_consent = '1';

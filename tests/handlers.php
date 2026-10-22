@@ -122,7 +122,7 @@ $invoice->status = 'paid';
 $paymentIntent->id = 'pi_second_settled';
 $paymentIntent->currency = 'usd';
 $gateway->webhook(eventRequest($paymentIntent));
-check(ExtensionHelper::$applications === $before, 'A different intent cannot apply to an already paid invoice');
+check(ExtensionHelper::$applications === $before + 1 && $invoice->status === 'paid', 'A different settled intent is recorded on the paid invoice');
 $invoice->status = 'pending';
 
 // Currency-specific reverse conversion also applies to recorded payments and charge fees.
