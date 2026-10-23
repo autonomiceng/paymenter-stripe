@@ -1,6 +1,6 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-namespace Paymenter\Extensions\Gateways\StripeSaved;
+namespace Paymenter\Extensions\Gateways\AeStripe;
 
 use RuntimeException;
 

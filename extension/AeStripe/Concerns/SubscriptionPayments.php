@@ -1,6 +1,6 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
+namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Models\{Invoice, InvoiceTransaction, Service, User};
 use Illuminate\Support\Facades\{DB, Log};
@@ -25,13 +25,13 @@ trait SubscriptionPayments
             // Event snapshots are immutable: recover the current remote binding on every retry.
             $current = $this->request('get', '/invoices/' . $stripeInvoice->id);
             $invoices = $this->subscriptionInvoices($service);
-            $bound = $current->metadata->stripe_saved_invoice_id ?? null;
+            $bound = $current->metadata->ae_stripe_invoice_id ?? null;
             $invoice = $bound ? ($invoices[$bound] ?? null) : (count($invoices) === 1 ? reset($invoices) : null);
             if (!$invoice || strtolower($invoice->currency_code) !== strtolower($stripeInvoice->currency ?? '')) {
-                Log::warning('StripeSaved subscription invoice needs reconciliation', ['service_id' => $service->id]);
+                Log::warning('AeStripe subscription invoice needs reconciliation', ['service_id' => $service->id]);
                 return false;
             }
-            if (!$bound) $this->request('post', '/invoices/' . $stripeInvoice->id, ['metadata' => ['stripe_saved_invoice_id' => $invoice->id]]);
+            if (!$bound) $this->request('post', '/invoices/' . $stripeInvoice->id, ['metadata' => ['ae_stripe_invoice_id' => $invoice->id]]);
             return true;
         });
     }
@@ -40,11 +40,11 @@ trait SubscriptionPayments
     {
         // No invoice can be inferred safely. Keep a gateway audit entry for the Stripe invoice.
         DB::transaction(function () use ($stripeInvoice, $reason) {
-            $gateway = \App\Models\Gateway::where('extension', 'StripeSaved')->lockForUpdate()->firstOrFail();
-            if (\App\Models\Audit::where('event', 'stripe_saved_subscription_review')
+            $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->lockForUpdate()->firstOrFail();
+            if (\App\Models\Audit::where('event', 'ae_stripe_subscription_review')
                 ->where('new_values->stripe_invoice_id', $stripeInvoice->id)->lockForUpdate()->first()) return;
             \App\Models\Audit::create([
-                'event' => 'stripe_saved_subscription_review', 'auditable_type' => \App\Models\Gateway::class,
+                'event' => 'ae_stripe_subscription_review', 'auditable_type' => \App\Models\Gateway::class,
                 'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => [
                     'stripe_invoice_id' => $stripeInvoice->id, 'amount_minor' => $stripeInvoice->amount_paid,
                     'currency' => $stripeInvoice->currency, 'reason' => $reason,
@@ -85,7 +85,7 @@ trait SubscriptionPayments
             if ($service) abort_unless($service->user_id === $ownerId, 409);
             if (!$service) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
             if (InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first()) return;
-            $invoiceId = $stripeInvoice->metadata->stripe_saved_invoice_id ?? null;
+            $invoiceId = $stripeInvoice->metadata->ae_stripe_invoice_id ?? null;
             $invoice = $invoiceId ? $service->invoiceItems()->where('invoice_id', $invoiceId)->first()?->invoice : null;
             if (!$invoice) {
                 $this->recordSubscriptionReview($stripeInvoice, 'Invoice binding missing or unrelated');
@@ -97,12 +97,12 @@ trait SubscriptionPayments
             // Subscription metadata owns the local binding, not PaymentIntent metadata.
             $intent->metadata = (object) ['invoice_id' => $invoice->id];
             if (!in_array($invoice->status, ['pending', 'paid'], true)) {
-                Log::warning('StripeSaved subscription invoice needs reconciliation', ['service_id' => $service->id]);
+                Log::warning('AeStripe subscription invoice needs reconciliation', ['service_id' => $service->id]);
                 $this->recordRefusedPayment($invoice, $intent, 'invoice not pending');
                 return;
             }
             if (strtolower($invoice->currency_code) !== strtolower($stripeInvoice->currency ?? '')) {
-                Log::warning('StripeSaved subscription payment currency mismatch', ['service_id' => $service->id]);
+                Log::warning('AeStripe subscription payment currency mismatch', ['service_id' => $service->id]);
                 $this->recordRefusedPayment($invoice, $intent, 'currency mismatch');
                 return;
             }

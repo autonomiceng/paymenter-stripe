@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Http;
 Gateway::$enabled = true;
 $oldHandler = Http::$handler;
 $optIntent = (object) ['id' => 'pi_options', 'status' => 'requires_confirmation', 'customer' => 'cus_owner',
-    'payment_method' => 'pm_options', 'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
+    'payment_method' => 'pm_options', 'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1']];
 Http::$handler = fn () => $optIntent;
 foreach ([true, false] as $save) {
     $gateway->consent(new Request(['intent' => 'pi_options', 'save' => $save]));
@@ -16,11 +16,11 @@ foreach ([true, false] as $save) {
         'setup_future_usage' => '',
         'payment_method_options' => ['card' => ['setup_future_usage' => $save ? 'off_session' : ''],
             'link' => ['setup_future_usage' => $save ? 'off_session' : '']],
-        'metadata' => ['stripe_saved_consent' => $save ? '1' : '0'],
+        'metadata' => ['ae_stripe_consent' => $save ? '1' : '0'],
     ], $save ? 'Saving sets card and Link usage and clears legacy usage' : 'Clearing removes legacy, card and Link usage');
 }
 $optIntent->status = 'requires_action';
-$optIntent->metadata->stripe_saved_consent = '1';
+$optIntent->metadata->ae_stripe_consent = '1';
 $before = count(Http::$calls);
 $gateway->consent(new Request(['intent' => 'pi_options', 'save' => true]));
 check(count(Http::$calls) === $before + 1, '3DS resumes without modifying per-method consent');

@@ -1,6 +1,6 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
+namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Models\User;
 use Illuminate\Http\Client\{ConnectionException, RequestException};
@@ -10,7 +10,7 @@ trait SubscriptionAttempt
 {
     private function subscriptionAttempt($user, $setupIntent, $service, array $data): string
     {
-        $property = 'stripe_saved_subscription_' . $service->id;
+        $property = 'ae_stripe_subscription_' . $service->id;
         $key = 'sched_' . $setupIntent->id . '_' . $service->id;
         // This transaction commits before any remote schedule creation. Its immutable
         // payload survives later service-write failures and partial multi-service setup.

@@ -349,7 +349,7 @@ namespace Illuminate\Support\Facades {
     class DB {
         public static $tables = [], $locks = [], $updates = [];
         public static $concurrentAgreements = [];
-        public static function table($name) { return $name === 'stripe_saved_payment_fees' ? new \FeeQuery : new \AdoptionQuery($name); }
+        public static function table($name) { return $name === 'ae_stripe_payment_fees' ? new \FeeQuery : new \AdoptionQuery($name); }
         public static $beforeUserLock = null;
         public static $locked = false;
         public static $modelLocks = [];
@@ -416,7 +416,7 @@ namespace {
         public function lockForUpdate() { $this->locked = true; return $this; }
         public function get() {
             $rows = [];
-            foreach (\Illuminate\Support\Facades\DB::$tables['stripe_saved_payment_fees'] ?? [] as $row) {
+            foreach (\Illuminate\Support\Facades\DB::$tables['ae_stripe_payment_fees'] ?? [] as $row) {
                 foreach ($this->filters as $key => $value) if ($row[$key] !== $value) continue 2;
                 $rows[] = (object) $row;
             }
@@ -430,12 +430,12 @@ namespace {
         }
         public function insert($row) {
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Fee insert lock missing');
-            $rows = &\Illuminate\Support\Facades\DB::$tables['stripe_saved_payment_fees'];
+            $rows = &\Illuminate\Support\Facades\DB::$tables['ae_stripe_payment_fees'];
             if (isset($rows[$row['payment_intent_id']])) throw new \RuntimeException('Duplicate PaymentIntent');
             $rows[$row['payment_intent_id']] = $row;
         }
         public function update($values) {
-            foreach ($this->get() as $row) \Illuminate\Support\Facades\DB::$tables['stripe_saved_payment_fees'][$row->payment_intent_id] = array_merge((array) $row, $values);
+            foreach ($this->get() as $row) \Illuminate\Support\Facades\DB::$tables['ae_stripe_payment_fees'][$row->payment_intent_id] = array_merge((array) $row, $values);
         }
     }
 }

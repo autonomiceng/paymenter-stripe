@@ -8,7 +8,7 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCES = ('extension/StripeSaved', 'LICENSE', 'UPSTREAM.md', 'NOTICES.md', 'README.md', 'docs')
+SOURCES = ('extension/AeStripe', 'LICENSE', 'UPSTREAM.md', 'NOTICES.md', 'README.md', 'docs')
 
 
 def tracked_files():
@@ -35,7 +35,7 @@ def build(output):
         if name.startswith('extension/'):
             entries[name.removeprefix('extension/')] = path
         else:
-            entries['StripeSaved/' + name] = path
+            entries['AeStripe/' + name] = path
     with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for name, source in sorted(entries.items()):
             info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
@@ -49,5 +49,5 @@ def build(output):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', default='dist/StripeSaved-0.1.0.zip')
+    parser.add_argument('--output', default='dist/AeStripe.zip')
     build(parser.parse_args().output)

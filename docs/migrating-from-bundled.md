@@ -34,8 +34,8 @@ soft delete (`deleted_at`), which preserves the row for rollback.
 3. From the Paymenter root, as its application user, review a dry run:
 
    ```sh
-   php artisan stripe-saved:adopt-bundled --confirm-paused
-   php artisan stripe-saved:adopt-bundled --confirm-paused --apply --plan='<digest>'
+   php artisan ae-stripe:adopt-bundled --confirm-paused
+   php artisan ae-stripe:adopt-bundled --confirm-paused --apply --plan='<digest>'
    ```
 
    Retired bundled rows are ignored only when they have no live agreements, service
@@ -68,7 +68,7 @@ soft delete (`deleted_at`), which preserves the row for rollback.
    imported/customized databases that permit duplicates. No extension/agreement is deleted.
 
    Apply writes a private JSON rollback manifest before any database update to
-   `storage/app/stripe-saved-adoption/<manifest>.json`, synchronizing file and directory
+   `storage/app/ae-stripe-adoption/<manifest>.json`, synchronizing file and directory
    entries before commit. Keep this directory on durable local storage, backed up and
    accessible only to the application user. It contains row snapshots; do not publish
    it. A per-directory lock excludes simultaneous command runs. If interrupted, keep
@@ -77,7 +77,7 @@ soft delete (`deleted_at`), which preserves the row for rollback.
    Optionally enable one-time redisplay while still paused, before endpoint delivery or other fork activity:
 
    ```sh
-   php artisan stripe-saved:adopt-bundled --confirm-paused --redisplay='<manifest>.json' --confirm-setup-consent
+   php artisan ae-stripe:adopt-bundled --confirm-paused --redisplay='<manifest>.json' --confirm-setup-consent
    ```
 
    Paymenter v1.5.9 `extensions/Gateways/Stripe/Stripe.php::setupBillingAgreement()`
@@ -116,7 +116,7 @@ For rollback, pause/drain the same writers and disable fork webhook delivery fir
 Finish or expire fork checkout sessions; keep both endpoints stopped during restore:
 
 ```sh
-php artisan stripe-saved:adopt-bundled --confirm-paused --rollback='<manifest>.json'
+php artisan ae-stripe:adopt-bundled --confirm-paused --rollback='<manifest>.json'
 ```
 
 This restores the bundled gateway row (`deleted_at` back to null), its exact original
@@ -145,12 +145,12 @@ Existing Stripe subscriptions need dedicated sandbox billing and
 cancellation tests before delivery changes. No subscription converter is provided.
 
 The extension uses its `boot()` hook and Laravel Console Application's starting
-callback to register `stripe-saved:adopt-bundled`, following the local Paymenter
+callback to register `ae-stripe:adopt-bundled`, following the local Paymenter
 1.5.9 source lifecycle. No tinker or core application changes are required. Native
 command discovery is unverified; test it in the installed sandbox before release.
 
 The fork marks its PaymentIntents, SetupIntents and subscription schedules/phases
-with `stripe_saved_gateway=1`. While a non-deleted bundled Stripe row exists (even
+with `ae_stripe_gateway=1`. While a non-deleted bundled Stripe row exists (even
 `enabled=0`), the fork acknowledges unmarked intent and subscription events without
 effects and logs only the event type and local invoice ID. After bundled Stripe is
 soft-deleted or absent, the fork accepts

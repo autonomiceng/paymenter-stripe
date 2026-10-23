@@ -1,7 +1,7 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 use Illuminate\Support\Facades\{DB, Http};
-use Paymenter\Extensions\Gateways\StripeSaved\{Adoption, AdoptionStore, AdoptBundledCommand};
+use Paymenter\Extensions\Gateways\AeStripe\{Adoption, AdoptionStore, AdoptBundledCommand};
 
 class AdoptionCollection implements IteratorAggregate
 {
@@ -44,11 +44,11 @@ class AdoptionQuery
 }
 $adoptionStorage = sys_get_temp_dir() . '/stripe-adoption-test-' . bin2hex(random_bytes(6));
 $fixture = new AdoptionFake;
-DB::$tables = ['extensions' => [['id' => 1, 'type' => 'gateway', 'extension' => 'Stripe', 'deleted_at' => null, 'enabled' => true], ['id' => 2, 'type' => 'gateway', 'extension' => 'StripeSaved', 'deleted_at' => null, 'enabled' => true]], 'settings' => [],
+DB::$tables = ['extensions' => [['id' => 1, 'type' => 'gateway', 'extension' => 'Stripe', 'deleted_at' => null, 'enabled' => true], ['id' => 2, 'type' => 'gateway', 'extension' => 'AeStripe', 'deleted_at' => null, 'enabled' => true]], 'settings' => [],
     'billing_agreements' => $fixture->state['agreements'], 'services' => $fixture->state['services'],
     'properties' => [['id' => 1, 'model_id' => 10, 'model_type' => \App\Models\BillingAgreement::class, 'value' => 'unchanged']]];
 \App\Models\Gateway::$rows = [];
-foreach (['Stripe', 'StripeSaved'] as $i => $name) {
+foreach (['Stripe', 'AeStripe'] as $i => $name) {
     $settings = [];
     foreach (['stripe_secret_key' => 'secret', 'stripe_publishable_key' => 'public', 'stripe_webhook_secret' => 'webhook'] as $key => $field) {
         $settings[] = ['key' => $key, 'value' => $fixture->config[$i][$field]];
@@ -86,7 +86,7 @@ check(DB::$tables['properties'] === $original['properties'], 'Properties untouch
 check(array_unique(DB::$locks) === ['extensions', 'settings', 'billing_agreements', 'services', 'properties'], 'All snapshot tables locked');
 $manifest = $store->load($result['manifest']);
 check($manifest === $plan, 'JSON manifest round trips with exact types and digest');
-check((fileperms($adoptionStorage . '/app/stripe-saved-adoption/' . $result['manifest']) & 0777) === 0600, 'Manifest permissions private');
+check((fileperms($adoptionStorage . '/app/ae-stripe-adoption/' . $result['manifest']) & 0777) === 0600, 'Manifest permissions private');
 rejects(fn () => new AdoptionStore, 'Another adoption command is running');
 $engine->rollback($manifest);
 check(DB::$tables === $original, 'Production updates restore exact raw tables');
@@ -219,8 +219,8 @@ check((new Adoption($selected))->run()['before']['bundled'] === 62, 'Active sour
 unset($selected);
 \App\Models\Gateway::$rows['Stripe'][0]->id = 1;
 DB::$tables = $original;
-\App\Models\Gateway::$rows['StripeSaved'] = [];
+\App\Models\Gateway::$rows['AeStripe'] = [];
 check($command->handle() === 1 && str_contains(end($command->output), 'installed row'), 'CLI refuses uninstalled fork');
 \App\Models\Gateway::$rows = null;
-foreach (glob($adoptionStorage . '/app/stripe-saved-adoption/*') as $file) unlink($file);
-rmdir($adoptionStorage . '/app/stripe-saved-adoption'); rmdir($adoptionStorage . '/app'); rmdir($adoptionStorage);
+foreach (glob($adoptionStorage . '/app/ae-stripe-adoption/*') as $file) unlink($file);
+rmdir($adoptionStorage . '/app/ae-stripe-adoption'); rmdir($adoptionStorage . '/app'); rmdir($adoptionStorage);

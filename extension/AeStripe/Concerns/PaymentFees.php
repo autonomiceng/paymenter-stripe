@@ -1,6 +1,6 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
+namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Helpers\ExtensionHelper;
 use App\Models\{Audit, Invoice, InvoiceTransaction, Notification, User};
@@ -15,7 +15,7 @@ trait PaymentFees
 
     public function upgraded($oldVersion = null)
     {
-        app(\Illuminate\Database\Migrations\Migrator::class)->run(base_path('extensions/Gateways/StripeSaved/database/migrations'));
+        app(\Illuminate\Database\Migrations\Migrator::class)->run(base_path('extensions/Gateways/AeStripe/database/migrations'));
     }
 
     private static bool $paymentFeeSchemaReady = false;
@@ -23,14 +23,14 @@ trait PaymentFees
     private function ensurePaymentFeeSchema(): void
     {
         if (self::$paymentFeeSchemaReady) return;
-        if (!\Illuminate\Support\Facades\Schema::hasTable('stripe_saved_payment_fees')) $this->upgraded();
+        if (!\Illuminate\Support\Facades\Schema::hasTable('ae_stripe_payment_fees')) $this->upgraded();
         self::$paymentFeeSchemaReady = true;
     }
 
     private function feeRows()
     {
         $this->ensurePaymentFeeSchema();
-        return DB::table('stripe_saved_payment_fees');
+        return DB::table('ae_stripe_payment_fees');
     }
 
     public function retryPaymentFees(): void
@@ -39,7 +39,7 @@ trait PaymentFees
         foreach ($this->feeRows()->where('state', 'pending')->orderBy('attempts')->orderBy('created_at')->limit(100)->get() as $row) {
             try {
                 $transaction = InvoiceTransaction::where('transaction_id', $row->payment_intent_id)->first();
-                if (!$transaction || !$transaction->invoice || ($transaction->gateway->extension ?? null) !== 'StripeSaved') {
+                if (!$transaction || !$transaction->invoice || ($transaction->gateway->extension ?? null) !== 'AeStripe') {
                     DB::transaction(function () use ($row) {
                         $current = $this->feeRows()->where('payment_intent_id', $row->payment_intent_id)->lockForUpdate()->first();
                         if (($current->state ?? null) !== 'pending') return;
@@ -82,7 +82,7 @@ trait PaymentFees
     {
         $intent = $this->request('get', '/payment_intents/' . $paymentId);
         abort_unless(($intent->id ?? null) === $paymentId, 409);
-        if (Audit::where('event', 'stripe_saved_payment_review')->where('new_values->payment_intent_id', $paymentId)->first()) return false;
+        if (Audit::where('event', 'ae_stripe_payment_review')->where('new_values->payment_intent_id', $paymentId)->first()) return false;
         $invoiceId = $charge->invoice ?? $intent->invoice ?? null;
         if (is_object($invoiceId)) $invoiceId = $invoiceId->id ?? null;
         if (!$invoiceId && !isset($intent->metadata->invoice_id)) {
@@ -97,13 +97,13 @@ trait PaymentFees
             $invoiceId = $payment->invoice ?? null;
             if (is_object($invoiceId)) $invoiceId = $invoiceId->id ?? null;
         }
-        if ($invoiceId && Audit::where('event', 'stripe_saved_subscription_review')
+        if ($invoiceId && Audit::where('event', 'ae_stripe_subscription_review')
             ->where('new_values->stripe_invoice_id', $invoiceId)->first()) return false;
         if (isset($intent->metadata->invoice_id) && $this->ownsWebhookObject($intent, 'charge.succeeded')) return true;
         if (!$invoiceId) return false;
         $invoice = $this->request('get', '/invoices/' . $invoiceId);
         return ($invoice->parent->type ?? null) === 'subscription_details'
-            && isset($invoice->metadata->stripe_saved_invoice_id) && $this->ownsWebhookObject($invoice, 'charge.succeeded');
+            && isset($invoice->metadata->ae_stripe_invoice_id) && $this->ownsWebhookObject($invoice, 'charge.succeeded');
     }
 
     private function recordChargeFee($charge): bool
@@ -116,7 +116,7 @@ trait PaymentFees
             if ($this->feeSettlementExpected($charge, $paymentId)) abort(409);
             return false;
         }
-        if (($transaction->gateway->extension ?? null) !== 'StripeSaved') return false;
+        if (($transaction->gateway->extension ?? null) !== 'AeStripe') return false;
         $snapshot = $this->feeRows()->where('payment_intent_id', $paymentId)->get()[0] ?? null;
         if ($snapshot && $snapshot->state !== 'pending') return true;
         $balanceId = $charge->balance_transaction ?? $snapshot?->balance_transaction_id;
@@ -139,7 +139,7 @@ trait PaymentFees
             User::where('id', $transaction->invoice->user_id)->lockForUpdate()->firstOrFail();
             $invoice = Invoice::where('id', $transaction->invoice->id)->lockForUpdate()->firstOrFail();
             $current = InvoiceTransaction::where('transaction_id', $paymentId)->lockForUpdate()->first();
-            abort_unless(($current->gateway->extension ?? null) === 'StripeSaved'
+            abort_unless(($current->gateway->extension ?? null) === 'AeStripe'
                 && $current->invoice->id === $invoice->id, 409);
             $row = $this->feeRows()->where('payment_intent_id', $paymentId)->lockForUpdate()->first();
             if ($row && $row->state !== 'pending') return;
@@ -197,7 +197,7 @@ trait PaymentFees
     private function stopPaymentFee($row, $invoice): void
     {
         Audit::create([
-            'event' => 'stripe_saved_fee_review', 'auditable_type' => $invoice?->getMorphClass() ?? Invoice::class,
+            'event' => 'ae_stripe_fee_review', 'auditable_type' => $invoice?->getMorphClass() ?? Invoice::class,
             'auditable_id' => $row->invoice_id, 'old_values' => [], 'new_values' => array_merge((array) $row, ['state' => 'review']),
         ]);
         foreach (User::whereNotNull('role_id')->get() as $staff) {

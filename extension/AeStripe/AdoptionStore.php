@@ -1,6 +1,6 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-namespace Paymenter\Extensions\Gateways\StripeSaved;
+namespace Paymenter\Extensions\Gateways\AeStripe;
 
 use App\Models\Gateway;
 use Illuminate\Support\Facades\{DB, Http};
@@ -15,7 +15,7 @@ final class AdoptionStore
 
     public function __construct(private ?int $sourceGateway = null)
     {
-        $this->directory = storage_path('app/stripe-saved-adoption');
+        $this->directory = storage_path('app/ae-stripe-adoption');
         $existing = $this->directory;
         while (!is_dir($existing)) $existing = dirname($existing);
         if (!is_dir($this->directory) && !mkdir($this->directory, 0700, true)) throw new AdoptionRefusal('Storage unavailable');
@@ -34,7 +34,7 @@ final class AdoptionStore
     public function configuration(): array
     {
         $config = $this->gateways = [];
-        foreach (['Stripe', 'StripeSaved'] as $extension) {
+        foreach (['Stripe', 'AeStripe'] as $extension) {
             // Rollback must still find the bundled row after native admin Delete (soft delete).
             $rows = Gateway::withTrashed()->where('extension', $extension)->get();
             $candidates = [];

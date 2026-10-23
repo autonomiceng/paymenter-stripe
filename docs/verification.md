@@ -5,8 +5,8 @@ Offline, with PHP 8.3+ and Python 3:
 ```sh
 php -n tests/run.php
 find extension tests -name '*.php' ! -name '*.blade.php' -exec php -n -l {} \;
-python3 tools/build_release.py --output dist/StripeSaved-0.1.0.zip
-(cd dist && sha256sum -c StripeSaved-0.1.0.zip.sha256)
+python3 tools/build_release.py --output dist/AeStripe.zip
+(cd dist && sha256sum -c AeStripe.zip.sha256)
 ```
 
 Upgrade through the native admin upload over an installed copy; root PHP files must declare only classes for Paymenter 1.5.9 `getExtensionType()`.
@@ -55,9 +55,9 @@ still needs the sandbox checks below.
 Checkout renders persist a retry key and PaymentIntent ID in native user properties
 before and after creation. Reopening retrieves the same unfinished intent. A changed
 invoice payload, finished/cancelled intent, or unresolved creation older than 23 hours
-returns 409; reconcile the stored `stripe_saved_checkout_<invoice-id>` property
+returns 409; reconcile the stored `ae_stripe_checkout_<invoice-id>` property
 against Stripe before clearing it for a new attempt. Never clear an unresolved or
-settled payment to retry. Reconcile `stripe_saved_subscription_<service-id>`
+settled payment to retry. Reconcile `ae_stripe_subscription_<service-id>`
 in the same way before removing an unresolved schedule attempt. This intentionally requires operator reconciliation rather
 than creating a second charge after Stripe's idempotency retention window. Fakes do not
 prove real database isolation, native uploader/route behavior or Stripe.js/API
@@ -103,7 +103,7 @@ A successful charge refused for a customer or currency mismatch, or a subscripti
 charge on a cancelled invoice, is not applied to the invoice. A record in Paymenter's native invoice **Audit Log** retains the
 PaymentIntent ID, invoice ID, received amount in Stripe minor units, currency and
 reason. Open the invoice's **Audit Log** action, or **System > Audits**, to read
-the `stripe_saved_payment_review` entry and reconcile the charge in Stripe before
+the `ae_stripe_payment_review` entry and reconcile the charge in Stripe before
 refunding or crediting the correct customer. These records use the native audit
 table, with no retention limit in Paymenter 1.5.9's default audit configuration.
 Retries reuse the same record. Failure to store it leaves the webhook retryable.
@@ -127,7 +127,7 @@ Fee recovery requires read access to Charges, PaymentIntents, Invoices, Invoice
 Payments and Balance Transactions. Check the full [Stripe API permissions](settings.md#stripe-api-permissions)
 with the configured restricted key in the sandbox.
 
-Fee recovery uses the `stripe_saved_payment_fees` extension table, created on install
+Fee recovery uses the `ae_stripe_payment_fees` extension table, created on install
 or upgrade, with a fallback on the first fee operation. Keep Paymenter's scheduler running every minute. The hourly
 recovery task checks pending fees in batches of 100, ordered by attempt count.
 A missing balance transaction, missing fee data or invalid conversion rate stays pending.
@@ -135,7 +135,7 @@ Pending funds already have a final fee. No rate is estimated.
 Stripe lookups finish before user and invoice locks serialize webhook and task writes. Completed records remain
 as replay guards. After 24 attempts or 72 hours, the record moves to `review`.
 Staff receive one native inbox notice per recipient. The invoice Audit Log and
-System > Audits retain a `stripe_saved_fee_review` entry with the identifiers and error.
+System > Audits retain a `ae_stripe_fee_review` entry with the identifiers and error.
 Deleted payments also move to review without blocking the next fee.
 Resolve these records manually against Stripe; do not delete completed records.
 Existing webhook endpoints may keep `charge.updated`; new endpoints also include
@@ -144,7 +144,7 @@ Foreign charges, refused payments and subscriptions held for review are acknowle
 Only paid, successful charges create fee records. Fees skipped before this upgrade
 have no recovery record and require manual reconciliation.
 
-Unresolved subscription successes retain one `stripe_saved_subscription_review`
+Unresolved subscription successes retain one `ae_stripe_subscription_review`
 entry per Stripe invoice in System > Audits. This covers
 missing services or bindings and incomplete or split payments. Review the Stripe
 invoice before applying money. Refund and dispute events remain unsupported.

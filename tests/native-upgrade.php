@@ -7,10 +7,10 @@ $uploadProcess = function (array $command): array {
     fclose($pipes[1]);
     return [proc_close($process), $output];
 };
-$uploadDirectory = sys_get_temp_dir() . '/stripe-saved-upload-' . bin2hex(random_bytes(8));
+$uploadDirectory = sys_get_temp_dir() . '/ae-stripe-upload-' . bin2hex(random_bytes(8));
 mkdir($uploadDirectory, 0700);
 // Untracked files in the release sources (e.g. a stray .env) must never be packaged.
-$untrackedProbes = [__DIR__ . '/../extension/StripeSaved/.env-release-probe-' . bin2hex(random_bytes(4)),
+$untrackedProbes = [__DIR__ . '/../extension/AeStripe/.env-release-probe-' . bin2hex(random_bytes(4)),
     __DIR__ . '/../docs/untracked-release-probe-' . bin2hex(random_bytes(4)) . '.md'];
 try {
     foreach ($untrackedProbes as $probe) {
@@ -37,20 +37,25 @@ try {
     check($status === 0, 'Release entry safety regression tests: ' . $output);
     // The uploaded candidate always comes from the current checkout.
     [$status, $output] = $uploadProcess(['python3', __DIR__ . '/../tools/build_release.py',
-        '--output', $uploadDirectory . '/StripeSaved.zip']);
+        '--output', $uploadDirectory . '/AeStripe.zip']);
     check($status === 0, 'Native ZIP builds offline: ' . $output);
     [$status, $output] = $uploadProcess(['python3', '-c',
         'import sys, zipfile; archive = zipfile.ZipFile(sys.argv[1]); [archive.extractall(path) for path in sys.argv[2:]]',
-        $uploadDirectory . '/StripeSaved.zip', $uploadDirectory . '/extracted']);
+        $uploadDirectory . '/AeStripe.zip', $uploadDirectory . '/extracted']);
     check($status === 0, 'Current native ZIP extracts as the uploaded candidate: ' . $output);
     foreach ($untrackedProbes as $probe) {
-        $entry = $uploadDirectory . '/extracted/StripeSaved/' . (str_contains($probe, '/docs/') ? 'docs/' : '') . basename($probe);
+        $entry = $uploadDirectory . '/extracted/AeStripe/' . (str_contains($probe, '/docs/') ? 'docs/' : '') . basename($probe);
         check(!file_exists($entry), 'Native ZIP omits untracked ' . basename($probe));
     }
-    foreach (['installed/StripeSaved', 'absent'] as $installedCopy) {
+    foreach (['installed/StripeSaved', 'absent'] as $index => $installedCopy) {
+        $candidate = $uploadDirectory . '/candidate-' . $index;
+        [$status, $output] = $uploadProcess(['python3', '-c',
+            'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])',
+            $uploadDirectory . '/AeStripe.zip', $candidate]);
+        check($status === 0, 'Each upload has a fresh extraction: ' . $output);
         [$status, $output] = $uploadProcess([PHP_BINARY, '-n', __DIR__ . '/native-upload-probe.php',
-            $uploadDirectory . '/' . $installedCopy, $uploadDirectory . '/extracted/StripeSaved']);
-        check($status === 0 && trim($output) === 'PASS: native upload detected gateway StripeSaved',
+            $uploadDirectory . '/' . $installedCopy, $candidate . '/AeStripe']);
+        check($status === 0 && trim($output) === 'PASS: native upload detected gateway AeStripe',
             'Native upload detects gateway with ' . $installedCopy . ': ' . $output);
     }
 } finally {
@@ -66,7 +71,7 @@ try {
 
 // php_strip_whitespace works under php -n without the optional tokenizer extension.
 // Ignore comments and quoted strings when checking for non-class declarations.
-foreach (glob(__DIR__ . '/../extension/StripeSaved/*.php') as $file) {
+foreach (glob(__DIR__ . '/../extension/AeStripe/*.php') as $file) {
     $source = preg_replace('/\x27(?:[^\x27\\\\]|\\\\.)*\x27|"(?:[^"\\\\]|\\\\.)*"/s', '', php_strip_whitespace($file));
     check(preg_match('/\b(?:trait|interface|enum)\s+[A-Za-z_]/', $source) === 0,
         basename($file) . ': native uploader root may declare only classes');

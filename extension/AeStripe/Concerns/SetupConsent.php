@@ -1,6 +1,6 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
+namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Models\User;
 use Illuminate\Http\Request;
@@ -23,17 +23,17 @@ trait SetupConsent
             && ($intent->metadata->is_billing_agreement ?? null) === '1'
             && $customer && ($intent->customer ?? null) === $customer, 403);
         if ($intent->status === 'requires_action') {
-            abort_unless(($intent->metadata->stripe_saved_setup_consent ?? null) === 'off_session_v1'
-                && !empty($intent->metadata->stripe_saved_setup_consent_at)
-                && ($intent->metadata->stripe_saved_setup_consent_user ?? null) == Auth::id(), 409);
+            abort_unless(($intent->metadata->ae_stripe_setup_consent ?? null) === 'off_session_v1'
+                && !empty($intent->metadata->ae_stripe_setup_consent_at)
+                && ($intent->metadata->ae_stripe_setup_consent_user ?? null) == Auth::id(), 409);
             return response()->json(['ok' => true]);
         }
         abort_unless(in_array($intent->status, ['requires_payment_method', 'requires_confirmation']), 409);
         // Record the versioned terms and authenticated acceptance before confirmation.
         $this->request('post', '/setup_intents/' . $intent->id, ['metadata' => [
-            'stripe_saved_setup_consent' => 'off_session_v1',
-            'stripe_saved_setup_consent_at' => (string) time(),
-            'stripe_saved_setup_consent_user' => (string) Auth::id(),
+            'ae_stripe_setup_consent' => 'off_session_v1',
+            'ae_stripe_setup_consent_at' => (string) time(),
+            'ae_stripe_setup_consent_user' => (string) Auth::id(),
         ]]);
         return response()->json(['ok' => true]);
     }

@@ -1,6 +1,6 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-use Paymenter\Extensions\Gateways\StripeSaved\Adoption;
+use Paymenter\Extensions\Gateways\AeStripe\Adoption;
 
 class AdoptionFake
 {
@@ -15,7 +15,7 @@ class AdoptionFake
         $this->config = array_fill(0, 2, ['secret' => 'rk_' . 'test_fixture', 'public' => 'pk_' . 'test_fixture', 'webhook' => 'fixture']);
         $this->state = ['bundled' => 1, 'fork' => 2, 'extensions' => [
                 1 => ['id' => 1, 'type' => 'gateway', 'extension' => 'Stripe', 'deleted_at' => null, 'enabled' => true],
-                2 => ['id' => 2, 'type' => 'gateway', 'extension' => 'StripeSaved', 'deleted_at' => null]],
+                2 => ['id' => 2, 'type' => 'gateway', 'extension' => 'AeStripe', 'deleted_at' => null]],
             'configuration' => Adoption::digest($this->config), 'settingsHash' => 'settings', 'propertiesHash' => 'properties',
             'agreements' => [10 => $this->row(10, 1), 11 => $this->row(11, 1, '2020-01-01 00:00:00'),
                 12 => $this->row(12, 1), 13 => $this->row(13, 2), 14 => $this->row(14, 2)],
@@ -157,6 +157,6 @@ foreach (['empty account', 'missing gateway'] as $invalid) {
     check($f->writes === 0 && $f->manifests === [], 'Preflight refuses ' . $invalid . ' before persistence');
 }
 foreach (['Adoption.php', 'AdoptionStore.php', 'AdoptBundledCommand.php'] as $file) {
-    check(!preg_match('/->(?:delete|forceDelete|truncate)\s*\(|\bDELETE\s+FROM\b/i', file_get_contents(__DIR__ . '/../extension/StripeSaved/' . $file)), 'No destructive operation in ' . $file);
+    check(!preg_match('/->(?:delete|forceDelete|truncate)\s*\(|\bDELETE\s+FROM\b/i', file_get_contents(__DIR__ . '/../extension/AeStripe/' . $file)), 'No destructive operation in ' . $file);
 }
 check(count(\Illuminate\Console\Application::$callbacks) >= 2, 'Command registered during extension boot including bundled-present path');

@@ -1,6 +1,6 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
+namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Models\User;
 use Illuminate\Support\Facades\DB;
@@ -11,7 +11,7 @@ trait CheckoutIntent
     {
         // User properties are native storage. Commit the key before contacting Stripe so a
         // lost response cannot roll it back; serialize competing render requests on the user.
-        $property = 'stripe_saved_checkout_' . $invoice->id;
+        $property = 'ae_stripe_checkout_' . $invoice->id;
         $attempt = DB::transaction(function () use ($invoice, $data, $property) {
             $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
             $stored = $user->properties()->where('key', $property)->first()?->value;

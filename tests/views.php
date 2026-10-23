@@ -1,7 +1,7 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 // Static checks: Stripe.js runs only in a browser, so assert the view contract offline.
-$views = __DIR__ . '/../extension/StripeSaved/resources/views/';
+$views = __DIR__ . '/../extension/AeStripe/resources/views/';
 $theme = file_get_contents($views . 'stripe-theme.blade.php');
 foreach (['pay', 'billing-agreement'] as $name) {
     $view = file_get_contents($views . $name . '.blade.php');
@@ -22,7 +22,7 @@ foreach (['pay', 'billing-agreement'] as $name) {
         && str_contains($wait, 'findForm();'), "$name: form lookup checks now and waits at most five seconds");
     check(str_contains($wait, 'const paymentForm = await new Promise(')
         && str_contains($wait, "if (!paymentForm) {")
-        && str_contains($wait, "console.error('StripeSaved: payment form did not appear within 5 seconds.');")
+        && str_contains($wait, "console.error('AeStripe: payment form did not appear within 5 seconds.');")
         && str_contains($wait, 'return;'), "$name: missing form logs once and stops initialization");
     check(str_contains($view, "if (submit) submit.disabled = true;")
         && str_contains($view, "if (message) message.textContent = 'Could not load the payment form. Reload to try again.';"),
@@ -32,7 +32,7 @@ foreach (['pay', 'billing-agreement'] as $name) {
     check(preg_match('/preventDefault\(\);\s+(clearMessage\(\)|message\.replaceChildren\(\));\s+setLoading\(true\)/', $view) === 1,
         "$name: the next submit clears the previous error");
     check(!preg_match("/theme:\s*'(night|stripe)'/", $view), "$name: Stripe theme is not hard-coded");
-    check(str_contains($view, "@include('gateways.stripe-saved::stripe-theme')")
+    check(str_contains($view, "@include('gateways.ae-stripe::stripe-theme')")
         && str_contains($view, 'appearance: stripeAppearance(form)')
         && str_contains($view, 'syncStripeTheme(form, elements)')
         && str_contains($view, 'stopThemeSync();'), "$name: theme derives from the page and follows changes");
@@ -54,7 +54,7 @@ foreach (['pay', 'billing-agreement'] as $name) {
 $setupView = file_get_contents($views . 'billing-agreement.blade.php');
 check(str_contains($setupView, 'id="setup-consent" required disabled') && str_contains($setupView, 'I agree to save this payment method and allow charges to it for my future invoices, including renewals, when I am not present.')
     && str_contains($setupView, 'Saving does not turn on Auto Pay; you can choose it for a service later.'), 'Setup has an explicit future off-session opt-in');
-$recordConsentCall = "await fetch(@js(route('extensions.gateways.stripe-saved.setup-consent'))";
+$recordConsentCall = "await fetch(@js(route('extensions.gateways.ae-stripe.setup-consent'))";
 $confirmSetupCall = 'await stripe.confirmSetup(';
 $recordsConsentBeforeConfirmation = static function ($view) use ($recordConsentCall, $confirmSetupCall) {
     $consentPosition = strpos($view, $recordConsentCall);

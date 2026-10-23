@@ -21,13 +21,13 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $service->invoiceRows = [(object) ['invoice' => $invoice]];
     $intent = (object) ['id' => 'pi_received', 'status' => 'succeeded', 'amount' => 2000,
         'amount_received' => 1250, 'currency' => 'usd', 'customer' => 'cus_owner',
-        'metadata' => (object) ['invoice_id' => $invoice->id, 'stripe_saved_gateway' => '1']];
+        'metadata' => (object) ['invoice_id' => $invoice->id, 'ae_stripe_gateway' => '1']];
     $stripeInvoice = (object) ['id' => 'in_settlement', 'currency' => 'usd', 'amount_paid' => 1250,
-        'metadata' => (object) ['stripe_saved_invoice_id' => $invoice->id],
+        'metadata' => (object) ['ae_stripe_invoice_id' => $invoice->id],
         'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) [
-            'subscription' => $service->subscription_id, 'metadata' => (object) ['stripe_saved_gateway' => '1']]]];
+            'subscription' => $service->subscription_id, 'metadata' => (object) ['ae_stripe_gateway' => '1']]]];
     Http::$handler = function ($verb, $path) use ($intent) {
-        if ($verb === 'get' && $path === '/invoices/in_settlement') return ['metadata' => ['stripe_saved_invoice_id' => 112]];
+        if ($verb === 'get' && $path === '/invoices/in_settlement') return ['metadata' => ['ae_stripe_invoice_id' => 112]];
         if ($verb === 'get' && $path === '/invoice_payments') return ['data' => [
             ['status' => 'paid', 'amount_paid' => 1250,
                 'payment' => ['type' => 'payment_intent', 'payment_intent' => $intent->id]]]];
@@ -81,7 +81,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     check(ExtensionHelper::$applications === $before + 1,
         'Subscription then PaymentIntent success cannot duplicate the late charge');
     check(count(Log::$warnings) === $warnings + 1 && end(Log::$warnings) === [
-        'StripeSaved payment received for paid invoice', ['invoice_id' => $invoice->id]],
+        'AeStripe payment received for paid invoice', ['invoice_id' => $invoice->id]],
         'Late subscription payment logs only the invoice ID');
     check(array_slice(DB::$modelLocks, $locks, 4) === [User::class, Service::class, InvoiceTransaction::class, Invoice::class],
         'Subscription success keeps user-first settlement lock order');
@@ -197,12 +197,12 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $records = count(Audit::$rows);
     $before = ExtensionHelper::$applications;
     foreach ([null, 999] as $binding) {
-        $stripeInvoice->metadata->stripe_saved_invoice_id = $binding;
+        $stripeInvoice->metadata->ae_stripe_invoice_id = $binding;
         $deliver();
         check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records + 1,
             'An unbound or unrelated subscription payment retains one gateway review record');
     }
-    $stripeInvoice->metadata->stripe_saved_invoice_id = $invoice->id;
+    $stripeInvoice->metadata->ae_stripe_invoice_id = $invoice->id;
     $records = count(Audit::$rows);
     $invoice->user_id = 99;
     rejects($deliver, 'HTTP 409');
@@ -265,7 +265,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         $intent = (object) ['id' => 'pi_bound_query', 'status' => 'succeeded', 'amount' => 2000,
             'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner'];
         $stripeInvoice = (object) ['id' => 'in_bound_query', 'currency' => 'usd', 'amount_paid' => 2000,
-            'metadata' => (object) ['stripe_saved_invoice_id' => 412],
+            'metadata' => (object) ['ae_stripe_invoice_id' => 412],
             'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) [
                 'subscription' => $service->subscription_id]]];
         Http::$handler = function ($verb, $path) use ($intent) {
@@ -289,7 +289,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         $before = ExtensionHelper::$applications;
         $records = count(Audit::$rows);
         foreach ([null, 999] as $binding) {
-            $stripeInvoice->metadata->stripe_saved_invoice_id = $binding;
+            $stripeInvoice->metadata->ae_stripe_invoice_id = $binding;
             invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice);
             check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records + 1
                 && end(Audit::$rows)['new_values']['stripe_invoice_id'] === $stripeInvoice->id

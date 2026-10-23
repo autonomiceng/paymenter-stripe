@@ -1,6 +1,6 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
+namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Exceptions\DisplayException;
 use App\Models\Service;
@@ -12,11 +12,11 @@ trait Webhooks
     {
         $metadata = $object->metadata ?? null;
         $subscriptionMetadata = $object->parent->subscription_details->metadata ?? null;
-        if (($metadata->stripe_saved_gateway ?? null) === '1'
-            || ($subscriptionMetadata->stripe_saved_gateway ?? null) === '1'
+        if (($metadata->ae_stripe_gateway ?? null) === '1'
+            || ($subscriptionMetadata->ae_stripe_gateway ?? null) === '1'
             || $this->bundledInactive(requireAbsent: true)) return true;
-        \Illuminate\Support\Facades\Log::info('StripeSaved webhook ignored: bundled gateway owns unmarked event', [
-            'event_type' => $type, 'invoice_id' => $metadata->invoice_id ?? $metadata->stripe_saved_invoice_id ?? null,
+        \Illuminate\Support\Facades\Log::info('AeStripe webhook ignored: bundled gateway owns unmarked event', [
+            'event_type' => $type, 'invoice_id' => $metadata->invoice_id ?? $metadata->ae_stripe_invoice_id ?? null,
         ]);
         return false;
     }
@@ -28,7 +28,7 @@ trait Webhooks
         }
         // Non-2xx so Stripe keeps retrying; a 200 here would discard the event.
         if (!$this->gatewayEnabled()) {
-            \Illuminate\Support\Facades\Log::info('StripeSaved webhook deferred: gateway disabled or missing');
+            \Illuminate\Support\Facades\Log::info('AeStripe webhook deferred: gateway disabled or missing');
             return response()->json(['error' => 'Gateway disabled'], 503);
         }
 
@@ -63,7 +63,7 @@ trait Webhooks
                 try {
                     $this->savePaidMethod($paymentIntent);
                 } catch (DisplayException $e) {
-                    \Illuminate\Support\Facades\Log::warning('StripeSaved saved method refused', ['reason' => $e->getMessage()]);
+                    \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['reason' => $e->getMessage()]);
                 }
                 break;
             case 'payment_intent.payment_failed':
@@ -84,7 +84,7 @@ trait Webhooks
                     try {
                         $this->setupBillingAgreement($setupIntent);
                     } catch (DisplayException $e) {
-                        \Illuminate\Support\Facades\Log::warning('StripeSaved saved method refused', ['reason' => $e->getMessage()]);
+                        \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['reason' => $e->getMessage()]);
                     }
                 } elseif (isset($setupIntent->metadata->invoice_id)) {
                     $this->setupSubscription($setupIntent);
