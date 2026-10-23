@@ -55,7 +55,7 @@ foreach (['Stripe', 'AeStripe'] as $i => $name) {
     }
     \App\Models\Gateway::$rows[$name] = [new class($i + 1, $settings) {
         public bool $rejectUpdates = false;
-        public function __construct(public int $id, private array $values) {}
+        public function __construct(public int $id, public array $values) {}
         public function settings() { return new AdoptionCollection($this->values); }
         public function update($changes) {
             if ($this->rejectUpdates) return false;
@@ -78,6 +78,34 @@ $store = new AdoptionStore;
 $engine = new Adoption($store);
 $original = DB::$tables;
 $plan = $engine->run();
+// Apply must finish preflight before changing core state or ownership.
+$preflightHandler = Http::$handler;
+foreach ([1, 2] as $failAt) {
+    $reads = 0;
+    $updates = count(DB::$updates);
+    $files = glob($adoptionStorage . '/app/ae-stripe-adoption/*');
+    \Filament\Notifications\Notification::$sent = [];
+    Http::$handler = function ($verb, $path) use (&$reads, $failAt) {
+        check($verb === 'get' && $path === '/account', 'Adoption preflight only reads account identity');
+        if (++$reads === $failAt) throw new RuntimeException('Synthetic adoption preflight failure');
+        return ['id' => 'acct_fixture'];
+    };
+    rejects(fn () => $engine->run($plan['digest']), 'Synthetic adoption preflight failure');
+    check(DB::$tables === $original && count(DB::$updates) === $updates, 'Failed adoption preflight preserves enabled core Stripe and ownership: ' . $failAt);
+    check(glob($adoptionStorage . '/app/ae-stripe-adoption/*') === $files && \Filament\Notifications\Notification::$sent === [], 'Failed adoption preflight writes no manifest or disable notice: ' . $failAt);
+}
+Http::$handler = $preflightHandler;
+foreach (['Stripe', 'AeStripe'] as $name) {
+    $row = \App\Models\Gateway::$rows[$name][0];
+    $settings = $row->values;
+    foreach ($row->values as &$setting) if ($setting['key'] === 'stripe_webhook_secret') $setting['value'] = '';
+    unset($setting);
+    $updates = count(DB::$updates);
+    \Filament\Notifications\Notification::$sent = [];
+    rejects(fn () => $engine->run($plan['digest']), 'Gateway configuration or key mode invalid');
+    check(DB::$tables === $original && count(DB::$updates) === $updates && \Filament\Notifications\Notification::$sent === [], 'Missing ' . $name . ' webhook setup refuses apply before disabling core');
+    $row->values = $settings;
+}
 $result = $engine->run($plan['digest']);
 check(DB::$tables['extensions'][0]['enabled'] === false, 'Production apply disables bundled Stripe');
 check(DB::$tables['billing_agreements'][11]['gateway_id'] === 2, 'Production adapter includes soft-deleted rows');
@@ -177,7 +205,21 @@ $command->options = ['confirm-paused' => true];
 check($command->handle() === 1 && str_contains(end($command->output), '1, 28') && str_contains(end($command->output), '--source-gateway=ID'), 'CLI lists ambiguous bundled sources');
 $command->options = ['confirm-paused' => true, 'source-gateway' => '1'];
 check($command->handle() === 0, 'CLI accepts explicit source among ambiguous gateways');
+foreach (['abc', '0', '-1', ''] as $bad) {
+    $before = DB::$tables; $updates = count(DB::$updates); $calls = count(Http::$calls);
+    $command->options = ['confirm-paused' => true, 'source-gateway' => $bad];
+    check($command->handle() === 1 && end($command->output) === 'Use --source-gateway with a positive gateway ID', 'CLI rejects invalid source-gateway ' . var_export($bad, true));
+    check(DB::$tables === $before && count(DB::$updates) === $updates && count(Http::$calls) === $calls, 'Invalid selector makes no database or Stripe calls');
+}
+$command->options = ['confirm-paused' => true, 'source-gateway' => '999'];
+$before = DB::$tables; $updates = count(DB::$updates); $calls = count(Http::$calls);
+check($command->handle() === 1 && end($command->output) === 'Exactly one installed row per gateway required', 'CLI rejects unknown source gateway');
+check(DB::$tables === $before && count(DB::$updates) === $updates && count(Http::$calls) === $calls, 'Unknown selector makes no database or Stripe calls');
 DB::$tables['extensions'][2]['deleted_at'] = '2020-01-01';
+$command->options = ['confirm-paused' => true, 'source-gateway' => '28'];
+$before = DB::$tables; $updates = count(DB::$updates);
+check($command->handle() === 1 && end($command->output) === 'Gateway row removed', 'CLI refuses a soft-deleted source gateway');
+check(DB::$tables === $before && count(DB::$updates) === $updates, 'Soft-deleted selector preserves core state and ownership');
 $command->options = ['confirm-paused' => true];
 check($command->handle() === 0, 'CLI dry run succeeds with actual adapter');
 check(!str_contains(implode('\n', $command->output), 'private fixture'), 'CLI output contains no stored names');

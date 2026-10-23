@@ -118,6 +118,11 @@ if ($scenario === 'all') {
             $warnings = count(Log::$warnings);
             check($entries[$entry]()['status'] === 200 && count(Log::$warnings) === $warnings + 1,
                 "$entry acknowledges and logs permanent $field refusal");
+            $context = end(Log::$warnings)[1];
+            $intentKey = $entry === 'setup webhook' ? 'setup_intent_id' : 'payment_intent_id';
+            $intentId = $entry === 'setup webhook' ? $agreementSetup->id : $agreementPaid->id;
+            check(($context[$intentKey] ?? null) === $intentId && isset($context['reason']), "$entry refusal log identifies the intent and reason for $field");
+            check(!str_contains($result['message'], $intentId), "$entry intent ID stays out of customer refusal text");
         }
         check(ExtensionHelper::$agreements === [$agreementMethod->id => $conflict], "Refusal preserves $field ownership and deletion");
         check(count(array_filter(array_slice(Http::$calls, $before), fn ($call) => $call[0] === 'post')) === 0,

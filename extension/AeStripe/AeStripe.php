@@ -198,8 +198,8 @@ class AeStripe extends Gateway
 
     public function enabled(Extension $gateway)
     {
-        $this->disableEmptyBundled();
         $this->updated($gateway);
+        $this->disableEmptyBundled();
     }
 
     private function disableEmptyBundled(): void
@@ -216,8 +216,8 @@ class AeStripe extends Gateway
 
     public function updated(Extension $gateway)
     {
-        if ($gateway->enabled && $gateway->wasChanged('enabled')) $this->disableEmptyBundled();
         if (!empty($gateway->settings()->where('key', 'stripe_webhook_secret')->first()->value)) {
+            if ($gateway->enabled && $gateway->wasChanged('enabled')) $this->disableEmptyBundled();
             return;
         }
 
@@ -261,6 +261,8 @@ class AeStripe extends Gateway
             ->title('Webhook created')
             ->body('We\'ve created a webhook for you on Stripe (refresh the page to see the secret)')
             ->send();
+
+        if ($gateway->enabled && $gateway->wasChanged('enabled')) $this->disableEmptyBundled();
     }
 
     private function request($method, $url, $data = [], ?string $idempotencyKey = null)

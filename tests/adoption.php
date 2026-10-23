@@ -159,4 +159,3 @@ foreach (['empty account', 'missing gateway'] as $invalid) {
 foreach (['Adoption.php', 'AdoptionStore.php', 'AdoptBundledCommand.php'] as $file) {
     check(!preg_match('/->(?:delete|forceDelete|truncate)\s*\(|\bDELETE\s+FROM\b/i', file_get_contents(__DIR__ . '/../extension/AeStripe/' . $file)), 'No destructive operation in ' . $file);
 }
-check(count(\Illuminate\Console\Application::$callbacks) >= 2, 'Command registered during extension boot including bundled-present path');

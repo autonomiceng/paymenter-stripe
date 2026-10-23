@@ -63,7 +63,7 @@ trait Webhooks
                 try {
                     $this->savePaidMethod($paymentIntent);
                 } catch (DisplayException $e) {
-                    \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['reason' => $e->getMessage()]);
+                    \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['payment_intent_id' => $paymentIntent->id ?? null, 'reason' => $e->getMessage()]);
                 }
                 break;
             case 'payment_intent.payment_failed':
@@ -84,7 +84,7 @@ trait Webhooks
                     try {
                         $this->setupBillingAgreement($setupIntent);
                     } catch (DisplayException $e) {
-                        \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['reason' => $e->getMessage()]);
+                        \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['setup_intent_id' => $setupIntent->id ?? null, 'reason' => $e->getMessage()]);
                     }
                 } elseif (isset($setupIntent->metadata->invoice_id)) {
                     $this->setupSubscription($setupIntent);

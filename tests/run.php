@@ -62,12 +62,14 @@ if (in_array('--gateway-lifecycle', $argv, true)) {
     return;
 }
 
+\Illuminate\Console\Application::$callbacks = [];
 $gateway->boot();
 check(Event::$listeners === [], 'Bundled row retains subscription callbacks even when disabled');
 check(Route::$routes === ['/extensions/ae-stripe/webhook', '/extensions/ae-stripe/setup-agreement',
     '/extensions/ae-stripe/consent', '/extensions/ae-stripe/setup-consent', '/extensions/ae-stripe/disable-core'], 'Distinct routes are still registered');
 Gateway::$bundled = false;
 $gateway->boot();
+check(count(\Illuminate\Console\Application::$callbacks) === 2, 'Commands registered once per extension boot including bundled-present path');
 check(count(Event::$listeners) === 2, 'Standalone fork registers legacy subscription callbacks');
 Gateway::$bundled = true;
 
