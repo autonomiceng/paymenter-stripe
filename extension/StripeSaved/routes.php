@@ -16,3 +16,7 @@ Route::post('/extensions/stripe-saved/consent', [StripeSaved::class, 'consent'])
 Route::post('/extensions/stripe-saved/setup-consent', [StripeSaved::class, 'setupConsent'])
     ->middleware(['web', 'auth'])
     ->name('extensions.gateways.stripe-saved.setup-consent');
+
+Route::post('/extensions/stripe-saved/disable-core', [StripeSaved::class, 'disableCore'])
+    ->middleware(['web', 'auth'])
+    ->name('extensions.gateways.stripe-saved.disable-core');

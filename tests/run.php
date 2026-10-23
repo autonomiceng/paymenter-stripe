@@ -56,10 +56,16 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
     };
 };
 
+if (in_array('--gateway-lifecycle', $argv, true)) {
+    require __DIR__ . '/gateway-lifecycle.php';
+    echo "PASS: $count gateway lifecycle assertions\n";
+    return;
+}
+
 $gateway->boot();
 check(Event::$listeners === [], 'Bundled row retains subscription callbacks even when disabled');
 check(Route::$routes === ['/extensions/stripe-saved/webhook', '/extensions/stripe-saved/setup-agreement',
-    '/extensions/stripe-saved/consent', '/extensions/stripe-saved/setup-consent'], 'Distinct routes are still registered');
+    '/extensions/stripe-saved/consent', '/extensions/stripe-saved/setup-consent', '/extensions/stripe-saved/disable-core'], 'Distinct routes are still registered');
 Gateway::$bundled = false;
 $gateway->boot();
 check(count(Event::$listeners) === 2, 'Standalone fork registers legacy subscription callbacks');
@@ -188,6 +194,7 @@ $before = count(Http::$calls);
 rejects(fn () => $gateway->setupConsent(new Request(['intent' => $disabledSetupId, 'consent' => true])), 'HTTP 409');
 check(count(Http::$calls) === $before, 'Disabled setup consent makes no HTTP requests');
 Http::$handler = $oldHandler;
+require __DIR__ . '/gateway-lifecycle.php';
 require __DIR__ . '/subscription-listeners.php';
 require __DIR__ . '/adoption.php';
 require __DIR__ . '/adoption-store.php';

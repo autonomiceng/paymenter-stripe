@@ -43,6 +43,7 @@ final class Adoption
     {
         if ($before['configuration'] !== $identity['configuration']) throw new AdoptionRefusal('Configuration changed during preflight');
         $after = $before;
+        $after['extensions'][$before['bundled']]['enabled'] = false;
         $groups = $adopted = $actions = [];
         foreach ($before['agreements'] as $id => $row) {
             if (!preg_match('/^pm_[a-zA-Z0-9]+$/D', $row['external_reference'])) {
@@ -95,11 +96,21 @@ final class Adoption
         });
     }
 
+    private function manifestSnapshot(array $plan, bool $allowRetiredBundled = false): array
+    {
+        $current = $this->store->snapshot($allowRetiredBundled);
+        $bundled = $plan['after']['bundled'];
+        // Older manifests did not include enabled state. Preserve it during restore.
+        if (!array_key_exists('enabled', $plan['after']['extensions'][$bundled])) unset($current['extensions'][$bundled]['enabled']);
+        return $current;
+    }
+
     public function rollback(array $plan): void
     {
+        $this->store->selectSource((int) $plan['before']['bundled']);
         $identity = $this->preflight();
         $this->store->transaction(function () use ($plan, $identity) {
-            $current = $this->store->snapshot(allowRetiredBundled: true);
+            $current = $this->manifestSnapshot($plan, allowRetiredBundled: true);
             $expected = $plan['after'];
             // Native retirement is the sole allowed difference in the recorded scope.
             $bundled = $expected['bundled'];
@@ -113,9 +124,10 @@ final class Adoption
 
     public function redisplay(array $plan, string $name): array
     {
+        $this->store->selectSource((int) $plan['before']['bundled']);
         if ($this->preflight() !== $plan['identity']) throw new AdoptionRefusal('Stripe identity changed');
         $this->store->transaction(function () use ($plan) {
-            if ($this->store->snapshot() !== $plan['after']) throw new AdoptionRefusal('Redisplay drift; review ownership first');
+            if ($this->manifestSnapshot($plan) !== $plan['after']) throw new AdoptionRefusal('Redisplay drift; review ownership first');
         });
         $outcomes = $this->store->outcomes($name);
         $key = $this->store->configuration()[1]['secret'];

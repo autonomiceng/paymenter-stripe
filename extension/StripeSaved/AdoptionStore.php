@@ -5,13 +5,15 @@ namespace Paymenter\Extensions\Gateways\StripeSaved;
 use App\Models\Gateway;
 use Illuminate\Support\Facades\{DB, Http};
 
+require_once __DIR__ . '/GatewayLifecycle.php';
+
 final class AdoptionStore
 {
     private array $gateways;
     private string $directory;
     private $lock;
 
-    public function __construct()
+    public function __construct(private ?int $sourceGateway = null)
     {
         $this->directory = storage_path('app/stripe-saved-adoption');
         $existing = $this->directory;
@@ -25,8 +27,9 @@ final class AdoptionStore
         $this->lock = fopen($this->directory . '/command.lock', 'c');
         if (!$this->lock || !flock($this->lock, LOCK_EX | LOCK_NB)) throw new AdoptionRefusal('Another adoption command is running');
         chmod($this->directory . '/command.lock', 0600);
-        $this->configuration();
     }
+
+    public function selectSource(int $id): void { $this->sourceGateway = $id; }
 
     public function configuration(): array
     {
@@ -34,8 +37,24 @@ final class AdoptionStore
         foreach (['Stripe', 'StripeSaved'] as $extension) {
             // Rollback must still find the bundled row after native admin Delete (soft delete).
             $rows = Gateway::withTrashed()->where('extension', $extension)->get();
-            if ($rows->count() !== 1) throw new AdoptionRefusal('Exactly one installed row per gateway required');
-            $gateway = $rows->first();
+            $candidates = [];
+            foreach ($rows as $row) {
+                if ($extension === 'Stripe' && $this->sourceGateway !== null) {
+                    if ($row->id == $this->sourceGateway) $candidates[] = $row;
+                } elseif ($extension !== 'Stripe' || $row->deleted_at === null || GatewayLifecycle::hasReferences($row)) {
+                    $candidates[] = $row;
+                }
+            }
+            if (count($candidates) !== 1) {
+                if ($extension === 'Stripe' && count($candidates) > 1) {
+                    $ids = array_map(fn ($row) => $row->id, $candidates);
+                    sort($ids);
+                    throw new AdoptionRefusal('Multiple bundled Stripe gateways: ' . implode(', ', $ids) . '. Use --source-gateway=ID');
+                }
+                throw new AdoptionRefusal('Exactly one installed row per gateway required');
+            }
+            $gateway = $candidates[0];
+            if ($extension === 'Stripe') $this->sourceGateway = (int) $gateway->id;
             $this->gateways[] = $gateway;
             $values = $gateway->settings()->get()->pluck('value', 'key');
             $config[] = ['secret' => (string) ($values['stripe_secret_key'] ?? ''),
@@ -64,7 +83,9 @@ final class AdoptionStore
             if ($extension['deleted_at'] !== null && (!$allowRetiredBundled || $extension['id'] != $ids[0])) {
                 throw new AdoptionRefusal('Gateway row removed');
             }
+            $enabled = (bool) $extension['enabled'];
             $extension = array_intersect_key($extension, array_flip(['id', 'type', 'extension', 'deleted_at']));
+            if ($extension['id'] == $ids[0]) $extension['enabled'] = $enabled;
         }
         unset($extension);
         $settings = $this->rows('settings', fn ($q) => $q->whereIn('settingable_id', $ids)
@@ -80,12 +101,22 @@ final class AdoptionStore
 
     public function replace(array $before, array $after): void
     {
-        foreach (['extensions' => ['extensions', ['deleted_at']],
+        foreach (['extensions' => ['extensions', ['deleted_at', 'enabled']],
             'agreements' => ['billing_agreements', ['gateway_id', 'deleted_at']],
             'services' => ['services', ['billing_agreement_id']]] as $key => [$table, $columns]) {
             foreach ($after[$key] as $id => $row) {
                 $changes = [];
-                foreach ($columns as $column) if ($before[$key][$id][$column] !== $row[$column]) $changes[$column] = $row[$column];
+                foreach ($columns as $column) if (array_key_exists($column, $row) && $before[$key][$id][$column] !== $row[$column]) $changes[$column] = $row[$column];
+                if ($key === 'extensions') {
+                    $gateway = $this->gateways[$id == $after['bundled'] ? 0 : 1];
+                    if (array_key_exists('enabled', $changes)) {
+                        if ($changes['enabled']) $gateway->update(['enabled' => true]);
+                        else GatewayLifecycle::disable($gateway);
+                        $saved = $this->rows('extensions', fn ($q) => $q->where('id', $id));
+                        if ((bool) $saved[$id]['enabled'] !== $changes['enabled']) throw new AdoptionRefusal('Gateway update failed');
+                        unset($changes['enabled']);
+                    }
+                }
                 // Raw updates intentionally avoid gateway cancellation hooks and timestamp/property changes.
                 if ($changes && DB::table($table)->where('id', $id)->update($changes) !== 1) throw new AdoptionRefusal('Row update failed');
             }

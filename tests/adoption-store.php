@@ -54,16 +54,32 @@ foreach (['Stripe', 'StripeSaved'] as $i => $name) {
         $settings[] = ['key' => $key, 'value' => $fixture->config[$i][$field]];
     }
     \App\Models\Gateway::$rows[$name] = [new class($i + 1, $settings) {
+        public bool $rejectUpdates = false;
         public function __construct(public int $id, private array $values) {}
         public function settings() { return new AdoptionCollection($this->values); }
+        public function update($changes) {
+            if ($this->rejectUpdates) return false;
+            check(DB::$locked, 'Native gateway update shares ownership transaction');
+            foreach (DB::$tables['extensions'] as &$row) if ($row['id'] === $this->id) $row = array_replace($row, $changes);
+        }
+        public function __get($key) {
+            foreach (DB::$tables['extensions'] as $row) if ($row['id'] === $this->id) return $row[$key] ?? null;
+            return null;
+        }
     }];
 }
+// Retired history must not prevent adoption from the current bundled gateway.
+$retiredGateway = clone \App\Models\Gateway::$rows['Stripe'][0];
+$retiredGateway->id = 28;
+DB::$tables['extensions'][] = ['id' => 28, 'type' => 'gateway', 'extension' => 'Stripe', 'deleted_at' => '2020-01-01', 'enabled' => false];
+\App\Models\Gateway::$rows['Stripe'][] = $retiredGateway;
 Http::$handler = fn ($verb, $path, $data) => $path === '/account' && $verb === 'get' ? ['id' => 'acct_fixture'] : throw new RuntimeException('Unexpected adapter HTTP');
 $store = new AdoptionStore;
 $engine = new Adoption($store);
 $original = DB::$tables;
 $plan = $engine->run();
 $result = $engine->run($plan['digest']);
+check(DB::$tables['extensions'][0]['enabled'] === false, 'Production apply disables bundled Stripe');
 check(DB::$tables['billing_agreements'][11]['gateway_id'] === 2, 'Production adapter includes soft-deleted rows');
 check(DB::$tables['services'][21]['billing_agreement_id'] === 12, 'Production adapter repoints services');
 check(DB::$tables['properties'] === $original['properties'], 'Properties untouched by production adapter');
@@ -110,6 +126,39 @@ foreach ([0, 1] as $row) {
     check(DB::$tables === $deleted && count(DB::$updates) === $updates, 'Apply refuses soft-deleted gateway without writes: ' . $row);
     DB::$tables = $original;
 }
+\App\Models\Gateway::$rows['Stripe'][0]->rejectUpdates = true;
+rejects(fn () => $engine->run($plan['digest']), 'Gateway update failed');
+check(DB::$tables === $original, 'Refused native update rolls ownership back');
+\App\Models\Gateway::$rows['Stripe'][0]->rejectUpdates = false;
+foreach ([true, false] as $enabledBefore) {
+    DB::$tables['extensions'][0]['enabled'] = $enabledBefore;
+    $beforeApply = DB::$tables;
+    $enabledPlan = $engine->run();
+    AdoptionQuery::$failTable = 'billing_agreements';
+    rejects(fn () => $engine->run($enabledPlan['digest']), 'Simulated restore failure');
+    check(DB::$tables === $beforeApply, 'Failed apply restores enabled state and ownership together');
+    AdoptionQuery::$failTable = null;
+    $engine->run($enabledPlan['digest']);
+    DB::$tables['extensions'][0]['enabled'] = true;
+    rejects(fn () => $engine->rollback($enabledPlan), 'Rollback drift; restore from reviewed backup instead');
+    rejects(fn () => $engine->redisplay($enabledPlan, $result['manifest']), 'Redisplay drift; review ownership first');
+    DB::$tables['extensions'][0]['enabled'] = false;
+    $engine->rollback($enabledPlan);
+    check(DB::$tables === $beforeApply, 'Rollback restores exact original enabled state');
+    DB::$tables = $original;
+}
+check(!array_filter(DB::$updates, fn ($update) => $update[0] === 'extensions' && array_key_exists('enabled', $update[1])), 'Enabled state never uses raw table updates');
+// Old manifests cannot restore an enabled state they never recorded.
+$legacy = $manifest;
+unset($legacy['before']['extensions'][1]['enabled'], $legacy['after']['extensions'][1]['enabled']);
+$engine->run($plan['digest']);
+$accountHandler = Http::$handler;
+Http::$handler = fn ($verb, $path, $data) => $path === '/account' ? ['id' => 'acct_fixture'] : ['id' => basename($path)];
+check($engine->redisplay($legacy, $result['manifest']) === ['pm_10' => 'ok', 'pm_12' => 'ok'], 'Redisplay accepts manifests created before enabled state was recorded');
+$engine->rollback($legacy);
+check(DB::$tables['extensions'][0]['enabled'] === false, 'Legacy rollback preserves current enabled state');
+DB::$tables = $original;
+Http::$handler = $accountHandler;
 $store->saveOutcomes($result['manifest'], ['pm_10' => 'retry']);
 check($store->outcomes($result['manifest']) === ['pm_10' => 'retry'], 'Atomic outcome file round trip');
 rejects(fn () => $store->load('../escape'), 'Use a manifest basename from storage');
@@ -123,6 +172,12 @@ check($command->handle() === 1 && str_contains(end($command->output), 'Choose dr
 $command->options = ['confirm-paused' => true, 'redisplay' => $result['manifest']];
 check($command->handle() === 1 && str_contains(end($command->output), '--confirm-setup-consent'), 'CLI requires explicit setup consent basis');
 unset($store, $engine);
+DB::$tables['extensions'][2]['deleted_at'] = null;
+$command->options = ['confirm-paused' => true];
+check($command->handle() === 1 && str_contains(end($command->output), '1, 28') && str_contains(end($command->output), '--source-gateway=ID'), 'CLI lists ambiguous bundled sources');
+$command->options = ['confirm-paused' => true, 'source-gateway' => '1'];
+check($command->handle() === 0, 'CLI accepts explicit source among ambiguous gateways');
+DB::$tables['extensions'][2]['deleted_at'] = '2020-01-01';
 $command->options = ['confirm-paused' => true];
 check($command->handle() === 0, 'CLI dry run succeeds with actual adapter');
 check(!str_contains(implode('\n', $command->output), 'private fixture'), 'CLI output contains no stored names');
@@ -131,6 +186,7 @@ $command->options = ['confirm-paused' => true, 'apply' => true, 'plan' => $plan[
 check($command->handle() === 0, 'CLI applies reviewed plan');
 preg_match('/Manifest: ([a-f0-9]{32}\.json)/', end($command->output), $match);
 check(isset($match[1]), 'CLI reports protected rollback manifest basename');
+DB::$tables['extensions'][2]['deleted_at'] = null;
 Http::$handler = fn ($verb, $path, $data) => $path === '/account' ? ['id' => 'acct_fixture'] : ['id' => basename($path)];
 $command->options = ['confirm-paused' => true, 'redisplay' => $match[1], 'confirm-setup-consent' => true];
 check($command->handle() === 0, 'CLI independently redisplays adopted active methods');
@@ -140,8 +196,29 @@ DB::$tables['extensions'][0]['deleted_at'] = '2026-01-01 00:00:00';
 $command->options = ['confirm-paused' => true, 'rollback' => $match[1]];
 check($command->handle() === 0 && DB::$tables['extensions'][0]['deleted_at'] === null, 'CLI rollback finds and restores soft-deleted bundled gateway');
 check(count(array_filter($command->output, fn ($line) => str_starts_with($line, 'Rollback checklist:') && str_contains($line, 'restores bundled gateway'))) > 0, 'Rollback prints native gateway restoration and reverse delivery checklist');
-DB::$tables['extensions'][0]['enabled'] = true;
+DB::$tables['extensions'][2]['deleted_at'] = '2020-01-01';
 check(DB::$tables === $original, 'CLI apply and rollback preserve all rows and properties');
+// A retired source remains selectable when it still has live ownership references.
+DB::$tables['billing_agreements'][90] = array_replace($fixture->state['agreements'][10], ['id' => 90, 'gateway_id' => 28]);
+rejects(fn () => (new AdoptionStore)->configuration(), 'Multiple bundled Stripe gateways: 1, 28. Use --source-gateway=ID');
+DB::$tables['billing_agreements'][90]['deleted_at'] = '2020-01-01';
+check(count((new AdoptionStore)->configuration()) === 2, 'Retired source with only removed agreements is ignored');
+DB::$tables['services'][90] = ['id' => 90, 'billing_agreement_id' => 90];
+rejects(fn () => (new AdoptionStore)->configuration(), 'Multiple bundled Stripe gateways: 1, 28. Use --source-gateway=ID');
+DB::$tables = $original;
+DB::$tables['services'][90] = ['id' => 90, 'billing_agreement_id' => null, 'subscription_id' => 'sub_legacy'];
+DB::$tables['properties'][] = ['id' => 90, 'model_id' => 90, 'model_type' => \App\Models\Service::class, 'key' => 'has_stripe_subscription', 'value' => '1'];
+rejects(fn () => (new AdoptionStore)->configuration(), 'Multiple bundled Stripe gateways: 1, 28. Use --source-gateway=ID');
+DB::$tables = $original;
+\App\Models\Gateway::$rows['Stripe'][0]->id = 62;
+DB::$tables['extensions'][0]['id'] = 62;
+foreach (DB::$tables['billing_agreements'] as &$row) if ($row['gateway_id'] === 1) $row['gateway_id'] = 62;
+unset($row);
+$selected = new AdoptionStore;
+check((new Adoption($selected))->run()['before']['bundled'] === 62, 'Active source 62 is selected beside retired empty 28');
+unset($selected);
+\App\Models\Gateway::$rows['Stripe'][0]->id = 1;
+DB::$tables = $original;
 \App\Models\Gateway::$rows['StripeSaved'] = [];
 check($command->handle() === 1 && str_contains(end($command->output), 'installed row'), 'CLI refuses uninstalled fork');
 \App\Models\Gateway::$rows = null;

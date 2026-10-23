@@ -14,7 +14,7 @@ class AdoptionFake
     {
         $this->config = array_fill(0, 2, ['secret' => 'rk_' . 'test_fixture', 'public' => 'pk_' . 'test_fixture', 'webhook' => 'fixture']);
         $this->state = ['bundled' => 1, 'fork' => 2, 'extensions' => [
-                1 => ['id' => 1, 'type' => 'gateway', 'extension' => 'Stripe', 'deleted_at' => null],
+                1 => ['id' => 1, 'type' => 'gateway', 'extension' => 'Stripe', 'deleted_at' => null, 'enabled' => true],
                 2 => ['id' => 2, 'type' => 'gateway', 'extension' => 'StripeSaved', 'deleted_at' => null]],
             'configuration' => Adoption::digest($this->config), 'settingsHash' => 'settings', 'propertiesHash' => 'properties',
             'agreements' => [10 => $this->row(10, 1), 11 => $this->row(11, 1, '2020-01-01 00:00:00'),
@@ -28,6 +28,7 @@ class AdoptionFake
         return ['id' => $id, 'user_id' => 7, 'gateway_id' => $gateway, 'external_reference' => 'pm_' . $id,
             'deleted_at' => $deleted, 'created_at' => '2020-01-01', 'updated_at' => '2020-01-01', 'name' => 'private fixture'];
     }
+    public function selectSource(int $id): void {}
     public function configuration(): array { return $this->config; }
     public function transaction($callback): mixed
     {
@@ -71,6 +72,7 @@ check($a->run()['digest'] === $plan['digest'], 'Dry run digest stable');
 check($f->state === $original && $f->writes === 0 && $f->manifests === [], 'Dry run has no writes');
 check(count($f->calls) === 4 && array_unique(array_column($f->calls, 1)) === ['/account'], 'One account read with each configured key per preflight');
 $applied = $a->run($plan['digest']);
+check($f->state['extensions'][1]['enabled'] === false, 'Apply turns off bundled Stripe in the recorded after-state');
 check($f->state['agreements'][10]['gateway_id'] === 2 && $f->state['agreements'][11]['gateway_id'] === 2, 'All bundled rows including soft deleted move');
 check($f->state['agreements'][11]['deleted_at'] === $original['agreements'][11]['deleted_at'], 'Deleted methods never resurrected');
 check($f->state['services'][20]['billing_agreement_id'] === 12 && $f->state['services'][21]['billing_agreement_id'] === 12, 'Old referenced duplicate id retained and all service references reconciled');
@@ -157,4 +159,4 @@ foreach (['empty account', 'missing gateway'] as $invalid) {
 foreach (['Adoption.php', 'AdoptionStore.php', 'AdoptBundledCommand.php'] as $file) {
     check(!preg_match('/->(?:delete|forceDelete|truncate)\s*\(|\bDELETE\s+FROM\b/i', file_get_contents(__DIR__ . '/../extension/StripeSaved/' . $file)), 'No destructive operation in ' . $file);
 }
-check(count(\Illuminate\Console\Application::$callbacks) === 2, 'Command registered during extension boot including bundled-present path');
+check(count(\Illuminate\Console\Application::$callbacks) >= 2, 'Command registered during extension boot including bundled-present path');

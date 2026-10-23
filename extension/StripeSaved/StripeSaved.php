@@ -17,6 +17,9 @@ use App\Models\User;
 use Carbon\Carbon;
 use Exception;
 use Filament\Notifications\Notification;
+use Filament\Facades\Filament;
+use Filament\Support\Facades\FilamentView;
+use Filament\View\PanelsRenderHook;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -35,6 +38,7 @@ use Paymenter\Extensions\Gateways\StripeSaved\Concerns\SubscriptionPayments;
 use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Webhooks;
 use Str;
 
+require_once __DIR__ . '/GatewayLifecycle.php';
 require_once __DIR__ . '/Concerns/Signature.php';
 require_once __DIR__ . '/Concerns/Checkout.php';
 require_once __DIR__ . '/Concerns/Amounts.php';
@@ -69,6 +73,7 @@ class StripeSaved extends Gateway
         require __DIR__ . '/routes.php';
         // Register webhook route
         View::addNamespace('gateways.stripe-saved', __DIR__ . '/resources/views');
+        FilamentView::registerRenderHook(PanelsRenderHook::PAGE_START, fn () => $this->gatewayWarning());
         // Core boots disabled gateways too. Let the bundled listener own legacy subscriptions.
         if (!$this->bundledInactive(requireAbsent: true)) {
             return;
@@ -113,13 +118,38 @@ class StripeSaved extends Gateway
     private function bundledInactive(bool $requireAbsent = false): bool
     {
         // Soft-deleted rows are excluded by the native model scope. Disabled rows still boot listeners.
-        $bundled = \App\Models\Gateway::where('extension', 'Stripe')->first();
-        return !$bundled || (!$requireAbsent && !$bundled->enabled);
+        $bundled = \App\Models\Gateway::where('extension', 'Stripe');
+        if (!$requireAbsent) $bundled->where('enabled', true);
+        return !$bundled->exists();
     }
 
     public function canUseGateway($total, $currency, $type, $items): bool
     {
         return $this->gatewayEnabled() && $this->bundledInactive();
+    }
+
+    public function gatewayWarning()
+    {
+        $panel = Filament::getCurrentPanel();
+        $user = Auth::user();
+        if (!$panel || $panel->getId() !== 'admin' || !$user || !$user->canAccessPanel($panel) || !$this->gatewayEnabled()) return '';
+        $gateways = [];
+        foreach (\App\Models\Gateway::where('extension', 'Stripe')->where('enabled', true)->get() as $bundled) {
+            $gateways[] = ['id' => $bundled->id, 'hasReferences' => GatewayLifecycle::hasReferences($bundled),
+                'canUpdate' => $user->can('update', $bundled)];
+        }
+        return $gateways ? view('gateways.stripe-saved::gateway-warning', compact('gateways')) : '';
+    }
+
+    public function disableCore(Request $request)
+    {
+        $request->validate(['gateway_id' => 'required|integer']);
+        $bundled = \App\Models\Gateway::where('extension', 'Stripe')->where('id', $request->input('gateway_id'))->firstOrFail();
+        abort_unless(Auth::user()?->can('update', $bundled), 403);
+        abort_unless($this->gatewayEnabled() && !GatewayLifecycle::hasReferences($bundled), 409);
+        GatewayLifecycle::disable($bundled);
+        Notification::make()->title('Core Stripe was turned off.')->success()->send();
+        return redirect()->route('filament.admin.resources.gateways.index');
     }
 
     public function getConfig($values = [])
@@ -162,11 +192,25 @@ class StripeSaved extends Gateway
 
     public function enabled(Extension $gateway)
     {
+        $this->disableEmptyBundled();
         $this->updated($gateway);
+    }
+
+    private function disableEmptyBundled(): void
+    {
+        $disabled = false;
+        foreach (\App\Models\Gateway::where('extension', 'Stripe')->where('enabled', true)->get() as $bundled) {
+            if (!GatewayLifecycle::hasReferences($bundled)) {
+                GatewayLifecycle::disable($bundled);
+                $disabled = true;
+            }
+        }
+        if ($disabled) Notification::make()->title('Core Stripe was turned off.')->success()->send();
     }
 
     public function updated(Extension $gateway)
     {
+        if ($gateway->enabled && $gateway->wasChanged('enabled')) $this->disableEmptyBundled();
         if (!empty($gateway->settings()->where('key', 'stripe_webhook_secret')->first()->value)) {
             return;
         }
