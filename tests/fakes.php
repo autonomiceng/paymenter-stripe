@@ -11,7 +11,8 @@ namespace Illuminate\Console {
     }
     class Application { public static $callbacks = []; public static function starting($callback) { self::$callbacks[] = $callback; } }
 }
-namespace App\Exceptions { class DisplayException extends \RuntimeException {} }
+namespace App\Exceptions { class DisplayException extends \Exception {} }
+namespace Illuminate\Database { class UniqueConstraintViolationException extends \RuntimeException {} }
 namespace Illuminate\Http\Client {
     class ConnectionException extends \RuntimeException {}
     class RequestException extends \RuntimeException {
@@ -127,6 +128,7 @@ namespace App\Models {
     class Service {
         public const STATUS_CANCELLED = 'cancelled';
         public $user_id = 7, $status = 'active';
+        public $billing_agreement_id = null, $auto_pay = false;
         public $id = 41, $subscription_id = 'sub_test', $price = '19.99', $quantity = 3;
         public static $row;
         public $currency, $plan, $product, $properties;
@@ -155,7 +157,39 @@ namespace App\Models {
         }
         public function isDirty($field) { return in_array($field, $this->dirty); }
     }
-    class BillingAgreement { public $external_reference = 'pm_test', $id = 4; }
+    class BillingAgreement {
+        public $external_reference = 'pm_test', $id = 4;
+        public static ?array $snapshot = null;
+        public static $beforeInsert = null;
+        public static function withTrashed() { return new AgreementQuery(true); }
+        public static function where($key, $value) { return (new AgreementQuery)->where($key, $value); }
+        public function __construct(private array $attributes = []) {
+            $this->external_reference = $attributes['external_reference'] ?? 'pm_test';
+            $this->id = $attributes['id'] ?? 4;
+        }
+        public function __get($key) { return $this->attributes[$key] ?? null; }
+        public function trashed() { return $this->deleted_at !== null; }
+        public function update($data) {
+            \App\Helpers\ExtensionHelper::$agreements[$this->attributes['external_reference']] = array_replace($this->attributes, $data);
+        }
+    }
+    class AgreementQuery {
+        private array $filters = [];
+        private bool $current = false;
+        public function __construct(private bool $trashed = false) {}
+        public function where($key, $value) { $this->filters[$key] = $value; return $this; }
+        public function lockForUpdate() { $this->current = true; return $this; }
+        public function first() {
+            $rows = $this->current ? \App\Helpers\ExtensionHelper::$agreements : (BillingAgreement::$snapshot ?? \App\Helpers\ExtensionHelper::$agreements);
+            foreach ($rows as $id => $row) {
+                $row += ['external_reference' => $id, 'deleted_at' => null];
+                if (!$this->trashed && $row['deleted_at'] !== null) continue;
+                foreach ($this->filters as $key => $value) if (($row[$key] ?? null) != $value) continue 2;
+                return new BillingAgreement($row);
+            }
+            return null;
+        }
+    }
     class Extension {}
     class Audit {
         public static $rows = [], $fail = false;
@@ -213,8 +247,19 @@ namespace App\Helpers {
         public static function addPaymentFee($id, $fee) { ++self::$feeWrites; self::$fees[$id] = $fee; }
         public static function makeBillingAgreement($user, $gateway, $name, $id, $type, $expiry) {
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Agreement lock missing');
-            self::$agreements[$id] = compact('name', 'gateway', 'type', 'expiry');
+            $gateway_id = \App\Models\Gateway::where('extension', $gateway)->firstOrFail()->id;
+            $row = \App\Models\BillingAgreement::where('external_reference', $id)->where('user_id', $user->id)->where('gateway_id', $gateway_id)->first();
+            if (!$row) {
+                if ($hook = \App\Models\BillingAgreement::$beforeInsert) {
+                    \App\Models\BillingAgreement::$beforeInsert = null;
+                    $hook();
+                }
+                if (isset(self::$agreements[$id])) throw new \Illuminate\Database\UniqueConstraintViolationException('Duplicate external_reference');
+            }
+            self::$agreements[$id] = compact('name', 'gateway', 'type', 'expiry', 'gateway_id')
+                + ['id' => 4, 'external_reference' => $id, 'user_id' => $user->id, 'deleted_at' => null];
             if (self::$agreementFailure) { self::$agreementFailure = false; throw new \RuntimeException('Interrupted agreement response'); }
+            return new \App\Models\BillingAgreement(self::$agreements[$id]);
         }
         // Native helper updateOrCreate is keyed by invoice + transaction_id under an invoice lock.
         public static function addPayment($invoice, $gateway, $amount, $fee, $id, $status = 'succeeded') {
@@ -258,6 +303,7 @@ namespace Illuminate\Support\Facades {
     class Auth { public static $id = 7; public static function id() { return self::$id; } }
     class DB {
         public static $tables = [], $locks = [], $updates = [];
+        public static $concurrentAgreements = [];
         public static function table($name) { return $name === 'stripe_saved_payment_fees' ? new \FeeQuery : new \AdoptionQuery($name); }
         public static $beforeUserLock = null;
         public static $locked = false;
@@ -269,7 +315,7 @@ namespace Illuminate\Support\Facades {
             $audit = \App\Models\Audit::$rows;
             $notifications = \App\Models\Notification::$rows;
             self::$locked = true;
-            try { return $callback(); } catch (\Throwable $e) { self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = $agreements; \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
+            try { return $callback(); } catch (\Throwable $e) { self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
             finally { self::$locked = false; }
         }
     }

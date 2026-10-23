@@ -16,7 +16,7 @@ function check($value, $label) {
     ++$count;
 }
 function rejects($callback, $message) {
-    try { $callback(); } catch (RuntimeException $e) { check($e->getMessage() === $message, $message); return; }
+    try { $callback(); } catch (Exception $e) { check($e->getMessage() === $message, $message); return; }
     throw new RuntimeException('Expected: ' . $message);
 }
 function invoke($gateway, $method, ...$args) { return (new ReflectionMethod($gateway, $method))->invoke($gateway, ...$args); }
@@ -207,4 +207,5 @@ require __DIR__ . '/fee-recovery.php';
 require __DIR__ . '/fee-recovery-review.php';
 require __DIR__ . '/schema-scheduler.php';
 require __DIR__ . '/native-upgrade.php';
+require __DIR__ . '/agreement-persistence.php';
 echo "PASS: $count offline assertions\n";

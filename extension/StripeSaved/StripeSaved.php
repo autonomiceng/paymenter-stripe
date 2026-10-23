@@ -583,7 +583,13 @@ class StripeSaved extends Gateway
             abort(403, 'Unauthorized');
         }
 
-        abort_unless($this->setupBillingAgreement($setupIntent), 409);
+        try {
+            abort_unless($this->setupBillingAgreement($setupIntent), 409);
+        } catch (DisplayException $e) {
+            return redirect()->route('account.payment-methods')->with('notification', [
+                'type' => 'danger', 'message' => $e->getMessage(),
+            ]);
+        }
 
         return redirect()->route('account.payment-methods')->with('notification', [
             'type' => 'success',

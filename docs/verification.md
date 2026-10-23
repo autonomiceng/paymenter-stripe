@@ -43,6 +43,15 @@ Both delivery paths serialize settlement on the customer and use locking current
 reads to skip a successful transaction globally, so one PaymentIntent cannot settle two local invoices. A resumed
 3DS attempt shows and preserves its existing consent without changing payment preferences.
 
+Agreement saves use a locking current read by the globally unique payment method
+reference, including soft-deleted rows. Retries reuse only the same user's agreement
+on the same gateway, including after an insert race. Removed methods stay removed
+to preserve the deletion and service payment preferences. The setup return shows a
+clear refusal notification; webhooks log and acknowledge permanent ownership or
+deletion conflicts. Request and database failures remain retryable. Offline tests
+cover stale snapshots and insert conflicts with fakes; real MariaDB concurrency
+still needs the sandbox checks below.
+
 Checkout renders persist a retry key and PaymentIntent ID in native user properties
 before and after creation. Reopening retrieves the same unfinished intent. A changed
 invoice payload, finished/cancelled intent, or unresolved creation older than 23 hours
