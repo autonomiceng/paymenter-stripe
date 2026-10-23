@@ -29,6 +29,7 @@ use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\View;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\Amounts;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\Checkout;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\CardDuplicates;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\PaymentFees;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\CheckoutIntent;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SetupConsent;
@@ -43,6 +44,7 @@ require_once __DIR__ . '/GatewayLifecycle.php';
 require_once __DIR__ . '/Concerns/StripeMetadata.php';
 require_once __DIR__ . '/Concerns/Signature.php';
 require_once __DIR__ . '/Concerns/Checkout.php';
+require_once __DIR__ . '/Concerns/CardDuplicates.php';
 require_once __DIR__ . '/Concerns/Amounts.php';
 require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
 require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
@@ -60,7 +62,7 @@ require_once __DIR__ . '/Concerns/PaymentFees.php';
 )]
 class AeStripe extends Gateway
 {
-    use PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks, StripeMetadata;
+    use CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks, StripeMetadata;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -69,9 +71,11 @@ class AeStripe extends Gateway
         if (app()->runningInConsole()) {
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryPaymentFees())
                 ->name('ae-stripe:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
+            require_once __DIR__ . '/DeduplicateCardsCommand.php';
             require_once __DIR__ . '/AdoptBundledCommand.php';
             require_once __DIR__ . '/ConvertFromStripeSavedCommand.php';
             \Illuminate\Console\Application::starting(function ($artisan) {
+                $artisan->resolve(DeduplicateCardsCommand::class);
                 $artisan->resolve(AdoptBundledCommand::class);
                 $artisan->resolve(ConvertFromStripeSavedCommand::class);
             });
@@ -631,7 +635,8 @@ class AeStripe extends Gateway
         }
 
         try {
-            abort_unless($this->setupBillingAgreement($setupIntent), 409);
+            $saved = $this->setupBillingAgreement($setupIntent);
+            abort_unless($saved, 409);
         } catch (DisplayException $e) {
             return redirect()->route('account.payment-methods')->with('notification', [
                 'type' => 'danger', 'message' => $e->getMessage(),
@@ -640,7 +645,7 @@ class AeStripe extends Gateway
 
         return redirect()->route('account.payment-methods')->with('notification', [
             'type' => 'success',
-            'message' => 'Payment method added successfully.',
+            'message' => $saved === 'duplicate' ? 'This card is already saved.' : 'Payment method added successfully.',
         ]);
     }
 
@@ -663,7 +668,7 @@ class AeStripe extends Gateway
         // Get the actual payment method that will be used for future charges
         $actualPaymentMethod = $this->getActualPaymentMethod($setupIntent);
 
-        return $this->persistAgreement($user, $actualPaymentMethod);
+        return $this->persistAgreement($user, $actualPaymentMethod, deduplicate: true);
     }
 
     private function getActualPaymentMethod($setupIntent)

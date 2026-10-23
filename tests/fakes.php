@@ -196,6 +196,8 @@ namespace App\Models {
         }
         public function __get($key) { return $this->attributes[$key] ?? null; }
         public function trashed() { return $this->deleted_at !== null; }
+        public function services() { return Service::whereIn('billing_agreement_id', [$this->id]); }
+        public function delete() { $this->update(['deleted_at' => '2026-10-23 12:00:00']); }
         public function update($data) {
             \App\Helpers\ExtensionHelper::$agreements[$this->attributes['external_reference']] = array_replace($this->attributes, $data);
         }
@@ -214,16 +216,17 @@ namespace App\Models {
         }
         public function exists() { return $this->nativeRows()->exists(); }
         public function pluck($key) { return $this->nativeRows()->pluck($key); }
-        public function first() {
+        public function get() {
             $rows = $this->current ? \App\Helpers\ExtensionHelper::$agreements : (BillingAgreement::$snapshot ?? \App\Helpers\ExtensionHelper::$agreements);
             foreach ($rows as $id => $row) {
                 $row += ['external_reference' => $id, 'deleted_at' => null];
                 if (!$this->trashed && $row['deleted_at'] !== null) continue;
                 foreach ($this->filters as $key => $value) if (($row[$key] ?? null) != $value) continue 2;
-                return new BillingAgreement($row);
+                $result[] = new BillingAgreement($row);
             }
-            return null;
+            return $result ?? [];
         }
+        public function first() { return $this->get()[0] ?? null; }
     }
     #[\AllowDynamicProperties]
     class Extension {
@@ -284,6 +287,10 @@ namespace App\Models {
 }
 namespace App\Helpers {
     class ExtensionHelper {
+        public static function getExtension($type, $extension, $config = []) {
+            $class = '\\Paymenter\\Extensions\\' . ucfirst($type) . 's\\' . $extension . '\\' . $extension;
+            return new $class($config);
+        }
         public static $agreements = [];
         public static $agreementFailure = false;
         public static $payments = [];
