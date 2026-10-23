@@ -126,7 +126,7 @@ use Paymenter\Extensions\Gateways\AeStripe\ConvertFromStripeSavedCommand;
             check($command->handle() === 1, 'A row-update failure reports failure after DDL');
             check(end($command->output) === 'Conversion failed. Keep writers paused and inspect the schema and rows before retrying.'
                 && !str_contains(implode("\n", $command->output), 'Simulated restore failure'), 'Unexpected conversion failures keep the existing safe console message');
-            check(array_slice(Log::$errors, count($errors)) === [['AE Stripe conversion failed.', ['exception' => RuntimeException::class, 'message' => 'Simulated restore failure']]], 'Conversion logs the exception class and message');
+            check(array_slice(Log::$errors, count($errors)) === [['AE Stripe conversion failed.', ['exception' => RuntimeException::class, 'code' => 'conversion_failed']]], 'Conversion logs the exception class and a fixed code, not the message');
             check(isset(DB::$tables['ae_stripe_payment_fees']) && !isset(DB::$tables['stripe_saved_payment_fees']), 'Completed DDL remains outside the rolled-back row transaction');
             check(DB::$tables['extensions'] === $before['extensions'] && DB::$tables['properties'] === $before['properties'], 'A failed row phase rolls back identity and property updates together');
         } finally { AdoptionQuery::$failTable = null; }

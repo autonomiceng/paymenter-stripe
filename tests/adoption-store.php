@@ -248,7 +248,7 @@ Http::$handler = fn () => throw new RuntimeException('Synthetic adoption failure
 try {
     check($command->handle() === 1 && end($command->output) === 'Operation failed; keep writers paused and inspect protected manifest/database state before retrying', 'Unexpected adoption failures keep the existing safe console message');
     check(!str_contains(implode("\n", $command->output), 'Synthetic adoption failure'), 'Adoption does not print the raw exception');
-    check(array_slice(\Illuminate\Support\Facades\Log::$errors, count($errors)) === [['AE Stripe adoption failed.', ['exception' => RuntimeException::class, 'message' => 'Synthetic adoption failure']]], 'Adoption logs the exception class and message');
+    check(array_slice(\Illuminate\Support\Facades\Log::$errors, count($errors)) === [['AE Stripe adoption failed.', ['exception' => RuntimeException::class, 'code' => 'adoption_failed']]], 'Adoption logs the exception class and a fixed code, not the message');
 } finally { Http::$handler = $failureHandler; }
 check($command->handle() === 0, 'CLI dry run succeeds with actual adapter');
 check(!str_contains(implode('\n', $command->output), 'private fixture'), 'CLI output contains no stored names');

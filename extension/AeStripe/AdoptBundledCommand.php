@@ -58,7 +58,7 @@ final class AdoptBundledCommand extends Command
             }
             return self::SUCCESS;
         } catch (\Throwable $e) {
-            Log::error('AE Stripe adoption failed.', ['exception' => $e::class, 'message' => $e->getMessage()]);
+            Log::error('AE Stripe adoption failed.', ['exception' => $e::class, 'code' => 'adoption_failed']);
             // Do not render HTTP exceptions or row contents: either may contain credentials or PII.
             $safe = $e instanceof AdoptionRefusal;
             $this->error($safe ? $e->getMessage() : 'Operation failed; keep writers paused and inspect protected manifest/database state before retrying');

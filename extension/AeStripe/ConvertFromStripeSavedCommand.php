@@ -46,7 +46,7 @@ final class ConvertFromStripeSavedCommand extends Command
             $this->info('Converted gateway #' . $old[0]->id . ' to AE Stripe. IDs, settings and agreement/service references were preserved.');
             return self::SUCCESS;
         } catch (\Throwable $e) {
-            Log::error('AE Stripe conversion failed.', ['exception' => $e::class, 'message' => $e->getMessage()]);
+            Log::error('AE Stripe conversion failed.', ['exception' => $e::class, 'code' => 'conversion_failed']);
             $this->error($e instanceof ConversionRefusal ? $e->getMessage() : 'Conversion failed. Keep writers paused and inspect the schema and rows before retrying.');
             return self::FAILURE;
         }
