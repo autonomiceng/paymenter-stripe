@@ -25,8 +25,8 @@ use Illuminate\Support\Facades\{DB, Http};
     check(Gateway::$bundledEnabled, 'Legacy Stripe subscription without an agreement prevents automatic disable');
     \App\Models\User::$staff = true;
     $gateway->boot();
-    $warning = \Filament\Support\Facades\FilamentView::$hooks['panels::page.start'] ?? null;
-    check($warning && $warning()['name'] === 'gateways.ae-stripe::gateway-warning', 'Boot installs a persistent admin warning for enabled core Stripe');
+    $warning = \Filament\Support\Facades\FilamentView::$hooks['panels::content.start'] ?? null;
+    check($warning && $warning()['name'] === 'gateways.ae-stripe::gateway-warning', 'Boot installs the warning at the shared panel content hook for resource pages');
     DB::$tables['extensions'] = [
         ['id' => 28, 'deleted_at' => null], ['id' => 62, 'deleted_at' => null],
         ['id' => 63, 'deleted_at' => null], ['id' => 64, 'deleted_at' => '2026-01-01'], ['id' => 2, 'deleted_at' => null],

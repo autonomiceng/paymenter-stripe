@@ -200,6 +200,7 @@ require __DIR__ . '/adoption.php';
 require __DIR__ . '/adoption-store.php';
 require __DIR__ . '/conversion.php';
 require __DIR__ . '/converted-metadata.php';
+require __DIR__ . '/settings.php';
 require __DIR__ . '/views.php';
 require __DIR__ . '/amounts.php';
 require __DIR__ . '/settlement-regressions.php';

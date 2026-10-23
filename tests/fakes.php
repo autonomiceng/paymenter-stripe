@@ -512,4 +512,4 @@ namespace Filament\Support\Facades {
         public static function registerRenderHook($name, $callback) { self::$hooks[$name] = $callback; }
     }
 }
-namespace Filament\View { class PanelsRenderHook { const PAGE_START = 'panels::page.start'; } }
+namespace Filament\View { class PanelsRenderHook { const PAGE_START = 'panels::page.start'; const CONTENT_START = 'panels::content.start'; } }

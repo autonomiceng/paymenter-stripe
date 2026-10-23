@@ -1,5 +1,6 @@
-<div role="alert" class="rounded-lg border border-warning-500 p-4">
-    <p>Core Stripe and AeStripe are both on. Customers are using core Stripe.</p>
+<x-filament::section role="alert" icon="heroicon-o-exclamation-triangle" icon-color="warning">
+    <x-slot name="heading">Core Stripe and AE Stripe are both on.</x-slot>
+    <p>Customers are using core Stripe.</p>
     @foreach ($gateways as $gateway)
         <div class="mt-2">
             <p>Core Stripe #{{ $gateway['id'] }}</p>
@@ -17,4 +18,4 @@
             @endif
         </div>
     @endforeach
-</div>
+</x-filament::section>

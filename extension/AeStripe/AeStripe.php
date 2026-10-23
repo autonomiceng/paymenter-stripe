@@ -79,7 +79,7 @@ class AeStripe extends Gateway
         require __DIR__ . '/routes.php';
         // Register webhook route
         View::addNamespace('gateways.ae-stripe', __DIR__ . '/resources/views');
-        FilamentView::registerRenderHook(PanelsRenderHook::PAGE_START, fn () => $this->gatewayWarning());
+        FilamentView::registerRenderHook(PanelsRenderHook::CONTENT_START, fn () => $this->gatewayWarning());
         // Core boots disabled gateways too. Let the bundled listener own legacy subscriptions.
         if (!$this->bundledInactive(requireAbsent: true)) {
             return;
@@ -163,8 +163,8 @@ class AeStripe extends Gateway
         return [
             [
                 'name' => 'stripe_secret_key',
-                'label' => 'Stripe Restricted key',
-                'placeholder' => 'Enter your Stripe Restricted API key',
+                'label' => 'Stripe restricted API key',
+                'placeholder' => 'Enter your restricted API key',
                 'type' => 'text',
                 'encrypted' => true,
                 'description' => 'Find your API keys at https://dashboard.stripe.com/apikeys',
@@ -172,25 +172,25 @@ class AeStripe extends Gateway
             ],
             [
                 'name' => 'stripe_publishable_key',
-                'label' => 'Stripe Publishable Key',
-                'placeholder' => 'Enter your Stripe Publishable API key',
+                'label' => 'Stripe publishable key',
+                'placeholder' => 'Enter your publishable key',
                 'type' => 'text',
                 'description' => 'Find your API keys at https://dashboard.stripe.com/apikeys',
                 'required' => true,
             ],
             [
                 'name' => 'stripe_create_customers',
-                'label' => 'Create detailed Stripe customers',
+                'label' => 'Send address and phone to Stripe',
                 'type' => 'checkbox',
-                'description' => 'Controls the level of detail for Stripe customers. When enabled, customers include full address, phone, and company details. When disabled, customers include only basic information (name, email, user ID). Applies to both one-time payments and billing agreements.',
+                'description' => 'Include address, phone and company details for Stripe Tax and addresses on Stripe receipts.',
                 'required' => false,
             ],
             [
                 'name' => 'stripe_webhook_secret',
-                'label' => 'Stripe webhook secret (auto generated)',
+                'label' => 'Stripe webhook signing secret',
                 'type' => 'text',
                 'encrypted' => true,
-                'description' => 'Stripe webhook secret',
+                'description' => 'Created automatically when you enable the gateway. Refresh the page to see it.',
                 'required' => false,
             ],
         ];
