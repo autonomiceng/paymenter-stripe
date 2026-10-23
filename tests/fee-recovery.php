@@ -12,6 +12,8 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
     \Illuminate\Database\Migrations\Migrator::$ran = [];
     \Illuminate\Database\Schema\Blueprint::$primary = [];
     $gateway->boot();
+    Gateway::$enabled = true;
+    $gateway->retryPaymentFees();
     check(\Illuminate\Database\Schema\Blueprint::$primary === ['payment_intent_id'], 'Migration makes PaymentIntent unique');
     DB::$tables['stripe_saved_payment_fees']['sentinel'] = ['state' => 'completed'];
     $gateway->installed();

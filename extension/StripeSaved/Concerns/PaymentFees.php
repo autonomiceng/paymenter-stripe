@@ -29,6 +29,7 @@ trait PaymentFees
 
     private function feeRows()
     {
+        $this->ensurePaymentFeeSchema();
         return DB::table('stripe_saved_payment_fees');
     }
 

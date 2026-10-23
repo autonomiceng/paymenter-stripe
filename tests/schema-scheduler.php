@@ -16,25 +16,83 @@ $resetFeeSchema = function () {
         (new ReflectionProperty(StripeSaved::class, 'paymentFeeSchemaReady'))->setValue(null, false);
     }
 };
+$scenario = getenv('FEE_SCHEMA_SCENARIO') ?: 'all';
 $resetFeeSchema();
-$beforeSchedules = count(Schedule::$callbacks);
-$beforeCommands = count(Application::$callbacks);
 $schemaFailure = new RuntimeException('DDL unavailable');
-Schema::$beforeCheck = function () use (&$registrationAtCheck, $schemaFailure) {
-    $registrationAtCheck = [count(Schedule::$callbacks), count(Application::$callbacks)];
-    throw $schemaFailure;
-};
-try {
-    (new StripeSaved)->boot();
-    check($registrationAtCheck[0] === $beforeSchedules + 1, 'Fee schedule registered before schema checks');
-    check($registrationAtCheck[1] === $beforeCommands + 1, 'Adoption command registered before schema checks');
-    check(in_array($schemaFailure, $GLOBALS['reportedErrors'] ?? [], true), 'Schema failure reported without aborting boot');
-} finally {
-    Schema::$beforeCheck = null;
+if (in_array($scenario, ['all', 'boot'], true)) {
+    $beforeSchedules = count(Schedule::$callbacks);
+    $beforeCommands = count(Application::$callbacks);
+    $schemaChecks = Schema::$checks;
+    $reports = count($GLOBALS['reportedErrors'] ?? []);
+    Schema::$beforeCheck = function () use ($schemaFailure) { throw $schemaFailure; };
+    try {
+        (new StripeSaved)->boot();
+        (new StripeSaved)->boot();
+        check(Schema::$checks === $schemaChecks, 'Boot never checks or migrates the fee schema');
+        check(count($GLOBALS['reportedErrors'] ?? []) === $reports, 'Boot never reports fee schema failures');
+        check(count(Schedule::$callbacks) === $beforeSchedules + 2, 'Boot registers fee recovery without schema access');
+        check(count(Application::$callbacks) === $beforeCommands + 2, 'Boot registers adoption command without schema access');
+    } finally {
+        Schema::$beforeCheck = null;
+    }
+    $scheduledFee = end(Schedule::$events);
+    check($scheduledFee->singleServer, 'Fee recovery runs on one server');
+    check($scheduledFee->overlapMinutes === 55, 'Fee recovery mutex expires before the next hourly run');
 }
-$scheduledFee = end(Schedule::$events);
-check($scheduledFee->singleServer, 'Fee recovery runs on one server');
-check($scheduledFee->overlapMinutes === 55, 'Fee recovery mutex expires before the next hourly run');
+if (in_array($scenario, ['all', 'fee'], true)) {
+    $feeTables = DB::$tables;
+    $feePayments = \App\Helpers\ExtensionHelper::$payments;
+    $feeHandler = \Illuminate\Support\Facades\Http::$handler;
+    $feeEnabled = \App\Models\Gateway::$enabled;
+    $feeUser = \App\Models\User::$row;
+    $feeInvoice = \App\Models\Invoice::$row;
+    try {
+        \App\Models\Gateway::$enabled = true;
+        \App\Models\User::$row = new \App\Models\User(new \App\Models\Properties('cus_owner'));
+        \App\Models\Invoice::$row = new \App\Models\Invoice(\App\Models\User::$row);
+        \App\Helpers\ExtensionHelper::$payments['12:pi_schema'] = ['gateway' => 'StripeSaved', 'amount' => 20.0, 'status' => 'succeeded'];
+        \Illuminate\Support\Facades\Http::$handler = function ($verb, $path) {
+            check(!DB::$locked, 'First fee path resolves Stripe data before its transaction');
+            if ($path === '/balance_transactions/bt_schema') return ['fee' => 42, 'currency' => 'usd'];
+            throw new RuntimeException('Unexpected schema fixture request: ' . $path);
+        };
+        foreach (['webhook', 'scheduler'] as $entry) {
+            unset(DB::$tables['stripe_saved_payment_fees']);
+            \Illuminate\Database\Migrations\Migrator::$ran = [];
+            $resetFeeSchema();
+            Schema::$beforeCheck = function () { check(!DB::$locked, 'Fee schema check runs before DB transaction'); };
+            Schema::$beforeCreate = function () { check(!DB::$locked, 'Fee table DDL runs before DB transaction'); };
+            $firstGateway = new StripeSaved(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
+            if ($entry === 'webhook') {
+                $body = json_encode(['type' => 'charge.succeeded', 'data' => ['object' => [
+                    'id' => 'ch_schema', 'payment_intent' => 'pi_schema', 'balance_transaction' => 'bt_schema',
+                    'paid' => true, 'status' => 'succeeded',
+                ]]]);
+                $time = time();
+                $firstGateway->webhook(new \Illuminate\Http\Request(body: $body,
+                    signature: 't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.' . $body, 'whsec_test')));
+                check(count(\Illuminate\Database\Migrations\Migrator::$ran) === 1
+                    && (DB::$tables['stripe_saved_payment_fees']['pi_schema']['state'] ?? null) === 'completed',
+                    'First charge fee path creates the table and records the fee');
+            } else {
+                $firstGateway->retryPaymentFees();
+                check(isset(DB::$tables['stripe_saved_payment_fees']), 'First scheduled fee path creates the table');
+            }
+            $schemaChecks = Schema::$checks;
+            (new StripeSaved)->retryPaymentFees();
+            check(Schema::$checks === $schemaChecks, 'Successful fee schema check is reused across gateway instances: ' . $entry);
+        }
+    } finally {
+        Schema::$beforeCheck = Schema::$beforeCreate = null;
+        DB::$tables = $feeTables;
+        \App\Helpers\ExtensionHelper::$payments = $feePayments;
+        \Illuminate\Support\Facades\Http::$handler = $feeHandler;
+        \App\Models\Gateway::$enabled = $feeEnabled;
+        \App\Models\User::$row = $feeUser;
+        \App\Models\Invoice::$row = $feeInvoice;
+        $resetFeeSchema();
+    }
+}
 $schemaTable = DB::$tables['stripe_saved_payment_fees'] ?? null;
 unset(DB::$tables['stripe_saved_payment_fees']);
 $migration = require __DIR__ . '/../extension/StripeSaved/database/migrations/2026_10_22_000001_create_stripe_saved_payment_fees.php';
@@ -57,9 +115,5 @@ try {
     Schema::$beforeCreate = null;
     if ($schemaTable !== null) DB::$tables['stripe_saved_payment_fees'] = $schemaTable;
 }
-$schemaChecks = Schema::$checks;
-(new StripeSaved)->boot();
-(new StripeSaved)->boot();
-check(Schema::$checks === $schemaChecks + 1, 'Successful schema check is reused across gateway instances');
 $resetFeeSchema();
 if (realpath($_SERVER['SCRIPT_FILENAME']) === __FILE__) echo "PASS: $count schema/scheduler assertions\n";
