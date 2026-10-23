@@ -37,12 +37,14 @@ trait SubscriptionAttempt
             abort_unless(($subscription->id ?? null) === $attempt['subscription']
                 && is_string($subscription->status ?? null) && $subscription->status !== '', 409);
             $ended = in_array($subscription->status, ['canceled', 'incomplete_expired'], true);
-            $attempt = DB::transaction(function () use ($user, $property, $key, $data, $attempt, $ended) {
+            $attempt = DB::transaction(function () use ($user, $property, $key, $data, $attempt, $ended, $setupIntent, $subscription) {
                 $user = User::where('id', $user->id)->lockForUpdate()->firstOrFail();
                 $stored = $user->properties()->where('key', $property)->first()?->value;
                 // The Stripe read ran without a lock. Refuse if another request changed the attempt.
                 abort_unless($stored && json_decode($stored, true, flags: JSON_THROW_ON_ERROR) === $attempt, 409);
                 if (!$ended) return $attempt;
+                abort_unless(is_int($setupIntent->created ?? null) && is_int($subscription->created ?? null)
+                    && $setupIntent->created > $subscription->created, 409);
                 $replacement = ['key' => $key, 'data' => $data, 'created' => time()];
                 $user->properties()->updateOrCreate(['key' => $property], ['value' => json_encode($replacement, JSON_THROW_ON_ERROR)]);
                 return $replacement;

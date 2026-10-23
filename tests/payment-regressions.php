@@ -7,6 +7,107 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\{DB, Http, Log};
 
 (function () use ($gateway) {
+    $oldRows = Invoice::$rows;
+    $oldEnabled = Gateway::$enabled;
+    $oldAudits = Audit::$rows;
+    Gateway::$enabled = true;
+    $first = clone Invoice::$row;
+    $first->id = 212;
+    $second = clone $first;
+    $second->id = 213;
+    Invoice::$rows[$first->id] = $first;
+    Invoice::$rows[$second->id] = $second;
+    $settled = (object) ['id' => 'pi_review_invoice_identity', 'status' => 'succeeded', 'customer' => 'cus_foreign',
+        'amount' => 2000, 'amount_received' => 1250, 'currency' => 'usd',
+        'metadata' => (object) ['invoice_id' => $first->id, 'stripe_saved_gateway' => '1']];
+    $before = ExtensionHelper::$applications;
+    $records = count(Audit::$rows);
+    foreach ([$first, $second] as $invoice) {
+        $settled->metadata->invoice_id = $invoice->id;
+        $gateway->webhook(eventRequest($settled));
+        $gateway->webhook(eventRequest($settled));
+    }
+    $reviews = array_slice(Audit::$rows, $records);
+    check(count($reviews) === 2 && array_column($reviews, 'auditable_id') === [$first->id, $second->id],
+        'The same refused PaymentIntent retains one review on each invoice');
+    check(ExtensionHelper::$applications === $before,
+        'Invoice-specific refusal records cannot apply the charge');
+
+    $mapped = new class($first->user) extends Invoice {
+        public function getMorphClass() { return 'invoice'; }
+    };
+    $mapped->id = 214;
+    Invoice::$rows[$mapped->id] = $mapped;
+    $settled->id = 'pi_review_morph_identity';
+    $settled->metadata->invoice_id = $mapped->id;
+    DB::transaction(fn () => Audit::create([
+        'event' => 'stripe_saved_payment_review', 'auditable_type' => 'service', 'auditable_id' => $mapped->id,
+        'old_values' => [], 'new_values' => ['payment_intent_id' => $settled->id],
+    ]));
+    $records = count(Audit::$rows);
+    $gateway->webhook(eventRequest($settled));
+    $gateway->webhook(eventRequest($settled));
+    $review = end(Audit::$rows);
+    check(count(Audit::$rows) === $records + 1 && $review['auditable_type'] === $mapped->getMorphClass()
+        && $review['auditable_id'] === $mapped->id && $review['new_values']['payment_intent_id'] === $settled->id,
+        'A review on another morph type cannot suppress the mapped invoice review');
+    Invoice::$rows = $oldRows;
+    Audit::$rows = $oldAudits;
+    Gateway::$enabled = $oldEnabled;
+})();
+
+(function () use ($gateway) {
+    $oldRows = Invoice::$rows;
+    $oldEnabled = Gateway::$enabled;
+    $oldAudits = Audit::$rows;
+    Gateway::$enabled = true;
+    $invoice = clone Invoice::$row;
+    $invoice->id = 215;
+    $invoice->status = 'cancelled';
+    $invoice->currency_code = 'usd';
+    Invoice::$rows[$invoice->id] = $invoice;
+    $settled = (object) ['id' => 'pi_review_cancelled_checkout', 'status' => 'succeeded', 'customer' => 'cus_owner',
+        'amount' => 2000, 'amount_received' => 1250, 'currency' => 'usd',
+        'metadata' => (object) ['invoice_id' => $invoice->id, 'stripe_saved_gateway' => '1']];
+    $before = ExtensionHelper::$applications;
+    $records = count(Audit::$rows);
+    $calls = count(Http::$calls);
+    $locks = count(DB::$modelLocks);
+    $warnings = count(Log::$warnings);
+    $gateway->webhook(eventRequest($settled));
+    $gateway->webhook(eventRequest($settled));
+    check(ExtensionHelper::$applications === $before && $invoice->status === 'cancelled'
+        && !isset(ExtensionHelper::$payments[$invoice->id . ':' . $settled->id]),
+        'A settled checkout charge cannot be applied to a cancelled invoice');
+    $record = end(Audit::$rows);
+    check(count(Audit::$rows) === $records + 1 && $record['auditable_type'] === $invoice->getMorphClass()
+        && $record['auditable_id'] === $invoice->id
+        && $record['new_values']['payment_intent_id'] === $settled->id
+        && $record['new_values']['amount_minor'] === 1250 && $record['new_values']['currency'] === 'usd'
+        && $record['new_values']['reason'] === 'invoice not pending',
+        'Cancelled checkout success retains one invoice audit with received units and refusal reason');
+    check(array_slice(DB::$modelLocks, $locks, 4) === [\App\Models\User::class, Invoice::class,
+        \App\Models\InvoiceTransaction::class, Audit::class],
+        'Cancelled checkout refusal holds owner and invoice locks before the current audit read');
+    check(count(Http::$calls) === $calls, 'Cancelled checkout refusal makes no Stripe request');
+    check(array_slice(Log::$warnings, $warnings) === array_fill(0, 2, [
+        'StripeSaved payment received for nonpending invoice', ['invoice_id' => $invoice->id],
+    ]), 'Cancelled checkout warning contains only the constant message and invoice ID');
+
+    $settled->id = 'pi_review_cancelled_retry';
+    Audit::$fail = true;
+    rejects(fn () => $gateway->webhook(eventRequest($settled)), 'Review record unavailable');
+    $records = count(Audit::$rows);
+    $gateway->webhook(eventRequest($settled));
+    $gateway->webhook(eventRequest($settled));
+    check(count(Audit::$rows) === $records + 1 && ExtensionHelper::$applications === $before,
+        'Cancelled checkout audit failure retries without applying or losing the charge');
+    Invoice::$rows = $oldRows;
+    Audit::$rows = $oldAudits;
+    Gateway::$enabled = $oldEnabled;
+})();
+
+(function () use ($gateway) {
     $invoice = Invoice::$row;
     $user = $invoice->user;
     $oldStatus = $invoice->status;

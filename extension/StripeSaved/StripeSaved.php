@@ -258,6 +258,7 @@ class StripeSaved extends Gateway
                 continue;
             }
             $service = $item->reference;
+            if ($service->status === Service::STATUS_CANCELLED) continue;
             if ($service->subscription_id) {
                 $service->properties()->updateOrCreate(['key' => 'has_stripe_subscription'], ['value' => true]);
                 continue;

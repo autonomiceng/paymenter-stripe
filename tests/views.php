@@ -54,9 +54,22 @@ foreach (['pay', 'billing-agreement'] as $name) {
 $setupView = file_get_contents($views . 'billing-agreement.blade.php');
 check(str_contains($setupView, 'id="setup-consent" required disabled') && str_contains($setupView, 'I agree to save this payment method and allow charges to it for my future invoices, including renewals, when I am not present.')
     && str_contains($setupView, 'Saving does not turn on Auto Pay; you can choose it for a service later.'), 'Setup has an explicit future off-session opt-in');
-$consentPosition = strpos($setupView, 'setup-consent\')');
-$confirmPosition = strpos($setupView, 'stripe.confirmSetup');
-check($consentPosition !== false && $confirmPosition !== false && $consentPosition < $confirmPosition, 'Setup records consent before confirmation');
+$recordConsentCall = "await fetch(@js(route('extensions.gateways.stripe-saved.setup-consent'))";
+$confirmSetupCall = 'await stripe.confirmSetup(';
+$recordsConsentBeforeConfirmation = static function ($view) use ($recordConsentCall, $confirmSetupCall) {
+    $consentPosition = strpos($view, $recordConsentCall);
+    $confirmPosition = strpos($view, $confirmSetupCall);
+    return $consentPosition !== false && $confirmPosition !== false && $consentPosition < $confirmPosition;
+};
+check($recordsConsentBeforeConfirmation($setupView), 'Setup records consent before confirmation');
+check(!$recordsConsentBeforeConfirmation(str_replace($recordConsentCall, '', $setupView)),
+    'Setup order check rejects missing consent recording despite the DOM reference');
+check(!$recordsConsentBeforeConfirmation(str_replace($recordConsentCall, substr($recordConsentCall, strlen('await ')), $setupView)),
+    'Setup order check requires awaited consent recording');
+check(!$recordsConsentBeforeConfirmation(str_replace($confirmSetupCall, '', $setupView)),
+    'Setup order check rejects missing confirmation');
+check(!$recordsConsentBeforeConfirmation(strtr($setupView, [$recordConsentCall => $confirmSetupCall, $confirmSetupCall => $recordConsentCall])),
+    'Setup order check rejects confirmation before consent recording');
 check(str_contains($setupView, 'if (error) throw error;') && str_contains($setupView, 'message.replaceChildren(text);')
     && str_contains($setupView, 'finally {') && str_contains($setupView, 'setLoading(false);'), 'Setup errors remain in alert and unlock retry');
 

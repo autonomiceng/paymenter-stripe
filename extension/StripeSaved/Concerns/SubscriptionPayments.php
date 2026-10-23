@@ -86,7 +86,7 @@ trait SubscriptionPayments
             if (!$service) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
             if (InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first()) return;
             $invoiceId = $stripeInvoice->metadata->stripe_saved_invoice_id ?? null;
-            $invoice = $invoiceId ? ($this->subscriptionInvoices($service, pendingOnly: false)[$invoiceId] ?? null) : null;
+            $invoice = $invoiceId ? $service->invoiceItems()->where('invoice_id', $invoiceId)->first()?->invoice : null;
             if (!$invoice) {
                 $this->recordSubscriptionReview($stripeInvoice, 'Invoice binding missing or unrelated');
                 return;

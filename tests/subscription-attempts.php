@@ -9,21 +9,24 @@ use Illuminate\Support\Facades\{DB, Http};
     $oldEnabled = Gateway::$enabled;
     $oldProperties = $user->props->values;
     $oldSubscription = $service->subscription_id;
+    $oldStatus = $service->status;
     $oldServiceProperties = $service->properties->values;
     Gateway::$enabled = true;
     $property = 'stripe_saved_subscription_' . $service->id;
     $olderSetup = clone $setup;
     $olderSetup->id = 'seti_older';
+    $olderSetup->created = 1700000099;
     $data = ['customer' => 'cus_owner', 'start_date' => 'now', 'phases' => [['price' => 1999]]];
     $resolved = json_encode(['key' => 'sched_seti_newer_' . $service->id, 'data' => $data,
         'created' => time() - 86400, 'subscription' => 'sub_newer']);
     $status = 'active';
     $schedules = 0;
-    $handler = function ($verb, $path) use (&$status, &$schedules) {
+    $subscriptionCreated = 1700000100;
+    $handler = function ($verb, $path) use (&$status, &$schedules, &$subscriptionCreated) {
         check(!DB::$locked, 'Subscription HTTP requests run outside the user transaction');
         if ($path === '/subscriptions/sub_newer') {
             check($verb === 'get', 'Resolved subscription status is retrieved');
-            return ['id' => 'sub_newer', 'status' => $status];
+            return ['id' => 'sub_newer', 'status' => $status, 'created' => $subscriptionCreated];
         }
         if ($path === '/subscription_schedules') {
             ++$schedules;
@@ -63,20 +66,53 @@ use Illuminate\Support\Facades\{DB, Http};
             'A bound service skips the resolved attempt lookup on webhook replay');
 
         foreach (['canceled', 'incomplete_expired'] as $status) {
-            $user->props->values[$property] = $resolved;
-            $service->subscription_id = null;
-            $beforeSchedules = $schedules;
+            foreach ([1700000099, 1700000100, null, '1700000101', 1700000101.5] as $created) {
+                $olderSetup->created = $created;
+                $user->props->values[$property] = $resolved;
+                $service->subscription_id = null;
+                $beforeSchedules = $schedules;
+                for ($retry = 0; $retry < 2; ++$retry) {
+                    rejects(fn () => $gateway->webhook(eventRequest($olderSetup, type: 'setup_intent.succeeded')), 'HTTP 409');
+                    check($user->props->values[$property] === $resolved && $schedules === $beforeSchedules
+                        && $service->subscription_id === null,
+                        'Stale or noninteger SetupIntent cannot replace an ended subscription: ' . $status);
+                }
+            }
+            $newerSetup = clone $olderSetup;
+            $newerSetup->id = 'seti_newest';
+            $newerSetup->created = 1700000101;
+            foreach ([null, '1700000100', 1700000100.5] as $subscriptionCreated) {
+                rejects(fn () => $gateway->webhook(eventRequest($newerSetup, type: 'setup_intent.succeeded')), 'HTTP 409');
+                check($user->props->values[$property] === $resolved && $schedules === $beforeSchedules
+                    && $service->subscription_id === null, 'Missing or noninteger subscription creation time prevents replacement');
+            }
+            $subscriptionCreated = 1700000100;
             for ($retry = 0; $retry < 2; ++$retry) {
-                $gateway->webhook(eventRequest($olderSetup, type: 'setup_intent.succeeded'));
+                $gateway->webhook(eventRequest($newerSetup, type: 'setup_intent.succeeded'));
             }
             $attempt = json_decode($user->props->values[$property], true);
             check($service->subscription_id === 'sub_older' && $schedules === $beforeSchedules + 1
-                && $attempt['key'] === 'sched_seti_older_' . $service->id && $attempt['subscription'] === 'sub_older',
-                'An ended subscription allows exactly one replacement schedule: ' . $status);
+                && $attempt['key'] === 'sched_seti_newest_' . $service->id && $attempt['subscription'] === 'sub_older',
+                'A newer integer SetupIntent allows exactly one replacement schedule: ' . $status);
             $before = count(Http::$calls);
-            check(invoke($gateway, 'subscriptionAttempt', $user, $olderSetup, $service, $data) === 'sub_older'
+            check(invoke($gateway, 'subscriptionAttempt', $user, $newerSetup, $service, $data) === 'sub_older'
                 && count(Http::$calls) === $before, 'The same resolved key returns without any Stripe lookup');
         }
+
+        $service->status = \App\Models\Service::STATUS_CANCELLED;
+        foreach ([null, 'sub_existing'] as $subscriptionId) {
+            $service->subscription_id = $subscriptionId;
+            $service->properties->values = [];
+            $user->props->values[$property] = $resolved;
+            $before = count(Http::$calls);
+            invoke($gateway, 'setupSubscription', $newerSetup);
+            check($service->subscription_id === $subscriptionId && $service->properties->values === []
+                && $user->props->values[$property] === $resolved
+                && count(array_filter(array_slice(Http::$calls, $before), fn ($call) =>
+                    in_array($call[1], ['/products/search', '/subscription_schedules', '/subscriptions/sub_newer'], true))) === 0,
+                'Cancelled service skips schedule creation and listener marker repair');
+        }
+        $service->status = $oldStatus;
 
         $failures = [new ConnectionException('Connection refused'), new ConnectionException('Request timed out'),
             new RequestException(404), new RequestException(503), new JsonException('Invalid JSON'),
@@ -123,6 +159,7 @@ use Illuminate\Support\Facades\{DB, Http};
         Gateway::$enabled = $oldEnabled;
         $user->props->values = $oldProperties;
         $service->subscription_id = $oldSubscription;
+        $service->status = $oldStatus;
         $service->properties->values = $oldServiceProperties;
     }
 })();
