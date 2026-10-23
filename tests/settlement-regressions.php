@@ -213,3 +213,64 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     Service::$row = $oldService;
     Invoice::$rows = $oldRows;
 })();
+
+(function () use ($gateway) {
+    $oldHandler = Http::$handler;
+    $oldEnabled = Gateway::$enabled;
+    $oldService = Service::$row;
+    $oldRows = Invoice::$rows;
+    try {
+        Gateway::$enabled = true;
+        $invoice = clone Invoice::$row;
+        $invoice->id = 412;
+        $invoice->currency_code = 'usd';
+        Invoice::$rows[$invoice->id] = $invoice;
+        $unrelatedInvoice = clone $invoice;
+        $unrelatedInvoice->id = 999;
+        Invoice::$rows[$unrelatedInvoice->id] = $unrelatedInvoice;
+        $service = Service::$row = new Service;
+        $service->subscription_id = 'sub_bound_query';
+        $unrelatedItem = new class {
+            public $invoice_id = 411;
+            public function __get($key) { throw new RuntimeException('Bound settlement must not load unrelated invoice history'); }
+        };
+        $service->invoiceRows = [$unrelatedItem, (object) ['invoice_id' => 412, 'invoice' => $invoice]];
+        $intent = (object) ['id' => 'pi_bound_query', 'status' => 'succeeded', 'amount' => 2000,
+            'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner'];
+        $stripeInvoice = (object) ['id' => 'in_bound_query', 'currency' => 'usd', 'amount_paid' => 2000,
+            'metadata' => (object) ['stripe_saved_invoice_id' => 412],
+            'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) [
+                'subscription' => $service->subscription_id]]];
+        Http::$handler = function ($verb, $path) use ($intent) {
+            if ($verb === 'get' && $path === '/invoice_payments') return ['data' => [
+                ['status' => 'paid', 'amount_paid' => 2000,
+                    'payment' => ['type' => 'payment_intent', 'payment_intent' => $intent->id]]]];
+            if ($verb === 'get' && $path === '/payment_intents/' . $intent->id) return $intent;
+            throw new RuntimeException('Unexpected bound query request: ' . $path);
+        };
+        foreach (['pending', 'paid'] as $status) {
+            $invoice->status = $status;
+            $intent->id = 'pi_bound_query_' . $status;
+            $before = ExtensionHelper::$applications;
+            invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice);
+            invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice);
+            check(ExtensionHelper::$applications === $before + 1
+                && ExtensionHelper::$payments['412:' . $intent->id]['amount'] === 20.0,
+                'Bound settlement loads only the requested related invoice: ' . $status);
+        }
+        $intent->id = 'pi_bound_query_absent';
+        $before = ExtensionHelper::$applications;
+        $records = count(Audit::$rows);
+        foreach ([null, 999] as $binding) {
+            $stripeInvoice->metadata->stripe_saved_invoice_id = $binding;
+            invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice);
+            check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records,
+                'Absent or unrelated binding cannot settle through the filtered relation');
+        }
+    } finally {
+        Http::$handler = $oldHandler;
+        Gateway::$enabled = $oldEnabled;
+        Service::$row = $oldService;
+        Invoice::$rows = $oldRows;
+    }
+})();

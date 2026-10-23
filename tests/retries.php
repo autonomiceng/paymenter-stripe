@@ -80,6 +80,7 @@ rejects(fn () => invoke($gateway, 'subscriptionAttempt', $user, $setup, $service
 check(count(Http::$calls) === $before, 'Expired unresolved schedule attempt cannot create a duplicate');
 $newSetup = clone $setup;
 $newSetup->id = 'seti_resubscribe';
+$newSetup->created = 1700000101;
 rejects(fn () => invoke($gateway, 'subscriptionAttempt', $user, $newSetup, $service, $data), 'HTTP 409');
 check(count(Http::$calls) === $before, 'Different setup key cannot replace an unresolved schedule attempt');
 // A completed attempt survives cancellation; a new SetupIntent starts a new lifecycle.
@@ -89,7 +90,7 @@ $service->subscription_id = 'sub_recovered';
 $service->properties->values['has_stripe_subscription'] = '1';
 Http::$handler = function ($verb, $path) {
     return match ($path) {
-        '/subscriptions/sub_recovered' => ['id' => 'sub_recovered', 'status' => 'canceled'],
+        '/subscriptions/sub_recovered' => ['id' => 'sub_recovered', 'status' => 'canceled', 'created' => 1700000100],
         '/customers/cus_owner' => ['id' => 'cus_owner'],
         '/payment_methods/pm_test' => ['id' => 'pm_test', 'customer' => 'cus_owner'],
         '/products/search' => ['data' => [['id' => 'prod_test']]],

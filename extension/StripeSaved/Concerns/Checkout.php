@@ -121,6 +121,11 @@ trait Checkout
                 if ($status === 'succeeded') $this->recordRefusedPayment($invoice, $intent, 'currency mismatch');
                 return;
             }
+            if ($status === 'succeeded' && !in_array($invoice->status, ['pending', 'paid'], true)) {
+                \Illuminate\Support\Facades\Log::warning('StripeSaved payment received for nonpending invoice', ['invoice_id' => $invoice->id]);
+                $this->recordRefusedPayment($invoice, $intent, 'invoice not pending');
+                return;
+            }
             if ($status === 'succeeded' && $invoice->status === 'paid') {
                 \Illuminate\Support\Facades\Log::warning('StripeSaved payment received for paid invoice', ['invoice_id' => $invoice->id]);
             }
@@ -134,8 +139,9 @@ trait Checkout
 
     private function recordRefusedPayment($invoice, $intent, string $reason): void
     {
-        // The caller holds the user and invoice locks. Keep one staff record per PaymentIntent.
-        if (Audit::where('event', 'stripe_saved_payment_review')->where('new_values->payment_intent_id', $intent->id)->lockForUpdate()->first()) return;
+        // The caller holds the user and invoice locks. Keep one staff record per invoice and PaymentIntent.
+        if (Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
+            ->where('event', 'stripe_saved_payment_review')->where('new_values->payment_intent_id', $intent->id)->lockForUpdate()->first()) return;
         Audit::create([
             'event' => 'stripe_saved_payment_review',
             'auditable_type' => $invoice->getMorphClass(), 'auditable_id' => $invoice->id,

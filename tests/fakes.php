@@ -125,7 +125,7 @@ namespace App\Models {
     }
     class Service {
         public const STATUS_CANCELLED = 'cancelled';
-        public $user_id = 7;
+        public $user_id = 7, $status = 'active';
         public $id = 41, $subscription_id = 'sub_test', $price = '19.99', $quantity = 3;
         public static $row;
         public $currency, $plan, $product, $properties;
@@ -135,6 +135,11 @@ namespace App\Models {
         public function properties() { return $this->properties; }
         public function invoiceItems() { return new class($this->invoiceRows) {
             public function __construct(private $rows) {}
+            public function where($key, $value) {
+                if ($key !== 'invoice_id') throw new \RuntimeException('Unexpected invoice item filter: ' . $key);
+                $this->rows = array_filter($this->rows, fn ($row) => ($row->invoice_id ?? $row->invoice->id) == $value);
+                return $this;
+            }
             public function whereHas($relation, $callback) { $this->rows = array_filter($this->rows, fn ($row) => $row->invoice->status === 'pending'); return $this; }
             public function get() { return $this->rows; }
             public function latest($field) { usort($this->rows, fn ($a, $b) => $b->created_at <=> $a->created_at); return $this; }
