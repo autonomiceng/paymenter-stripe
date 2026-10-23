@@ -47,7 +47,7 @@ namespace App\Models {
         public function exists() { return (bool) $this->value; }
         public function firstOrFail() { return $this->value ?? throw new \RuntimeException('Missing row'); }
         public function where($key, $value) { return $this; }
-        public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $hook(); } \Illuminate\Support\Facades\DB::$locked = true; \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
+        public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $hook(); } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
     }
     class Properties {
         public array $values = [];
@@ -359,18 +359,21 @@ namespace Illuminate\Support\Facades {
         public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } }; }
         public static $concurrentAgreements = [];
         public static function table($name) { return $name === 'ae_stripe_payment_fees' ? new \FeeQuery : new \AdoptionQuery($name); }
-        public static $beforeUserLock = null;
-        public static $locked = false;
+        public static $beforeUserLock = null, $afterTransaction = null;
+        public static $locked = false, $userLocked = false;
         public static $modelLocks = [];
         public static function transaction($callback) {
+            $priorUserLock = self::$userLocked;
             $before = self::$tables;
             $agreements = \App\Helpers\ExtensionHelper::$agreements;
             $fees = \App\Helpers\ExtensionHelper::$fees;
             $audit = \App\Models\Audit::$rows;
             $notifications = \App\Models\Notification::$rows;
             self::$locked = true;
-            try { return $callback(); } catch (\Throwable $e) { self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
-            finally { self::$locked = false; }
+            try { $result = $callback(); } catch (\Throwable $e) { self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
+            finally { self::$locked = false; self::$userLocked = $priorUserLock; }
+            if ($hook = self::$afterTransaction) { self::$afterTransaction = null; $hook(); }
+            return $result;
         }
     }
     class Log { public static $lines = [], $contexts = [], $warnings = [], $errors = []; public static function info($message, $context = []) { self::$lines[] = $message; self::$contexts[] = $context; } public static function warning($message, $context = []) { self::$warnings[] = [$message, $context]; } public static function error($message, $context = []) { self::$errors[] = [$message, $context]; } }

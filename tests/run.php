@@ -230,4 +230,5 @@ require __DIR__ . '/schema-scheduler.php';
 require __DIR__ . '/native-upgrade.php';
 require __DIR__ . '/agreement-persistence.php';
 require __DIR__ . '/card-dedupe.php';
+require __DIR__ . '/card-dedupe-races.php';
 echo "PASS: $count offline assertions\n";

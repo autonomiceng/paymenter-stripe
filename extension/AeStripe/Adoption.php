@@ -138,7 +138,11 @@ final class Adoption
             if (($outcomes[$method] ?? '') === 'ok') continue;
             $this->store->throttle();
             try {
-                $this->store->stripe($key, 'post', '/payment_methods/' . $method, ['allow_redisplay' => 'always']);
+                $this->store->transaction(function () use ($plan, $row, $key, $method) {
+                    $this->store->lockUser((int) $row['user_id']);
+                    if ($this->manifestSnapshot($plan) !== $plan['after']) throw new AdoptionRefusal('Redisplay drift; review ownership first');
+                    $this->store->stripe($key, 'post', '/payment_methods/' . $method, ['allow_redisplay' => 'always']);
+                });
                 $outcomes[$method] = 'ok';
             } catch (\Throwable $e) {
                 // Transport errors can contain secrets/PII; record a safe retry status only.

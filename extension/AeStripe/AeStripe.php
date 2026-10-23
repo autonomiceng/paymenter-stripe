@@ -526,7 +526,15 @@ class AeStripe extends Gateway
      */
     private function createOrGetStripeCustomer($user, $includeDetails = true)
     {
-        $stripeCustomerId = $user->properties()->where('key', 'stripe_id')->first();
+        return \Illuminate\Support\Facades\DB::transaction(function () use ($user, $includeDetails) {
+            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+            return $this->lockedStripeCustomer($user, $includeDetails);
+        });
+    }
+
+    private function lockedStripeCustomer($user, bool $includeDetails)
+    {
+        $stripeCustomerId = $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first();
 
         if ($stripeCustomerId) {
             try {
@@ -605,13 +613,23 @@ class AeStripe extends Gateway
 
     public function cancelBillingAgreement(BillingAgreement $billingAgreement): bool
     {
-        try {
-            $request = $this->request('post', '/payment_methods/' . $billingAgreement->external_reference . '/detach');
-        } catch (Exception $e) {
-            // If the payment method is already removed, we still delete the billing agreement
-        }
-
-        return true;
+        return \Illuminate\Support\Facades\DB::transaction(function () use ($billingAgreement) {
+            $user = User::where('id', $billingAgreement->user_id)->lockForUpdate()->firstOrFail();
+            $current = BillingAgreement::withTrashed()->where('external_reference', $billingAgreement->external_reference)->lockForUpdate()->first();
+            if (!$current) return false;
+            $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail();
+            if ($current->id != $billingAgreement->id || $current->user_id != $user->id || $current->gateway_id != $gateway->id) return false;
+            if ($current->trashed()) return true;
+            $method = $this->request('get', '/payment_methods/' . $current->external_reference);
+            if (($method->customer ?? null) === null) return true;
+            if (!$this->methodCustomerMatches($user, $method, current: true)) return false;
+            try {
+                $this->request('post', '/payment_methods/' . $current->external_reference . '/detach');
+            } catch (Exception $e) {
+                // Native cancellation still removes the local agreement after a Stripe failure.
+            }
+            return true;
+        });
     }
 
     public function setupAgreement(Request $request)
