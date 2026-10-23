@@ -43,6 +43,15 @@ Both delivery paths serialize settlement on the customer and use locking current
 reads to skip a successful transaction globally, so one PaymentIntent cannot settle two local invoices. A resumed
 3DS attempt shows and preserves its existing consent without changing payment preferences.
 
+Agreement saves use a locking current read by the globally unique payment method
+reference, including soft-deleted rows. Retries reuse only the same user's agreement
+on the same gateway, including after an insert race. Removed methods stay removed
+to preserve the deletion and service payment preferences. The setup return shows a
+clear refusal notification; webhooks log and acknowledge permanent ownership or
+deletion conflicts. Request and database failures remain retryable. Offline tests
+cover stale snapshots and insert conflicts with fakes; real MariaDB concurrency
+still needs the sandbox checks below.
+
 Checkout renders persist a retry key and PaymentIntent ID in native user properties
 before and after creation. Reopening retrieves the same unfinished intent. A changed
 invoice payload, finished/cancelled intent, or unresolved creation older than 23 hours
@@ -114,8 +123,12 @@ top-level `setup_future_usage` with an empty form value. During authentication,
 consent changes still return 409 and resuming performs no update. Include an
 unfinished intent from the earlier release in the sandbox consent checks.
 
+Fee recovery requires read access to Charges, PaymentIntents, Invoices, Invoice
+Payments and Balance Transactions. Check the full [Stripe API permissions](settings.md#stripe-api-permissions)
+with the configured restricted key in the sandbox.
+
 Fee recovery uses the `stripe_saved_payment_fees` extension table, created on install
-or the first boot after upgrading to 0.1.1. Keep Paymenter's scheduler running every minute. The hourly
+or upgrade, with a fallback on the first fee operation. Keep Paymenter's scheduler running every minute. The hourly
 recovery task checks pending fees in batches of 100, ordered by attempt count.
 A missing balance transaction, missing fee data or invalid conversion rate stays pending.
 Pending funds already have a final fee. No rate is estimated.

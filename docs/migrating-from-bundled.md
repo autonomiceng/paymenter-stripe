@@ -27,8 +27,9 @@ soft delete (`deleted_at`), which preserves the row for rollback.
    Keep both endpoints disabled during the database and redisplay steps.
    Each gateway needs its configured secret, publishable and webhook signing keys.
    Every invocation requires exactly one `GET /v1/account` with each secret key;
-   restricted keys must permit that read. The fork key also needs payment-method
-   write permission for optional redisplay. There is no bypass. Account IDs and key
+   restricted keys must permit that read. The fork key also needs `POST /v1/payment_methods/{id}`
+   write access for optional redisplay and the full [Stripe API permissions](settings.md#stripe-api-permissions)
+   for normal operation. There is no bypass. Account IDs and key
    test/live modes must match. The command never changes webhook configuration.
 3. From the Paymenter root, as its application user, review a dry run:
 
@@ -37,13 +38,22 @@ soft delete (`deleted_at`), which preserves the row for rollback.
    php artisan stripe-saved:adopt-bundled --confirm-paused --apply --plan='<digest>'
    ```
 
+   Retired bundled rows are ignored only when they have no live agreements, service
+   references or Stripe subscriptions. Historical transactions do not block adoption.
+   If several bundled candidates remain, the command lists their IDs and requires
+   `--source-gateway=ID` on both dry run and apply. For example, select source #62
+   with `--source-gateway=62`; keep retired #28 and its history. Rollback and
+   redisplay use the source ID in the manifest, without a selector.
+
    The first command prints counts, agreement IDs, changed service IDs, canonical duplicate IDs,
    inactive states and a SHA-256 plan digest. It performs no database writes or Stripe
    writes. Copy that digest into the second command. Any drift in the reviewed scope
    refuses apply: rerun the dry run and review again. All agreements on both gateways,
    including soft-deleted rows, referenced services, agreement properties and gateway
    settings are locked and checked in one transaction. Apply refuses if either
-   gateway is already soft-deleted. Gateway enable/name changes
+   gateway is already soft-deleted. Apply turns off bundled Stripe in the same
+   transaction as ownership changes. Its original enabled state is recorded for
+   rollback; changes to that state require a new dry run. Gateway name changes
    are outside the ownership plan; gateway identity/removal and settings are checked.
 
    All bundled agreements move to the fork. Duplicate user/method pairs retain the
@@ -85,8 +95,9 @@ soft delete (`deleted_at`), which preserves the row for rollback.
    only the bundled retirement exception described below. Changing
    gateway settings, creating an agreement, or renewing a referenced service blocks
    both commands for that manifest; neither offers a continuation override.
-4. Make the rollback decision before allowing new activity. After adoption apply
-   and optional redisplay, use **Delete** on the bundled **Stripe** gateway in
+4. Make the rollback decision before allowing new activity. Apply has already turned
+   off bundled Stripe. After adoption and optional redisplay, use **Delete** on the
+   bundled **Stripe** gateway in
    Paymenter's admin gateway list. This soft-deletes its row: bundled disappears
    from checkout and its webhook route stops booting. Do not hard-delete the row
    or uninstall its source files. Ensure the fork gateway is **enabled before enabling its endpoint**.
@@ -108,10 +119,12 @@ Finish or expire fork checkout sessions; keep both endpoints stopped during rest
 php artisan stripe-saved:adopt-bundled --confirm-paused --rollback='<manifest>.json'
 ```
 
-This restores the bundled gateway row (`deleted_at` back to null), original gateway ownership, duplicate deleted states and service
+This restores the bundled gateway row (`deleted_at` back to null), its exact original
+enabled state, original gateway ownership, duplicate deleted states and service
 references in one locked transaction, only if all scoped rows/settings still match
 its recorded after-state, except for the bundled row's retirement `deleted_at`.
-Any other drift (including renewal updates to a referenced service)
+Older manifests do not record enabled state; rollback preserves its current value
+for those manifests. Any other drift (including renewal updates to a referenced service)
 refuses rollback. There is no override or reviewed-continuation mode: use a
 separately reviewed recovery/backup procedure instead, accounting for settled payments. It never reverses
 Stripe redisplay, charges, invoices or webhook changes. Verify the restored bundled gateway is active; the fork hides at checkout while bundled is active. Enable only the bundled

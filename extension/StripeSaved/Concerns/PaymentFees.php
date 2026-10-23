@@ -29,6 +29,7 @@ trait PaymentFees
 
     private function feeRows()
     {
+        $this->ensurePaymentFeeSchema();
         return DB::table('stripe_saved_payment_fees');
     }
 
@@ -84,6 +85,18 @@ trait PaymentFees
         if (Audit::where('event', 'stripe_saved_payment_review')->where('new_values->payment_intent_id', $paymentId)->first()) return false;
         $invoiceId = $charge->invoice ?? $intent->invoice ?? null;
         if (is_object($invoiceId)) $invoiceId = $invoiceId->id ?? null;
+        if (!$invoiceId && !isset($intent->metadata->invoice_id)) {
+            $payments = $this->request('get', '/invoice_payments', [
+                'payment' => ['type' => 'payment_intent', 'payment_intent' => $paymentId],
+                'status' => 'paid', 'limit' => 2,
+            ]);
+            if (($payments->has_more ?? false) || !is_array($payments->data ?? null) || count($payments->data) !== 1) return false;
+            $payment = $payments->data[0];
+            if (($payment->status ?? null) !== 'paid' || ($payment->payment->type ?? null) !== 'payment_intent'
+                || ($payment->payment->payment_intent ?? null) !== $paymentId) return false;
+            $invoiceId = $payment->invoice ?? null;
+            if (is_object($invoiceId)) $invoiceId = $invoiceId->id ?? null;
+        }
         if ($invoiceId && Audit::where('event', 'stripe_saved_subscription_review')
             ->where('new_values->stripe_invoice_id', $invoiceId)->first()) return false;
         if (isset($intent->metadata->invoice_id) && $this->ownsWebhookObject($intent, 'charge.succeeded')) return true;

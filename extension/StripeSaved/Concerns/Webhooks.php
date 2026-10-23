@@ -2,6 +2,7 @@
 
 namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
 
+use App\Exceptions\DisplayException;
 use App\Models\Service;
 use Illuminate\Http\Request;
 
@@ -59,7 +60,11 @@ trait Webhooks
                     break;
                 }
                 $this->recordIntentPayment($paymentIntent, 'succeeded');
-                $this->savePaidMethod($paymentIntent);
+                try {
+                    $this->savePaidMethod($paymentIntent);
+                } catch (DisplayException $e) {
+                    \Illuminate\Support\Facades\Log::warning('StripeSaved saved method refused', ['reason' => $e->getMessage()]);
+                }
                 break;
             case 'payment_intent.payment_failed':
                 $paymentIntent = $event->data->object; // contains a StripePaymentIntent
@@ -76,7 +81,11 @@ trait Webhooks
                 $setupIntent = $event->data->object; // contains a StripeSetupIntent
                 // If it's a billing agreement, call setupBillingAgreement
                 if (($setupIntent->metadata->is_billing_agreement ?? null) === '1') {
-                    $this->setupBillingAgreement($setupIntent);
+                    try {
+                        $this->setupBillingAgreement($setupIntent);
+                    } catch (DisplayException $e) {
+                        \Illuminate\Support\Facades\Log::warning('StripeSaved saved method refused', ['reason' => $e->getMessage()]);
+                    }
                 } elseif (isset($setupIntent->metadata->invoice_id)) {
                     $this->setupSubscription($setupIntent);
                 }

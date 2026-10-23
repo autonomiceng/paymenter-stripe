@@ -11,7 +11,8 @@ namespace Illuminate\Console {
     }
     class Application { public static $callbacks = []; public static function starting($callback) { self::$callbacks[] = $callback; } }
 }
-namespace App\Exceptions { class DisplayException extends \RuntimeException {} }
+namespace App\Exceptions { class DisplayException extends \Exception {} }
+namespace Illuminate\Database { class UniqueConstraintViolationException extends \RuntimeException {} }
 namespace Illuminate\Http\Client {
     class ConnectionException extends \RuntimeException {}
     class RequestException extends \RuntimeException {
@@ -65,6 +66,9 @@ namespace App\Models {
     }
     class User {
         public static $row;
+        public static $staff = false, $gatewayUpdate = false;
+        public function canAccessPanel($panel) { return self::$staff; }
+        public function can($ability, $model) { return self::$gatewayUpdate; }
         public $id = 7;
         public $name = 'Test';
         public $email = 'user@example.test';
@@ -95,7 +99,7 @@ namespace App\Models {
             return self::$rows[$id] ?? ($id == self::$row->id ? self::$row : throw new \RuntimeException('Missing invoice'));
         }
     }
-    class Gateway {
+    class Gateway extends Extension {
         public static $rows = null;
         public static $enabled = true;
         public static $present = true, $deleted = false;
@@ -115,18 +119,43 @@ namespace App\Models {
                     }
                     return false;
                 });
-                return new \AdoptionCollection($rows);
+                return new NativeModelQuery($rows);
             }
             $bundled = $value === 'Stripe';
             $present = $bundled ? self::$bundled : self::$present;
             $deleted = $bundled ? self::$bundledDeleted : self::$deleted;
-            return new Query($present && ($withTrashed || !$deleted)
-                ? (object) ['id' => $bundled ? 1 : 2, 'enabled' => $bundled ? self::$bundledEnabled : self::$enabled] : null);
+            return new NativeModelQuery($present && ($withTrashed || !$deleted)
+                ? [new Extension(['id' => $bundled ? 1 : 2, 'extension' => $value, 'enabled' => $bundled ? self::$bundledEnabled : self::$enabled])] : []);
         }
+    }
+    class NativeModelQuery implements \IteratorAggregate {
+        public function __construct(private array $rows) {}
+        public static function table($table) { return new self(array_map(fn ($r) => (object) $r, \Illuminate\Support\Facades\DB::$tables[$table] ?? [])); }
+        public function where($key, $value) { $this->rows = array_filter($this->rows, fn ($r) => ($r->$key ?? null) == $value); return $this; }
+        public function whereIn($key, $values) { $this->rows = array_filter($this->rows, fn ($r) => in_array($r->$key ?? null, (array) $values)); return $this; }
+        public function whereNull($key) { return $this->where($key, null); }
+        public function whereNotNull($key) { $this->rows = array_filter($this->rows, fn ($r) => ($r->$key ?? null) !== null); return $this; }
+        public function whereHas($relation, $callback) {
+            $this->rows = array_filter($this->rows, function ($r) use ($callback) {
+                $query = self::table('properties')->where('model_id', $r->id)->where('model_type', Service::class);
+                $callback($query); return $query->exists();
+            }); return $this;
+        }
+        public function lockForUpdate() { \Illuminate\Support\Facades\DB::$locked = true; \Illuminate\Support\Facades\DB::$modelLocks[] = Gateway::class; return $this; }
+        public function get() { return $this; }
+        public function first() { return reset($this->rows) ?: null; }
+        public function firstOrFail() { return $this->first() ?? throw new \RuntimeException('Missing row'); }
+        public function exists() { return (bool) $this->rows; }
+        public function pluck($key) { return array_map(fn ($r) => $r->$key, array_values($this->rows)); }
+        public function count() { return count($this->rows); }
+        public function getIterator(): \Traversable { return new \ArrayIterator($this->rows); }
     }
     class Service {
         public const STATUS_CANCELLED = 'cancelled';
+        public static function whereIn($key, $values) { return NativeModelQuery::table('services')->whereIn($key, $values); }
+        public static function whereNull($key) { return NativeModelQuery::table('services')->whereNull($key); }
         public $user_id = 7, $status = 'active';
+        public $billing_agreement_id = null, $auto_pay = false;
         public $id = 41, $subscription_id = 'sub_test', $price = '19.99', $quantity = 3;
         public static $row;
         public $currency, $plan, $product, $properties;
@@ -155,8 +184,58 @@ namespace App\Models {
         }
         public function isDirty($field) { return in_array($field, $this->dirty); }
     }
-    class BillingAgreement { public $external_reference = 'pm_test', $id = 4; }
-    class Extension {}
+    class BillingAgreement {
+        public $external_reference = 'pm_test', $id = 4;
+        public static ?array $snapshot = null;
+        public static $beforeInsert = null;
+        public static function withTrashed() { return new AgreementQuery(true); }
+        public static function where($key, $value) { return (new AgreementQuery)->where($key, $value); }
+        public function __construct(private array $attributes = []) {
+            $this->external_reference = $attributes['external_reference'] ?? 'pm_test';
+            $this->id = $attributes['id'] ?? 4;
+        }
+        public function __get($key) { return $this->attributes[$key] ?? null; }
+        public function trashed() { return $this->deleted_at !== null; }
+        public function update($data) {
+            \App\Helpers\ExtensionHelper::$agreements[$this->attributes['external_reference']] = array_replace($this->attributes, $data);
+        }
+    }
+    class AgreementQuery {
+        private array $filters = [];
+        private bool $current = false;
+        public function __construct(private bool $trashed = false) {}
+        public function where($key, $value) { $this->filters[$key] = $value; return $this; }
+        public function lockForUpdate() { $this->current = true; return $this; }
+        private function nativeRows() {
+            $q = NativeModelQuery::table('billing_agreements');
+            if (!$this->trashed) $q->whereNull('deleted_at');
+            foreach ($this->filters as $key => $value) $q->where($key, $value);
+            return $q;
+        }
+        public function exists() { return $this->nativeRows()->exists(); }
+        public function pluck($key) { return $this->nativeRows()->pluck($key); }
+        public function first() {
+            $rows = $this->current ? \App\Helpers\ExtensionHelper::$agreements : (BillingAgreement::$snapshot ?? \App\Helpers\ExtensionHelper::$agreements);
+            foreach ($rows as $id => $row) {
+                $row += ['external_reference' => $id, 'deleted_at' => null];
+                if (!$this->trashed && $row['deleted_at'] !== null) continue;
+                foreach ($this->filters as $key => $value) if (($row[$key] ?? null) != $value) continue 2;
+                return new BillingAgreement($row);
+            }
+            return null;
+        }
+    }
+    #[\AllowDynamicProperties]
+    class Extension {
+        public function __construct(array $values = []) { foreach ($values as $k => $v) $this->$k = $v; }
+        public function settings() { return new class { public function where($k, $v) { return new Query((object) ['value' => 'whsec_test']); } }; }
+        public function wasChanged($key) { return $this->changed ?? false; }
+        public function update($values) {
+            foreach ($values as $k => $v) $this->$k = $v;
+            foreach (\Illuminate\Support\Facades\DB::$tables['extensions'] ?? [] as $i => $r) if ($r['id'] == $this->id) \Illuminate\Support\Facades\DB::$tables['extensions'][$i] = array_replace($r, $values);
+            if (Gateway::$rows === null && ($this->extension ?? '') === 'Stripe') Gateway::$bundledEnabled = $this->enabled;
+        }
+    }
     class Audit {
         public static $rows = [], $fail = false;
         public static function where($key, $value) { return new class($key, $value) {
@@ -213,8 +292,19 @@ namespace App\Helpers {
         public static function addPaymentFee($id, $fee) { ++self::$feeWrites; self::$fees[$id] = $fee; }
         public static function makeBillingAgreement($user, $gateway, $name, $id, $type, $expiry) {
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Agreement lock missing');
-            self::$agreements[$id] = compact('name', 'gateway', 'type', 'expiry');
+            $gateway_id = \App\Models\Gateway::where('extension', $gateway)->firstOrFail()->id;
+            $row = \App\Models\BillingAgreement::where('external_reference', $id)->where('user_id', $user->id)->where('gateway_id', $gateway_id)->first();
+            if (!$row) {
+                if ($hook = \App\Models\BillingAgreement::$beforeInsert) {
+                    \App\Models\BillingAgreement::$beforeInsert = null;
+                    $hook();
+                }
+                if (isset(self::$agreements[$id])) throw new \Illuminate\Database\UniqueConstraintViolationException('Duplicate external_reference');
+            }
+            self::$agreements[$id] = compact('name', 'gateway', 'type', 'expiry', 'gateway_id')
+                + ['id' => 4, 'external_reference' => $id, 'user_id' => $user->id, 'deleted_at' => null];
             if (self::$agreementFailure) { self::$agreementFailure = false; throw new \RuntimeException('Interrupted agreement response'); }
+            return new \App\Models\BillingAgreement(self::$agreements[$id]);
         }
         // Native helper updateOrCreate is keyed by invoice + transaction_id under an invoice lock.
         public static function addPayment($invoice, $gateway, $amount, $fee, $id, $status = 'succeeded') {
@@ -237,11 +327,11 @@ namespace Illuminate\Http {
 }
 namespace Illuminate\Support\Facades {
     class Route {
-        public static $routes = [];
-        public static function post($path, $action) { self::$routes[] = $path; return new self; }
+        public static $routes = [], $definitions = [];
+        public static function post($path, $action) { self::$routes[] = $path; self::$definitions[$path] = ['method' => 'POST', 'action' => $action]; return new self; }
         public static function get($path, $action) { self::$routes[] = $path; return new self; }
         public function withoutMiddleware($value) { return $this; }
-        public function middleware($value) { return $this; }
+        public function middleware($value) { self::$definitions[end(self::$routes)]['middleware'] = $value; return $this; }
         public function name($value) { return $this; }
     }
     class Schedule {
@@ -255,9 +345,10 @@ namespace Illuminate\Support\Facades {
     }
     class View { public static function addNamespace($name, $path) {} }
     class Event { public static $listeners = []; public static function listen($type, $callback) { self::$listeners[] = $callback; } }
-    class Auth { public static $id = 7; public static function id() { return self::$id; } }
+    class Auth { public static $id = 7; public static function id() { return self::$id; } public static function user() { return self::$id ? \App\Models\User::$row : null; } }
     class DB {
         public static $tables = [], $locks = [], $updates = [];
+        public static $concurrentAgreements = [];
         public static function table($name) { return $name === 'stripe_saved_payment_fees' ? new \FeeQuery : new \AdoptionQuery($name); }
         public static $beforeUserLock = null;
         public static $locked = false;
@@ -269,7 +360,7 @@ namespace Illuminate\Support\Facades {
             $audit = \App\Models\Audit::$rows;
             $notifications = \App\Models\Notification::$rows;
             self::$locked = true;
-            try { return $callback(); } catch (\Throwable $e) { self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = $agreements; \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
+            try { return $callback(); } catch (\Throwable $e) { self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
             finally { self::$locked = false; }
         }
     }
@@ -375,3 +466,28 @@ namespace Illuminate\Support\Facades {
         public static function dropIfExists($name) { unset(DB::$tables[$name]); }
     }
 }
+
+namespace Filament\Notifications {
+    class Notification {
+        public static $sent = [];
+        private $title;
+        public static function make() { return new self; }
+        public function title($value) { $this->title = $value; return $this; }
+        public function success() { return $this; }
+        public function send() { self::$sent[] = $this->title; }
+    }
+}
+
+namespace Filament\Facades {
+    class Filament {
+        public static $panel = 'admin';
+        public static function getCurrentPanel() { return new class { public function getId() { return Filament::$panel; } }; }
+    }
+}
+namespace Filament\Support\Facades {
+    class FilamentView {
+        public static $hooks = [];
+        public static function registerRenderHook($name, $callback) { self::$hooks[$name] = $callback; }
+    }
+}
+namespace Filament\View { class PanelsRenderHook { const PAGE_START = 'panels::page.start'; } }

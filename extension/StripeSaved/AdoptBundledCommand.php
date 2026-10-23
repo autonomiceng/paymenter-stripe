@@ -10,7 +10,7 @@ require_once __DIR__ . '/AdoptionStore.php';
 final class AdoptBundledCommand extends Command
 {
     protected $signature = 'stripe-saved:adopt-bundled {--apply} {--plan=} {--confirm-paused}
-        {--rollback=} {--redisplay=} {--confirm-setup-consent}';
+        {--source-gateway=} {--rollback=} {--redisplay=} {--confirm-setup-consent}';
     protected $description = 'Review, adopt or restore bundled Stripe agreements; default is dry run';
 
     public function handle(): int
@@ -23,7 +23,7 @@ final class AdoptBundledCommand extends Command
         } elseif ($redisplay) {
             $this->line('Redisplay checklist: keep both endpoints stopped and writers paused; exact manifest after-state required. No webhook changes are made.');
         } else {
-            $this->line('Cutover checklist: stop both endpoints in Stripe Dashboard; finish old sessions; retain both rows. After adoption and optional redisplay, use admin Delete on bundled gateway (soft delete); enable fork gateway BEFORE only fork delivery; reconcile missed events.');
+            $this->line('Cutover checklist: stop both endpoints in Stripe Dashboard; finish old sessions; retain both rows. Apply turns off bundled Stripe. After optional redisplay, use admin Delete on bundled gateway (soft delete); enable fork gateway BEFORE only fork delivery; reconcile missed events.');
         }
         try {
             if (!$this->option('confirm-paused')) throw new AdoptionRefusal('Requires --confirm-paused after the checklist');
@@ -31,7 +31,11 @@ final class AdoptBundledCommand extends Command
             if ((int) $apply + (int) (bool) $rollback + (int) (bool) $redisplay > 1
                 || ($apply !== (bool) $this->option('plan'))) throw new AdoptionRefusal('Choose dry run, --apply --plan, --rollback or --redisplay');
             if ($redisplay && !$this->option('confirm-setup-consent')) throw new AdoptionRefusal('Redisplay requires --confirm-setup-consent; see migration consent basis');
-            $store = new AdoptionStore;
+            $source = $this->option('source-gateway');
+            if ($source !== null && filter_var($source, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]) === false) {
+                throw new AdoptionRefusal('Use --source-gateway with a positive gateway ID');
+            }
+            $store = new AdoptionStore($source === null ? null : (int) $source);
             $adoption = new Adoption($store);
             if ($rollback) {
                 $adoption->rollback($store->load($rollback));
@@ -49,7 +53,7 @@ final class AdoptBundledCommand extends Command
                     if ($old != $service['billing_agreement_id']) $this->line(json_encode(['service' => $id, 'from' => $old, 'to' => $service['billing_agreement_id']]));
                 }
                 $this->line('Plan: ' . $plan['digest']);
-                if ($apply) $this->info('Committed. Manifest: ' . $plan['manifest'] . '; redisplay is a separate step.');
+                if ($apply) $this->info('Committed. Core Stripe was turned off. Manifest: ' . $plan['manifest'] . '; redisplay is a separate step.');
             }
             return self::SUCCESS;
         } catch (\Throwable $e) {

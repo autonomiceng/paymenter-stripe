@@ -12,13 +12,20 @@ use Illuminate\Support\Facades\{DB, Http};
     $intent = (object) ['id' => 'pi_review', 'metadata' => (object) []];
     $balance = ['fee' => 42, 'currency' => 'usd', 'status' => 'pending'];
     $boundInvoice = ['metadata' => ['stripe_saved_invoice_id' => 12], 'parent' => ['type' => 'subscription_details']];
-    Http::$handler = function ($verb, $path) use (&$intent, &$balance, &$boundInvoice) {
+    $invoicePayments = ['object' => 'list', 'url' => '/v1/invoice_payments', 'has_more' => false, 'data' => []];
+    Http::$handler = function ($verb, $path, $data) use (&$intent, &$balance, &$boundInvoice, &$invoicePayments) {
         check(!DB::$locked, 'Fee requests run before settlement locks: ' . $path);
         return match (true) {
-            str_starts_with($path, '/payment_intents/') => $intent,
-            str_starts_with($path, '/charges/') => ['payment_intent' => 'pi_review', 'balance_transaction' => 'bt_review'],
-            str_starts_with($path, '/invoices/') => $boundInvoice,
-            default => $balance,
+            $verb === 'get' && $path === '/payment_intents/pi_review' => $intent,
+            $verb === 'get' && $path === '/charges/ch_review' => ['payment_intent' => 'pi_review', 'balance_transaction' => 'bt_review'],
+            $verb === 'get' && in_array($path, ['/invoices/in_review', '/invoices/in_bound'], true) => $boundInvoice,
+            $verb === 'get' && $path === '/invoice_payments' => (function () use ($data, &$invoicePayments) {
+                check($data === ['payment' => ['type' => 'payment_intent', 'payment_intent' => 'pi_review'],
+                    'status' => 'paid', 'limit' => 2], 'Basil invoice payments filter uses this PaymentIntent and paid status');
+                return $invoicePayments;
+            })(),
+            $verb === 'get' && $path === '/balance_transactions/bt_review' => $balance,
+            default => throw new RuntimeException('Unexpected fee request: ' . $verb . ' ' . $path),
         };
     };
     $deliver = fn ($type = 'charge.succeeded') => $gateway->webhook(eventRequest($charge, type: $type));
@@ -43,8 +50,47 @@ use Illuminate\Support\Facades\{DB, Http};
     $intent->metadata = (object) ['stripe_saved_gateway' => '1'];
     check($deliver()['data'] === ['ignored' => true], 'Gateway marker alone has no PaymentIntent settlement path');
     unset($charge->metadata); Gateway::$bundled = false; $intent->metadata = (object) [];
+    // Legacy webhook fields remain supported, but Basil omits them on both objects.
     $charge->invoice = 'in_bound';
     rejects($deliver, 'HTTP 409');
+    unset($charge->invoice);
+    $paidEntry = ['id' => 'inpay_bound', 'object' => 'invoice_payment', 'invoice' => 'in_bound',
+        'status' => 'paid', 'payment' => ['type' => 'payment_intent', 'payment_intent' => 'pi_review'],
+        'amount_paid' => 2000, 'amount_requested' => 2000, 'currency' => 'usd'];
+    $invoicePayments['data'] = [$paidEntry];
+    check(!isset($charge->invoice) && !isset($intent->invoice) && !isset($intent->metadata->invoice_id),
+        'Basil subscription charge and PaymentIntent have no invoice field or local binding');
+    foreach (['charge.succeeded', 'charge.updated'] as $type) {
+        rejects(fn () => $deliver($type), 'HTTP 409');
+        $calls = count(Http::$calls);
+        Audit::$rows[] = ['event' => 'stripe_saved_subscription_review', 'new_values' => ['stripe_invoice_id' => 'in_bound']];
+        check($deliver($type)['data'] === ['ignored' => true], 'Basil subscription review is acknowledged: ' . $type);
+        check(array_column(array_slice(Http::$calls, $calls), 1) === ['/payment_intents/pi_review', '/invoice_payments'],
+            'Subscription review stops before invoice retrieval: ' . $type);
+        Audit::$rows = $audits;
+        $calls = count(Http::$calls);
+        Audit::$rows[] = ['event' => 'stripe_saved_payment_review', 'new_values' => ['payment_intent_id' => 'pi_review']];
+        check($deliver($type)['data'] === ['ignored' => true], 'Basil payment review is acknowledged: ' . $type);
+        check(array_column(array_slice(Http::$calls, $calls), 1) === ['/payment_intents/pi_review'],
+            'Payment review stops before invoice payment lookup: ' . $type);
+        Audit::$rows = $audits;
+    }
+    foreach (['empty', 'multiple', 'paginated', 'unpaid', 'wrong intent', 'wrong type'] as $invalid) {
+        $invoicePayments['data'] = match ($invalid) {
+            'empty' => [],
+            'multiple' => [$paidEntry, array_merge($paidEntry, ['id' => 'inpay_other', 'invoice' => 'in_other'])],
+            'unpaid' => [array_merge($paidEntry, ['status' => 'open'])],
+            'wrong intent' => [array_merge($paidEntry, ['payment' => ['type' => 'payment_intent', 'payment_intent' => 'pi_other']])],
+            'wrong type' => [array_merge($paidEntry, ['payment' => ['type' => 'payment_record', 'payment_record' => 'pyr_other']])],
+            default => [$paidEntry],
+        };
+        $invoicePayments['has_more'] = $invalid === 'paginated';
+        $calls = count(Http::$calls);
+        check($deliver()['data'] === ['ignored' => true], 'Unresolved Basil invoice payment is acknowledged: ' . $invalid);
+        check(array_column(array_slice(Http::$calls, $calls), 1) === ['/payment_intents/pi_review', '/invoice_payments'],
+            'Unresolved invoice payment cannot select an invoice: ' . $invalid);
+    }
+    $invoicePayments['data'] = [$paidEntry]; $invoicePayments['has_more'] = false;
     Gateway::$bundled = true; $boundInvoice['metadata']['stripe_saved_gateway'] = '1';
     rejects($deliver, 'HTTP 409');
     foreach (['parent', 'binding', 'ownership'] as $missing) {
@@ -56,7 +102,6 @@ use Illuminate\Support\Facades\{DB, Http};
         $boundInvoice = $valid;
     }
     Gateway::$bundled = false;
-    unset($charge->invoice);
     ExtensionHelper::$payments['12:pi_review'] = ['gateway' => 'StripeSaved', 'amount' => 20.0, 'status' => 'succeeded'];
     foreach ([['paid' => false, 'status' => 'succeeded'], ['paid' => true, 'status' => 'pending'], ['paid' => true, 'status' => 'failed']] as $state) {
         $charge->paid = $state['paid']; $charge->status = $state['status']; $calls = count(Http::$calls);

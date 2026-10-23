@@ -6,10 +6,13 @@ use App\Helpers\ExtensionHelper;
 use App\Exceptions\DisplayException;
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use App\Models\Audit;
+use App\Models\BillingAgreement;
+use App\Models\Gateway;
 use App\Models\Invoice;
 use App\Models\InvoiceTransaction;
 use App\Models\User;
 use Illuminate\Http\Request;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 
@@ -188,16 +191,35 @@ trait Checkout
     private function persistAgreement($user, $method)
     {
         if (!$this->methodCustomerMatches($user, $method)) return false;
+        $data = $this->getPaymentDetails($method);
+        // Native external_reference is globally unique, including soft-deleted rows.
+        DB::transaction(function () use ($user, $method, $data) {
+            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+            $gateway = Gateway::where('extension', 'StripeSaved')->firstOrFail();
+            // Locking reads see concurrent commits even under REPEATABLE READ.
+            $find = fn () => BillingAgreement::withTrashed()->where('external_reference', $method->id)->lockForUpdate()->first();
+            $agreement = $find();
+            if (!$agreement) {
+                try {
+                    $agreement = ExtensionHelper::makeBillingAgreement($user, 'StripeSaved', $data['name'],
+                        $method->id, $data['type'], $data['expiry']);
+                } catch (UniqueConstraintViolationException $e) {
+                    // Another writer may not take our user lock. Recheck its committed row.
+                    $agreement = $find();
+                    if (!$agreement) throw $e;
+                }
+            }
+            if ($agreement->user_id != $user->id || $agreement->gateway_id != $gateway->id) {
+                throw new DisplayException('This payment method belongs to another account or gateway.');
+            }
+            if ($agreement->trashed()) {
+                throw new DisplayException('This payment method was removed. Add a new payment method.');
+            }
+            $agreement->update(['name' => $data['name'], 'type' => $data['type'], 'expiry' => $data['expiry']]);
+        });
         // Explicit checkout opt-in or account setup authorizes future redisplay.
         // https://docs.stripe.com/api/payment_methods/update#update_payment_method-allow_redisplay
         $this->request('post', '/payment_methods/' . $method->id, ['allow_redisplay' => 'always']);
-        $data = $this->getPaymentDetails($method);
-        // Native updateOrCreate has no unique index: serialize webhook/redirect retries.
-        DB::transaction(function () use ($user, $method, $data) {
-            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-            ExtensionHelper::makeBillingAgreement($user, 'StripeSaved', $data['name'],
-                $method->id, $data['type'], $data['expiry']);
-        });
         return true; // Never assign a service billing_agreement_id or enable Auto Pay.
     }
 }
