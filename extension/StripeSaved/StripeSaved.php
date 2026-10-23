@@ -26,6 +26,7 @@ use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\View;
 use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Amounts;
 use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Checkout;
+use Paymenter\Extensions\Gateways\StripeSaved\Concerns\PaymentFees;
 use Paymenter\Extensions\Gateways\StripeSaved\Concerns\CheckoutIntent;
 use Paymenter\Extensions\Gateways\StripeSaved\Concerns\SetupConsent;
 use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Signature;
@@ -42,25 +43,33 @@ require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
 require_once __DIR__ . '/Concerns/CheckoutIntent.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
 require_once __DIR__ . '/Concerns/Webhooks.php';
+require_once __DIR__ . '/Concerns/PaymentFees.php';
 
 #[ExtensionMeta(
     name: 'Stripe Saved Methods',
     description: 'Stripe Payment Element with saved methods and optional card saving.',
-    version: '0.1.0',
+    version: '0.1.1',
     author: 'Autonomic Engineering',
     icon: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgZmlsbD0iIzUzM0FGRCIvPjxwYXRoIGQ9Ik0xMjAgMzkyTDM5MiAzMzRWMTEyTDEyMCAxNz hWMzk yWiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg=='
 )]
 class StripeSaved extends Gateway
 {
-    use Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks;
+    use PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks;
 
     private const API_VERSION = '2025-07-30.basil';
 
     public function boot()
     {
         if (app()->runningInConsole()) {
+            app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryPaymentFees())
+                ->name('stripe-saved:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
             require_once __DIR__ . '/AdoptBundledCommand.php';
             \Illuminate\Console\Application::starting(fn ($artisan) => $artisan->resolve(AdoptBundledCommand::class));
+        }
+        try {
+            $this->ensurePaymentFeeSchema();
+        } catch (\Throwable $error) {
+            report($error);
         }
         require __DIR__ . '/routes.php';
         // Register webhook route
@@ -195,6 +204,7 @@ class StripeSaved extends Gateway
                 'invoice.created',
                 'invoice.payment_succeeded',
                 'charge.updated',
+                'charge.succeeded',
             ],
             'api_version' => self::API_VERSION,
         ]);

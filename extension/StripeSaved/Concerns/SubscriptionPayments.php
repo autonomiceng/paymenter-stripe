@@ -36,11 +36,29 @@ trait SubscriptionPayments
         });
     }
 
+    private function recordSubscriptionReview($stripeInvoice, string $reason): void
+    {
+        // No invoice can be inferred safely. Keep a gateway audit entry for the Stripe invoice.
+        DB::transaction(function () use ($stripeInvoice, $reason) {
+            $gateway = \App\Models\Gateway::where('extension', 'StripeSaved')->lockForUpdate()->firstOrFail();
+            if (\App\Models\Audit::where('event', 'stripe_saved_subscription_review')
+                ->where('new_values->stripe_invoice_id', $stripeInvoice->id)->lockForUpdate()->first()) return;
+            \App\Models\Audit::create([
+                'event' => 'stripe_saved_subscription_review', 'auditable_type' => \App\Models\Gateway::class,
+                'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => [
+                    'stripe_invoice_id' => $stripeInvoice->id, 'amount_minor' => $stripeInvoice->amount_paid,
+                    'currency' => $stripeInvoice->currency, 'reason' => $reason,
+                    'subscription_id' => $stripeInvoice->parent->subscription_details->subscription ?? null,
+                ],
+            ]);
+        });
+    }
+
     private function recordSubscriptionPayment($stripeInvoice)
     {
         if (($stripeInvoice->parent->type ?? null) !== 'subscription_details') return;
         $subscriptionId = $stripeInvoice->parent->subscription_details->subscription ?? null;
-        if (!$subscriptionId) return;
+        if (!$subscriptionId) { $this->recordSubscriptionReview($stripeInvoice, 'Subscription missing'); return; }
         $payments = $this->request('get', '/invoice_payments', ['invoice' => $stripeInvoice->id]);
         $paymentIds = [];
         $paidAmount = null;
@@ -52,7 +70,7 @@ trait SubscriptionPayments
             }
         }
         if (count($paymentIds) !== 1 || ($paidAmount !== null && $paidAmount !== $stripeInvoice->amount_paid)) {
-            if ($paymentIds) Log::warning('StripeSaved split payment needs reconciliation');
+            $this->recordSubscriptionReview($stripeInvoice, 'Payment list incomplete or split');
             return;
         }
         $paymentId = $paymentIds[0];
@@ -60,20 +78,21 @@ trait SubscriptionPayments
         abort_unless($intent->id === $paymentId && $intent->status === 'succeeded', 409);
         DB::transaction(function () use ($stripeInvoice, $subscriptionId, $paymentId, $intent) {
             $ownerId = Service::where('subscription_id', $subscriptionId)->first()?->user_id;
-            if (!$ownerId) return;
+            if (!$ownerId) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
             // Match PaymentIntent settlement: serialize on the customer before other rows.
             User::where('id', $ownerId)->lockForUpdate()->firstOrFail();
             $service = Service::where('subscription_id', $subscriptionId)->lockForUpdate()->first();
             if ($service) abort_unless($service->user_id === $ownerId, 409);
-            if (!$service || InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first()) return;
+            if (!$service) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
+            if (InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first()) return;
             $invoiceId = $stripeInvoice->metadata->stripe_saved_invoice_id ?? null;
             $invoice = $invoiceId ? $service->invoiceItems()->where('invoice_id', $invoiceId)->first()?->invoice : null;
             if (!$invoice) {
-                Log::warning('StripeSaved subscription invoice needs reconciliation', ['service_id' => $service->id]);
+                $this->recordSubscriptionReview($stripeInvoice, 'Invoice binding missing or unrelated');
                 return;
             }
             $invoice = Invoice::where('id', $invoice->id)->lockForUpdate()->first();
-            if (!$invoice) return;
+            if (!$invoice) { $this->recordSubscriptionReview($stripeInvoice, 'Invoice missing'); return; }
             abort_unless($invoice->user_id === $ownerId, 409);
             // Subscription metadata owns the local binding, not PaymentIntent metadata.
             $intent->metadata = (object) ['invoice_id' => $invoice->id];

@@ -199,15 +199,42 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     foreach ([null, 999] as $binding) {
         $stripeInvoice->metadata->stripe_saved_invoice_id = $binding;
         $deliver();
-        check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records,
-            'An unbound or unrelated subscription payment cannot attach to a local invoice');
+        check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records + 1,
+            'An unbound or unrelated subscription payment retains one gateway review record');
     }
     $stripeInvoice->metadata->stripe_saved_invoice_id = $invoice->id;
+    $records = count(Audit::$rows);
     $invoice->user_id = 99;
     rejects($deliver, 'HTTP 409');
     check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records,
         'Subscription binding cannot apply money or write audits to another owner');
 
+    $invoice->user_id = 7;
+    foreach (['empty', 'split', 'amount', 'service', 'subscription', 'service race', 'invoice race'] as $case) {
+        $stripeInvoice->id = 'in_review_' . $case;
+        $records = count(Audit::$rows);
+        $savedHandler = Http::$handler;
+        Http::$handler = function ($verb, $path) use ($savedHandler, $case) {
+            if ($path === '/invoice_payments' && in_array($case, ['empty', 'split', 'amount'])) {
+                $entry = ['status' => 'paid', 'amount_paid' => $case === 'amount' ? 1200 : 1250,
+                    'payment' => ['type' => 'payment_intent', 'payment_intent' => 'pi_unbound']];
+                return ['data' => $case === 'empty' ? [] : ($case === 'split' ? [$entry, $entry] : [$entry])];
+            }
+            return $savedHandler($verb, $path);
+        };
+        if ($case === 'service') Service::$row = null;
+        if ($case === 'service race') DB::$beforeUserLock = function () { Service::$row = null; };
+        if ($case === 'invoice race') DB::$beforeUserLock = function () use ($invoice) { unset(Invoice::$rows[$invoice->id]); };
+        if ($case === 'subscription') $stripeInvoice->parent->subscription_details->subscription = null;
+        $deliver();
+        check(count(Audit::$rows) === $records + 1, 'First unresolved subscription delivery persists review: ' . $case);
+        $deliver();
+        check(count(Audit::$rows) === $records + 1 && end(Audit::$rows)['new_values']['stripe_invoice_id'] === $stripeInvoice->id,
+            'Unresolved subscription success retains one durable gateway review: ' . $case);
+        Invoice::$rows[$invoice->id] = $invoice;
+        Service::$row = $service; Http::$handler = $savedHandler;
+        $stripeInvoice->parent->subscription_details->subscription = $service->subscription_id;
+    }
     Http::$handler = $oldHandler;
     Gateway::$enabled = $oldEnabled;
     Service::$row = $oldService;
@@ -264,8 +291,10 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         foreach ([null, 999] as $binding) {
             $stripeInvoice->metadata->stripe_saved_invoice_id = $binding;
             invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice);
-            check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records,
-                'Absent or unrelated binding cannot settle through the filtered relation');
+            check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records + 1
+                && end(Audit::$rows)['new_values']['stripe_invoice_id'] === $stripeInvoice->id
+                && end(Audit::$rows)['new_values']['reason'] === 'Invoice binding missing or unrelated',
+                'Absent or unrelated binding cannot settle and retains one review through the filtered relation');
         }
     } finally {
         Http::$handler = $oldHandler;

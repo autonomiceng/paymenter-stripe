@@ -70,6 +70,22 @@ check(!$recordsConsentBeforeConfirmation(str_replace($confirmSetupCall, '', $set
     'Setup order check rejects missing confirmation');
 check(!$recordsConsentBeforeConfirmation(strtr($setupView, [$recordConsentCall => $confirmSetupCall, $confirmSetupCall => $recordConsentCall])),
     'Setup order check rejects confirmation before consent recording');
+$consentFailureGuard = "if (!result.ok) throw new Error('Could not record your agreement. Try again.');";
+$guardsConsentBeforeConfirmation = static function ($view) use ($recordConsentCall, $consentFailureGuard, $confirmSetupCall) {
+    $consentPosition = strpos($view, $recordConsentCall);
+    $guardPosition = strpos($view, $consentFailureGuard);
+    $confirmPosition = strpos($view, $confirmSetupCall);
+    return $consentPosition !== false && $guardPosition !== false && $confirmPosition !== false
+        && $consentPosition < $guardPosition && $guardPosition < $confirmPosition;
+};
+check($guardsConsentBeforeConfirmation($setupView), 'Setup stops on failed consent before confirmation');
+$setupWithoutConsentGuard = str_replace($consentFailureGuard, '', $setupView);
+check(!$guardsConsentBeforeConfirmation($setupWithoutConsentGuard),
+    'Setup consent guard check rejects a missing failure guard');
+check(!$guardsConsentBeforeConfirmation(str_replace($recordConsentCall, $consentFailureGuard . $recordConsentCall, $setupWithoutConsentGuard)),
+    'Setup consent guard check rejects a failure guard before the consent request');
+check(!$guardsConsentBeforeConfirmation(str_replace($confirmSetupCall, $confirmSetupCall . $consentFailureGuard, $setupWithoutConsentGuard)),
+    'Setup consent guard check rejects a failure guard after confirmation');
 check(str_contains($setupView, 'if (error) throw error;') && str_contains($setupView, 'message.replaceChildren(text);')
     && str_contains($setupView, 'finally {') && str_contains($setupView, 'setLoading(false);'), 'Setup errors remain in alert and unlock retry');
 
