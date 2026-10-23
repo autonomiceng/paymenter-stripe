@@ -5,9 +5,13 @@ use Illuminate\Support\Facades\Route;
 use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
 
 Route::post('/extensions/ae-stripe/webhook', [AeStripe::class, 'webhook'])->withoutMiddleware([VerifyCsrfToken::class])->name('extensions.gateways.ae-stripe.webhook');
+Route::post('/extensions/stripe-saved/webhook', [AeStripe::class, 'webhook'])->withoutMiddleware([VerifyCsrfToken::class])->name('extensions.gateways.stripe-saved.webhook');
 Route::get('/extensions/ae-stripe/setup-agreement', [AeStripe::class, 'setupAgreement'])
     ->middleware(['web', 'auth'])
     ->name('extensions.gateways.ae-stripe.setup-agreement');
+Route::get('/extensions/stripe-saved/setup-agreement', [AeStripe::class, 'setupAgreement'])
+    ->middleware(['web', 'auth'])
+    ->name('extensions.gateways.stripe-saved.setup-agreement');
 
 Route::post('/extensions/ae-stripe/consent', [AeStripe::class, 'consent'])
     ->middleware(['web', 'auth'])

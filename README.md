@@ -22,6 +22,8 @@ sandbox checks are pending. Complete them before accepting live payments.
 
 - [Installation](docs/install.md) and reproducible native ZIP packaging.
 - [Convert an existing StripeSaved install](docs/convert-stripe-saved.md) without a second gateway.
+  The old webhook URL remains an alias with the same handler and signing secret.
+  The command recommends updating the existing endpoint to `/extensions/ae-stripe/webhook`.
 - [Settings and consent](docs/settings.md), including legacy redisplay limits.
 - [Migration from bundled Stripe](docs/migrating-from-bundled.md): preserve the
   old extension row, adopt agreements with a reviewed dry-run command, and move

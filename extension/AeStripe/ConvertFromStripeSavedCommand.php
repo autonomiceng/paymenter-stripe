@@ -3,7 +3,7 @@
 namespace Paymenter\Extensions\Gateways\AeStripe;
 
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\{DB, Schema};
+use Illuminate\Support\Facades\{DB, Log, Schema};
 
 final class ConvertFromStripeSavedCommand extends Command
 {
@@ -22,6 +22,7 @@ final class ConvertFromStripeSavedCommand extends Command
             foreach ($columns as [$table, $from, $to]) $this->line($table . '.' . $from . ' -> ' . $to);
             foreach ($updates as [$table, $id, $field, $target]) $this->line($table . ' #' . $id . ': rename ' . $field);
             $this->line('Gateway #' . $old[0]->id . ': StripeSaved -> AeStripe');
+            $this->line('Recommended: update the existing Stripe webhook URL to ' . url('/extensions/ae-stripe/webhook') . '. Keep its signing secret.');
             if (!$this->option('apply')) {
                 $this->info('Dry run. Use --apply with writers and webhook delivery paused.');
                 return self::SUCCESS;
@@ -45,6 +46,7 @@ final class ConvertFromStripeSavedCommand extends Command
             $this->info('Converted gateway #' . $old[0]->id . ' to AE Stripe. IDs, settings and agreement/service references were preserved.');
             return self::SUCCESS;
         } catch (\Throwable $e) {
+            Log::error('AE Stripe conversion failed.', ['exception' => $e::class, 'message' => $e->getMessage()]);
             $this->error($e instanceof ConversionRefusal ? $e->getMessage() : 'Conversion failed. Keep writers paused and inspect the schema and rows before retrying.');
             return self::FAILURE;
         }
@@ -86,20 +88,25 @@ final class ConvertFromStripeSavedCommand extends Command
         $updates = [];
         foreach (['settings' => 'key', 'properties' => 'key', 'audits' => 'event', 'migrations' => 'migration'] as $table => $field) {
             if (!Schema::hasTable($table)) continue;
-            $rows = DB::table($table)->orderBy('id')->lockForUpdate()->get();
+            $query = DB::table($table)->where(fn ($query) => $query
+                ->where($field, 'like', '%stripe_saved_%')
+                ->orWhere($field, 'like', '%stripe-saved%')
+                ->orWhere($field, 'like', '%StripeSaved%'));
+            if ($table === 'settings') {
+                $query->where('settingable_id', $old[0]->id)
+                    ->whereIn('settingable_type', [\App\Models\Gateway::class, \App\Models\Extension::class]);
+            }
+            $rows = $query->orderBy('id')->lockForUpdate()->get();
             foreach ($rows as $row) {
                 $value = $row->$field;
-                if ($table === 'settings' && ($row->settingable_id != $old[0]->id
-                    || !in_array($row->settingable_type, [\App\Models\Gateway::class, \App\Models\Extension::class], true))) continue;
                 $target = str_replace(['stripe_saved_', 'stripe-saved', 'StripeSaved'], ['ae_stripe_', 'ae-stripe', 'AeStripe'], $value);
                 if ($target === $value) continue;
                 if (in_array($table, ['settings', 'properties'], true)) {
-                    foreach ($rows as $other) {
-                        $owner = $table === 'settings' ? ['settingable_id', 'settingable_type'] : ['model_id', 'model_type'];
-                        if ($other->$field === $target && $other->{$owner[0]} === $row->{$owner[0]} && $other->{$owner[1]} === $row->{$owner[1]}) {
-                            throw new ConversionRefusal('Both source and target keys exist in ' . $table . ' for row #' . $row->id);
-                        }
-                    }
+                    $owner = $table === 'settings' ? ['settingable_id', 'settingable_type'] : ['model_id', 'model_type'];
+                    $other = DB::table($table)->where($field, $target)
+                        ->where($owner[0], $row->{$owner[0]})->where($owner[1], $row->{$owner[1]})
+                        ->lockForUpdate()->first();
+                    if ($other) throw new ConversionRefusal('Both source and target keys exist in ' . $table . ' for row #' . $row->id);
                 }
                 $updates[] = [$table, $row->id, $field, $target, (array) $row];
             }

@@ -15,11 +15,30 @@ class AdoptionCollection implements IteratorAggregate
 class AdoptionQuery
 {
     public static ?string $failTable = null;
+    public static array $loadedRows = [];
     private array $filters = [];
     private bool $locked = false;
     public function __construct(private string $table) {}
     public function whereIn($key, $values): self { $this->filters[] = fn ($r) => in_array($r[$key], $values); return $this; }
-    public function where($key, $value): self { return $this->whereIn($key, [$value]); }
+    public function where($key, $operator = null, $value = null): self {
+        if ($key instanceof Closure) {
+            $group = new self($this->table); $key($group);
+            $this->filters[] = fn ($row) => $group->matches($row);
+            return $this;
+        }
+        if (func_num_args() === 2) return $this->whereIn($key, [$operator]);
+        if ($operator !== 'like') throw new RuntimeException('Unsupported query operator');
+        $pattern = '/^' . str_replace(['%', '_'], ['.*', '.'], preg_quote($value, '/')) . '$/s';
+        $this->filters[] = fn ($row) => preg_match($pattern, $row[$key]) === 1;
+        return $this;
+    }
+    public function orWhere($key, $operator, $value): self {
+        $previous = array_pop($this->filters);
+        $group = new self($this->table); $group->where($key, $operator, $value);
+        $this->filters[] = fn ($row) => $previous($row) || $group->matches($row);
+        return $this;
+    }
+    public function first(): mixed { return $this->get()->first(); }
     public function orderBy($key): self { return $this; }
     public function lockForUpdate(): self { check(DB::$locked, 'Real adapter locks in transaction'); $this->locked = true; return $this; }
     private function matches($row): bool { foreach ($this->filters as $f) if (!$f($row)) return false; return true; }
@@ -27,7 +46,9 @@ class AdoptionQuery
     {
         check($this->locked, 'Adapter snapshot requires row locks for ' . $this->table);
         DB::$locks[] = $this->table;
-        return new AdoptionCollection(array_map(fn ($r) => (object) $r, array_filter(DB::$tables[$this->table], fn ($r) => $this->matches($r))));
+        $rows = array_filter(DB::$tables[$this->table], fn ($r) => $this->matches($r));
+        foreach ($rows as $row) self::$loadedRows[$this->table][] = $row['id'];
+        return new AdoptionCollection(array_map(fn ($r) => (object) $r, $rows));
     }
     public function update($changes): int
     {
@@ -221,6 +242,14 @@ $before = DB::$tables; $updates = count(DB::$updates);
 check($command->handle() === 1 && end($command->output) === 'Gateway row removed', 'CLI refuses a soft-deleted source gateway');
 check(DB::$tables === $before && count(DB::$updates) === $updates, 'Soft-deleted selector preserves core state and ownership');
 $command->options = ['confirm-paused' => true];
+$failureHandler = Http::$handler;
+$errors = \Illuminate\Support\Facades\Log::$errors;
+Http::$handler = fn () => throw new RuntimeException('Synthetic adoption failure');
+try {
+    check($command->handle() === 1 && end($command->output) === 'Operation failed; keep writers paused and inspect protected manifest/database state before retrying', 'Unexpected adoption failures keep the existing safe console message');
+    check(!str_contains(implode("\n", $command->output), 'Synthetic adoption failure'), 'Adoption does not print the raw exception');
+    check(array_slice(\Illuminate\Support\Facades\Log::$errors, count($errors)) === [['AE Stripe adoption failed.', ['exception' => RuntimeException::class, 'message' => 'Synthetic adoption failure']]], 'Adoption logs the exception class and message');
+} finally { Http::$handler = $failureHandler; }
 check($command->handle() === 0, 'CLI dry run succeeds with actual adapter');
 check(!str_contains(implode('\n', $command->output), 'private fixture'), 'CLI output contains no stored names');
 check(in_array('{"service":21,"from":13,"to":12}', $command->output, true), 'CLI prints each changed service id and before/after reference');

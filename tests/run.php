@@ -65,8 +65,17 @@ if (in_array('--gateway-lifecycle', $argv, true)) {
 \Illuminate\Console\Application::$callbacks = [];
 $gateway->boot();
 check(Event::$listeners === [], 'Bundled row retains subscription callbacks even when disabled');
-check(Route::$routes === ['/extensions/ae-stripe/webhook', '/extensions/ae-stripe/setup-agreement',
+check(Route::$routes === ['/extensions/ae-stripe/webhook', '/extensions/stripe-saved/webhook',
+    '/extensions/ae-stripe/setup-agreement', '/extensions/stripe-saved/setup-agreement',
     '/extensions/ae-stripe/consent', '/extensions/ae-stripe/setup-consent', '/extensions/ae-stripe/disable-core'], 'Distinct routes are still registered');
+$legacyWebhook = Route::$definitions['/extensions/stripe-saved/webhook'];
+check($legacyWebhook === Route::$definitions['/extensions/ae-stripe/webhook'], 'Legacy webhook shares the POST handler and CSRF exemption');
+[$handlerClass, $handlerMethod] = $legacyWebhook['action'];
+$legacyGateway = new $handlerClass(['stripe_webhook_secret' => 'whsec_test']);
+$legacyEvent = eventRequest((object) ['id' => 'evt_converted'], type: 'unhandled.event');
+check($legacyGateway->$handlerMethod($legacyEvent)['status'] === 200, 'Legacy webhook accepts an event signed with the stored secret');
+check($legacyGateway->$handlerMethod(new Request(body: $legacyEvent->body, signature: 't=' . time() . ',v1=invalid'))['status'] === 400, 'Legacy webhook refuses a bad signature');
+check(Route::$definitions['/extensions/stripe-saved/setup-agreement'] === Route::$definitions['/extensions/ae-stripe/setup-agreement'], 'Legacy setup return shares the authenticated GET handler');
 Gateway::$bundled = false;
 $gateway->boot();
 check(count(\Illuminate\Console\Application::$callbacks) === 2, 'Commands registered once per extension boot including bundled-present path');

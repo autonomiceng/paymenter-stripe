@@ -330,8 +330,8 @@ namespace Illuminate\Support\Facades {
         public static $routes = [], $definitions = [], $names = [];
         public static function has($name) { return isset(self::$names[$name]); }
         public static function post($path, $action) { self::$routes[] = $path; self::$definitions[$path] = ['method' => 'POST', 'action' => $action]; return new self; }
-        public static function get($path, $action) { self::$routes[] = $path; return new self; }
-        public function withoutMiddleware($value) { return $this; }
+        public static function get($path, $action) { self::$routes[] = $path; self::$definitions[$path] = ['method' => 'GET', 'action' => $action]; return new self; }
+        public function withoutMiddleware($value) { self::$definitions[end(self::$routes)]['withoutMiddleware'] = $value; return $this; }
         public function middleware($value) { self::$definitions[end(self::$routes)]['middleware'] = $value; return $this; }
         public function name($value) { self::$names[$value] = end(self::$routes); return $this; }
     }
@@ -366,7 +366,7 @@ namespace Illuminate\Support\Facades {
             finally { self::$locked = false; }
         }
     }
-    class Log { public static $lines = [], $contexts = [], $warnings = []; public static function info($message, $context = []) { self::$lines[] = $message; self::$contexts[] = $context; } public static function warning($message, $context = []) { self::$warnings[] = [$message, $context]; } }
+    class Log { public static $lines = [], $contexts = [], $warnings = [], $errors = []; public static function info($message, $context = []) { self::$lines[] = $message; self::$contexts[] = $context; } public static function warning($message, $context = []) { self::$warnings[] = [$message, $context]; } public static function error($message, $context = []) { self::$errors[] = [$message, $context]; } }
     class Http {
         public static $calls = [];
         public static $handler;
@@ -404,7 +404,8 @@ namespace {
     function abort_unless($condition, $status) { if (!$condition) throw new \RuntimeException('HTTP ' . $status); }
     function __($key, $values = []) { return $key; }
     function view($name, $data) { return compact('name', 'data'); }
-    function route($name) { return 'https://paymenter.example.test' . \Illuminate\Support\Facades\Route::$names[$name]; }
+    function url($path) { return 'https://paymenter.example.com' . $path; }
+    function route($name) { return url(\Illuminate\Support\Facades\Route::$names[$name]); }
     function redirect() { return new class { public function route($name) { return $this; } public function with($key, $value) { return $value; } }; }
     function response() { return new class { public function json($data, $status = 200) { return compact('data', 'status'); } }; }
 }
@@ -463,8 +464,8 @@ namespace Illuminate\Database\Schema {
 }
 namespace Illuminate\Support\Facades {
     class Schema {
-        public static $checks = 0, $beforeCheck = null, $beforeCreate = null;
-        public static function rename($from, $to) { if (DB::$locked) throw new \RuntimeException('MySQL DDL ends the active transaction'); DB::$tables[$to] = DB::$tables[$from]; unset(DB::$tables[$from]); }
+        public static $checks = 0, $beforeCheck = null, $beforeCreate = null, $afterRename = null;
+        public static function rename($from, $to) { if (DB::$locked) throw new \RuntimeException('MySQL DDL ends the active transaction'); DB::$tables[$to] = DB::$tables[$from]; unset(DB::$tables[$from]); if ($hook = self::$afterRename) $hook(); }
         public static function table($table, $callback) { if (DB::$locked) throw new \RuntimeException('MySQL DDL ends the active transaction'); $callback(new class($table) {
             public function __construct(private $table) {}
             public function renameColumn($from, $to) { foreach (DB::$tables[$this->table] as &$row) { $row[$to] = $row[$from]; unset($row[$from]); } }

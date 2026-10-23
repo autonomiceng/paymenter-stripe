@@ -51,14 +51,19 @@ transaction. An interrupted schema conversion can resume by running dry run and
 apply again. Do not resume writers after a failure; inspect the schema and rows.
 A database restore with the matching old files is the rollback path.
 
-After success, verify row IDs and counts, update webhook delivery to
-`/extensions/ae-stripe/webhook`, clear application/view caches and restart workers.
-Use the same endpoint and signing secret when changing an existing Stripe URL.
+After success, verify row IDs and counts, clear application/view caches and restart
+workers. `/extensions/stripe-saved/webhook` remains an alias of the AE Stripe
+webhook handler, using the preserved signing secret and signature checks. The command
+prints the recommended new URL, `/extensions/ae-stripe/webhook`. Update the existing
+endpoint URL in Stripe when convenient; keep the same endpoint and signing secret.
+The command does not contact Stripe or change its endpoint configuration.
 Existing sandbox object metadata is read under both prefixes, with new keys taking
 precedence. New objects use `ae_stripe_*`. An unresolved checkout retry preserves
 its original payload and key; subscription retries also retain immutable payloads.
-Old routes and PHP namespaces are not registered. Reload old browser forms before
-retrying. Verify setup, consent and subscription settlement before resuming writers.
+The old `/extensions/stripe-saved/setup-agreement` return URL also remains an
+authenticated alias for existing Stripe redirects. Reload old browser forms before
+retrying consent. Old PHP namespaces are not registered. Verify setup, consent and
+subscription settlement before resuming writers.
 
 Remove the old extension directory only after success. If your deployment restores
 extensions from saved ZIPs, archive the old ZIP privately outside that restore

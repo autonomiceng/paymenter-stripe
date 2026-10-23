@@ -6,6 +6,8 @@ require __DIR__ . '/../extension/AeStripe/ConvertFromStripeSavedCommand.php';
 
 $container = new Illuminate\Foundation\Application($argv[1]);
 Illuminate\Container\Container::setInstance($container);
+$container->instance('url', new Illuminate\Routing\UrlGenerator(
+    new Illuminate\Routing\RouteCollection, Illuminate\Http\Request::create('https://paymenter.example.com')));
 Illuminate\Support\Facades\Facade::setFacadeApplication($container);
 // No app boot or gateway creation. The database boundary starts with the old identity.
 $database = new class {

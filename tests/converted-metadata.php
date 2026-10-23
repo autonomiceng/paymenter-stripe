@@ -25,9 +25,13 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
     try {
         $gateway->webhook(eventRequest($setup, type: 'setup_intent.succeeded'));
         check(isset(ExtensionHelper::$agreements['pm_converted']), 'Converted sandbox SetupIntent keeps routing and recorded consent');
-        $gateway->setupAgreement(new Request(['setup_intent' => 'seti_converted']));
+        [$returnClass, $returnMethod] = \Illuminate\Support\Facades\Route::$definitions['/extensions/stripe-saved/setup-agreement']['action'];
+        (new $returnClass(['stripe_secret_key' => 'fake-secret']))->$returnMethod(new Request(['setup_intent' => 'seti_converted']));
         check(ExtensionHelper::$agreements['pm_converted']['gateway'] === 'AeStripe', 'Converted setup redirect retains the new local gateway identity');
         $setup->status = 'requires_action';
+        $setup->metadata->stripe_saved_setup_consent_user = '8';
+        rejects(fn () => $gateway->setupConsent(new Request(['intent' => 'seti_converted', 'consent' => true])), 'HTTP 409');
+        $setup->metadata->stripe_saved_setup_consent_user = '7';
         check($gateway->setupConsent(new Request(['intent' => 'seti_converted', 'consent' => true]))['data']['ok'], 'Converted setup authentication retry keeps the original consent');
         $invoice = clone Invoice::$row; $invoice->id = 912; Invoice::$rows[912] = $invoice;
         $legacyData = ['description' => 'invoices.payment_for_invoice', 'amount' => 2000, 'currency' => 'usd',
@@ -49,12 +53,19 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
             }
             throw new RuntimeException('Unexpected converted checkout request: ' . $path);
         };
+        $storedAttempt = User::$row->props->values['ae_stripe_checkout_912'];
+        User::$row->props->values['ae_stripe_checkout_912'] = json_encode(array_replace($attempt, ['digest' => str_repeat('0', 64)]));
+        rejects(fn () => $gateway->pay($invoice, 20), 'HTTP 409');
+        User::$row->props->values['ae_stripe_checkout_912'] = $storedAttempt;
         check($gateway->pay($invoice, 20)['data']['customerSessionSecret'] === 'cuss_converted', 'Converted unresolved checkout can render again');
         check($gateway->pay($invoice, 20)['data']['customerSessionSecret'] === 'cuss_converted', 'Converted resolved checkout reuses its existing intent');
         $gateway->consent(new Request(['intent' => 'pi_converted', 'save' => false]));
         $intent->metadata->ae_stripe_gateway = '0';
         rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_converted', 'save' => true])), 'HTTP 403');
         unset($intent->metadata->ae_stripe_gateway);
+        $intent->metadata->stripe_saved_gateway = '0';
+        rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_converted', 'save' => true])), 'HTTP 403');
+        $intent->metadata->stripe_saved_gateway = '1';
         $intent->id = 'pi_converted_subscription'; $intent->status = 'succeeded';
         $intent->amount = $intent->amount_received = 2000; $intent->currency = 'usd';
         $service = Service::$row = new Service;
