@@ -60,12 +60,16 @@ class StripeSaved extends Gateway
 
     public function boot()
     {
-        $this->ensurePaymentFeeSchema();
         if (app()->runningInConsole()) {
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryPaymentFees())
-                ->name('stripe-saved:payment-fees')->hourly()->withoutOverlapping());
+                ->name('stripe-saved:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
             require_once __DIR__ . '/AdoptBundledCommand.php';
             \Illuminate\Console\Application::starting(fn ($artisan) => $artisan->resolve(AdoptBundledCommand::class));
+        }
+        try {
+            $this->ensurePaymentFeeSchema();
+        } catch (\Throwable $error) {
+            report($error);
         }
         require __DIR__ . '/routes.php';
         // Register webhook route

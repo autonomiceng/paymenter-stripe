@@ -21,6 +21,7 @@ function rejects($callback, $message) {
 }
 function invoke($gateway, $method, ...$args) { return (new ReflectionMethod($gateway, $method))->invoke($gateway, ...$args); }
 function eventRequest($intent, $time = null, $type = 'payment_intent.succeeded') {
+    if (str_starts_with($type, 'charge.')) $intent = (object) array_merge(['paid' => true, 'status' => 'succeeded'], (array) $intent);
     $body = json_encode(['type' => $type, 'data' => ['object' => $intent]]);
     $time ??= time();
     return new Request(body: $body, signature: 't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.' . $body, 'whsec_test'));
@@ -203,5 +204,7 @@ require __DIR__ . '/failures.php';
 require __DIR__ . '/payment-regressions.php';
 require __DIR__ . '/method-consent.php';
 require __DIR__ . '/fee-recovery.php';
+require __DIR__ . '/fee-recovery-review.php';
+require __DIR__ . '/schema-scheduler.php';
 require __DIR__ . '/native-upgrade.php';
 echo "PASS: $count offline assertions\n";

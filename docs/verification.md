@@ -116,16 +116,20 @@ unfinished intent from the earlier release in the sandbox consent checks.
 
 Fee recovery uses the `stripe_saved_payment_fees` extension table, created on install
 or the first boot after upgrading to 0.1.1. Keep Paymenter's scheduler running every minute. The hourly
-recovery task checks pending fees in batches of 100. A missing or pending balance
-transaction or invalid conversion rate stays pending. No rate is estimated.
-User and invoice locks serialize webhook and task writes. Completed records remain
+recovery task checks pending fees in batches of 100, ordered by attempt count.
+A missing balance transaction, missing fee data or invalid conversion rate stays pending.
+Pending funds already have a final fee. No rate is estimated.
+Stripe lookups finish before user and invoice locks serialize webhook and task writes. Completed records remain
 as replay guards. After 24 attempts or 72 hours, the record moves to `review`.
 Staff receive one native inbox notice per recipient. The invoice Audit Log and
 System > Audits retain a `stripe_saved_fee_review` entry with the identifiers and error.
 Deleted payments also move to review without blocking the next fee.
 Resolve these records manually against Stripe; do not delete completed records.
 Existing webhook endpoints may keep `charge.updated`; new endpoints also include
-`charge.succeeded`. A charge arriving before the native payment returns 409 for retry.
+`charge.succeeded`. A charge belonging to this gateway and awaiting native settlement returns 409 for retry.
+Foreign charges, refused payments and subscriptions held for review are acknowledged.
+Only paid, successful charges create fee records. Fees skipped before this upgrade
+have no recovery record and require manual reconciliation.
 
 Unresolved subscription successes retain one `stripe_saved_subscription_review`
 entry per Stripe invoice in System > Audits. This covers

@@ -160,7 +160,7 @@ namespace App\Models {
             public function where($key, $value) { $this->filters[$key] = $value; return $this; }
             public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = Audit::class; return $this; }
             public function first() {
-                if (!$this->currentRead) throw new \RuntimeException('Review guard must use a current read');
+                if (!$this->currentRead && \Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Review guard must use a current read');
                 foreach (Audit::$rows as $row) {
                     foreach ($this->filters as $key => $value) {
                         $actual = str_starts_with($key, 'new_values->') ? ($row['new_values'][substr($key, 12)] ?? null) : ($row[$key] ?? null);
@@ -240,11 +240,13 @@ namespace Illuminate\Support\Facades {
         public function name($value) { return $this; }
     }
     class Schedule {
-        public static $callbacks = [];
-        public static function call($callback) { self::$callbacks[] = $callback; return new self; }
+        public static $callbacks = [], $events = [];
+        public static function call($callback) { self::$callbacks[] = $callback; return self::$events[] = new self; }
         public function name($value) { return $this; }
         public function hourly() { return $this; }
-        public function withoutOverlapping() { return $this; }
+        public $singleServer = false, $overlapMinutes = null;
+        public function onOneServer() { $this->singleServer = true; return $this; }
+        public function withoutOverlapping($minutes = 1440) { $this->overlapMinutes = $minutes; return $this; }
     }
     class View { public static function addNamespace($name, $path) {} }
     class Event { public static $listeners = []; public static function listen($type, $callback) { self::$listeners[] = $callback; } }
@@ -295,6 +297,7 @@ namespace Carbon {
     }
 }
 namespace {
+    function report($error) { $GLOBALS['reportedErrors'][] = $error; }
     function now() { return new class { public $timestamp = 1700000000; public function startOfDay() { return $this; } }; }
     function base_path($path) { return ($GLOBALS['paymenterBase'] ?? dirname(__DIR__)) . '/' . (isset($GLOBALS['paymenterBase']) ? $path : str_replace('extensions/Gateways/', 'extension/', $path)); }
     function storage_path($path) { return $GLOBALS['adoptionStorage'] . '/' . $path; }
@@ -310,9 +313,9 @@ namespace {
 namespace {
     class FeeQuery {
         public static $beforeRead = null;
-        private $filters = [], $locked = false, $limit = 100;
+        private $filters = [], $locked = false, $limit = 100, $order = [];
         public function where($key, $value) { $this->filters[$key] = $value; return $this; }
-        public function orderBy($key) { return $this; }
+        public function orderBy($key) { $this->order[] = $key; return $this; }
         public function limit($value) { $this->limit = $value; return $this; }
         public function lockForUpdate() { $this->locked = true; return $this; }
         public function get() {
@@ -321,6 +324,7 @@ namespace {
                 foreach ($this->filters as $key => $value) if ($row[$key] !== $value) continue 2;
                 $rows[] = (object) $row;
             }
+            usort($rows, function ($a, $b) { foreach ($this->order as $key) { if ($a->$key !== $b->$key) return $a->$key <=> $b->$key; } return 0; });
             return array_slice($rows, 0, $this->limit);
         }
         public function first() {
@@ -360,8 +364,9 @@ namespace Illuminate\Database\Schema {
 }
 namespace Illuminate\Support\Facades {
     class Schema {
-        public static function hasTable($name) { return isset(DB::$tables[$name]); }
-        public static function create($name, $callback) { if (isset(DB::$tables[$name])) throw new \RuntimeException('Table exists'); DB::$tables[$name] = []; $callback(new \Illuminate\Database\Schema\Blueprint); }
+        public static $checks = 0, $beforeCheck = null, $beforeCreate = null;
+        public static function hasTable($name) { ++self::$checks; if ($hook = self::$beforeCheck) $hook(); return isset(DB::$tables[$name]); }
+        public static function create($name, $callback) { if ($hook = self::$beforeCreate) $hook(); if (isset(DB::$tables[$name])) throw new \RuntimeException('Table exists'); DB::$tables[$name] = []; $callback(new \Illuminate\Database\Schema\Blueprint); }
         public static function dropIfExists($name) { unset(DB::$tables[$name]); }
     }
 }

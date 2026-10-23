@@ -18,9 +18,13 @@ trait PaymentFees
         app(\Illuminate\Database\Migrations\Migrator::class)->run(base_path('extensions/Gateways/StripeSaved/database/migrations'));
     }
 
+    private static bool $paymentFeeSchemaReady = false;
+
     private function ensurePaymentFeeSchema(): void
     {
+        if (self::$paymentFeeSchemaReady) return;
         if (!\Illuminate\Support\Facades\Schema::hasTable('stripe_saved_payment_fees')) $this->upgraded();
+        self::$paymentFeeSchemaReady = true;
     }
 
     private function feeRows()
@@ -31,44 +35,107 @@ trait PaymentFees
     public function retryPaymentFees(): void
     {
         if (!$this->gatewayEnabled()) return;
-        foreach ($this->feeRows()->where('state', 'pending')->orderBy('created_at')->limit(100)->get() as $row) {
-            $transaction = InvoiceTransaction::where('transaction_id', $row->payment_intent_id)->first();
-            if (!$transaction || !$transaction->invoice || ($transaction->gateway->extension ?? null) !== 'StripeSaved') {
-                DB::transaction(function () use ($row) {
-                    $current = $this->feeRows()->where('payment_intent_id', $row->payment_intent_id)->lockForUpdate()->first();
-                    if (($current->state ?? null) !== 'pending') return;
-                    $current->last_error = 'Payment transaction unavailable';
-                    $this->stopPaymentFee($current, null);
-                });
-                continue;
+        foreach ($this->feeRows()->where('state', 'pending')->orderBy('attempts')->orderBy('created_at')->limit(100)->get() as $row) {
+            try {
+                $transaction = InvoiceTransaction::where('transaction_id', $row->payment_intent_id)->first();
+                if (!$transaction || !$transaction->invoice || ($transaction->gateway->extension ?? null) !== 'StripeSaved') {
+                    DB::transaction(function () use ($row) {
+                        $current = $this->feeRows()->where('payment_intent_id', $row->payment_intent_id)->lockForUpdate()->first();
+                        if (($current->state ?? null) !== 'pending') return;
+                        $current->last_error = 'Payment transaction unavailable';
+                        $this->stopPaymentFee($current, null);
+                    });
+                    continue;
+                }
+                $this->recordChargeFee((object) [
+                    'payment_intent' => $row->payment_intent_id, 'id' => $row->charge_id,
+                    'balance_transaction' => $row->balance_transaction_id, 'paid' => true, 'status' => 'succeeded',
+                ]);
+            } catch (\Throwable $e) {
+                report($e);
+                // The failed transaction rolled back. Count this attempt separately.
+                try {
+                    $failed = DB::transaction(function () use ($row, $e) {
+                        $current = $this->feeRows()->where('payment_intent_id', $row->payment_intent_id)->lockForUpdate()->first();
+                        if (($current->state ?? null) !== 'pending') return;
+                        $current->attempts++;
+                        $current->last_error = 'Fee recovery failed: ' . get_class($e);
+                        $this->feeRows()->where('payment_intent_id', $row->payment_intent_id)->update([
+                            'attempts' => $current->attempts, 'last_error' => $current->last_error,
+                        ]);
+                        return $current;
+                    });
+                    if ($failed && ($failed->attempts >= 24 || time() - $failed->created_at >= 72 * 3600)) {
+                        DB::transaction(function () use ($failed) {
+                            $current = $this->feeRows()->where('payment_intent_id', $failed->payment_intent_id)->lockForUpdate()->first();
+                            if (($current->state ?? null) !== 'pending') return;
+                            $this->stopPaymentFee($current, null);
+                        });
+                    }
+                } catch (\Throwable $failure) { report($failure); }
             }
-            $this->recordChargeFee((object) [
-                'payment_intent' => $row->payment_intent_id, 'id' => $row->charge_id,
-                'balance_transaction' => $row->balance_transaction_id,
-            ]);
         }
     }
 
-    private function recordChargeFee($charge): void
+    private function feeSettlementExpected($charge, string $paymentId): bool
+    {
+        $intent = $this->request('get', '/payment_intents/' . $paymentId);
+        abort_unless(($intent->id ?? null) === $paymentId, 409);
+        if (Audit::where('event', 'stripe_saved_payment_review')->where('new_values->payment_intent_id', $paymentId)->first()) return false;
+        $invoiceId = $charge->invoice ?? $intent->invoice ?? null;
+        if (is_object($invoiceId)) $invoiceId = $invoiceId->id ?? null;
+        if ($invoiceId && Audit::where('event', 'stripe_saved_subscription_review')
+            ->where('new_values->stripe_invoice_id', $invoiceId)->first()) return false;
+        if (isset($intent->metadata->invoice_id) && $this->ownsWebhookObject($intent, 'charge.succeeded')) return true;
+        if (!$invoiceId) return false;
+        $invoice = $this->request('get', '/invoices/' . $invoiceId);
+        return ($invoice->parent->type ?? null) === 'subscription_details'
+            && isset($invoice->metadata->stripe_saved_invoice_id) && $this->ownsWebhookObject($invoice, 'charge.succeeded');
+    }
+
+    private function recordChargeFee($charge): bool
     {
         $paymentId = $charge->payment_intent ?? null;
-        if (!$paymentId) return;
+        if (!$paymentId || !($charge->paid ?? false) || ($charge->status ?? null) !== 'succeeded') return false;
         $transaction = InvoiceTransaction::where('transaction_id', $paymentId)->first();
-        // A charge can arrive before settlement. Keep that delivery retryable.
-        abort_unless($transaction, 409);
-        if (($transaction->gateway->extension ?? null) !== 'StripeSaved') return;
-        DB::transaction(function () use ($charge, $paymentId, $transaction) {
+        if (!$transaction) {
+            // Retry only a payment whose local settlement is still expected.
+            if ($this->feeSettlementExpected($charge, $paymentId)) abort(409);
+            return false;
+        }
+        if (($transaction->gateway->extension ?? null) !== 'StripeSaved') return false;
+        $snapshot = $this->feeRows()->where('payment_intent_id', $paymentId)->get()[0] ?? null;
+        if ($snapshot && $snapshot->state !== 'pending') return true;
+        $balanceId = $charge->balance_transaction ?? $snapshot?->balance_transaction_id;
+        $chargeId = $charge->id ?? $snapshot?->charge_id;
+        $balance = null;
+        $error = 'Balance transaction unavailable';
+        if (!$snapshot || ($snapshot->attempts < 24 && time() - $snapshot->created_at < 72 * 3600)) {
+            try {
+                if (!$balanceId && $chargeId) {
+                    $latest = $this->request('get', '/charges/' . $chargeId);
+                    abort_unless(($latest->payment_intent ?? null) === $paymentId, 409);
+                    $balanceId = $latest->balance_transaction ?? null;
+                }
+                if ($balanceId) $balance = $this->request('get', '/balance_transactions/' . $balanceId);
+            } catch (\Illuminate\Http\Client\RequestException | \Illuminate\Http\Client\ConnectionException $e) {
+                $error = 'Balance transaction lookup failed';
+            }
+        }
+        DB::transaction(function () use ($charge, $paymentId, $transaction, $snapshot, $balanceId, $chargeId, $balance, $error) {
             User::where('id', $transaction->invoice->user_id)->lockForUpdate()->firstOrFail();
             $invoice = Invoice::where('id', $transaction->invoice->id)->lockForUpdate()->firstOrFail();
             $current = InvoiceTransaction::where('transaction_id', $paymentId)->lockForUpdate()->first();
-            abort_unless(($current->gateway->extension ?? null) === 'StripeSaved', 409);
+            abort_unless(($current->gateway->extension ?? null) === 'StripeSaved'
+                && $current->invoice->id === $invoice->id, 409);
             $row = $this->feeRows()->where('payment_intent_id', $paymentId)->lockForUpdate()->first();
             if ($row && $row->state !== 'pending') return;
+            if ($row && ($row->charge_id !== ($snapshot ? $snapshot->charge_id : $chargeId)
+                || $row->balance_transaction_id !== ($snapshot ? $snapshot->balance_transaction_id : $balanceId))) return;
             if (!$row) {
                 $this->feeRows()->insert([
                     'payment_intent_id' => $paymentId, 'invoice_id' => $invoice->id,
-                    'charge_id' => $charge->id ?? null,
-                    'balance_transaction_id' => $charge->balance_transaction ?? null,
+                    'charge_id' => $chargeId, 'balance_transaction_id' => $balanceId,
                     'state' => 'pending', 'attempts' => 0, 'created_at' => time(), 'last_error' => null,
                 ]);
                 $row = $this->feeRows()->where('payment_intent_id', $paymentId)->lockForUpdate()->first();
@@ -77,26 +144,9 @@ trait PaymentFees
                 $this->stopPaymentFee($row, $invoice);
                 return;
             }
-            $balanceId = $charge->balance_transaction ?? $row->balance_transaction_id;
-            $chargeId = $charge->id ?? $row->charge_id;
-            $error = 'Balance transaction unavailable';
             $fee = null;
             try {
-                if (!$balanceId && $chargeId) {
-                    $latest = $this->request('get', '/charges/' . $chargeId);
-                    abort_unless(($latest->payment_intent ?? null) === $paymentId, 409);
-                    $balanceId = $latest->balance_transaction ?? null;
-                }
-                if ($balanceId) {
-                    $balance = $this->request('get', '/balance_transactions/' . $balanceId);
-                    if (($balance->status ?? 'available') !== 'available') {
-                        $error = 'Balance transaction pending';
-                    } else {
-                        $fee = $this->paymentFeeAmount($balance, $invoice->currency_code);
-                    }
-                }
-            } catch (\Illuminate\Http\Client\RequestException | \Illuminate\Http\Client\ConnectionException $e) {
-                $error = 'Balance transaction lookup failed';
+                if ($balance) $fee = $this->paymentFeeAmount($balance, $invoice->currency_code);
             } catch (\InvalidArgumentException $e) {
                 $error = 'Fee conversion unavailable';
             }
@@ -113,6 +163,7 @@ trait PaymentFees
                 $this->stopPaymentFee((object) array_merge((array) $row, $values), $invoice);
             }
         });
+        return true;
     }
 
     private function paymentFeeAmount($balance, string $currency): float

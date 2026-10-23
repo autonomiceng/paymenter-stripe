@@ -70,7 +70,7 @@ trait Webhooks
                 break;
             case 'charge.succeeded':
             case 'charge.updated':
-                $this->recordChargeFee($object);
+                if (!$this->recordChargeFee($object)) return response()->json(['ignored' => true]);
                 break;
             case 'setup_intent.succeeded':
                 $setupIntent = $event->data->object; // contains a StripeSetupIntent

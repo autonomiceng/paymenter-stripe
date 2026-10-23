@@ -8,16 +8,20 @@ return new class extends Migration
 {
     public function up(): void
     {
-        Schema::create('stripe_saved_payment_fees', function (Blueprint $table) {
-            $table->string('payment_intent_id')->primary();
-            $table->unsignedBigInteger('invoice_id');
-            $table->string('charge_id')->nullable();
-            $table->string('balance_transaction_id')->nullable();
-            $table->string('state')->default('pending')->index();
-            $table->unsignedInteger('attempts')->default(0);
-            $table->unsignedBigInteger('created_at');
-            $table->string('last_error')->nullable();
-        });
+        try {
+            Schema::create('stripe_saved_payment_fees', function (Blueprint $table) {
+                $table->string('payment_intent_id')->primary();
+                $table->unsignedBigInteger('invoice_id');
+                $table->string('charge_id')->nullable();
+                $table->string('balance_transaction_id')->nullable();
+                $table->string('state')->default('pending')->index();
+                $table->unsignedInteger('attempts')->default(0);
+                $table->unsignedBigInteger('created_at');
+                $table->string('last_error')->nullable();
+            });
+        } catch (\Throwable $error) {
+            if (!Schema::hasTable('stripe_saved_payment_fees')) throw $error;
+        }
     }
 
     public function down(): void
