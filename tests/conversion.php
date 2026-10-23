@@ -53,6 +53,7 @@ use Paymenter\Extensions\Gateways\AeStripe\ConvertFromStripeSavedCommand;
         $command = new ConvertFromStripeSavedCommand;
         check($command->handle() === 0, 'Conversion defaults to a successful dry run');
         check(DB::$tables === $before, 'Dry run preserves schema, settings and every row');
+        check(!str_contains(implode("\n", $command->output), 'Previous apply was partial'), 'Fresh dry run does not report a partial apply');
         check(str_contains(implode("\n", $command->output), 'stripe_saved_payment_fees -> ae_stripe_payment_fees'), 'Dry run describes the table rename');
         $command = new ConvertFromStripeSavedCommand;
         $command->options = ['apply' => true];
@@ -124,8 +125,8 @@ use Paymenter\Extensions\Gateways\AeStripe\ConvertFromStripeSavedCommand;
         $command = new ConvertFromStripeSavedCommand; $command->options = ['apply' => true];
         try {
             check($command->handle() === 1, 'A row-update failure reports failure after DDL');
-            check(end($command->output) === 'Conversion failed. Keep writers paused and inspect the schema and rows before retrying.'
-                && !str_contains(implode("\n", $command->output), 'Simulated restore failure'), 'Unexpected conversion failures keep the existing safe console message');
+            check(end($command->output) === 'Conversion failed. Keep writers and webhook delivery paused. Fix the cause, then rerun the same command with --apply.'
+                && !str_contains(implode("\n", $command->output), 'Simulated restore failure'), 'Unexpected conversion failures explain how to resume safely');
             check(array_slice(Log::$errors, count($errors)) === [['AE Stripe conversion failed.', ['exception' => RuntimeException::class, 'code' => 'conversion_failed']]], 'Conversion logs the exception class and a fixed code, not the message');
             check(isset(DB::$tables['ae_stripe_payment_fees']) && !isset(DB::$tables['stripe_saved_payment_fees']), 'Completed DDL remains outside the rolled-back row transaction');
             check(DB::$tables['extensions'] === $before['extensions'] && DB::$tables['properties'] === $before['properties'], 'A failed row phase rolls back identity and property updates together');
@@ -136,8 +137,95 @@ use Paymenter\Extensions\Gateways\AeStripe\ConvertFromStripeSavedCommand;
         // Simulate an interruption after DDL but before the gateway row transaction.
         DB::$tables['ae_stripe_payment_fees'] = DB::$tables['stripe_saved_payment_fees'];
         unset(DB::$tables['stripe_saved_payment_fees']);
+        $partial = DB::$tables;
+        $command = new ConvertFromStripeSavedCommand;
+        check($command->handle() === 0 && DB::$tables === $partial, 'Table-only interruption has a read-only dry run');
+        check(in_array('Previous apply was partial. Completed schema renames will be skipped.', $command->output, true)
+            && !in_array('stripe_saved_payment_fees -> ae_stripe_payment_fees', $command->output, true)
+            && in_array('ae_stripe_payment_fees.stripe_saved_probe -> ae_stripe_probe', $command->output, true), 'Table-only partial dry run reports the remaining column rename');
         $command = new ConvertFromStripeSavedCommand; $command->options = ['apply' => true];
         check($command->handle() === 0 && DB::$tables === $converted, 'Interrupted DDL resumes without duplicating or losing rows');
+
+        $fixture = $before;
+        $fixture['settings'][] = ['id' => 10, 'settingable_id' => 42, 'settingable_type' => \App\Models\Gateway::class,
+            'key' => 'stripe_saved_option', 'value' => 'encrypted-option-placeholder'];
+        $fixture['services'][0]['stripe_saved_mode'] = 'kept';
+        $fixture['stripe_saved_attempts'] = [['id' => 92, 'stripe_saved_marker' => 'kept', 'payload' => 'immutable']];
+        foreach (['transactions', 'invoices', 'invoice_items', 'credits'] as $table) {
+            $fixture[$table] = [['id' => 101, 'amount' => 1250], ['id' => 102, 'amount' => 2500]];
+        }
+        DB::$tables = $fixture;
+        $command = new ConvertFromStripeSavedCommand; $command->options = ['apply' => true];
+        check($command->handle() === 0, 'Recovery fixture converts cleanly');
+        $clean = DB::$tables;
+        foreach (['billing_agreements', 'transactions', 'invoices', 'invoice_items', 'credits'] as $table) {
+            check($clean[$table] === $fixture[$table], 'Clean conversion preserves every row and value in ' . $table);
+        }
+        check($clean['services'] === [['id' => 91, 'billing_agreement_id' => 81, 'ae_stripe_mode' => 'kept']], 'Clean conversion preserves service IDs and agreement references');
+        check($clean['settings'] === [$fixture['settings'][0], array_replace($fixture['settings'][1], ['key' => 'ae_stripe_option'])], 'Clean conversion preserves settings IDs, owners and encrypted values');
+        $counts = array_map('count', $clean);
+        $tableWork = ['stripe_saved_payment_fees -> ae_stripe_payment_fees', 'stripe_saved_attempts -> ae_stripe_attempts'];
+        $columnWork = ['services.stripe_saved_mode -> ae_stripe_mode',
+            'stripe_saved_payment_fees.stripe_saved_probe -> ae_stripe_probe', 'stripe_saved_attempts.stripe_saved_marker -> ae_stripe_marker'];
+        // Faults run after the actual DDL or row write. Only the row phase rolls back.
+        foreach (['column rename' => 3, 'table rename' => 2, 'reference update' => 4, 'gateway update' => 1] as $phase => $points) {
+            for ($point = 1; $point <= $points; ++$point) {
+                DB::$tables = $fixture;
+                $seen = 0; $interrupted = null;
+                $fault = function () use (&$seen, &$interrupted, $point) {
+                    if (++$seen !== $point) return;
+                    $interrupted = DB::$tables;
+                    throw new RuntimeException('Synthetic conversion failure with private details');
+                };
+                if ($phase === 'column rename') \Illuminate\Support\Facades\Schema::$afterColumnRename = $fault;
+                if ($phase === 'table rename') \Illuminate\Support\Facades\Schema::$afterRename = $fault;
+                if (in_array($phase, ['reference update', 'gateway update'], true)) {
+                    AdoptionQuery::$afterUpdate = function ($table) use ($phase, $fault) {
+                        if (($table === 'extensions') === ($phase === 'gateway update')) $fault();
+                    };
+                }
+                $label = $phase . ' #' . $point;
+                $errors = count(Log::$errors);
+                $command = new ConvertFromStripeSavedCommand; $command->options = ['apply' => true];
+                try {
+                    check($command->handle() === 1 && $seen === $point && $interrupted !== null, 'Apply fails after ' . $label);
+                } finally {
+                    \Illuminate\Support\Facades\Schema::$afterColumnRename = null;
+                    \Illuminate\Support\Facades\Schema::$afterRename = null;
+                    AdoptionQuery::$afterUpdate = null;
+                }
+                check(!str_contains(implode("\n", $command->output), 'private details'), 'Failure hides exception details after ' . $label);
+                check(end($command->output) === 'Conversion failed. Keep writers and webhook delivery paused. Fix the cause, then rerun the same command with --apply.', 'Failure explains the exact retry after ' . $label);
+                check(array_slice(Log::$errors, $errors) === [['AE Stripe conversion failed.', ['exception' => RuntimeException::class, 'code' => 'conversion_failed']]], 'Failure keeps the fixed log code after ' . $label);
+                if (in_array($phase, ['column rename', 'table rename'], true)) {
+                    check(DB::$tables === $interrupted && DB::$tables !== $fixture, 'Completed DDL survives failure after ' . $label);
+                } else {
+                    check(DB::$tables['extensions'] === $fixture['extensions'], 'Gateway update rolls back after ' . $label);
+                    foreach (['settings', 'properties', 'audits', 'migrations'] as $table) {
+                        check(DB::$tables[$table] === $fixture[$table], 'Reference updates roll back in ' . $table . ' after ' . $label);
+                    }
+                    check(isset(DB::$tables['ae_stripe_payment_fees'], DB::$tables['ae_stripe_attempts']), 'Row failure preserves completed table renames after ' . $label);
+                }
+                $partial = DB::$tables;
+                $dryRun = new ConvertFromStripeSavedCommand;
+                check($dryRun->handle() === 0 && DB::$tables === $partial, 'Partial dry run makes no changes after ' . $label);
+                $completedColumns = $phase === 'column rename' ? $point : 3;
+                $completedTables = $phase === 'column rename' ? 0 : ($phase === 'table rename' ? $point : 2);
+                check($dryRun->output === array_merge(
+                    ['Previous apply was partial. Completed schema renames will be skipped.'],
+                    array_slice($tableWork, $completedTables), array_slice($columnWork, $completedColumns),
+                    ['settings #10: rename key', 'properties #11: rename key', 'audits #13: rename event',
+                        'migrations #14: rename migration', 'Gateway #42: StripeSaved -> AeStripe',
+                        'Recommended: update the existing Stripe webhook URL to https://paymenter.example.com/extensions/ae-stripe/webhook. Keep its signing secret.',
+                        'Dry run. Use --apply with writers and webhook delivery paused.']
+                ), 'Partial dry run reports exactly the remaining work after ' . $label);
+                $command = new ConvertFromStripeSavedCommand; $command->options = ['apply' => true];
+                check($command->handle() === 0 && DB::$tables === $clean, 'Retry matches clean IDs, settings, references and rows after ' . $label);
+                check(array_map('count', DB::$tables) === $counts, 'Retry preserves all row counts after ' . $label);
+                $command = new ConvertFromStripeSavedCommand; $command->options = ['apply' => true];
+                check($command->handle() === 0 && $command->output === ['Already converted to AE Stripe. No changes.'] && DB::$tables === $clean, 'Third apply is already converted after ' . $label);
+            }
+        }
     } finally {
         $foreignReads = array_filter(\Illuminate\Support\Facades\Schema::$inspectedTables, fn ($name) => str_starts_with($name, 'other_app.'));
         \Illuminate\Support\Facades\Schema::$foreignTables = [];

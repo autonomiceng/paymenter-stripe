@@ -47,8 +47,9 @@ columns present in a customized install are renamed in place.
 
 MySQL schema changes commit implicitly. The command checks the plan first, runs
 schema changes outside transactions, then rechecks and updates rows in a new
-transaction. An interrupted schema conversion can resume by running dry run and
-apply again. Do not resume writers after a failure; inspect the schema and rows.
+transaction. If apply fails, keep writers and webhook delivery paused, fix the cause
+and rerun the same `ae_convert --apply`. A dry run reports the partial apply and only
+the remaining work. Completed schema renames remain; failed row updates roll back together.
 A database restore with the matching old files is the rollback path.
 
 After success, verify row IDs and counts, clear application/view caches and restart

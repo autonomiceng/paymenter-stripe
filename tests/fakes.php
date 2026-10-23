@@ -464,11 +464,11 @@ namespace Illuminate\Database\Schema {
 }
 namespace Illuminate\Support\Facades {
     class Schema {
-        public static $checks = 0, $beforeCheck = null, $beforeCreate = null, $afterRename = null;
+        public static $checks = 0, $beforeCheck = null, $beforeCreate = null, $afterRename = null, $afterColumnRename = null;
         public static function rename($from, $to) { if (DB::$locked) throw new \RuntimeException('MySQL DDL ends the active transaction'); DB::$tables[$to] = DB::$tables[$from]; unset(DB::$tables[$from]); if ($hook = self::$afterRename) $hook(); }
         public static function table($table, $callback) { if (DB::$locked) throw new \RuntimeException('MySQL DDL ends the active transaction'); $callback(new class($table) {
             public function __construct(private $table) {}
-            public function renameColumn($from, $to) { foreach (DB::$tables[$this->table] as &$row) { $row[$to] = $row[$from]; unset($row[$from]); } }
+            public function renameColumn($from, $to) { foreach (DB::$tables[$this->table] as &$row) { $row[$to] = $row[$from]; unset($row[$from]); } if ($hook = Schema::$afterColumnRename) $hook(); }
         }); }
         public static $foreignTables = [], $inspectedTables = [];
         public static function getTableListing($schema = null, $schemaQualified = true) {

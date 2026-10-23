@@ -1,5 +1,11 @@
 # Migrate from bundled Stripe
 
+For an existing StripeSaved install, follow the [conversion instructions](convert-stripe-saved.md).
+If conversion apply fails, keep writers and webhook delivery paused,
+fix the cause and rerun the same `ae_convert --apply`. Completed schema renames stay
+in place; a dry run reports the partial apply and only the remaining work. Row updates
+roll back together, and the retry preserves IDs, settings and agreement/service references.
+
 Rehearse in an isolated Paymenter/Stripe test-mode copy before live use. Back up
 and verify a restore first. Stripe keeps cards on the shared customer (`stripe_id`);
 this command changes Paymenter ownership. Auto Pay stays on the same card; services
