@@ -17,6 +17,8 @@ From the Paymenter root, review existing duplicates with
 agreement IDs. `php artisan ae-stripe:deduplicate-cards --apply` detaches and
 soft-deletes only duplicates with no service binding. It preserves the broadest
 existing redisplay setting and rechecks ownership and bindings before removal.
+Failed agreements are reported for manual review while the remaining rows continue.
+If any agreements are skipped, the command reports the count and exits nonzero.
 Use a sandbox first. No cleanup has been run against a live installation.
 
 Invoice labels belong to the theme. The Beco `components/transaction-label.blade.php`

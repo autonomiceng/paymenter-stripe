@@ -109,27 +109,35 @@ trait CardDuplicates
         if (($method->customer ?? null) !== null) $this->request('post', '/payment_methods/' . $method->id . '/detach');
     }
 
-    public function deduplicateCards(bool $apply, callable $report): void
+    public function deduplicateCards(bool $apply, callable $report): int
     {
         $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
         $rows = BillingAgreement::where('gateway_id', $gateway->id)->get();
+        $skipped = 0;
         foreach ($rows as $row) {
-            $action = DB::transaction(function () use ($gateway, $row, $apply, $report) {
-                $user = User::where('id', $row->user_id)->lockForUpdate()->firstOrFail();
-                $incoming = BillingAgreement::where('external_reference', $row->external_reference)->lockForUpdate()->first();
-                if (!$incoming || $incoming->gateway_id != $gateway->id || $incoming->user_id != $user->id) return null;
-                $method = $this->request('get', '/payment_methods/' . $incoming->external_reference);
-                $duplicate = $this->duplicateCard($user, $method, $gateway, $incoming, report: $report);
-                if (!$duplicate) return null;
-                [$kept, $remote] = $duplicate;
-                $report('Agreement #' . $incoming->id . ' duplicates #' . $kept->id . ' (customer #' . $user->id . ').');
-                if (!$apply) return null;
-                $this->rememberDuplicate($user, $method, $kept);
-                return [$user, $method];
-            });
-            if (!$action) continue;
-            [$user, $method] = $action;
-            $this->finalizeDuplicate($user, $method, consented: false, report: $report, incomingId: $row->id);
+            try {
+                $action = DB::transaction(function () use ($gateway, $row, $apply, $report) {
+                    $user = User::where('id', $row->user_id)->lockForUpdate()->firstOrFail();
+                    $incoming = BillingAgreement::where('external_reference', $row->external_reference)->lockForUpdate()->first();
+                    if (!$incoming || $incoming->gateway_id != $gateway->id || $incoming->user_id != $user->id) return null;
+                    $method = $this->request('get', '/payment_methods/' . $incoming->external_reference);
+                    $duplicate = $this->duplicateCard($user, $method, $gateway, $incoming, report: $report);
+                    if (!$duplicate) return null;
+                    [$kept, $remote] = $duplicate;
+                    $report('Agreement #' . $incoming->id . ' duplicates #' . $kept->id . ' (customer #' . $user->id . ').');
+                    if (!$apply) return null;
+                    $this->rememberDuplicate($user, $method, $kept);
+                    return [$user, $method];
+                });
+                if (!$action) continue;
+                [$user, $method] = $action;
+                $this->finalizeDuplicate($user, $method, consented: false, report: $report, incomingId: $row->id);
+            } catch (\Throwable $e) {
+                ++$skipped;
+                Log::warning('ae_stripe_deduplicate_agreement_skipped', ['agreement_id' => $row->id, 'error' => get_class($e)]);
+                $report('Agreement #' . $row->id . ' skipped. Review it manually.');
+            }
         }
+        return $skipped;
     }
 }

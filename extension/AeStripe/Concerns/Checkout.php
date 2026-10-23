@@ -210,7 +210,17 @@ trait Checkout
             if ($agreement?->trashed() && !$receipt) {
                 throw new DisplayException('This payment method was removed. Add a new payment method.');
             }
-            if ($deduplicate && ($duplicate = $this->duplicateCard($user, $method, $gateway, $agreement))) {
+            $duplicate = null;
+            if ($deduplicate) {
+                try {
+                    $duplicate = $this->duplicateCard($user, $method, $gateway, $agreement);
+                } catch (RequestException $e) {
+                    if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') throw $e;
+                    // A missing comparison card cannot prevent saving the verified incoming method.
+                    \Illuminate\Support\Facades\Log::warning('ae_stripe_duplicate_candidate_missing', ['error' => get_class($e)]);
+                }
+            }
+            if ($duplicate) {
                 [$kept] = $duplicate;
                 $this->rememberDuplicate($user, $method, $kept);
                 return [...$duplicate, $agreement?->id];

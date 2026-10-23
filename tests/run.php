@@ -232,4 +232,5 @@ require __DIR__ . '/agreement-persistence.php';
 require __DIR__ . '/card-dedupe.php';
 require __DIR__ . '/card-dedupe-races.php';
 require __DIR__ . '/converted-card-dedupe.php';
+require __DIR__ . '/card-dedupe-failures.php';
 echo "PASS: $count offline assertions\n";

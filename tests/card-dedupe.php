@@ -159,12 +159,9 @@ Http::$handler = function ($verb, $path, $data) use ($handler, &$lostDetach) {
     }
     return $result;
 };
-try {
-    $gateway->deduplicateCards(true, fn ($line) => null);
-    throw new RuntimeException('Cleanup failure must remain retryable');
-} catch (\Illuminate\Http\Client\ConnectionException $e) {
-    check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null, 'Cleanup rolls back local removal on an uncertain detach');
-}
+check($gateway->deduplicateCards(true, fn ($line) => null) === 1,
+    'Cleanup reports an agreement skipped after an uncertain detach');
+check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null, 'Cleanup rolls back local removal on an uncertain detach');
 $gateway->deduplicateCards(true, fn ($line) => null);
 check(ExtensionHelper::$agreements['pm_new']['deleted_at'] !== null && $methods['pm_old']->allow_redisplay === 'always',
     'Cleanup resumes a detached method without reducing the retained consent');

@@ -15,7 +15,11 @@ final class DeduplicateCardsCommand extends Command
         try {
             $row = \App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail();
             $gateway = ExtensionHelper::getExtension('gateway', 'AeStripe', $row->settings);
-            $gateway->deduplicateCards((bool) $this->option('apply'), fn ($line) => $this->line($line));
+            $skipped = $gateway->deduplicateCards((bool) $this->option('apply'), fn ($line) => $this->line($line));
+            if ($skipped > 0) {
+                $this->error($skipped . ' agreement(s) skipped. Review them manually.');
+                return self::FAILURE;
+            }
             $this->info($this->option('apply') ? 'Duplicate cleanup completed.' : 'Dry run. No changes. Use --apply to remove unbound duplicates.');
             return self::SUCCESS;
         } catch (\Throwable $e) {

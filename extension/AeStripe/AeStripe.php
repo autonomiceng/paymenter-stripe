@@ -620,7 +620,12 @@ class AeStripe extends Gateway
             $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail();
             if ($current->id != $billingAgreement->id || $current->user_id != $user->id || $current->gateway_id != $gateway->id) return false;
             if ($current->trashed()) return true;
-            $method = $this->request('get', '/payment_methods/' . $current->external_reference);
+            try {
+                $method = $this->request('get', '/payment_methods/' . $current->external_reference);
+            } catch (Exception $e) {
+                \Illuminate\Support\Facades\Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
+                return true;
+            }
             if (($method->customer ?? null) === null) return true;
             if (!$this->methodCustomerMatches($user, $method, current: true)) return false;
             try {
