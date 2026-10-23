@@ -39,7 +39,7 @@ $service->properties->values['has_stripe_subscription'] = '1';
 $before = count(Http::$calls);
 $gateway->cancelSubscription($service);
 check(count(Http::$calls) === $before, 'Empty subscription id stops cancellation even with marker');
-$setup = (object) ['id' => 'seti_subscription', 'customer' => 'cus_owner', 'payment_method' => 'pm_test', 'metadata' => (object) ['invoice_id' => 12]];
+$setup = (object) ['id' => 'seti_subscription', 'customer' => 'cus_owner', 'payment_method' => 'pm_test', 'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
 $invoice->items = [(object) ['reference_type' => Service::class, 'reference' => $service, 'price' => '20.99']];
 Http::$handler = function ($verb, $path, $data) {
     return match ($path) {
@@ -65,20 +65,23 @@ try { invoke($gateway, 'setupSubscription', $setup); throw new RuntimeException(
 catch (Exception $error) { check($error->getMessage() === 'Stripe customer not found', 'Missing customer throws message-only exception'); }
 $user->props->customer = 'cus_owner';
 $before = count(Http::$calls);
-$gateway->webhook(eventRequest((object) ['metadata' => (object) []], type: 'setup_intent.succeeded'));
+$gateway->webhook(eventRequest((object) ['metadata' => (object) ['stripe_saved_gateway' => '1']], type: 'setup_intent.succeeded'));
 check(count(Http::$calls) === $before, 'Unrelated SetupIntent is acknowledged without effects');
 $service->subscription_id = 'sub_created';
-$gateway->webhook(eventRequest((object) ['id' => 'sched_test', 'subscription' => 'sub_created'], type: 'subscription_schedule.canceled'));
+$gateway->webhook(eventRequest((object) ['id' => 'sched_test', 'subscription' => 'sub_created', 'metadata' => (object) ['stripe_saved_gateway' => '1']], type: 'subscription_schedule.canceled'));
 check($service->subscription_id === null, 'Schedule cancellation uses subscription id');
 
 $service->subscription_id = 'sub_test';
 $service->invoiceRows = [(object) ['invoice' => $invoice, 'created_at' => 1]];
 $stripeInvoice = (object) ['id' => 'in_test', 'currency' => 'usd', 'amount_paid' => 1999,
     'metadata' => (object) ['stripe_saved_invoice_id' => 12],
-    'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) ['subscription' => 'sub_test']]];
+    'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) ['subscription' => 'sub_test', 'metadata' => (object) ['stripe_saved_gateway' => '1']]]];
 $paymentRows = [];
-Http::$handler = function ($verb, $path, $data) use (&$paymentRows) {
+Http::$handler = function ($verb, $path, $data) use (&$paymentRows, $stripeInvoice) {
     if ($path === '/invoice_payments') return ['data' => $paymentRows];
+    if ($verb === 'get' && str_starts_with($path, '/payment_intents/')) return [
+        'id' => substr($path, strlen('/payment_intents/')), 'status' => 'succeeded', 'customer' => 'cus_owner',
+        'amount' => 2500, 'amount_received' => 1999, 'currency' => $stripeInvoice->currency];
     throw new RuntimeException('Unexpected payment request: ' . $path);
 };
 $deliver = fn ($object) => $gateway->webhook(eventRequest($object, type: 'invoice.payment_succeeded'));
@@ -89,19 +92,25 @@ $service->invoiceRows = [];
 check($deliver($stripeInvoice)['status'] === 200, 'No matching invoice is a 2xx no-op');
 $service->invoiceRows = [(object) ['invoice' => $invoice, 'created_at' => 1]];
 $invoice->status = 'paid';
+$paymentRows[0]->payment->payment_intent = 'pi_subscription_late';
 $before = ExtensionHelper::$applications;
 $deliver($stripeInvoice);
-check(ExtensionHelper::$applications === $before, 'Paid invoice receives no payment');
+check(ExtensionHelper::$applications === $before + 1 && $invoice->status === 'paid', 'Paid bound subscription invoice retains its late payment');
+$before = ExtensionHelper::$applications;
+$paymentRows[0]->payment->payment_intent = 'pi_subscription';
 $invoice->status = 'pending';
 $stripeInvoice->currency = 'eur';
 $deliver($stripeInvoice);
 check(ExtensionHelper::$applications === $before && end(Log::$warnings)[1] === ['service_id' => 41], 'Currency mismatch is logged without applying money');
 $stripeInvoice->currency = 'usd';
+\Illuminate\Support\Facades\DB::$modelLocks = [];
 $deliver($stripeInvoice);
+check(array_slice(\Illuminate\Support\Facades\DB::$modelLocks, 0, 4) === [\App\Models\User::class, Service::class, \App\Models\InvoiceTransaction::class, Invoice::class],
+    'Subscription settlement locks customer before service and invoice');
 check(ExtensionHelper::$payments['12:pi_subscription']['amount'] === 19.99, 'Subscription invoice records major units');
 $before = ExtensionHelper::$applications;
 $deliver($stripeInvoice);
-$paymentIntent = (object) ['id' => 'pi_subscription', 'amount' => 1999, 'currency' => 'usd', 'metadata' => (object) ['invoice_id' => 12]];
+$paymentIntent = (object) ['id' => 'pi_subscription', 'amount' => 1999, 'amount_received' => 1999, 'currency' => 'usd', 'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
 $gateway->webhook(eventRequest($paymentIntent));
 check(ExtensionHelper::$applications === $before, 'Subscription then PaymentIntent delivery cannot reapply payment');
 $paymentIntent->id = 'pi_first';
@@ -119,20 +128,35 @@ $invoice->status = 'paid';
 $paymentIntent->id = 'pi_second_settled';
 $paymentIntent->currency = 'usd';
 $gateway->webhook(eventRequest($paymentIntent));
-check(ExtensionHelper::$applications === $before, 'A different intent cannot apply to an already paid invoice');
+check(ExtensionHelper::$applications === $before + 1 && $invoice->status === 'paid', 'A different settled intent is recorded on the paid invoice');
 $invoice->status = 'pending';
 
 // Currency-specific reverse conversion also applies to recorded payments and charge fees.
 $invoice->currency_code = 'JPY';
 $paymentIntent->id = 'pi_yen';
 $paymentIntent->currency = 'jpy';
-$paymentIntent->amount = 123;
+$paymentIntent->amount = $paymentIntent->amount_received = 123;
 $gateway->webhook(eventRequest($paymentIntent));
 check(ExtensionHelper::$payments['12:pi_yen']['amount'] === 123.0, 'JPY webhook records yen without dividing by 100');
 Http::$handler = fn () => ['fee' => 5, 'currency' => 'jpy'];
 $gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_yen', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
-check(ExtensionHelper::$fees['pi_yen'] === 5.0, 'JPY balance transaction fee uses its own currency');
+check(ExtensionHelper::$fees['pi_yen'] === 5.0, 'Same-currency JPY fee remains in invoice currency');
+// Settlement USD -> invoice JPY: convert major units then round to whole yen.
+Http::$handler = fn () => ['fee' => 333, 'currency' => 'usd', 'exchange_rate' => 0.007];
+$gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_yen', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
+check(ExtensionHelper::$fees['pi_yen'] === 476.0, 'Cross-currency fee rounds to invoice JPY minor units');
 $invoice->currency_code = 'usd';
+Http::$handler = fn () => ['fee' => 100, 'currency' => 'jpy', 'exchange_rate' => 150];
+$gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_yen', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
+check(ExtensionHelper::$fees['pi_yen'] === 0.67, 'Settlement JPY fee converts back to invoice USD cents');
+foreach ([null, 0, -1, 'invalid', 'INF', 'NaN', '1e309'] as $invalidRate) {
+    Http::$handler = fn () => ['fee' => 100, 'currency' => 'jpy', 'exchange_rate' => $invalidRate];
+    $warnings = count(Log::$warnings);
+    $gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_yen', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
+    check(ExtensionHelper::$fees['pi_yen'] === 0 && count(Log::$warnings) === $warnings + 1
+        && end(Log::$warnings) === ['StripeSaved fee conversion unavailable', ['invoice_id' => 12]],
+        'Invalid or missing exchange rate records no fee and a safe warning: ' . var_export($invalidRate, true));
+}
 Http::$handler = function ($verb, $path) {
     return match ($path) {
         '/subscriptions/sub_test' => ['schedule' => 'sched_test'],

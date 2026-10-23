@@ -18,7 +18,10 @@ def tracked_files():
     paths = sorted(name for name in listing.split('\0') if name)
     for name in paths:
         path = ROOT / name
-        if path.is_symlink() or not path.is_file():
+        components = [path, *path.parents]
+        if (any(component.is_symlink() for component in components if component != ROOT and ROOT in component.parents)
+                or not path.resolve().is_relative_to(ROOT)
+                or not path.is_file()):
             raise SystemExit(f'Refusing release entry {name}: not a regular tracked file')
     return paths
 

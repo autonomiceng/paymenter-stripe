@@ -137,9 +137,10 @@ callback to register `stripe-saved:adopt-bundled`, following the local Paymenter
 command discovery is unverified; test it in the installed sandbox before release.
 
 The fork marks its PaymentIntents, SetupIntents and subscription schedules/phases
-with `stripe_saved_gateway=1`. While bundled Stripe is active (`enabled=1` and not soft-deleted), the fork acknowledges
-unmarked intent and subscription events without effects and logs only the event type
-and local invoice ID. After bundled Stripe is soft-deleted, absent, or `enabled=0`, the fork accepts
+with `stripe_saved_gateway=1`. While a non-deleted bundled Stripe row exists (even
+`enabled=0`), the fork acknowledges unmarked intent and subscription events without
+effects and logs only the event type and local invoice ID. After bundled Stripe is
+soft-deleted or absent, the fork accepts
 unmarked events so in-flight bundled payments can settle after cutover. Fee updates
 require a transaction already owned by the fork; they never change bundled transactions.
 Keep the old endpoint stopped: these guards cannot stop the bundled handler itself.

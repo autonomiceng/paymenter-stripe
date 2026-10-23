@@ -4,7 +4,8 @@ namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
 
 use App\Helpers\ExtensionHelper;
 use App\Exceptions\DisplayException;
-use Illuminate\Http\Client\RequestException;
+use Illuminate\Http\Client\{ConnectionException, RequestException};
+use App\Models\Audit;
 use App\Models\Invoice;
 use App\Models\InvoiceTransaction;
 use App\Models\User;
@@ -53,9 +54,9 @@ trait Checkout
                     ],
                 ]],
             ]);
-        } catch (RequestException $e) {
+        } catch (RequestException | ConnectionException $e) {
             \Illuminate\Support\Facades\Log::warning('StripeSaved customer session unavailable', [
-                'invoice_id' => $invoice->id, 'http_status' => $e->response->status(),
+                'invoice_id' => $invoice->id, 'http_status' => $e instanceof RequestException ? $e->response->status() : null,
             ]);
         }
 
@@ -90,8 +91,9 @@ trait Checkout
             return response()->json(['ok' => true]);
         }
         abort_unless(in_array($intent->status, ['requires_payment_method', 'requires_confirmation']), 409);
-        // Basil accepts an empty string to unset each method-specific future usage.
+        // Clear legacy top-level usage; consent applies only to card and Link.
         $this->request('post', '/payment_intents/' . $intent->id, [
+            'setup_future_usage' => '',
             'payment_method_options' => [
                 'card' => ['setup_future_usage' => $save ? 'off_session' : ''],
                 'link' => ['setup_future_usage' => $save ? 'off_session' : ''],
@@ -111,18 +113,46 @@ trait Checkout
             if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->lockForUpdate()->first()) return;
             if (!empty($intent->customer) && $intent->customer !== $invoice->user->properties()->where('key', 'stripe_id')->first()?->value) {
                 \Illuminate\Support\Facades\Log::warning('StripeSaved payment customer mismatch', ['invoice_id' => $invoice->id]);
+                if ($status === 'succeeded') $this->recordRefusedPayment($invoice, $intent, 'customer mismatch');
                 return;
             }
-            if ($status === 'succeeded' && $invoice->status === 'paid') return;
             if (strtolower($invoice->currency_code) !== strtolower($intent->currency ?? '')) {
                 \Illuminate\Support\Facades\Log::warning('StripeSaved payment currency mismatch', ['invoice_id' => $invoice->id]);
+                if ($status === 'succeeded') $this->recordRefusedPayment($invoice, $intent, 'currency mismatch');
                 return;
+            }
+            if ($status === 'succeeded' && !in_array($invoice->status, ['pending', 'paid'], true)) {
+                \Illuminate\Support\Facades\Log::warning('StripeSaved payment received for nonpending invoice', ['invoice_id' => $invoice->id]);
+                $this->recordRefusedPayment($invoice, $intent, 'invoice not pending');
+                return;
+            }
+            if ($status === 'succeeded' && $invoice->status === 'paid') {
+                \Illuminate\Support\Facades\Log::warning('StripeSaved payment received for paid invoice', ['invoice_id' => $invoice->id]);
             }
             $helper = match ($status) {
                 'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',
             };
-            ExtensionHelper::{$helper}($invoice, 'StripeSaved', $this->fromMinorUnits($intent->amount, $intent->currency), null, $intent->id);
+            $amount = $status === 'succeeded' ? $intent->amount_received : $intent->amount;
+            ExtensionHelper::{$helper}($invoice, 'StripeSaved', $this->fromMinorUnits($amount, $intent->currency), null, $intent->id);
         });
+    }
+
+    private function recordRefusedPayment($invoice, $intent, string $reason): void
+    {
+        // The caller holds the user and invoice locks. Keep one staff record per invoice and PaymentIntent.
+        if (Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
+            ->where('event', 'stripe_saved_payment_review')->where('new_values->payment_intent_id', $intent->id)->lockForUpdate()->first()) return;
+        Audit::create([
+            'event' => 'stripe_saved_payment_review',
+            'auditable_type' => $invoice->getMorphClass(), 'auditable_id' => $invoice->id,
+            'old_values' => [],
+            'new_values' => [
+                'payment_intent_id' => $intent->id,
+                'amount_minor' => $intent->amount_received,
+                'currency' => $intent->currency ?? '', 'reason' => $reason,
+                'resolution' => 'Payment was not applied. Review the charge in Stripe for a refund or record the correct customer credit in Paymenter.',
+            ],
+        ]);
     }
 
     private function savePaidMethod($intent)

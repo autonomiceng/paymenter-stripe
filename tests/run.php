@@ -29,7 +29,7 @@ $user = User::$row = new User(new Properties('cus_owner'));
 $invoice = Invoice::$row = new Invoice($user);
 $gateway = new StripeSaved(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
 $intent = (object) ['id' => 'pi_test', 'customer' => 'cus_owner', 'status' => 'requires_payment_method',
-    'client_secret' => 'pi_test_secret', 'currency' => 'usd', 'amount' => 2000, 'payment_method' => 'pm_test',
+    'client_secret' => 'pi_test_secret', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 2000, 'payment_method' => 'pm_test',
     'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
 $method = (object) ['id' => 'pm_test', 'customer' => 'cus_owner', 'type' => 'card',
     'card' => (object) ['brand' => 'visa', 'last4' => '4242', 'exp_year' => 2030, 'exp_month' => 5]];
@@ -100,12 +100,18 @@ check(ExtensionHelper::$agreements['pm_test']['gateway'] === 'StripeSaved', 'Ind
 check(ExtensionHelper::$agreements['pm_test']['expiry'] === '2030-05-31', 'Card expiry preserved');
 check(end(Http::$calls)[2] === ['allow_redisplay' => 'always'], 'Redisplay opt-in reaches Stripe');
 $method->customer = 'cus_other';
+$warningCount = count(Log::$warnings);
+$callCount = count(Http::$calls);
 invoke($gateway, 'savePaidMethod', $intent);
-check(str_contains(end(Log::$warnings)[0], 'customer mismatch'), 'Permanent saving mismatch logs and returns');
+check(count(Log::$warnings) === $warningCount + 1 && str_contains(end(Log::$warnings)[0], 'customer mismatch'), 'Payment method customer mismatch adds its own warning');
+check(count(array_filter(array_slice(Http::$calls, $callCount), fn ($call) => $call[0] === 'post')) === 0, 'Payment method mismatch cannot update redisplay');
 $method->customer = 'cus_owner';
 $intent->customer = 'cus_other';
+$warningCount = count(Log::$warnings);
+$callCount = count(Http::$calls);
 invoke($gateway, 'savePaidMethod', $intent);
-check(str_contains(end(Log::$warnings)[0], 'customer mismatch'), 'Permanent saving mismatch logs and returns');
+check(count(Log::$warnings) === $warningCount + 1 && str_contains(end(Log::$warnings)[0], 'customer mismatch'), 'Intent customer mismatch adds its own warning');
+check(count(Http::$calls) === $callCount, 'Intent customer mismatch returns before method lookup');
 $intent->customer = 'cus_owner';
 $intent->status = 'succeeded';
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 409');
@@ -186,12 +192,15 @@ require __DIR__ . '/adoption.php';
 require __DIR__ . '/adoption-store.php';
 require __DIR__ . '/views.php';
 require __DIR__ . '/amounts.php';
+require __DIR__ . '/settlement-regressions.php';
 require __DIR__ . '/handlers.php';
 require __DIR__ . '/retries.php';
+require __DIR__ . '/subscription-attempts.php';
 require __DIR__ . '/setup-consent.php';
 require __DIR__ . '/ownership.php';
 require __DIR__ . '/checkout-owner.php';
 require __DIR__ . '/failures.php';
+require __DIR__ . '/payment-regressions.php';
 require __DIR__ . '/method-consent.php';
 require __DIR__ . '/native-upgrade.php';
 echo "PASS: $count offline assertions\n";

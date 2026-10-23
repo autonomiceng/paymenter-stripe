@@ -13,13 +13,19 @@ namespace Illuminate\Console {
 }
 namespace App\Exceptions { class DisplayException extends \RuntimeException {} }
 namespace Illuminate\Http\Client {
+    class ConnectionException extends \RuntimeException {}
     class RequestException extends \RuntimeException {
         public $response;
-        public function __construct($status) {
+        public function __construct($status, $error = []) {
             parent::__construct('sensitive request payload');
-            $this->response = new class($status) {
-                public function __construct(private $code) {}
+            $this->response = new class($status, $error) {
+                public function __construct(private $code, private $error) {}
                 public function status() { return $this->code; }
+                public function json($key) {
+                    $value = $this->error;
+                    foreach (explode('.', $key) as $part) $value = $value[$part] ?? null;
+                    return $value;
+                }
             };
         }
     }
@@ -35,12 +41,12 @@ namespace App\Classes\Extension {
 }
 namespace App\Models {
     class Query {
-        public function __construct(private $value) {}
+        public function __construct(private $value, private ?string $model = null) {}
         public function first() { return $this->value; }
         public function exists() { return (bool) $this->value; }
         public function firstOrFail() { return $this->value ?? throw new \RuntimeException('Missing row'); }
         public function where($key, $value) { return $this; }
-        public function lockForUpdate() { \Illuminate\Support\Facades\DB::$locked = true; return $this; }
+        public function lockForUpdate() { \Illuminate\Support\Facades\DB::$locked = true; \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
     }
     class Properties {
         public array $values = [];
@@ -52,7 +58,10 @@ namespace App\Models {
                 public function delete() { unset($this->properties->values[$this->key]); }
             };
         }
-        public function updateOrCreate($key, $data) { $this->values[$key['key']] = $data['value']; }
+        public function updateOrCreate($key, $data) {
+            if ($key['key'] === 'stripe_id') $this->customer = $data['value'];
+            else $this->values[$key['key']] = $data['value'];
+        }
     }
     class User {
         public static $row;
@@ -62,7 +71,7 @@ namespace App\Models {
         public function __construct(public Properties $props) {}
         public function properties() { return $this->props; }
         public function __get($key) { return $this->props; }
-        public static function where($key, $id) { return new Query(self::$row); }
+        public static function where($key, $id) { return new Query(self::$row, User::class); }
         public static function findOrFail($id) { return self::$row; }
     }
     class Invoice {
@@ -74,7 +83,8 @@ namespace App\Models {
         public $currency_code = 'usd', $status = 'pending';
         public $items = [];
         public function __construct(public User $user) {}
-        public static function where($key, $id) { return new Query(self::$rows[$id] ?? (self::$row && self::$row->id == $id ? self::$row : null)); }
+        public function getMorphClass() { return self::class; }
+        public static function where($key, $id) { return new Query(self::$rows[$id] ?? (self::$row && self::$row->id == $id ? self::$row : null), Invoice::class); }
         public function transactions() { return new class {
             private $id;
             public function where($key, $value) { if ($key === 'transaction_id') $this->id = $value; return $this; }
@@ -115,15 +125,21 @@ namespace App\Models {
     }
     class Service {
         public const STATUS_CANCELLED = 'cancelled';
+        public $user_id = 7, $status = 'active';
         public $id = 41, $subscription_id = 'sub_test', $price = '19.99', $quantity = 3;
         public static $row;
         public $currency, $plan, $product, $properties;
         public array $invoiceRows = [];
-        public static function where($key, $value) { return new Query(self::$row && self::$row->$key === $value ? self::$row : null); }
+        public static function where($key, $value) { return new Query(self::$row && self::$row->$key === $value ? self::$row : null, Service::class); }
         public function update($values) { foreach ($values as $key => $value) $this->$key = $value; }
         public function properties() { return $this->properties; }
         public function invoiceItems() { return new class($this->invoiceRows) {
             public function __construct(private $rows) {}
+            public function where($key, $value) {
+                if ($key !== 'invoice_id') throw new \RuntimeException('Unexpected invoice item filter: ' . $key);
+                $this->rows = array_filter($this->rows, fn ($row) => ($row->invoice_id ?? $row->invoice->id) == $value);
+                return $this;
+            }
             public function whereHas($relation, $callback) { $this->rows = array_filter($this->rows, fn ($row) => $row->invoice->status === 'pending'); return $this; }
             public function get() { return $this->rows; }
             public function latest($field) { usort($this->rows, fn ($a, $b) => $b->created_at <=> $a->created_at); return $this; }
@@ -140,15 +156,40 @@ namespace App\Models {
     }
     class BillingAgreement { public $external_reference = 'pm_test', $id = 4; }
     class Extension {}
+    class Audit {
+        public static $rows = [], $fail = false;
+        public static function where($key, $value) { return new class($key, $value) {
+            private $filters = [], $currentRead = false;
+            public function __construct($key, $value) { $this->where($key, $value); }
+            public function where($key, $value) { $this->filters[$key] = $value; return $this; }
+            public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = Audit::class; return $this; }
+            public function first() {
+                if (!$this->currentRead) throw new \RuntimeException('Review guard must use a current read');
+                foreach (Audit::$rows as $row) {
+                    foreach ($this->filters as $key => $value) {
+                        $actual = str_starts_with($key, 'new_values->') ? ($row['new_values'][substr($key, 12)] ?? null) : ($row[$key] ?? null);
+                        if ($actual !== $value) continue 2;
+                    }
+                    return (object) $row;
+                }
+                return null;
+            }
+        }; }
+        public static function create($row) {
+            if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Review record lock missing');
+            if (self::$fail) { self::$fail = false; throw new \RuntimeException('Review record unavailable'); }
+            self::$rows[] = $row;
+        }
+    }
     class InvoiceTransaction {
         public static function where($key, $value) { return new class($value) {
             private $status, $currentRead = false;
             public function __construct(private $id) {}
-            public function lockForUpdate() { $this->currentRead = true; return $this; }
+            public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = InvoiceTransaction::class; return $this; }
             public function first() {
                 if ($this->status && !$this->currentRead) throw new \RuntimeException('Settlement guard must use a current read');
                 foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
-                if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return (object) [...$row, 'gateway' => (object) ['extension' => $row['gateway']]];
+                if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return (object) [...$row, 'invoice' => Invoice::findOrFail(explode(':', $key)[0]), 'gateway' => (object) ['extension' => $row['gateway']]];
             } return null; }
             public function where($key, $value) { if ($key === 'status') $this->status = $value; return $this; }
             public function exists() { foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
@@ -205,6 +246,7 @@ namespace Illuminate\Support\Facades {
         public static $tables = [], $locks = [], $updates = [];
         public static function table($name) { return new \AdoptionQuery($name); }
         public static $locked = false;
+        public static $modelLocks = [];
         public static function transaction($callback) {
             $before = self::$tables;
             $agreements = \App\Helpers\ExtensionHelper::$agreements;

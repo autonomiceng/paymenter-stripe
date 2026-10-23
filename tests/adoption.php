@@ -131,6 +131,29 @@ $f->manifestFail = false; $f->replaceFail = true;
 rejects(fn () => $a->run($plan['digest']), 'Simulated database failure');
 check($f->state === $original && isset($f->manifests['fixture']), 'Failed database commit retains manifest and rolls back ownership');
 rejects(fn () => $a->rollback($f->manifests['fixture']), 'Rollback drift; restore from reviewed backup instead');
+$f = new AdoptionFake; $a = new Adoption($f);
+$f->state['agreements'][10]['external_reference'] = 'legacy_card_10';
+$original = $f->state;
+rejects(fn () => $a->run(), 'Unsupported method reference; manual review required');
+check($f->state === $original && $f->writes === 0 && $f->manifests === [], 'Unsupported reference refuses without persistence');
+$f = new AdoptionFake; $a = new Adoption($f); $plan = $a->run(); $a->run($plan['digest']);
+$f->accounts = ['acct_changed', 'acct_changed'];
+$original = $f->state; $beforeCalls = count($f->calls);
+rejects(fn () => $a->redisplay($plan, 'fixture'), 'Stripe identity changed');
+check($f->state === $original && $f->results === [] && count($f->calls) === $beforeCalls + 2,
+    'Redisplay identity refusal makes only preflight reads and preserves state');
+foreach (['public' => 'pk_live_fixture', 'webhook' => ''] as $key => $invalid) {
+    $f = new AdoptionFake; $a = new Adoption($f); $f->config[0][$key] = $invalid;
+    rejects(fn () => $a->run(), 'Gateway configuration or key mode invalid');
+    check($f->calls === [] && $f->writes === 0 && $f->manifests === [], 'Invalid ' . $key . ' refuses before Stripe or persistence');
+}
+foreach (['empty account', 'missing gateway'] as $invalid) {
+    $f = new AdoptionFake; $a = new Adoption($f);
+    if ($invalid === 'empty account') $f->accounts = ['', ''];
+    else array_pop($f->config);
+    rejects(fn () => $a->run(), 'Stripe account mismatch');
+    check($f->writes === 0 && $f->manifests === [], 'Preflight refuses ' . $invalid . ' before persistence');
+}
 foreach (['Adoption.php', 'AdoptionStore.php', 'AdoptBundledCommand.php'] as $file) {
     check(!preg_match('/->(?:delete|forceDelete|truncate)\s*\(|\bDELETE\s+FROM\b/i', file_get_contents(__DIR__ . '/../extension/StripeSaved/' . $file)), 'No destructive operation in ' . $file);
 }

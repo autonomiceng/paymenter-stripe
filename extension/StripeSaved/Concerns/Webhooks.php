@@ -14,7 +14,7 @@ trait Webhooks
         $subscriptionMetadata = $object->parent->subscription_details->metadata ?? null;
         if (($metadata->stripe_saved_gateway ?? null) === '1'
             || ($subscriptionMetadata->stripe_saved_gateway ?? null) === '1'
-            || $this->bundledInactive()) return true;
+            || $this->bundledInactive(requireAbsent: true)) return true;
         \Illuminate\Support\Facades\Log::info('StripeSaved webhook ignored: bundled gateway owns unmarked event', [
             'event_type' => $type, 'invoice_id' => $metadata->invoice_id ?? $metadata->stripe_saved_invoice_id ?? null,
         ]);
@@ -79,7 +79,24 @@ trait Webhooks
                 $fee = 0;
                 if ($charge->balance_transaction) {
                     $balanceTransaction = $this->request('get', '/balance_transactions/' . $charge->balance_transaction);
-                    $fee = $this->fromMinorUnits($balanceTransaction->fee, $balanceTransaction->currency);
+                    $invoiceCurrency = $invoiceTransaction->invoice->currency_code;
+                    $settlementFee = $this->fromMinorUnits($balanceTransaction->fee, $balanceTransaction->currency);
+                    if (strtolower($balanceTransaction->currency) === strtolower($invoiceCurrency)) {
+                        $fee = $settlementFee;
+                    } else {
+                        // Stripe's rate converts charge currency to settlement currency.
+                        $rate = $balanceTransaction->exchange_rate ?? null;
+                        try {
+                            if (!is_numeric($rate) || !is_finite((float) $rate) || $rate <= 0) {
+                                throw new \InvalidArgumentException('Invalid exchange rate');
+                            }
+                            $fee = $this->fromMinorUnits($this->toMinorUnits($settlementFee / $rate, $invoiceCurrency), $invoiceCurrency);
+                        } catch (\InvalidArgumentException $e) {
+                            \Illuminate\Support\Facades\Log::warning('StripeSaved fee conversion unavailable', [
+                                'invoice_id' => $invoiceTransaction->invoice->id,
+                            ]);
+                        }
+                    }
                 }
                 ExtensionHelper::addPaymentFee($charge->payment_intent, $fee);
 

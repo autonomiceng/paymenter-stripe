@@ -16,6 +16,15 @@ foreach (['isk', 'ugx'] as $currency) {
     check(invoke($gateway, 'toMinorUnits', 500, $currency) === 50000, $currency . ' API retains two-decimal compatibility');
     check(invoke($gateway, 'fromMinorUnits', 50000, $currency) === 500.0, $currency . ' reverses compatibility scale');
 }
+foreach (['malformed' => 'not-an-amount', 'NaN' => NAN, 'infinity' => INF, 'negative infinity' => -INF,
+    'oversized decimal' => '9999999999999999999999999999', 'oversized float' => PHP_FLOAT_MAX] as $label => $invalid) {
+    try {
+        invoke($gateway, 'toMinorUnits', $invalid, 'usd');
+        throw new RuntimeException('Accepted invalid amount: ' . $label);
+    } catch (InvalidArgumentException $e) {
+        check(true, 'InvalidArgumentException rejects ' . $label);
+    }
+}
 $previousHandler = Http::$handler;
 Gateway::$enabled = true;
 Http::$handler = function ($verb, $path, $data) {

@@ -27,7 +27,7 @@
         };
         const observer = new MutationObserver(update);
         const scheme = matchMedia('(prefers-color-scheme: dark)');
-        for (const node of [document.documentElement, document.body]) {
+        for (let node = form; node; node = node.parentElement) {
             observer.observe(node, {attributes: true, attributeFilter: ['class', 'data-theme', 'style']});
         }
         scheme.addEventListener('change', update);
