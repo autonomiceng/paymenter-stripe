@@ -18,6 +18,7 @@ final class ConvertFromStripeSavedCommand extends Command
             });
             if (is_int($plan)) return $plan;
             ['old' => $old, 'renames' => $renames, 'columns' => $columns, 'updates' => $updates] = $plan;
+            if (!$this->option('apply') && $plan['partial']) $this->info('Previous apply was partial. Completed schema renames will be skipped.');
             foreach ($renames as $from => $to) $this->line($from . ' -> ' . $to);
             foreach ($columns as [$table, $from, $to]) $this->line($table . '.' . $from . ' -> ' . $to);
             foreach ($updates as [$table, $id, $field, $target]) $this->line($table . ' #' . $id . ': rename ' . $field);
@@ -47,7 +48,7 @@ final class ConvertFromStripeSavedCommand extends Command
             return self::SUCCESS;
         } catch (\Throwable $e) {
             Log::error('AE Stripe conversion failed.', ['exception' => $e::class, 'code' => 'conversion_failed']);
-            $this->error($e instanceof ConversionRefusal ? $e->getMessage() : 'Conversion failed. Keep writers paused and inspect the schema and rows before retrying.');
+            $this->error($e instanceof ConversionRefusal ? $e->getMessage() : 'Conversion failed. Keep writers and webhook delivery paused. Fix the cause, then rerun the same command with --apply.');
             return self::FAILURE;
         }
     }
@@ -67,8 +68,9 @@ final class ConvertFromStripeSavedCommand extends Command
             return self::SUCCESS;
         }
         $tables = Schema::getTableListing(DB::connection()->getDatabaseName(), false);
-        $renames = [];
+        $renames = []; $partial = false;
         foreach ($tables as $table) {
+            if (str_starts_with($table, 'ae_stripe_')) $partial = true;
             if (str_starts_with($table, 'stripe_saved_')) {
                 $target = 'ae_stripe_' . substr($table, 13);
                 if (Schema::hasTable($target)) throw new ConversionRefusal('Both source and target tables exist: ' . $table);
@@ -79,6 +81,7 @@ final class ConvertFromStripeSavedCommand extends Command
         foreach ($tables as $table) {
             $names = Schema::getColumnListing($table);
             foreach ($names as $column) {
+                if (str_starts_with($column, 'ae_stripe_')) $partial = true;
                 if (!str_starts_with($column, 'stripe_saved_')) continue;
                 $target = 'ae_stripe_' . substr($column, 13);
                 if (in_array($target, $names, true)) throw new ConversionRefusal('Both source and target columns exist: ' . $table . '.' . $column);
@@ -111,7 +114,7 @@ final class ConvertFromStripeSavedCommand extends Command
                 $updates[] = [$table, $row->id, $field, $target, (array) $row];
             }
         }
-        return compact('old', 'new', 'renames', 'columns', 'updates');
+        return compact('old', 'new', 'renames', 'columns', 'updates', 'partial');
     }
 }
 

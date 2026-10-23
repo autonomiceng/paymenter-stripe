@@ -15,6 +15,7 @@ class AdoptionCollection implements IteratorAggregate
 class AdoptionQuery
 {
     public static ?string $failTable = null;
+    public static ?Closure $afterUpdate = null;
     public static array $loadedRows = [];
     private array $filters = [];
     private bool $locked = false;
@@ -60,6 +61,7 @@ class AdoptionQuery
             $row = array_replace($row, $changes); ++$count;
         }
         DB::$updates[] = [$this->table, $changes];
+        if ($hook = self::$afterUpdate) $hook($this->table, $changes);
         return $count;
     }
 }
