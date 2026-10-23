@@ -32,7 +32,7 @@ trait Webhooks
             return response()->json(['error' => 'Gateway disabled'], 503);
         }
 
-        $event = json_decode($request->getContent());
+        $event = $this->readStripeObject(json_decode($request->getContent()));
         if (!is_object($event) || !isset($event->type, $event->data->object)) {
             return response()->json(['error' => 'Invalid event'], 400);
         }

@@ -36,9 +36,11 @@ use Paymenter\Extensions\Gateways\AeStripe\Concerns\Signature;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SubscriptionAttempt;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SubscriptionPayments;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\Webhooks;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\StripeMetadata;
 use Str;
 
 require_once __DIR__ . '/GatewayLifecycle.php';
+require_once __DIR__ . '/Concerns/StripeMetadata.php';
 require_once __DIR__ . '/Concerns/Signature.php';
 require_once __DIR__ . '/Concerns/Checkout.php';
 require_once __DIR__ . '/Concerns/Amounts.php';
@@ -58,7 +60,7 @@ require_once __DIR__ . '/Concerns/PaymentFees.php';
 )]
 class AeStripe extends Gateway
 {
-    use PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks;
+    use PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks, StripeMetadata;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -68,7 +70,11 @@ class AeStripe extends Gateway
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryPaymentFees())
                 ->name('ae-stripe:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
             require_once __DIR__ . '/AdoptBundledCommand.php';
-            \Illuminate\Console\Application::starting(fn ($artisan) => $artisan->resolve(AdoptBundledCommand::class));
+            require_once __DIR__ . '/ConvertFromStripeSavedCommand.php';
+            \Illuminate\Console\Application::starting(function ($artisan) {
+                $artisan->resolve(AdoptBundledCommand::class);
+                $artisan->resolve(ConvertFromStripeSavedCommand::class);
+            });
         }
         require __DIR__ . '/routes.php';
         // Register webhook route
@@ -264,7 +270,7 @@ class AeStripe extends Gateway
             'Stripe-Version' => self::API_VERSION,
         ];
         if ($idempotencyKey !== null) $headers['Idempotency-Key'] = $idempotencyKey;
-        return Http::withHeaders($headers)->asForm()->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object();
+        return $this->readStripeObject(Http::withHeaders($headers)->asForm()->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object());
     }
 
     private function setupSubscription($setupIntent)

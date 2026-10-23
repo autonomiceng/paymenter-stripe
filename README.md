@@ -21,6 +21,7 @@ default, lets customers save a card during invoice payment; saving never enables
 sandbox checks are pending. Complete them before accepting live payments.
 
 - [Installation](docs/install.md) and reproducible native ZIP packaging.
+- [Convert an existing StripeSaved install](docs/convert-stripe-saved.md) without a second gateway.
 - [Settings and consent](docs/settings.md), including legacy redisplay limits.
 - [Migration from bundled Stripe](docs/migrating-from-bundled.md): preserve the
   old extension row, adopt agreements with a reviewed dry-run command, and move

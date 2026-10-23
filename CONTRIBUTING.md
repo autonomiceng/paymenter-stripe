@@ -21,3 +21,7 @@ Record offline checks separately from the pending Paymenter/Stripe sandbox check
 Use Conventional Commits and preserve contributor attribution; no generated-by trailers.
 Describe changed behavior, validation and remaining limits in each pull request.
 Contributions use the project's [MIT license](LICENSE).
+
+Optional command-registration check against an installed Paymenter 1.5.9 vendor tree:
+`php -n tests/conversion-bootstrap.php /path/to/paymenter`. It uses local database
+fakes and never boots the referenced application or connects to its database.

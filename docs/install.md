@@ -22,3 +22,6 @@ before accepting live payments; see [verification](verification.md).
 Both extensions can be installed together: class, routes, views and payment
 records use distinct gateway identities. Create exactly one gateway row per extension;
 Paymenter's configuration lookup selects the first matching row.
+
+Existing StripeSaved development or staging installs must use the explicit
+[conversion command](convert-stripe-saved.md) before native installation.
