@@ -43,4 +43,16 @@ $reflection = new ReflectionClass($prefix . 'StripeSaved');
 if ($reflection->getFileName() !== $expected . '/StripeSaved.php') {
     throw new RuntimeException('Native upload did not use the expected gateway copy');
 }
+if ($expected === $extracted) {
+    // The uploader deletes extraction before calling the already loaded class.
+    $GLOBALS['paymenterBase'] = dirname($extracted) . '/fee-app';
+    $destination = base_path('extensions/Gateways/StripeSaved');
+    mkdir(dirname($destination), 0700, true);
+    rename($extracted, $destination);
+    $gateway = new ($prefix . 'StripeSaved');
+    $gateway->installed();
+    if (!isset(\Illuminate\Support\Facades\DB::$tables['stripe_saved_payment_fees'])) {
+        throw new RuntimeException('Fresh upload did not migrate from the installed directory');
+    }
+}
 echo "PASS: native upload detected gateway StripeSaved\n";

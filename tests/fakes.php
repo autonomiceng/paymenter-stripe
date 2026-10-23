@@ -46,7 +46,7 @@ namespace App\Models {
         public function exists() { return (bool) $this->value; }
         public function firstOrFail() { return $this->value ?? throw new \RuntimeException('Missing row'); }
         public function where($key, $value) { return $this; }
-        public function lockForUpdate() { \Illuminate\Support\Facades\DB::$locked = true; \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
+        public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $hook(); } \Illuminate\Support\Facades\DB::$locked = true; \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
     }
     class Properties {
         public array $values = [];
@@ -73,6 +73,7 @@ namespace App\Models {
         public function __get($key) { return $this->props; }
         public static function where($key, $id) { return new Query(self::$row, User::class); }
         public static function findOrFail($id) { return self::$row; }
+        public static function whereNotNull($key) { return new class { public function get() { return [(object) ['id' => 99]]; } }; }
     }
     class Invoice {
         public static $row;
@@ -120,7 +121,7 @@ namespace App\Models {
             $present = $bundled ? self::$bundled : self::$present;
             $deleted = $bundled ? self::$bundledDeleted : self::$deleted;
             return new Query($present && ($withTrashed || !$deleted)
-                ? (object) ['enabled' => $bundled ? self::$bundledEnabled : self::$enabled] : null);
+                ? (object) ['id' => $bundled ? 1 : 2, 'enabled' => $bundled ? self::$bundledEnabled : self::$enabled] : null);
         }
     }
     class Service {
@@ -176,6 +177,10 @@ namespace App\Models {
             self::$rows[] = $row;
         }
     }
+    class Notification {
+        public static $rows = [], $fail = false;
+        public static function create($row) { if (self::$fail) throw new \RuntimeException('Inbox unavailable'); self::$rows[] = $row; }
+    }
     class InvoiceTransaction {
         public static function where($key, $value) { return new class($value) {
             private $status, $currentRead = false;
@@ -199,8 +204,8 @@ namespace App\Helpers {
         public static $agreementFailure = false;
         public static $payments = [];
         public static $applications = 0;
-        public static $fees = [];
-        public static function addPaymentFee($id, $fee) { self::$fees[$id] = $fee; }
+        public static $fees = [], $feeWrites = 0;
+        public static function addPaymentFee($id, $fee) { ++self::$feeWrites; self::$fees[$id] = $fee; }
         public static function makeBillingAgreement($user, $gateway, $name, $id, $type, $expiry) {
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Agreement lock missing');
             self::$agreements[$id] = compact('name', 'gateway', 'type', 'expiry');
@@ -234,19 +239,30 @@ namespace Illuminate\Support\Facades {
         public function middleware($value) { return $this; }
         public function name($value) { return $this; }
     }
+    class Schedule {
+        public static $callbacks = [];
+        public static function call($callback) { self::$callbacks[] = $callback; return new self; }
+        public function name($value) { return $this; }
+        public function hourly() { return $this; }
+        public function withoutOverlapping() { return $this; }
+    }
     class View { public static function addNamespace($name, $path) {} }
     class Event { public static $listeners = []; public static function listen($type, $callback) { self::$listeners[] = $callback; } }
     class Auth { public static $id = 7; public static function id() { return self::$id; } }
     class DB {
         public static $tables = [], $locks = [], $updates = [];
-        public static function table($name) { return new \AdoptionQuery($name); }
+        public static function table($name) { return $name === 'stripe_saved_payment_fees' ? new \FeeQuery : new \AdoptionQuery($name); }
+        public static $beforeUserLock = null;
         public static $locked = false;
         public static $modelLocks = [];
         public static function transaction($callback) {
             $before = self::$tables;
             $agreements = \App\Helpers\ExtensionHelper::$agreements;
+            $fees = \App\Helpers\ExtensionHelper::$fees;
+            $audit = \App\Models\Audit::$rows;
+            $notifications = \App\Models\Notification::$rows;
             self::$locked = true;
-            try { return $callback(); } catch (\Throwable $e) { self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = $agreements; throw $e; }
+            try { return $callback(); } catch (\Throwable $e) { self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = $agreements; \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
             finally { self::$locked = false; }
         }
     }
@@ -280,12 +296,72 @@ namespace Carbon {
 }
 namespace {
     function now() { return new class { public $timestamp = 1700000000; public function startOfDay() { return $this; } }; }
+    function base_path($path) { return ($GLOBALS['paymenterBase'] ?? dirname(__DIR__)) . '/' . (isset($GLOBALS['paymenterBase']) ? $path : str_replace('extensions/Gateways/', 'extension/', $path)); }
     function storage_path($path) { return $GLOBALS['adoptionStorage'] . '/' . $path; }
-    function app() { return new class { public function runningInConsole() { return true; } }; }
+    function app($class = null) { if ($class) return new $class; return new class { public function runningInConsole() { return true; } public function booted($callback) { $callback(); } }; }
     function abort($status, $message = '') { throw new \RuntimeException('HTTP ' . $status); }
     function abort_unless($condition, $status) { if (!$condition) throw new \RuntimeException('HTTP ' . $status); }
     function __($key, $values = []) { return $key; }
     function view($name, $data) { return compact('name', 'data'); }
     function redirect() { return new class { public function route($name) { return $this; } public function with($key, $value) { return $value; } }; }
     function response() { return new class { public function json($data, $status = 200) { return compact('data', 'status'); } }; }
+}
+
+namespace {
+    class FeeQuery {
+        public static $beforeRead = null;
+        private $filters = [], $locked = false, $limit = 100;
+        public function where($key, $value) { $this->filters[$key] = $value; return $this; }
+        public function orderBy($key) { return $this; }
+        public function limit($value) { $this->limit = $value; return $this; }
+        public function lockForUpdate() { $this->locked = true; return $this; }
+        public function get() {
+            $rows = [];
+            foreach (\Illuminate\Support\Facades\DB::$tables['stripe_saved_payment_fees'] ?? [] as $row) {
+                foreach ($this->filters as $key => $value) if ($row[$key] !== $value) continue 2;
+                $rows[] = (object) $row;
+            }
+            return array_slice($rows, 0, $this->limit);
+        }
+        public function first() {
+            if ($hook = self::$beforeRead) { self::$beforeRead = null; $hook(); }
+            if (!$this->locked || !\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Fee current read lock missing');
+            return $this->get()[0] ?? null;
+        }
+        public function insert($row) {
+            if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Fee insert lock missing');
+            $rows = &\Illuminate\Support\Facades\DB::$tables['stripe_saved_payment_fees'];
+            if (isset($rows[$row['payment_intent_id']])) throw new \RuntimeException('Duplicate PaymentIntent');
+            $rows[$row['payment_intent_id']] = $row;
+        }
+        public function update($values) {
+            foreach ($this->get() as $row) \Illuminate\Support\Facades\DB::$tables['stripe_saved_payment_fees'][$row->payment_intent_id] = array_merge((array) $row, $values);
+        }
+    }
+}
+
+namespace Illuminate\Database\Migrations {
+    class Migration {}
+    class Migrator {
+        public static $ran = [];
+        public function run($path) {
+            foreach (glob($path . '/*.php') as $file) {
+                if (isset(self::$ran[$file])) continue;
+                (require $file)->up(); self::$ran[$file] = true;
+            }
+        }
+    }
+}
+namespace Illuminate\Database\Schema {
+    class Blueprint {
+        public static $primary = [];
+        public function __call($method, $args) { if ($method === 'primary') self::$primary[] = $GLOBALS['feeColumn']; else $GLOBALS['feeColumn'] = $args[0] ?? null; return $this; }
+    }
+}
+namespace Illuminate\Support\Facades {
+    class Schema {
+        public static function hasTable($name) { return isset(DB::$tables[$name]); }
+        public static function create($name, $callback) { if (isset(DB::$tables[$name])) throw new \RuntimeException('Table exists'); DB::$tables[$name] = []; $callback(new \Illuminate\Database\Schema\Blueprint); }
+        public static function dropIfExists($name) { unset(DB::$tables[$name]); }
+    }
 }

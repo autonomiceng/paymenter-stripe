@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 use App\Helpers\ExtensionHelper;
 use App\Models\{Gateway, Invoice, Service};
-use Illuminate\Support\Facades\{Event, Http, Log};
+use Illuminate\Support\Facades\{DB, Event, Http, Log};
 
 Gateway::$enabled = true;
 $oldHandler = Http::$handler;
@@ -141,14 +141,17 @@ check(ExtensionHelper::$payments['12:pi_yen']['amount'] === 123.0, 'JPY webhook 
 Http::$handler = fn () => ['fee' => 5, 'currency' => 'jpy'];
 $gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_yen', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
 check(ExtensionHelper::$fees['pi_yen'] === 5.0, 'Same-currency JPY fee remains in invoice currency');
+// Use separate payments for each currency fixture. Completed fee records are immutable.
+ExtensionHelper::$payments['12:pi_yen_cross'] = ExtensionHelper::$payments['12:pi_yen'];
 // Settlement USD -> invoice JPY: convert major units then round to whole yen.
 Http::$handler = fn () => ['fee' => 333, 'currency' => 'usd', 'exchange_rate' => 0.007];
-$gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_yen', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
-check(ExtensionHelper::$fees['pi_yen'] === 476.0, 'Cross-currency fee rounds to invoice JPY minor units');
+$gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_yen_cross', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
+check(ExtensionHelper::$fees['pi_yen_cross'] === 476.0, 'Cross-currency fee rounds to invoice JPY minor units');
 $invoice->currency_code = 'usd';
+ExtensionHelper::$payments['12:pi_usd_cross'] = ExtensionHelper::$payments['12:pi_yen'];
 Http::$handler = fn () => ['fee' => 100, 'currency' => 'jpy', 'exchange_rate' => 150];
-$gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_yen', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
-check(ExtensionHelper::$fees['pi_yen'] === 0.67, 'Settlement JPY fee converts back to invoice USD cents');
+$gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_usd_cross', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
+check(ExtensionHelper::$fees['pi_usd_cross'] === 0.67, 'Settlement JPY fee converts back to invoice USD cents');
 foreach ([null, 0, -1, 'invalid', 'INF', 'NaN', '1e309'] as $rateIndex => $invalidRate) {
     foreach ([false, true] as $hasFee) {
         $feeIntent = (object) ['id' => 'pi_fee_' . $rateIndex . '_' . (int) $hasFee,
@@ -168,7 +171,6 @@ foreach ([null, 0, -1, 'invalid', 'INF', 'NaN', '1e309'] as $rateIndex => $inval
             throw new RuntimeException('Unexpected fee request: ' . $path);
         };
         for ($delivery = 0; $delivery < 2; ++$delivery) {
-            $warnings = count(Log::$warnings);
             $result = $gateway->webhook(eventRequest((object) [
                 'payment_intent' => $feeIntent->id, 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
             check($result['status'] === 200 && $result['data']['received'] === true,
@@ -179,11 +181,9 @@ foreach ([null, 0, -1, 'invalid', 'INF', 'NaN', '1e309'] as $rateIndex => $inval
                 && $payment === ['gateway' => 'StripeSaved', 'amount' => 20.0, 'status' => 'succeeded']
                 && ExtensionHelper::$applications === $applications + 1,
                 'Unavailable fee conversion preserves the settled payment: ' . $feeIntent->id);
-            check(count(Log::$warnings) === $warnings + 1
-                && end(Log::$warnings) === ['StripeSaved fee conversion unavailable', [
-                    'invoice_id' => 12, 'payment_intent_id' => $feeIntent->id,
-                    'invoice_currency' => 'usd', 'settlement_currency' => 'jpy']],
-                'Unavailable fee conversion logs payment and currencies without secrets: ' . $feeIntent->id);
+            $pending = DB::$tables['stripe_saved_payment_fees'][$feeIntent->id];
+            check($pending['state'] === 'pending' && $pending['last_error'] === 'Fee conversion unavailable',
+                'Unavailable conversion persists a pending fee: ' . $feeIntent->id);
         }
         Http::$handler = fn () => ['fee' => 100, 'currency' => 'jpy', 'exchange_rate' => 150];
         $result = $gateway->webhook(eventRequest((object) [

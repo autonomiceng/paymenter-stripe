@@ -2,8 +2,7 @@
 
 namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
 
-use App\Helpers\ExtensionHelper;
-use App\Models\{InvoiceTransaction, Service};
+use App\Models\Service;
 use Illuminate\Http\Request;
 
 trait Webhooks
@@ -69,41 +68,9 @@ trait Webhooks
                 }
                 $this->recordIntentPayment($paymentIntent, 'failed');
                 break;
+            case 'charge.succeeded':
             case 'charge.updated':
-                $charge = $event->data->object; // contains a StripeCharge
-                $invoiceTransaction = InvoiceTransaction::where('transaction_id', $charge->payment_intent)->first();
-                if (($invoiceTransaction->gateway->extension ?? null) !== 'StripeSaved') {
-                    break;
-                }
-                // Get fee from charge
-                $fee = 0;
-                if ($charge->balance_transaction) {
-                    $balanceTransaction = $this->request('get', '/balance_transactions/' . $charge->balance_transaction);
-                    $invoiceCurrency = $invoiceTransaction->invoice->currency_code;
-                    $settlementFee = $this->fromMinorUnits($balanceTransaction->fee, $balanceTransaction->currency);
-                    if (strtolower($balanceTransaction->currency) === strtolower($invoiceCurrency)) {
-                        $fee = $settlementFee;
-                    } else {
-                        // Stripe's rate converts charge currency to settlement currency.
-                        $rate = $balanceTransaction->exchange_rate ?? null;
-                        try {
-                            if (!is_numeric($rate) || !is_finite((float) $rate) || $rate <= 0) {
-                                throw new \InvalidArgumentException('Invalid exchange rate');
-                            }
-                            $fee = $this->fromMinorUnits($this->toMinorUnits($settlementFee / $rate, $invoiceCurrency), $invoiceCurrency);
-                        } catch (\InvalidArgumentException $e) {
-                            \Illuminate\Support\Facades\Log::warning('StripeSaved fee conversion unavailable', [
-                                'invoice_id' => $invoiceTransaction->invoice->id,
-                                'payment_intent_id' => $charge->payment_intent,
-                                'invoice_currency' => $invoiceCurrency,
-                                'settlement_currency' => $balanceTransaction->currency,
-                            ]);
-                            break;
-                        }
-                    }
-                }
-                ExtensionHelper::addPaymentFee($charge->payment_intent, $fee);
-
+                $this->recordChargeFee($object);
                 break;
             case 'setup_intent.succeeded':
                 $setupIntent = $event->data->object; // contains a StripeSetupIntent
