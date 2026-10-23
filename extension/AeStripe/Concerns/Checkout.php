@@ -1,6 +1,6 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
+namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Helpers\ExtensionHelper;
 use App\Exceptions\DisplayException;
@@ -27,14 +27,14 @@ trait Checkout
             'amount' => $this->toMinorUnits($total, $invoice->currency_code),
             'currency' => $invoice->currency_code,
             'automatic_payment_methods' => ['enabled' => 'true'],
-            'metadata' => ['invoice_id' => $invoice->id, 'stripe_saved_gateway' => '1'],
+            'metadata' => ['invoice_id' => $invoice->id, 'ae_stripe_gateway' => '1'],
         ];
 
         // Do not fall back to an anonymous intent: saved methods require this customer.
         try {
             $customer = $this->createOrGetStripeCustomer($invoice->user, (bool) $this->config('stripe_create_customers'));
         } catch (\Exception $e) {
-            \Illuminate\Support\Facades\Log::warning('StripeSaved customer setup failed', [
+            \Illuminate\Support\Facades\Log::warning('AeStripe customer setup failed', [
                 'invoice_id' => $invoice->id, 'error' => get_class($e),
             ]);
             throw new DisplayException('Could not prepare your payment. Please try again.');
@@ -58,12 +58,12 @@ trait Checkout
                 ]],
             ]);
         } catch (RequestException | ConnectionException $e) {
-            \Illuminate\Support\Facades\Log::warning('StripeSaved customer session unavailable', [
+            \Illuminate\Support\Facades\Log::warning('AeStripe customer session unavailable', [
                 'invoice_id' => $invoice->id, 'http_status' => $e instanceof RequestException ? $e->response->status() : null,
             ]);
         }
 
-        return view('gateways.stripe-saved::pay', [
+        return view('gateways.ae-stripe::pay', [
             'invoice' => $invoice, 'total' => $total, 'intent' => $intent,
             'customerSessionSecret' => $session?->client_secret,
             'stripePublishableKey' => $this->config('stripe_publishable_key'),
@@ -72,7 +72,7 @@ trait Checkout
 
     private function gatewayEnabled(): bool
     {
-        return (bool) \App\Models\Gateway::where('extension', 'StripeSaved')->first()?->enabled;
+        return (bool) \App\Models\Gateway::where('extension', 'AeStripe')->first()?->enabled;
     }
 
     public function consent(Request $request)
@@ -86,11 +86,11 @@ trait Checkout
         $invoice = Invoice::findOrFail($intent->metadata->invoice_id ?? null);
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
         abort_unless(Auth::id() == $invoice->user_id && $customer && $intent->customer === $customer
-            && ($intent->metadata->stripe_saved_gateway ?? null) === '1', 403);
+            && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 403);
         $save = $request->boolean('save');
         if ($intent->status === 'requires_action') {
             // Resume 3DS without changing the consent already used for confirmation.
-            abort_unless($save === (($intent->metadata->stripe_saved_consent ?? null) === '1'), 409);
+            abort_unless($save === (($intent->metadata->ae_stripe_consent ?? null) === '1'), 409);
             return response()->json(['ok' => true]);
         }
         abort_unless(in_array($intent->status, ['requires_payment_method', 'requires_confirmation']), 409);
@@ -101,7 +101,7 @@ trait Checkout
                 'card' => ['setup_future_usage' => $save ? 'off_session' : ''],
                 'link' => ['setup_future_usage' => $save ? 'off_session' : ''],
             ],
-            'metadata' => ['stripe_saved_consent' => $save ? '1' : '0'],
+            'metadata' => ['ae_stripe_consent' => $save ? '1' : '0'],
         ]);
 
         return response()->json(['ok' => true]);
@@ -115,28 +115,28 @@ trait Checkout
             $invoice = Invoice::where('id', $intent->metadata->invoice_id)->lockForUpdate()->firstOrFail();
             if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->lockForUpdate()->first()) return;
             if (!empty($intent->customer) && $intent->customer !== $invoice->user->properties()->where('key', 'stripe_id')->first()?->value) {
-                \Illuminate\Support\Facades\Log::warning('StripeSaved payment customer mismatch', ['invoice_id' => $invoice->id]);
+                \Illuminate\Support\Facades\Log::warning('AeStripe payment customer mismatch', ['invoice_id' => $invoice->id]);
                 if ($status === 'succeeded') $this->recordRefusedPayment($invoice, $intent, 'customer mismatch');
                 return;
             }
             if (strtolower($invoice->currency_code) !== strtolower($intent->currency ?? '')) {
-                \Illuminate\Support\Facades\Log::warning('StripeSaved payment currency mismatch', ['invoice_id' => $invoice->id]);
+                \Illuminate\Support\Facades\Log::warning('AeStripe payment currency mismatch', ['invoice_id' => $invoice->id]);
                 if ($status === 'succeeded') $this->recordRefusedPayment($invoice, $intent, 'currency mismatch');
                 return;
             }
             if ($status === 'succeeded' && !in_array($invoice->status, ['pending', 'paid'], true)) {
-                \Illuminate\Support\Facades\Log::warning('StripeSaved payment received for nonpending invoice', ['invoice_id' => $invoice->id]);
+                \Illuminate\Support\Facades\Log::warning('AeStripe payment received for nonpending invoice', ['invoice_id' => $invoice->id]);
                 $this->recordRefusedPayment($invoice, $intent, 'invoice not pending');
                 return;
             }
             if ($status === 'succeeded' && $invoice->status === 'paid') {
-                \Illuminate\Support\Facades\Log::warning('StripeSaved payment received for paid invoice', ['invoice_id' => $invoice->id]);
+                \Illuminate\Support\Facades\Log::warning('AeStripe payment received for paid invoice', ['invoice_id' => $invoice->id]);
             }
             $helper = match ($status) {
                 'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',
             };
             $amount = $status === 'succeeded' ? $intent->amount_received : $intent->amount;
-            ExtensionHelper::{$helper}($invoice, 'StripeSaved', $this->fromMinorUnits($amount, $intent->currency), null, $intent->id);
+            ExtensionHelper::{$helper}($invoice, 'AeStripe', $this->fromMinorUnits($amount, $intent->currency), null, $intent->id);
         });
     }
 
@@ -144,9 +144,9 @@ trait Checkout
     {
         // The caller holds the user and invoice locks. Keep one staff record per invoice and PaymentIntent.
         if (Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
-            ->where('event', 'stripe_saved_payment_review')->where('new_values->payment_intent_id', $intent->id)->lockForUpdate()->first()) return;
+            ->where('event', 'ae_stripe_payment_review')->where('new_values->payment_intent_id', $intent->id)->lockForUpdate()->first()) return;
         Audit::create([
-            'event' => 'stripe_saved_payment_review',
+            'event' => 'ae_stripe_payment_review',
             'auditable_type' => $invoice->getMorphClass(), 'auditable_id' => $invoice->id,
             'old_values' => [],
             'new_values' => [
@@ -160,14 +160,14 @@ trait Checkout
 
     private function savePaidMethod($intent)
     {
-        if (($intent->metadata->stripe_saved_gateway ?? null) !== '1'
-            || ($intent->metadata->stripe_saved_consent ?? null) !== '1') {
+        if (($intent->metadata->ae_stripe_gateway ?? null) !== '1'
+            || ($intent->metadata->ae_stripe_consent ?? null) !== '1') {
             return;
         }
         $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
         if (!$customer || ($intent->customer ?? null) !== $customer || empty($intent->payment_method)) {
-            \Illuminate\Support\Facades\Log::warning('StripeSaved saved method customer mismatch', ['invoice_id' => $invoice->id]);
+            \Illuminate\Support\Facades\Log::warning('AeStripe saved method customer mismatch', ['invoice_id' => $invoice->id]);
             return;
         }
         $method = $this->request('get', '/payment_methods/' . $intent->payment_method);
@@ -182,7 +182,7 @@ trait Checkout
     {
         $customer = $user->properties()->where('key', 'stripe_id')->first()?->value;
         if (!$customer || ($method->customer ?? null) !== $customer) {
-            \Illuminate\Support\Facades\Log::warning('StripeSaved saved method customer mismatch', ['user_id' => $user->id]);
+            \Illuminate\Support\Facades\Log::warning('AeStripe saved method customer mismatch', ['user_id' => $user->id]);
             return false;
         }
         return true;
@@ -195,13 +195,13 @@ trait Checkout
         // Native external_reference is globally unique, including soft-deleted rows.
         DB::transaction(function () use ($user, $method, $data) {
             User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-            $gateway = Gateway::where('extension', 'StripeSaved')->firstOrFail();
+            $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
             // Locking reads see concurrent commits even under REPEATABLE READ.
             $find = fn () => BillingAgreement::withTrashed()->where('external_reference', $method->id)->lockForUpdate()->first();
             $agreement = $find();
             if (!$agreement) {
                 try {
-                    $agreement = ExtensionHelper::makeBillingAgreement($user, 'StripeSaved', $data['name'],
+                    $agreement = ExtensionHelper::makeBillingAgreement($user, 'AeStripe', $data['name'],
                         $method->id, $data['type'], $data['expiry']);
                 } catch (UniqueConstraintViolationException $e) {
                     // Another writer may not take our user lock. Recheck its committed row.

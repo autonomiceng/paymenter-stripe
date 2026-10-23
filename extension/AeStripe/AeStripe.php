@@ -1,6 +1,6 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\StripeSaved;
+namespace Paymenter\Extensions\Gateways\AeStripe;
 
 use App\Attributes\ExtensionMeta;
 use App\Classes\Extension\Gateway;
@@ -27,18 +27,20 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\View;
-use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Amounts;
-use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Checkout;
-use Paymenter\Extensions\Gateways\StripeSaved\Concerns\PaymentFees;
-use Paymenter\Extensions\Gateways\StripeSaved\Concerns\CheckoutIntent;
-use Paymenter\Extensions\Gateways\StripeSaved\Concerns\SetupConsent;
-use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Signature;
-use Paymenter\Extensions\Gateways\StripeSaved\Concerns\SubscriptionAttempt;
-use Paymenter\Extensions\Gateways\StripeSaved\Concerns\SubscriptionPayments;
-use Paymenter\Extensions\Gateways\StripeSaved\Concerns\Webhooks;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\Amounts;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\Checkout;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\PaymentFees;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\CheckoutIntent;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\SetupConsent;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\Signature;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\SubscriptionAttempt;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\SubscriptionPayments;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\Webhooks;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\StripeMetadata;
 use Str;
 
 require_once __DIR__ . '/GatewayLifecycle.php';
+require_once __DIR__ . '/Concerns/StripeMetadata.php';
 require_once __DIR__ . '/Concerns/Signature.php';
 require_once __DIR__ . '/Concerns/Checkout.php';
 require_once __DIR__ . '/Concerns/Amounts.php';
@@ -50,15 +52,15 @@ require_once __DIR__ . '/Concerns/Webhooks.php';
 require_once __DIR__ . '/Concerns/PaymentFees.php';
 
 #[ExtensionMeta(
-    name: 'Stripe Saved Methods',
+    name: 'AE Stripe',
     description: 'Stripe Payment Element with saved methods and optional card saving.',
     version: '0.1.1',
     author: 'Autonomic Engineering',
     icon: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgZmlsbD0iIzUzM0FGRCIvPjxwYXRoIGQ9Ik0xMjAgMzkyTDM5MiAzMzRWMTEyTDEyMCAxNz hWMzk yWiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg=='
 )]
-class StripeSaved extends Gateway
+class AeStripe extends Gateway
 {
-    use PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks;
+    use PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks, StripeMetadata;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -66,14 +68,18 @@ class StripeSaved extends Gateway
     {
         if (app()->runningInConsole()) {
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryPaymentFees())
-                ->name('stripe-saved:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
+                ->name('ae-stripe:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
             require_once __DIR__ . '/AdoptBundledCommand.php';
-            \Illuminate\Console\Application::starting(fn ($artisan) => $artisan->resolve(AdoptBundledCommand::class));
+            require_once __DIR__ . '/ConvertFromStripeSavedCommand.php';
+            \Illuminate\Console\Application::starting(function ($artisan) {
+                $artisan->resolve(AdoptBundledCommand::class);
+                $artisan->resolve(ConvertFromStripeSavedCommand::class);
+            });
         }
         require __DIR__ . '/routes.php';
         // Register webhook route
-        View::addNamespace('gateways.stripe-saved', __DIR__ . '/resources/views');
-        FilamentView::registerRenderHook(PanelsRenderHook::PAGE_START, fn () => $this->gatewayWarning());
+        View::addNamespace('gateways.ae-stripe', __DIR__ . '/resources/views');
+        FilamentView::registerRenderHook(PanelsRenderHook::CONTENT_START, fn () => $this->gatewayWarning());
         // Core boots disabled gateways too. Let the bundled listener own legacy subscriptions.
         if (!$this->bundledInactive(requireAbsent: true)) {
             return;
@@ -88,7 +94,7 @@ class StripeSaved extends Gateway
                 try {
                     $this->updateSubscription($event->service);
                 } catch (Exception $e) {
-                    \Illuminate\Support\Facades\Log::warning('StripeSaved subscription sync failed', ['service_id' => $event->service->id]);
+                    \Illuminate\Support\Facades\Log::warning('AeStripe subscription sync failed', ['service_id' => $event->service->id]);
                 }
             }
             // Check if the service is canceled
@@ -96,7 +102,7 @@ class StripeSaved extends Gateway
                 try {
                     $this->cancelSubscription($event->service);
                 } catch (Exception $e) {
-                    \Illuminate\Support\Facades\Log::warning('StripeSaved subscription sync failed', ['service_id' => $event->service->id]);
+                    \Illuminate\Support\Facades\Log::warning('AeStripe subscription sync failed', ['service_id' => $event->service->id]);
                 }
             }
         });
@@ -110,7 +116,7 @@ class StripeSaved extends Gateway
             try {
                 $this->cancelSubscription($service);
             } catch (Exception $e) {
-                \Illuminate\Support\Facades\Log::warning('StripeSaved subscription sync failed', ['service_id' => $service->id]);
+                \Illuminate\Support\Facades\Log::warning('AeStripe subscription sync failed', ['service_id' => $service->id]);
             }
         });
     }
@@ -138,7 +144,7 @@ class StripeSaved extends Gateway
             $gateways[] = ['id' => $bundled->id, 'hasReferences' => GatewayLifecycle::hasReferences($bundled),
                 'canUpdate' => $user->can('update', $bundled)];
         }
-        return $gateways ? view('gateways.stripe-saved::gateway-warning', compact('gateways')) : '';
+        return $gateways ? view('gateways.ae-stripe::gateway-warning', compact('gateways')) : '';
     }
 
     public function disableCore(Request $request)
@@ -157,8 +163,8 @@ class StripeSaved extends Gateway
         return [
             [
                 'name' => 'stripe_secret_key',
-                'label' => 'Stripe Restricted key',
-                'placeholder' => 'Enter your Stripe Restricted API key',
+                'label' => 'Stripe restricted API key',
+                'placeholder' => 'Enter your restricted API key',
                 'type' => 'text',
                 'encrypted' => true,
                 'description' => 'Find your API keys at https://dashboard.stripe.com/apikeys',
@@ -166,25 +172,25 @@ class StripeSaved extends Gateway
             ],
             [
                 'name' => 'stripe_publishable_key',
-                'label' => 'Stripe Publishable Key',
-                'placeholder' => 'Enter your Stripe Publishable API key',
+                'label' => 'Stripe publishable key',
+                'placeholder' => 'Enter your publishable key',
                 'type' => 'text',
                 'description' => 'Find your API keys at https://dashboard.stripe.com/apikeys',
                 'required' => true,
             ],
             [
                 'name' => 'stripe_create_customers',
-                'label' => 'Create detailed Stripe customers',
+                'label' => 'Send address and phone to Stripe',
                 'type' => 'checkbox',
-                'description' => 'Controls the level of detail for Stripe customers. When enabled, customers include full address, phone, and company details. When disabled, customers include only basic information (name, email, user ID). Applies to both one-time payments and billing agreements.',
+                'description' => 'Include address, phone and company details for Stripe Tax and addresses on Stripe receipts.',
                 'required' => false,
             ],
             [
                 'name' => 'stripe_webhook_secret',
-                'label' => 'Stripe webhook secret (auto generated)',
+                'label' => 'Stripe webhook signing secret',
                 'type' => 'text',
                 'encrypted' => true,
-                'description' => 'Stripe webhook secret',
+                'description' => 'Created automatically when you enable the gateway. Refresh the page to see it.',
                 'required' => false,
             ],
         ];
@@ -192,8 +198,8 @@ class StripeSaved extends Gateway
 
     public function enabled(Extension $gateway)
     {
-        $this->disableEmptyBundled();
         $this->updated($gateway);
+        $this->disableEmptyBundled();
     }
 
     private function disableEmptyBundled(): void
@@ -210,20 +216,20 @@ class StripeSaved extends Gateway
 
     public function updated(Extension $gateway)
     {
-        if ($gateway->enabled && $gateway->wasChanged('enabled')) $this->disableEmptyBundled();
         if (!empty($gateway->settings()->where('key', 'stripe_webhook_secret')->first()->value)) {
+            if ($gateway->enabled && $gateway->wasChanged('enabled')) $this->disableEmptyBundled();
             return;
         }
 
         // If the extension isn't enabled, try to boot it
-        if (!Route::has('extensions.gateways.stripe-saved.webhook')) {
+        if (!Route::has('extensions.gateways.ae-stripe.webhook')) {
             require __DIR__ . '/routes.php';
         }
 
         // Check if webhook already exists
         $webhooks = $this->request('get', '/webhook_endpoints');
         foreach ($webhooks->data as $webhook) {
-            if ($webhook->url === route('extensions.gateways.stripe-saved.webhook')) {
+            if ($webhook->url === route('extensions.gateways.ae-stripe.webhook')) {
                 // Delete webhook
                 $this->request('delete', '/webhook_endpoints/' . $webhook->id);
                 break;
@@ -232,7 +238,7 @@ class StripeSaved extends Gateway
 
         // Create webhook on stripe
         $webhook = $this->request('post', '/webhook_endpoints', [
-            'url' => route('extensions.gateways.stripe-saved.webhook'),
+            'url' => route('extensions.gateways.ae-stripe.webhook'),
             'description' => 'Paymenter Stripe Webhook',
             'enabled_events' => [
                 'payment_intent.succeeded',
@@ -255,6 +261,8 @@ class StripeSaved extends Gateway
             ->title('Webhook created')
             ->body('We\'ve created a webhook for you on Stripe (refresh the page to see the secret)')
             ->send();
+
+        if ($gateway->enabled && $gateway->wasChanged('enabled')) $this->disableEmptyBundled();
     }
 
     private function request($method, $url, $data = [], ?string $idempotencyKey = null)
@@ -264,7 +272,7 @@ class StripeSaved extends Gateway
             'Stripe-Version' => self::API_VERSION,
         ];
         if ($idempotencyKey !== null) $headers['Idempotency-Key'] = $idempotencyKey;
-        return Http::withHeaders($headers)->asForm()->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object();
+        return $this->readStripeObject(Http::withHeaders($headers)->asForm()->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object());
     }
 
     private function setupSubscription($setupIntent)
@@ -280,7 +288,7 @@ class StripeSaved extends Gateway
         }
 
         if (($setupIntent->customer ?? null) !== $customer->id) {
-            \Illuminate\Support\Facades\Log::warning('StripeSaved subscription setup customer mismatch', ['invoice_id' => $invoice->id]);
+            \Illuminate\Support\Facades\Log::warning('AeStripe subscription setup customer mismatch', ['invoice_id' => $invoice->id]);
             return;
         }
         $method = $this->request('get', '/payment_methods/' . $setupIntent->payment_method);
@@ -337,7 +345,7 @@ class StripeSaved extends Gateway
                     ],
                     'iterations' => 1,
                     'metadata' => [
-                        'service_id' => $service->id, 'stripe_saved_gateway' => '1',
+                        'service_id' => $service->id, 'ae_stripe_gateway' => '1',
                     ],
                     'proration_behavior' => 'none',
                 ];
@@ -358,7 +366,7 @@ class StripeSaved extends Gateway
                     ],
                 ],
                 'metadata' => [
-                    'service_id' => $service->id, 'stripe_saved_gateway' => '1',
+                    'service_id' => $service->id, 'ae_stripe_gateway' => '1',
                 ],
                 'proration_behavior' => 'none',
             ];
@@ -367,7 +375,7 @@ class StripeSaved extends Gateway
                 'customer' => $customer->id,
                 'start_date' => 'now',
                 'phases' => $phases,
-                'metadata' => ['service_id' => $service->id, 'stripe_saved_gateway' => '1'],
+                'metadata' => ['service_id' => $service->id, 'ae_stripe_gateway' => '1'],
             ]);
 
             // Update service with subscription id
@@ -581,14 +589,14 @@ class StripeSaved extends Gateway
             'metadata' => [
                 'user_id' => $user->id,
                 'is_billing_agreement' => '1',
-                'stripe_saved_gateway' => '1',
+                'ae_stripe_gateway' => '1',
             ],
             'usage' => 'off_session',
             'customer' => $customer->id,
         ]);
 
         // Return the client secret to the frontend to complete the setup
-        return view('gateways.stripe-saved::billing-agreement', ['intent' => $setupIntent, 'type' => 'setup', 'stripePublishableKey' => $this->config('stripe_publishable_key')]);
+        return view('gateways.ae-stripe::billing-agreement', ['intent' => $setupIntent, 'type' => 'setup', 'stripePublishableKey' => $this->config('stripe_publishable_key')]);
     }
 
     public function cancelBillingAgreement(BillingAgreement $billingAgreement): bool
@@ -644,9 +652,9 @@ class StripeSaved extends Gateway
         ]);
 
         if (($setupIntent->metadata->is_billing_agreement ?? null) !== '1'
-            || ($setupIntent->metadata->stripe_saved_setup_consent ?? null) !== 'off_session_v1'
-            || empty($setupIntent->metadata->stripe_saved_setup_consent_at)
-            || ($setupIntent->metadata->stripe_saved_setup_consent_user ?? null) != ($setupIntent->metadata->user_id ?? null)
+            || ($setupIntent->metadata->ae_stripe_setup_consent ?? null) !== 'off_session_v1'
+            || empty($setupIntent->metadata->ae_stripe_setup_consent_at)
+            || ($setupIntent->metadata->ae_stripe_setup_consent_user ?? null) != ($setupIntent->metadata->user_id ?? null)
             || $setupIntent->status !== 'succeeded') return false;
         $user = User::findOrFail($setupIntent->metadata->user_id);
         $customer = $user->properties()->where('key', 'stripe_id')->first()?->value;
@@ -744,7 +752,7 @@ class StripeSaved extends Gateway
                 'payment_method' => $billingAgreement->external_reference,
                 'off_session' => 'true',
                 'confirm' => 'true',
-                'metadata' => ['invoice_id' => $invoice->id, 'billing_agreement_id' => $billingAgreement->id, 'stripe_saved_gateway' => '1'],
+                'metadata' => ['invoice_id' => $invoice->id, 'billing_agreement_id' => $billingAgreement->id, 'ae_stripe_gateway' => '1'],
             ]);
         } catch (Exception $e) {
             if ($e instanceof RequestException && $e->response->status() === 400) {

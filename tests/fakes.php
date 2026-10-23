@@ -327,12 +327,13 @@ namespace Illuminate\Http {
 }
 namespace Illuminate\Support\Facades {
     class Route {
-        public static $routes = [], $definitions = [];
+        public static $routes = [], $definitions = [], $names = [];
+        public static function has($name) { return isset(self::$names[$name]); }
         public static function post($path, $action) { self::$routes[] = $path; self::$definitions[$path] = ['method' => 'POST', 'action' => $action]; return new self; }
-        public static function get($path, $action) { self::$routes[] = $path; return new self; }
-        public function withoutMiddleware($value) { return $this; }
+        public static function get($path, $action) { self::$routes[] = $path; self::$definitions[$path] = ['method' => 'GET', 'action' => $action]; return new self; }
+        public function withoutMiddleware($value) { self::$definitions[end(self::$routes)]['withoutMiddleware'] = $value; return $this; }
         public function middleware($value) { self::$definitions[end(self::$routes)]['middleware'] = $value; return $this; }
-        public function name($value) { return $this; }
+        public function name($value) { self::$names[$value] = end(self::$routes); return $this; }
     }
     class Schedule {
         public static $callbacks = [], $events = [];
@@ -348,8 +349,9 @@ namespace Illuminate\Support\Facades {
     class Auth { public static $id = 7; public static function id() { return self::$id; } public static function user() { return self::$id ? \App\Models\User::$row : null; } }
     class DB {
         public static $tables = [], $locks = [], $updates = [];
+        public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } }; }
         public static $concurrentAgreements = [];
-        public static function table($name) { return $name === 'stripe_saved_payment_fees' ? new \FeeQuery : new \AdoptionQuery($name); }
+        public static function table($name) { return $name === 'ae_stripe_payment_fees' ? new \FeeQuery : new \AdoptionQuery($name); }
         public static $beforeUserLock = null;
         public static $locked = false;
         public static $modelLocks = [];
@@ -364,7 +366,7 @@ namespace Illuminate\Support\Facades {
             finally { self::$locked = false; }
         }
     }
-    class Log { public static $lines = [], $contexts = [], $warnings = []; public static function info($message, $context = []) { self::$lines[] = $message; self::$contexts[] = $context; } public static function warning($message, $context = []) { self::$warnings[] = [$message, $context]; } }
+    class Log { public static $lines = [], $contexts = [], $warnings = [], $errors = []; public static function info($message, $context = []) { self::$lines[] = $message; self::$contexts[] = $context; } public static function warning($message, $context = []) { self::$warnings[] = [$message, $context]; } public static function error($message, $context = []) { self::$errors[] = [$message, $context]; } }
     class Http {
         public static $calls = [];
         public static $handler;
@@ -402,6 +404,8 @@ namespace {
     function abort_unless($condition, $status) { if (!$condition) throw new \RuntimeException('HTTP ' . $status); }
     function __($key, $values = []) { return $key; }
     function view($name, $data) { return compact('name', 'data'); }
+    function url($path) { return 'https://paymenter.example.com' . $path; }
+    function route($name) { return url(\Illuminate\Support\Facades\Route::$names[$name]); }
     function redirect() { return new class { public function route($name) { return $this; } public function with($key, $value) { return $value; } }; }
     function response() { return new class { public function json($data, $status = 200) { return compact('data', 'status'); } }; }
 }
@@ -416,7 +420,7 @@ namespace {
         public function lockForUpdate() { $this->locked = true; return $this; }
         public function get() {
             $rows = [];
-            foreach (\Illuminate\Support\Facades\DB::$tables['stripe_saved_payment_fees'] ?? [] as $row) {
+            foreach (\Illuminate\Support\Facades\DB::$tables['ae_stripe_payment_fees'] ?? [] as $row) {
                 foreach ($this->filters as $key => $value) if ($row[$key] !== $value) continue 2;
                 $rows[] = (object) $row;
             }
@@ -430,12 +434,12 @@ namespace {
         }
         public function insert($row) {
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Fee insert lock missing');
-            $rows = &\Illuminate\Support\Facades\DB::$tables['stripe_saved_payment_fees'];
+            $rows = &\Illuminate\Support\Facades\DB::$tables['ae_stripe_payment_fees'];
             if (isset($rows[$row['payment_intent_id']])) throw new \RuntimeException('Duplicate PaymentIntent');
             $rows[$row['payment_intent_id']] = $row;
         }
         public function update($values) {
-            foreach ($this->get() as $row) \Illuminate\Support\Facades\DB::$tables['stripe_saved_payment_fees'][$row->payment_intent_id] = array_merge((array) $row, $values);
+            foreach ($this->get() as $row) \Illuminate\Support\Facades\DB::$tables['ae_stripe_payment_fees'][$row->payment_intent_id] = array_merge((array) $row, $values);
         }
     }
 }
@@ -460,7 +464,28 @@ namespace Illuminate\Database\Schema {
 }
 namespace Illuminate\Support\Facades {
     class Schema {
-        public static $checks = 0, $beforeCheck = null, $beforeCreate = null;
+        public static $checks = 0, $beforeCheck = null, $beforeCreate = null, $afterRename = null;
+        public static function rename($from, $to) { if (DB::$locked) throw new \RuntimeException('MySQL DDL ends the active transaction'); DB::$tables[$to] = DB::$tables[$from]; unset(DB::$tables[$from]); if ($hook = self::$afterRename) $hook(); }
+        public static function table($table, $callback) { if (DB::$locked) throw new \RuntimeException('MySQL DDL ends the active transaction'); $callback(new class($table) {
+            public function __construct(private $table) {}
+            public function renameColumn($from, $to) { foreach (DB::$tables[$this->table] as &$row) { $row[$to] = $row[$from]; unset($row[$from]); } }
+        }); }
+        public static $foreignTables = [], $inspectedTables = [];
+        public static function getTableListing($schema = null, $schemaQualified = true) {
+            $schemas = ['paymenter' => DB::$tables] + self::$foreignTables;
+            $names = [];
+            foreach ($schemas as $database => $tables) {
+                if ($schema !== null && $schema !== $database) continue;
+                foreach ($tables as $table => $rows) $names[] = $schemaQualified ? $database . '.' . $table : $table;
+            }
+            return $names;
+        }
+        public static function getColumnListing($name) {
+            self::$inspectedTables[] = $name;
+            [$schema, $table] = str_contains($name, '.') ? explode('.', $name, 2) : ['paymenter', $name];
+            $rows = $schema === 'paymenter' ? (DB::$tables[$table] ?? []) : (self::$foreignTables[$schema][$table] ?? []);
+            return array_keys($rows[array_key_first($rows)] ?? []);
+        }
         public static function hasTable($name) { ++self::$checks; if ($hook = self::$beforeCheck) $hook(); return isset(DB::$tables[$name]); }
         public static function create($name, $callback) { if ($hook = self::$beforeCreate) $hook(); if (isset(DB::$tables[$name])) throw new \RuntimeException('Table exists'); DB::$tables[$name] = []; $callback(new \Illuminate\Database\Schema\Blueprint); }
         public static function dropIfExists($name) { unset(DB::$tables[$name]); }
@@ -473,6 +498,7 @@ namespace Filament\Notifications {
         private $title;
         public static function make() { return new self; }
         public function title($value) { $this->title = $value; return $this; }
+        public function body($value) { return $this; }
         public function success() { return $this; }
         public function send() { self::$sent[] = $this->title; }
     }
@@ -490,4 +516,4 @@ namespace Filament\Support\Facades {
         public static function registerRenderHook($name, $callback) { self::$hooks[$name] = $callback; }
     }
 }
-namespace Filament\View { class PanelsRenderHook { const PAGE_START = 'panels::page.start'; } }
+namespace Filament\View { class PanelsRenderHook { const PAGE_START = 'panels::page.start'; const CONTENT_START = 'panels::content.start'; } }

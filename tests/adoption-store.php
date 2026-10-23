@@ -1,7 +1,7 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 use Illuminate\Support\Facades\{DB, Http};
-use Paymenter\Extensions\Gateways\StripeSaved\{Adoption, AdoptionStore, AdoptBundledCommand};
+use Paymenter\Extensions\Gateways\AeStripe\{Adoption, AdoptionStore, AdoptBundledCommand};
 
 class AdoptionCollection implements IteratorAggregate
 {
@@ -15,11 +15,30 @@ class AdoptionCollection implements IteratorAggregate
 class AdoptionQuery
 {
     public static ?string $failTable = null;
+    public static array $loadedRows = [];
     private array $filters = [];
     private bool $locked = false;
     public function __construct(private string $table) {}
     public function whereIn($key, $values): self { $this->filters[] = fn ($r) => in_array($r[$key], $values); return $this; }
-    public function where($key, $value): self { return $this->whereIn($key, [$value]); }
+    public function where($key, $operator = null, $value = null): self {
+        if ($key instanceof Closure) {
+            $group = new self($this->table); $key($group);
+            $this->filters[] = fn ($row) => $group->matches($row);
+            return $this;
+        }
+        if (func_num_args() === 2) return $this->whereIn($key, [$operator]);
+        if ($operator !== 'like') throw new RuntimeException('Unsupported query operator');
+        $pattern = '/^' . str_replace(['%', '_'], ['.*', '.'], preg_quote($value, '/')) . '$/s';
+        $this->filters[] = fn ($row) => preg_match($pattern, $row[$key]) === 1;
+        return $this;
+    }
+    public function orWhere($key, $operator, $value): self {
+        $previous = array_pop($this->filters);
+        $group = new self($this->table); $group->where($key, $operator, $value);
+        $this->filters[] = fn ($row) => $previous($row) || $group->matches($row);
+        return $this;
+    }
+    public function first(): mixed { return $this->get()->first(); }
     public function orderBy($key): self { return $this; }
     public function lockForUpdate(): self { check(DB::$locked, 'Real adapter locks in transaction'); $this->locked = true; return $this; }
     private function matches($row): bool { foreach ($this->filters as $f) if (!$f($row)) return false; return true; }
@@ -27,7 +46,9 @@ class AdoptionQuery
     {
         check($this->locked, 'Adapter snapshot requires row locks for ' . $this->table);
         DB::$locks[] = $this->table;
-        return new AdoptionCollection(array_map(fn ($r) => (object) $r, array_filter(DB::$tables[$this->table], fn ($r) => $this->matches($r))));
+        $rows = array_filter(DB::$tables[$this->table], fn ($r) => $this->matches($r));
+        foreach ($rows as $row) self::$loadedRows[$this->table][] = $row['id'];
+        return new AdoptionCollection(array_map(fn ($r) => (object) $r, $rows));
     }
     public function update($changes): int
     {
@@ -44,18 +65,18 @@ class AdoptionQuery
 }
 $adoptionStorage = sys_get_temp_dir() . '/stripe-adoption-test-' . bin2hex(random_bytes(6));
 $fixture = new AdoptionFake;
-DB::$tables = ['extensions' => [['id' => 1, 'type' => 'gateway', 'extension' => 'Stripe', 'deleted_at' => null, 'enabled' => true], ['id' => 2, 'type' => 'gateway', 'extension' => 'StripeSaved', 'deleted_at' => null, 'enabled' => true]], 'settings' => [],
+DB::$tables = ['extensions' => [['id' => 1, 'type' => 'gateway', 'extension' => 'Stripe', 'deleted_at' => null, 'enabled' => true], ['id' => 2, 'type' => 'gateway', 'extension' => 'AeStripe', 'deleted_at' => null, 'enabled' => true]], 'settings' => [],
     'billing_agreements' => $fixture->state['agreements'], 'services' => $fixture->state['services'],
     'properties' => [['id' => 1, 'model_id' => 10, 'model_type' => \App\Models\BillingAgreement::class, 'value' => 'unchanged']]];
 \App\Models\Gateway::$rows = [];
-foreach (['Stripe', 'StripeSaved'] as $i => $name) {
+foreach (['Stripe', 'AeStripe'] as $i => $name) {
     $settings = [];
     foreach (['stripe_secret_key' => 'secret', 'stripe_publishable_key' => 'public', 'stripe_webhook_secret' => 'webhook'] as $key => $field) {
         $settings[] = ['key' => $key, 'value' => $fixture->config[$i][$field]];
     }
     \App\Models\Gateway::$rows[$name] = [new class($i + 1, $settings) {
         public bool $rejectUpdates = false;
-        public function __construct(public int $id, private array $values) {}
+        public function __construct(public int $id, public array $values) {}
         public function settings() { return new AdoptionCollection($this->values); }
         public function update($changes) {
             if ($this->rejectUpdates) return false;
@@ -78,6 +99,34 @@ $store = new AdoptionStore;
 $engine = new Adoption($store);
 $original = DB::$tables;
 $plan = $engine->run();
+// Apply must finish preflight before changing core state or ownership.
+$preflightHandler = Http::$handler;
+foreach ([1, 2] as $failAt) {
+    $reads = 0;
+    $updates = count(DB::$updates);
+    $files = glob($adoptionStorage . '/app/ae-stripe-adoption/*');
+    \Filament\Notifications\Notification::$sent = [];
+    Http::$handler = function ($verb, $path) use (&$reads, $failAt) {
+        check($verb === 'get' && $path === '/account', 'Adoption preflight only reads account identity');
+        if (++$reads === $failAt) throw new RuntimeException('Synthetic adoption preflight failure');
+        return ['id' => 'acct_fixture'];
+    };
+    rejects(fn () => $engine->run($plan['digest']), 'Synthetic adoption preflight failure');
+    check(DB::$tables === $original && count(DB::$updates) === $updates, 'Failed adoption preflight preserves enabled core Stripe and ownership: ' . $failAt);
+    check(glob($adoptionStorage . '/app/ae-stripe-adoption/*') === $files && \Filament\Notifications\Notification::$sent === [], 'Failed adoption preflight writes no manifest or disable notice: ' . $failAt);
+}
+Http::$handler = $preflightHandler;
+foreach (['Stripe', 'AeStripe'] as $name) {
+    $row = \App\Models\Gateway::$rows[$name][0];
+    $settings = $row->values;
+    foreach ($row->values as &$setting) if ($setting['key'] === 'stripe_webhook_secret') $setting['value'] = '';
+    unset($setting);
+    $updates = count(DB::$updates);
+    \Filament\Notifications\Notification::$sent = [];
+    rejects(fn () => $engine->run($plan['digest']), 'Gateway configuration or key mode invalid');
+    check(DB::$tables === $original && count(DB::$updates) === $updates && \Filament\Notifications\Notification::$sent === [], 'Missing ' . $name . ' webhook setup refuses apply before disabling core');
+    $row->values = $settings;
+}
 $result = $engine->run($plan['digest']);
 check(DB::$tables['extensions'][0]['enabled'] === false, 'Production apply disables bundled Stripe');
 check(DB::$tables['billing_agreements'][11]['gateway_id'] === 2, 'Production adapter includes soft-deleted rows');
@@ -86,7 +135,7 @@ check(DB::$tables['properties'] === $original['properties'], 'Properties untouch
 check(array_unique(DB::$locks) === ['extensions', 'settings', 'billing_agreements', 'services', 'properties'], 'All snapshot tables locked');
 $manifest = $store->load($result['manifest']);
 check($manifest === $plan, 'JSON manifest round trips with exact types and digest');
-check((fileperms($adoptionStorage . '/app/stripe-saved-adoption/' . $result['manifest']) & 0777) === 0600, 'Manifest permissions private');
+check((fileperms($adoptionStorage . '/app/ae-stripe-adoption/' . $result['manifest']) & 0777) === 0600, 'Manifest permissions private');
 rejects(fn () => new AdoptionStore, 'Another adoption command is running');
 $engine->rollback($manifest);
 check(DB::$tables === $original, 'Production updates restore exact raw tables');
@@ -177,8 +226,30 @@ $command->options = ['confirm-paused' => true];
 check($command->handle() === 1 && str_contains(end($command->output), '1, 28') && str_contains(end($command->output), '--source-gateway=ID'), 'CLI lists ambiguous bundled sources');
 $command->options = ['confirm-paused' => true, 'source-gateway' => '1'];
 check($command->handle() === 0, 'CLI accepts explicit source among ambiguous gateways');
+foreach (['abc', '0', '-1', ''] as $bad) {
+    $before = DB::$tables; $updates = count(DB::$updates); $calls = count(Http::$calls);
+    $command->options = ['confirm-paused' => true, 'source-gateway' => $bad];
+    check($command->handle() === 1 && end($command->output) === 'Use --source-gateway with a positive gateway ID', 'CLI rejects invalid source-gateway ' . var_export($bad, true));
+    check(DB::$tables === $before && count(DB::$updates) === $updates && count(Http::$calls) === $calls, 'Invalid selector makes no database or Stripe calls');
+}
+$command->options = ['confirm-paused' => true, 'source-gateway' => '999'];
+$before = DB::$tables; $updates = count(DB::$updates); $calls = count(Http::$calls);
+check($command->handle() === 1 && end($command->output) === 'Exactly one installed row per gateway required', 'CLI rejects unknown source gateway');
+check(DB::$tables === $before && count(DB::$updates) === $updates && count(Http::$calls) === $calls, 'Unknown selector makes no database or Stripe calls');
 DB::$tables['extensions'][2]['deleted_at'] = '2020-01-01';
+$command->options = ['confirm-paused' => true, 'source-gateway' => '28'];
+$before = DB::$tables; $updates = count(DB::$updates);
+check($command->handle() === 1 && end($command->output) === 'Gateway row removed', 'CLI refuses a soft-deleted source gateway');
+check(DB::$tables === $before && count(DB::$updates) === $updates, 'Soft-deleted selector preserves core state and ownership');
 $command->options = ['confirm-paused' => true];
+$failureHandler = Http::$handler;
+$errors = \Illuminate\Support\Facades\Log::$errors;
+Http::$handler = fn () => throw new RuntimeException('Synthetic adoption failure');
+try {
+    check($command->handle() === 1 && end($command->output) === 'Operation failed; keep writers paused and inspect protected manifest/database state before retrying', 'Unexpected adoption failures keep the existing safe console message');
+    check(!str_contains(implode("\n", $command->output), 'Synthetic adoption failure'), 'Adoption does not print the raw exception');
+    check(array_slice(\Illuminate\Support\Facades\Log::$errors, count($errors)) === [['AE Stripe adoption failed.', ['exception' => RuntimeException::class, 'code' => 'adoption_failed']]], 'Adoption logs the exception class and a fixed code, not the message');
+} finally { Http::$handler = $failureHandler; }
 check($command->handle() === 0, 'CLI dry run succeeds with actual adapter');
 check(!str_contains(implode('\n', $command->output), 'private fixture'), 'CLI output contains no stored names');
 check(in_array('{"service":21,"from":13,"to":12}', $command->output, true), 'CLI prints each changed service id and before/after reference');
@@ -219,8 +290,8 @@ check((new Adoption($selected))->run()['before']['bundled'] === 62, 'Active sour
 unset($selected);
 \App\Models\Gateway::$rows['Stripe'][0]->id = 1;
 DB::$tables = $original;
-\App\Models\Gateway::$rows['StripeSaved'] = [];
+\App\Models\Gateway::$rows['AeStripe'] = [];
 check($command->handle() === 1 && str_contains(end($command->output), 'installed row'), 'CLI refuses uninstalled fork');
 \App\Models\Gateway::$rows = null;
-foreach (glob($adoptionStorage . '/app/stripe-saved-adoption/*') as $file) unlink($file);
-rmdir($adoptionStorage . '/app/stripe-saved-adoption'); rmdir($adoptionStorage . '/app'); rmdir($adoptionStorage);
+foreach (glob($adoptionStorage . '/app/ae-stripe-adoption/*') as $file) unlink($file);
+rmdir($adoptionStorage . '/app/ae-stripe-adoption'); rmdir($adoptionStorage . '/app'); rmdir($adoptionStorage);

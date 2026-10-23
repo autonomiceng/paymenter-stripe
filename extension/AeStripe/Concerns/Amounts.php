@@ -1,6 +1,6 @@
 <?php
 
-namespace Paymenter\Extensions\Gateways\StripeSaved\Concerns;
+namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 trait Amounts
 {

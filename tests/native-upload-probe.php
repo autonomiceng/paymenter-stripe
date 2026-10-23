@@ -4,7 +4,7 @@
 require __DIR__ . '/fakes.php';
 
 [$script, $installed, $extracted] = $argv;
-$prefix = 'Paymenter\\Extensions\\Gateways\\StripeSaved\\';
+$prefix = 'Paymenter\\Extensions\\Gateways\\AeStripe\\';
 spl_autoload_register(function ($class) use ($prefix, $installed) {
     if (!str_starts_with($class, $prefix)) return;
     $file = $installed . '/' . str_replace('\\', '/', substr($class, strlen($prefix))) . '.php';
@@ -35,24 +35,24 @@ foreach (glob($extracted . '/*.php') as $file) {
         }
     }
 }
-if ($type !== ['class' => 'StripeSaved', 'type' => 'gateway']) {
-    throw new RuntimeException('Native upload did not detect StripeSaved as a gateway');
+if ($type !== ['class' => 'AeStripe', 'type' => 'gateway']) {
+    throw new RuntimeException('Native upload did not detect AeStripe as a gateway');
 }
-$expected = is_file($installed . '/StripeSaved.php') ? $installed : $extracted;
-$reflection = new ReflectionClass($prefix . 'StripeSaved');
-if ($reflection->getFileName() !== $expected . '/StripeSaved.php') {
+$expected = is_file($installed . '/AeStripe.php') ? $installed : $extracted;
+$reflection = new ReflectionClass($prefix . 'AeStripe');
+if ($reflection->getFileName() !== $expected . '/AeStripe.php') {
     throw new RuntimeException('Native upload did not use the expected gateway copy');
 }
 if ($expected === $extracted) {
     // The uploader deletes extraction before calling the already loaded class.
     $GLOBALS['paymenterBase'] = dirname($extracted) . '/fee-app';
-    $destination = base_path('extensions/Gateways/StripeSaved');
+    $destination = base_path('extensions/Gateways/AeStripe');
     mkdir(dirname($destination), 0700, true);
     rename($extracted, $destination);
-    $gateway = new ($prefix . 'StripeSaved');
+    $gateway = new ($prefix . 'AeStripe');
     $gateway->installed();
-    if (!isset(\Illuminate\Support\Facades\DB::$tables['stripe_saved_payment_fees'])) {
+    if (!isset(\Illuminate\Support\Facades\DB::$tables['ae_stripe_payment_fees'])) {
         throw new RuntimeException('Fresh upload did not migrate from the installed directory');
     }
 }
-echo "PASS: native upload detected gateway StripeSaved\n";
+echo "PASS: native upload detected gateway AeStripe\n";

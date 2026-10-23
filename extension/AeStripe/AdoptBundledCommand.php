@@ -1,15 +1,16 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-namespace Paymenter\Extensions\Gateways\StripeSaved;
+namespace Paymenter\Extensions\Gateways\AeStripe;
 
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
 
 require_once __DIR__ . '/Adoption.php';
 require_once __DIR__ . '/AdoptionStore.php';
 
 final class AdoptBundledCommand extends Command
 {
-    protected $signature = 'stripe-saved:adopt-bundled {--apply} {--plan=} {--confirm-paused}
+    protected $signature = 'ae-stripe:adopt-bundled {--apply} {--plan=} {--confirm-paused}
         {--source-gateway=} {--rollback=} {--redisplay=} {--confirm-setup-consent}';
     protected $description = 'Review, adopt or restore bundled Stripe agreements; default is dry run';
 
@@ -57,6 +58,7 @@ final class AdoptBundledCommand extends Command
             }
             return self::SUCCESS;
         } catch (\Throwable $e) {
+            Log::error('AE Stripe adoption failed.', ['exception' => $e::class, 'code' => 'adoption_failed']);
             // Do not render HTTP exceptions or row contents: either may contain credentials or PII.
             $safe = $e instanceof AdoptionRefusal;
             $this->error($safe ? $e->getMessage() : 'Operation failed; keep writers paused and inspect protected manifest/database state before retrying');

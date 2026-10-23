@@ -7,7 +7,7 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
     $handler = Http::$handler;
     $enabled = Gateway::$enabled;
     $tables = DB::$tables;
-    unset(DB::$tables['stripe_saved_payment_fees']);
+    unset(DB::$tables['ae_stripe_payment_fees']);
     (new ReflectionProperty($gateway, 'paymentFeeSchemaReady'))->setValue(null, false);
     \Illuminate\Database\Migrations\Migrator::$ran = [];
     \Illuminate\Database\Schema\Blueprint::$primary = [];
@@ -15,10 +15,10 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
     Gateway::$enabled = true;
     $gateway->retryPaymentFees();
     check(\Illuminate\Database\Schema\Blueprint::$primary === ['payment_intent_id'], 'Migration makes PaymentIntent unique');
-    DB::$tables['stripe_saved_payment_fees']['sentinel'] = ['state' => 'completed'];
+    DB::$tables['ae_stripe_payment_fees']['sentinel'] = ['state' => 'completed'];
     $gateway->installed();
-    check(isset(DB::$tables['stripe_saved_payment_fees']['sentinel']), 'Upgrade and install reruns preserve existing records');
-    DB::$tables['stripe_saved_payment_fees'] = [];
+    check(isset(DB::$tables['ae_stripe_payment_fees']['sentinel']), 'Upgrade and install reruns preserve existing records');
+    DB::$tables['ae_stripe_payment_fees'] = [];
     Gateway::$enabled = true;
     $invoice = Invoice::$row;
     $invoice->currency_code = 'usd';
@@ -30,9 +30,9 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
         throw new RuntimeException('Unexpected recovery request: ' . $path);
     };
     $charge = (object) ['id' => 'ch_recovery', 'payment_intent' => 'pi_recovery', 'balance_transaction' => 'bt_recovery'];
-    ExtensionHelper::$payments['12:pi_recovery'] = ['gateway' => 'StripeSaved', 'amount' => 20.0, 'status' => 'succeeded'];
+    ExtensionHelper::$payments['12:pi_recovery'] = ['gateway' => 'AeStripe', 'amount' => 20.0, 'status' => 'succeeded'];
     $deliver = fn () => $gateway->webhook(eventRequest($charge, type: 'charge.succeeded'));
-    $row = fn () => DB::$tables['stripe_saved_payment_fees']['pi_recovery'];
+    $row = fn () => DB::$tables['ae_stripe_payment_fees']['pi_recovery'];
     $writes = ExtensionHelper::$feeWrites;
     check($deliver()['status'] === 200 && $row()['state'] === 'pending' && $row()['attempts'] === 1
         && $row()['charge_id'] === 'ch_recovery' && $row()['balance_transaction_id'] === 'bt_recovery'
@@ -49,7 +49,7 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
     check(count(Http::$calls) === $calls, 'Completed fee replays do not repeat remote lookups');
     check(ExtensionHelper::$feeWrites === $writes + 1, 'Completed fee blocks webhook and task replays');
 
-    $reset = function () { DB::$tables['stripe_saved_payment_fees'] = []; };
+    $reset = function () { DB::$tables['ae_stripe_payment_fees'] = []; };
     $reset(); $charge->balance_transaction = $balanceId = null;
     $writes = ExtensionHelper::$feeWrites;
     check($deliver()['status'] === 200 && $row()['state'] === 'pending' && ExtensionHelper::$feeWrites === $writes,
@@ -81,7 +81,7 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
     check(ExtensionHelper::$feeWrites === $writes + 1, 'Webhook wins concurrent task delivery without a duplicate fee');
     foreach (['attempts', 'age'] as $limit) {
         $reset(); $balance['exchange_rate'] = null; $deliver();
-        DB::$tables['stripe_saved_payment_fees']['pi_recovery'][$limit === 'attempts' ? 'attempts' : 'created_at'] =
+        DB::$tables['ae_stripe_payment_fees']['pi_recovery'][$limit === 'attempts' ? 'attempts' : 'created_at'] =
             $limit === 'attempts' ? 23 : time() - 72 * 3600;
         $notices = count(Notification::$rows); $audits = count(Audit::$rows); $calls = count(Http::$calls);
         Notification::$fail = true;
@@ -119,37 +119,37 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
     check(count(Http::$calls) === $calls && $row()['attempts'] === 1, 'Disabled task performs no recovery');
     Gateway::$enabled = true; $reset();
     $gateway->webhook(eventRequest((object) ['id' => 'ch_no_intent'], type: 'charge.updated'));
-    check(DB::$tables['stripe_saved_payment_fees'] === [], 'Non-PaymentIntent charge has no fee record');
+    check(DB::$tables['ae_stripe_payment_fees'] === [], 'Non-PaymentIntent charge has no fee record');
     DB::$beforeUserLock = function () { ExtensionHelper::$payments['12:pi_recovery']['gateway'] = 'Stripe'; };
     rejects($deliver, 'HTTP 409');
-    check(DB::$tables['stripe_saved_payment_fees'] === [], 'Ownership is reread under the settlement lock');
-    check($deliver()['status'] === 200 && DB::$tables['stripe_saved_payment_fees'] === [], 'Bundled fee remains owned by bundled gateway');
-    ExtensionHelper::$payments['12:pi_recovery']['gateway'] = 'StripeSaved';
+    check(DB::$tables['ae_stripe_payment_fees'] === [], 'Ownership is reread under the settlement lock');
+    check($deliver()['status'] === 200 && DB::$tables['ae_stripe_payment_fees'] === [], 'Bundled fee remains owned by bundled gateway');
+    ExtensionHelper::$payments['12:pi_recovery']['gateway'] = 'AeStripe';
     $balance['exchange_rate'] = null; $balance['currency'] = 'jpy'; $deliver();
-    DB::$tables['stripe_saved_payment_fees']['pi_recovery']['attempts'] = 24; $calls = count(Http::$calls);
+    DB::$tables['ae_stripe_payment_fees']['pi_recovery']['attempts'] = 24; $calls = count(Http::$calls);
     $gateway->retryPaymentFees();
     check($row()['state'] === 'review' && count(Http::$calls) === $calls, 'Exhausted attempt count prevents another lookup');
     $reset(); $balance['exchange_rate'] = null; $deliver();
     $pending = $row();
-    DB::$tables['stripe_saved_payment_fees'] = [
+    DB::$tables['ae_stripe_payment_fees'] = [
         'pi_deleted' => array_merge($pending, ['payment_intent_id' => 'pi_deleted', 'created_at' => time() - 1]),
         'pi_recovery' => $pending,
     ];
     $balance = ['fee' => 42, 'currency' => 'usd']; $notices = count(Notification::$rows);
     $gateway->retryPaymentFees(); $gateway->retryPaymentFees();
-    check(DB::$tables['stripe_saved_payment_fees']['pi_deleted']['state'] === 'review'
+    check(DB::$tables['ae_stripe_payment_fees']['pi_deleted']['state'] === 'review'
         && count(Notification::$rows) === $notices + 1 && $row()['state'] === 'completed',
         'Deleted transaction notifies once without blocking other fee records');
-    DB::$tables['stripe_saved_payment_fees']['pi_deleted']['state'] = 'pending';
-    FeeQuery::$beforeRead = function () { DB::$tables['stripe_saved_payment_fees']['pi_deleted']['state'] = 'completed'; };
+    DB::$tables['ae_stripe_payment_fees']['pi_deleted']['state'] = 'pending';
+    FeeQuery::$beforeRead = function () { DB::$tables['ae_stripe_payment_fees']['pi_deleted']['state'] = 'completed'; };
     $notices = count(Notification::$rows); $gateway->retryPaymentFees();
     check(count(Notification::$rows) === $notices, 'Stale orphan snapshot respects the completed record');
-    DB::$tables['stripe_saved_payment_fees']['pi_deleted']['state'] = 'pending';
-    FeeQuery::$beforeRead = function () { unset(DB::$tables['stripe_saved_payment_fees']['pi_deleted']); };
+    DB::$tables['ae_stripe_payment_fees']['pi_deleted']['state'] = 'pending';
+    FeeQuery::$beforeRead = function () { unset(DB::$tables['ae_stripe_payment_fees']['pi_deleted']); };
     $gateway->retryPaymentFees();
     check(count(Notification::$rows) === $notices, 'Stale orphan snapshot respects a removed record');
     $charge->payment_intent = 'pi_before_settlement';
-    $charge->metadata = (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1'];
+    $charge->metadata = (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1'];
     Http::$handler = fn () => (object) ['id' => 'pi_before_settlement', 'metadata' => $charge->metadata];
     rejects($deliver, 'HTTP 409');
     Http::$handler = $handler; Gateway::$enabled = $enabled; DB::$tables = $tables;

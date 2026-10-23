@@ -1,12 +1,12 @@
 # Settings and behavior
 
-- **Stripe Restricted key**: encrypted server key. Grant the resource permissions
+- **Stripe restricted API key**: encrypted server key. Grant the resource permissions
   below and confirm access in a test account. This fork pins `2025-07-30.basil`.
-- **Stripe Publishable Key**: same account and test/live mode as the server key.
-- **Create detailed Stripe customers**: includes optional address, phone and
-  company properties. Customer creation failures stop checkout rather than
+- **Stripe publishable key**: same account and test/live mode as the server key.
+- **Send address and phone to Stripe**: off by default. Includes optional address,
+  phone and company details for Stripe Tax and addresses on Stripe receipts. Customer creation failures stop checkout rather than
   falling back to an anonymous PaymentIntent.
-- **Stripe webhook secret**: encrypted endpoint signing secret; never expose it
+- **Stripe webhook signing secret**: encrypted endpoint signing secret; never expose it
   in browser markup. CustomerSession and intent client secrets are user-scoped
   capabilities supplied only to the invoice owner.
 

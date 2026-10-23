@@ -1,8 +1,8 @@
-# Paymenter Stripe Saved Methods
+# Paymenter AE Stripe
 
 Independent MIT gateway fork of Paymenter 1.5.9. Install beside the bundled
-Stripe gateway using the distinct `StripeSaved` class, `gateways.stripe-saved`
-views, and `/extensions/stripe-saved/webhook` endpoint.
+Stripe gateway using the distinct `AeStripe` class, `gateways.ae-stripe`
+views, and `/extensions/ae-stripe/webhook` endpoint.
 
 The `stripe_id` user property stays shared so existing Stripe customers and
 attached payment methods remain accessible. Existing Stripe metadata keys
@@ -21,6 +21,9 @@ default, lets customers save a card during invoice payment; saving never enables
 sandbox checks are pending. Complete them before accepting live payments.
 
 - [Installation](docs/install.md) and reproducible native ZIP packaging.
+- [Convert an existing StripeSaved install](docs/convert-stripe-saved.md) without a second gateway.
+  The old webhook URL remains an alias with the same handler and signing secret.
+  The command recommends updating the existing endpoint to `/extensions/ae-stripe/webhook`.
 - [Settings and consent](docs/settings.md), including legacy redisplay limits.
 - [Migration from bundled Stripe](docs/migrating-from-bundled.md): preserve the
   old extension row, adopt agreements with a reviewed dry-run command, and move
@@ -28,7 +31,7 @@ sandbox checks are pending. Complete them before accepting live payments.
 - [Offline tests and sandbox verification](docs/verification.md).
 
 Run `php -n tests/run.php`; no downloads or network are required. Build with
-`python3 tools/build_release.py --output dist/StripeSaved-0.1.0.zip`.
+`python3 tools/build_release.py --output dist/AeStripe.zip`.
 
 Requires Paymenter 1.5.9 and PHP 8.3+. Build the native ZIP above, then upload it
 through Paymenter's extension uploader; follow [installation](docs/install.md)

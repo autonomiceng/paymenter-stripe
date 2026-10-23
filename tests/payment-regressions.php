@@ -19,7 +19,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     Invoice::$rows[$second->id] = $second;
     $settled = (object) ['id' => 'pi_review_invoice_identity', 'status' => 'succeeded', 'customer' => 'cus_foreign',
         'amount' => 2000, 'amount_received' => 1250, 'currency' => 'usd',
-        'metadata' => (object) ['invoice_id' => $first->id, 'stripe_saved_gateway' => '1']];
+        'metadata' => (object) ['invoice_id' => $first->id, 'ae_stripe_gateway' => '1']];
     $before = ExtensionHelper::$applications;
     $records = count(Audit::$rows);
     foreach ([$first, $second] as $invoice) {
@@ -41,7 +41,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $settled->id = 'pi_review_morph_identity';
     $settled->metadata->invoice_id = $mapped->id;
     DB::transaction(fn () => Audit::create([
-        'event' => 'stripe_saved_payment_review', 'auditable_type' => 'service', 'auditable_id' => $mapped->id,
+        'event' => 'ae_stripe_payment_review', 'auditable_type' => 'service', 'auditable_id' => $mapped->id,
         'old_values' => [], 'new_values' => ['payment_intent_id' => $settled->id],
     ]));
     $records = count(Audit::$rows);
@@ -68,7 +68,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     Invoice::$rows[$invoice->id] = $invoice;
     $settled = (object) ['id' => 'pi_review_cancelled_checkout', 'status' => 'succeeded', 'customer' => 'cus_owner',
         'amount' => 2000, 'amount_received' => 1250, 'currency' => 'usd',
-        'metadata' => (object) ['invoice_id' => $invoice->id, 'stripe_saved_gateway' => '1']];
+        'metadata' => (object) ['invoice_id' => $invoice->id, 'ae_stripe_gateway' => '1']];
     $before = ExtensionHelper::$applications;
     $records = count(Audit::$rows);
     $calls = count(Http::$calls);
@@ -91,7 +91,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         'Cancelled checkout refusal holds owner and invoice locks before the current audit read');
     check(count(Http::$calls) === $calls, 'Cancelled checkout refusal makes no Stripe request');
     check(array_slice(Log::$warnings, $warnings) === array_fill(0, 2, [
-        'StripeSaved payment received for nonpending invoice', ['invoice_id' => $invoice->id],
+        'AeStripe payment received for nonpending invoice', ['invoice_id' => $invoice->id],
     ]), 'Cancelled checkout warning contains only the constant message and invoice ID');
 
     $settled->id = 'pi_review_cancelled_retry';
@@ -121,7 +121,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $invoice->status = 'paid';
     $settled = (object) ['id' => 'pi_late_success', 'status' => 'succeeded', 'customer' => 'cus_owner',
         'amount' => 2000, 'amount_received' => 2000, 'currency' => 'usd',
-        'metadata' => (object) ['invoice_id' => $invoice->id, 'stripe_saved_gateway' => '1']];
+        'metadata' => (object) ['invoice_id' => $invoice->id, 'ae_stripe_gateway' => '1']];
     $before = ExtensionHelper::$applications;
     $warnings = count(Log::$warnings);
     $calls = count(Http::$calls);
@@ -130,12 +130,12 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $gateway->webhook(eventRequest($settled, type: 'payment_intent.processing'));
     $gateway->webhook(eventRequest($settled, type: 'payment_intent.payment_failed'));
     check((ExtensionHelper::$payments[$invoice->id . ':pi_late_success'] ?? null) === [
-        'gateway' => 'StripeSaved', 'amount' => 20.0, 'status' => 'succeeded',
+        'gateway' => 'AeStripe', 'amount' => 20.0, 'status' => 'succeeded',
     ], 'Late successful charge remains visible as a native transaction');
     check(ExtensionHelper::$applications === $before + 1 && $invoice->status === 'paid',
         'Late success and delayed events preserve one payment and the paid invoice');
     check(count(Log::$warnings) === $warnings + 1 && end(Log::$warnings) === [
-        'StripeSaved payment received for paid invoice', ['invoice_id' => $invoice->id],
+        'AeStripe payment received for paid invoice', ['invoice_id' => $invoice->id],
     ], 'Late charge warns once without customer data');
     check(count(Http::$calls) === $calls, 'Late success never refunds or changes Stripe');
 
@@ -159,7 +159,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         check(array_slice(DB::$modelLocks, $locks, 4) === [\App\Models\User::class, Invoice::class, \App\Models\InvoiceTransaction::class, Audit::class],
             'Refused success uses the settlement lock order and a current audit read');
         $record = end(Audit::$rows);
-        check($record['event'] === 'stripe_saved_payment_review' && $record['new_values']['payment_intent_id'] === $settled->id
+        check($record['event'] === 'ae_stripe_payment_review' && $record['new_values']['payment_intent_id'] === $settled->id
             && $record['auditable_type'] === Invoice::class && $record['auditable_id'] === $invoice->id
             && $record['new_values']['amount_minor'] === 123
             && $record['new_values']['currency'] === $settled->currency
@@ -242,12 +242,12 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $user->props->customer = 'cus_owner';
     $legacy = (object) ['id' => 'pi_legacy_consent', 'status' => 'requires_confirmation', 'customer' => 'cus_owner',
         'setup_future_usage' => 'off_session',
-        'metadata' => (object) ['invoice_id' => $invoice->id, 'stripe_saved_gateway' => '1', 'stripe_saved_consent' => '1']];
+        'metadata' => (object) ['invoice_id' => $invoice->id, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1']];
     Http::$handler = function ($verb, $path, $data) use ($legacy) {
         if ($path !== '/payment_intents/pi_legacy_consent') throw new RuntimeException('Unexpected consent request');
         if ($verb === 'post') {
             if (array_key_exists('setup_future_usage', $data)) $legacy->setup_future_usage = $data['setup_future_usage'] === '' ? null : $data['setup_future_usage'];
-            $legacy->metadata->stripe_saved_consent = $data['metadata']['stripe_saved_consent'];
+            $legacy->metadata->ae_stripe_consent = $data['metadata']['ae_stripe_consent'];
             $legacy->payment_method_options = json_decode(json_encode($data['payment_method_options']));
         }
         return $legacy;
@@ -255,14 +255,14 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     foreach ([false, false, true, false] as $save) {
         $gateway->consent(new Request(['intent' => $legacy->id, 'save' => $save]));
         check($legacy->setup_future_usage === null, 'Consent update clears previous-release top-level future usage');
-        check($legacy->metadata->stripe_saved_consent === ($save ? '1' : '0')
+        check($legacy->metadata->ae_stripe_consent === ($save ? '1' : '0')
             && $legacy->payment_method_options->card->setup_future_usage === ($save ? 'off_session' : '')
             && $legacy->payment_method_options->link->setup_future_usage === ($save ? 'off_session' : ''),
             'Consent cycles preserve card and Link preferences');
     }
     $legacy->status = 'requires_action';
     $legacy->setup_future_usage = 'off_session';
-    $legacy->metadata->stripe_saved_consent = '1';
+    $legacy->metadata->ae_stripe_consent = '1';
     $before = count(Http::$calls);
     rejects(fn () => $gateway->consent(new Request(['intent' => $legacy->id, 'save' => false])), 'HTTP 409');
     $gateway->consent(new Request(['intent' => $legacy->id, 'save' => true]));

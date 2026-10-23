@@ -9,7 +9,7 @@ Gateway::$enabled = true;
 $previousHandler = Http::$handler;
 $agreementIntent = (object) ['id' => 'seti_consent', 'status' => 'requires_payment_method',
     'customer' => 'cus_owner', 'payment_method' => 'pm_consent', 'latest_attempt' => null,
-    'metadata' => (object) ['is_billing_agreement' => '1', 'user_id' => '7', 'stripe_saved_gateway' => '1']];
+    'metadata' => (object) ['is_billing_agreement' => '1', 'user_id' => '7', 'ae_stripe_gateway' => '1']];
 Http::$handler = function ($verb, $path, $data) use ($agreementIntent) {
     if ($path === '/setup_intents/seti_consent') {
         if ($verb === 'post') foreach ($data['metadata'] as $key => $value) $agreementIntent->metadata->$key = $value;
@@ -35,16 +35,16 @@ $agreementIntent->customer = 'cus_other';
 rejects(fn () => $gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true])), 'HTTP 403');
 $agreementIntent->customer = 'cus_owner';
 $gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true]));
-check($agreementIntent->metadata->stripe_saved_setup_consent === 'off_session_v1'
-    && $agreementIntent->metadata->stripe_saved_setup_consent_user === '7'
-    && preg_match('/^[0-9]+$/D', $agreementIntent->metadata->stripe_saved_setup_consent_at) === 1, 'Consent records terms, authenticated user and server timestamp');
+check($agreementIntent->metadata->ae_stripe_setup_consent === 'off_session_v1'
+    && $agreementIntent->metadata->ae_stripe_setup_consent_user === '7'
+    && preg_match('/^[0-9]+$/D', $agreementIntent->metadata->ae_stripe_setup_consent_at) === 1, 'Consent records terms, authenticated user and server timestamp');
 $agreementIntent->status = 'requires_action';
 $before = count(Http::$calls);
 $recordedMetadata = clone $agreementIntent->metadata;
 check($gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true]))['data']['ok'] === true
     && count(Http::$calls) === $before + 1 && end(Http::$calls)[0] === 'get'
     && $agreementIntent->metadata == $recordedMetadata, 'Setup authentication retry preserves recorded consent without metadata writes');
-foreach (['stripe_saved_setup_consent' => 'unknown', 'stripe_saved_setup_consent_at' => '', 'stripe_saved_setup_consent_user' => '99'] as $key => $invalid) {
+foreach (['ae_stripe_setup_consent' => 'unknown', 'ae_stripe_setup_consent_at' => '', 'ae_stripe_setup_consent_user' => '99'] as $key => $invalid) {
     $saved = $agreementIntent->metadata->$key;
     $agreementIntent->metadata->$key = $invalid;
     rejects(fn () => $gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true])), 'HTTP 409');
@@ -55,7 +55,7 @@ $gateway->webhook(eventRequest($agreementIntent, type: 'setup_intent.succeeded')
 $gateway->setupAgreement(new Request(['setup_intent' => 'seti_consent']));
 check(isset(ExtensionHelper::$agreements['pm_consent']), 'Recorded consent permits agreement on webhook and redirect');
 unset(ExtensionHelper::$agreements['pm_consent']);
-foreach (['customer' => 'cus_other', 'stripe_saved_setup_consent' => 'unknown', 'stripe_saved_setup_consent_at' => ''] as $key => $invalid) {
+foreach (['customer' => 'cus_other', 'ae_stripe_setup_consent' => 'unknown', 'ae_stripe_setup_consent_at' => ''] as $key => $invalid) {
     $target = $key === 'customer' ? $agreementIntent : $agreementIntent->metadata;
     $saved = $target->$key;
     $target->$key = $invalid;
@@ -63,7 +63,7 @@ foreach (['customer' => 'cus_other', 'stripe_saved_setup_consent' => 'unknown', 
         && !isset(ExtensionHelper::$agreements['pm_consent']), 'Setup persistence refuses ' . $key . ' without an agreement');
     $target->$key = $saved;
 }
-$agreementIntent->metadata->stripe_saved_setup_consent_user = '99';
+$agreementIntent->metadata->ae_stripe_setup_consent_user = '99';
 check(invoke($gateway, 'setupBillingAgreement', $agreementIntent) === false, 'Consent recorded for another user cannot persist');
 rejects(fn () => $gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true])), 'HTTP 409');
 Gateway::$enabled = false;

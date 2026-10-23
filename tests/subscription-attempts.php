@@ -12,7 +12,7 @@ use Illuminate\Support\Facades\{DB, Http};
     $oldStatus = $service->status;
     $oldServiceProperties = $service->properties->values;
     Gateway::$enabled = true;
-    $property = 'stripe_saved_subscription_' . $service->id;
+    $property = 'ae_stripe_subscription_' . $service->id;
     $olderSetup = clone $setup;
     $olderSetup->id = 'seti_older';
     $olderSetup->created = 1700000099;

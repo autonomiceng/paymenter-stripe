@@ -4,11 +4,11 @@ use App\Helpers\ExtensionHelper;
 use App\Models\{BillingAgreement, Gateway, Invoice, Properties, User};
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\{Auth, DB, Http, Log};
-use Paymenter\Extensions\Gateways\StripeSaved\StripeSaved;
+use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
 
 if (!function_exists('check')) {
     require __DIR__ . '/fakes.php';
-    require __DIR__ . '/../extension/StripeSaved/StripeSaved.php';
+    require __DIR__ . '/../extension/AeStripe/AeStripe.php';
     $count = 0;
     function check($value, $label) { global $count; if (!$value) throw new RuntimeException($label); ++$count; }
     function invoke($gateway, $method, ...$args) { return (new ReflectionMethod($gateway, $method))->invoke($gateway, ...$args); }
@@ -25,17 +25,17 @@ Gateway::$rows = null;
 Gateway::$enabled = Gateway::$present = true;
 Gateway::$deleted = false;
 Auth::$id = 7;
-$gateway = new StripeSaved(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
+$gateway = new AeStripe(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
 $agreementMethod = (object) ['id' => 'pm_duplicate', 'type' => 'card', 'customer' => 'cus_owner',
     'card' => (object) ['brand' => 'visa', 'last4' => '4242', 'exp_year' => 2030, 'exp_month' => 5]];
 $agreementSetup = (object) ['id' => 'seti_duplicate', 'status' => 'succeeded', 'payment_method' => $agreementMethod->id,
     'latest_attempt' => null, 'customer' => 'cus_owner', 'metadata' => (object) ['user_id' => '7',
-        'is_billing_agreement' => '1', 'stripe_saved_gateway' => '1', 'stripe_saved_setup_consent' => 'off_session_v1',
-        'stripe_saved_setup_consent_at' => '1700000000', 'stripe_saved_setup_consent_user' => '7']];
+        'is_billing_agreement' => '1', 'ae_stripe_gateway' => '1', 'ae_stripe_setup_consent' => 'off_session_v1',
+        'ae_stripe_setup_consent_at' => '1700000000', 'ae_stripe_setup_consent_user' => '7']];
 $agreementPaid = (object) ['id' => 'pi_duplicate', 'status' => 'succeeded', 'customer' => 'cus_owner',
     'client_secret' => 'pi_duplicate_secret', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 2000,
     'payment_method' => $agreementMethod->id, 'payment_method_options' => (object) ['card' => (object) ['setup_future_usage' => 'off_session']],
-    'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1', 'stripe_saved_consent' => '1']];
+    'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1']];
 Http::$handler = function ($verb, $path, $data) use ($agreementMethod, $agreementSetup, $agreementPaid) {
     if ($path === '/payment_methods/' . $agreementMethod->id) return $agreementMethod;
     if ($path === '/setup_intents/' . $agreementSetup->id || $path === '/setup_intents') {
@@ -48,7 +48,7 @@ Http::$handler = function ($verb, $path, $data) use ($agreementMethod, $agreemen
     throw new RuntimeException('Unexpected agreement request: ' . $path);
 };
 $agreementRow = ['id' => 19, 'external_reference' => $agreementMethod->id, 'user_id' => 7, 'gateway_id' => 2,
-    'gateway' => 'StripeSaved', 'name' => 'Visa **** 4242', 'type' => 'visa', 'expiry' => '2030-05-31', 'deleted_at' => null];
+    'gateway' => 'AeStripe', 'name' => 'Visa **** 4242', 'type' => 'visa', 'expiry' => '2030-05-31', 'deleted_at' => null];
 $scenario = getenv('AGREEMENT_SCENARIO') ?: 'all';
 if (in_array($scenario, ['all', 'sequential'])) {
     ExtensionHelper::$agreements = [];
@@ -118,6 +118,11 @@ if ($scenario === 'all') {
             $warnings = count(Log::$warnings);
             check($entries[$entry]()['status'] === 200 && count(Log::$warnings) === $warnings + 1,
                 "$entry acknowledges and logs permanent $field refusal");
+            $context = end(Log::$warnings)[1];
+            $intentKey = $entry === 'setup webhook' ? 'setup_intent_id' : 'payment_intent_id';
+            $intentId = $entry === 'setup webhook' ? $agreementSetup->id : $agreementPaid->id;
+            check(($context[$intentKey] ?? null) === $intentId && isset($context['reason']), "$entry refusal log identifies the intent and reason for $field");
+            check(!str_contains($result['message'], $intentId), "$entry intent ID stays out of customer refusal text");
         }
         check(ExtensionHelper::$agreements === [$agreementMethod->id => $conflict], "Refusal preserves $field ownership and deletion");
         check(count(array_filter(array_slice(Http::$calls, $before), fn ($call) => $call[0] === 'post')) === 0,

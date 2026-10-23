@@ -9,11 +9,11 @@ $invoice->status = 'pending';
 $invoice->currency_code = 'usd';
 $user->props->customer = 'cus_owner';
 $owned = (object) ['id' => 'pi_ownership', 'amount' => 2000, 'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner',
-    'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
+    'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1']];
 $before = ExtensionHelper::$applications;
 check($gateway->webhook(eventRequest($owned))['status'] === 200 && ExtensionHelper::$applications === $before + 1,
     'Marked intent is recorded while bundled is enabled');
-unset($owned->metadata->stripe_saved_gateway);
+unset($owned->metadata->ae_stripe_gateway);
 $owned->id = 'pi_bundled';
 foreach (['payment_intent.succeeded', 'payment_intent.processing', 'payment_intent.payment_failed'] as $type) {
     $before = ExtensionHelper::$applications;
@@ -30,9 +30,9 @@ foreach (['invoice.created', 'invoice.payment_succeeded', 'subscription_schedule
         'Unmarked subscription event ignored while bundled enabled: ' . $type);
 }
 check(invoke($gateway, 'ownsWebhookObject', (object) ['parent' => (object) ['subscription_details' => (object) [
-    'metadata' => (object) ['stripe_saved_gateway' => '1']]]], 'invoice.created'), 'Subscription phase metadata identifies fork invoice');
+    'metadata' => (object) ['ae_stripe_gateway' => '1']]]], 'invoice.created'), 'Subscription phase metadata identifies fork invoice');
 $markedSchedule = (object) ['id' => 'sched_marked', 'subscription' => 'sub_marked',
-    'metadata' => (object) ['stripe_saved_gateway' => '1']];
+    'metadata' => (object) ['ae_stripe_gateway' => '1']];
 $oldSubscription = $service->subscription_id;
 $service->subscription_id = 'sub_marked';
 $markedResult = $gateway->webhook(eventRequest($markedSchedule, type: 'subscription_schedule.canceled'));
@@ -48,11 +48,11 @@ foreach (['invoice.created', 'invoice.payment_succeeded', 'subscription_schedule
     check(($gateway->webhook(eventRequest((object) ['metadata' => (object) []], type: $type))['data']['ignored'] ?? false) === true,
         'Disabled but present bundled row still owns unmarked event: ' . $type);
 }
-$owned->metadata->stripe_saved_gateway = '1';
+$owned->metadata->ae_stripe_gateway = '1';
 $owned->id = 'pi_marked_disabled_bundled';
 $gateway->webhook(eventRequest($owned));
 check(ExtensionHelper::$applications === $before + 1, 'Marked intent still settles with a disabled bundled row');
-unset($owned->metadata->stripe_saved_gateway);
+unset($owned->metadata->ae_stripe_gateway);
 $owned->id = 'pi_bundled';
 Gateway::$bundledDeleted = true;
 $gateway->webhook(eventRequest($owned));
@@ -76,11 +76,11 @@ $gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_ownership', 'ba
 check(ExtensionHelper::$fees['pi_ownership'] === 0.1, 'Recorded fork ownership permits fee update even without charge metadata');
 Http::$handler = fn () => ['id' => 'cus_owner'];
 $gateway->charge($invoice, 20, new BillingAgreement);
-check(end(Http::$calls)[2]['metadata'] === ['invoice_id' => 12, 'billing_agreement_id' => 4, 'stripe_saved_gateway' => '1'],
+check(end(Http::$calls)[2]['metadata'] === ['invoice_id' => 12, 'billing_agreement_id' => 4, 'ae_stripe_gateway' => '1'],
     'Off-session intent preserves metadata and marks gateway');
 Http::$handler = fn () => ['id' => 'seti_created'];
 $gateway->createBillingAgreement($user);
-check(end(Http::$calls)[2]['metadata'] === ['user_id' => 7, 'is_billing_agreement' => '1', 'stripe_saved_gateway' => '1'],
+check(end(Http::$calls)[2]['metadata'] === ['user_id' => 7, 'is_billing_agreement' => '1', 'ae_stripe_gateway' => '1'],
     'Account setup marks gateway and preserves purpose');
 Http::$handler = $oldHandler;
 Gateway::$bundledEnabled = false;

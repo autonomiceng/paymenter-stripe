@@ -27,10 +27,10 @@ $intent->status = 'requires_payment_method';
 invoke($gateway, 'checkoutIntent', $invoice, $data);
 check($posts === 2 && end(Http::$calls)[0] === 'get', 'Later render retrieves the same intent');
 rejects(fn () => invoke($gateway, 'checkoutIntent', $invoice, ['amount' => 30]), 'HTTP 409');
-$stored = json_decode($user->props->values['stripe_saved_checkout_12'], true);
+$stored = json_decode($user->props->values['ae_stripe_checkout_12'], true);
 unset($stored['intent']);
 $stored['created'] = time() - 86400;
-$user->props->values['stripe_saved_checkout_12'] = json_encode($stored);
+$user->props->values['ae_stripe_checkout_12'] = json_encode($stored);
 rejects(fn () => invoke($gateway, 'checkoutIntent', $invoice, $data), 'HTTP 409');
 
 $service = Service::$row = new Service;
@@ -39,7 +39,7 @@ $service->properties->values['has_stripe_subscription'] = '1';
 $before = count(Http::$calls);
 $gateway->cancelSubscription($service);
 check(count(Http::$calls) === $before, 'Empty subscription id stops cancellation even with marker');
-$setup = (object) ['id' => 'seti_subscription', 'customer' => 'cus_owner', 'payment_method' => 'pm_test', 'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
+$setup = (object) ['id' => 'seti_subscription', 'customer' => 'cus_owner', 'payment_method' => 'pm_test', 'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1']];
 $invoice->items = [(object) ['reference_type' => Service::class, 'reference' => $service, 'price' => '20.99']];
 Http::$handler = function ($verb, $path, $data) {
     return match ($path) {
@@ -65,17 +65,17 @@ try { invoke($gateway, 'setupSubscription', $setup); throw new RuntimeException(
 catch (Exception $error) { check($error->getMessage() === 'Stripe customer not found', 'Missing customer throws message-only exception'); }
 $user->props->customer = 'cus_owner';
 $before = count(Http::$calls);
-$gateway->webhook(eventRequest((object) ['metadata' => (object) ['stripe_saved_gateway' => '1']], type: 'setup_intent.succeeded'));
+$gateway->webhook(eventRequest((object) ['metadata' => (object) ['ae_stripe_gateway' => '1']], type: 'setup_intent.succeeded'));
 check(count(Http::$calls) === $before, 'Unrelated SetupIntent is acknowledged without effects');
 $service->subscription_id = 'sub_created';
-$gateway->webhook(eventRequest((object) ['id' => 'sched_test', 'subscription' => 'sub_created', 'metadata' => (object) ['stripe_saved_gateway' => '1']], type: 'subscription_schedule.canceled'));
+$gateway->webhook(eventRequest((object) ['id' => 'sched_test', 'subscription' => 'sub_created', 'metadata' => (object) ['ae_stripe_gateway' => '1']], type: 'subscription_schedule.canceled'));
 check($service->subscription_id === null, 'Schedule cancellation uses subscription id');
 
 $service->subscription_id = 'sub_test';
 $service->invoiceRows = [(object) ['invoice' => $invoice, 'created_at' => 1]];
 $stripeInvoice = (object) ['id' => 'in_test', 'currency' => 'usd', 'amount_paid' => 1999,
-    'metadata' => (object) ['stripe_saved_invoice_id' => 12],
-    'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) ['subscription' => 'sub_test', 'metadata' => (object) ['stripe_saved_gateway' => '1']]]];
+    'metadata' => (object) ['ae_stripe_invoice_id' => 12],
+    'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) ['subscription' => 'sub_test', 'metadata' => (object) ['ae_stripe_gateway' => '1']]]];
 $paymentRows = [];
 Http::$handler = function ($verb, $path, $data) use (&$paymentRows, $stripeInvoice) {
     if ($path === '/invoice_payments') return ['data' => $paymentRows];
@@ -110,7 +110,7 @@ check(array_slice(\Illuminate\Support\Facades\DB::$modelLocks, 0, 4) === [\App\M
 check(ExtensionHelper::$payments['12:pi_subscription']['amount'] === 19.99, 'Subscription invoice records major units');
 $before = ExtensionHelper::$applications;
 $deliver($stripeInvoice);
-$paymentIntent = (object) ['id' => 'pi_subscription', 'amount' => 1999, 'amount_received' => 1999, 'currency' => 'usd', 'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
+$paymentIntent = (object) ['id' => 'pi_subscription', 'amount' => 1999, 'amount_received' => 1999, 'currency' => 'usd', 'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1']];
 $gateway->webhook(eventRequest($paymentIntent));
 check(ExtensionHelper::$applications === $before, 'Subscription then PaymentIntent delivery cannot reapply payment');
 $paymentIntent->id = 'pi_first';
@@ -156,7 +156,7 @@ foreach ([null, 0, -1, 'invalid', 'INF', 'NaN', '1e309'] as $rateIndex => $inval
     foreach ([false, true] as $hasFee) {
         $feeIntent = (object) ['id' => 'pi_fee_' . $rateIndex . '_' . (int) $hasFee,
             'amount' => 2000, 'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner',
-            'metadata' => (object) ['invoice_id' => 12, 'stripe_saved_gateway' => '1']];
+            'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1']];
         $applications = ExtensionHelper::$applications;
         check($gateway->webhook(eventRequest($feeIntent))['status'] === 200
             && ExtensionHelper::$applications === $applications + 1,
@@ -178,10 +178,10 @@ foreach ([null, 0, -1, 'invalid', 'INF', 'NaN', '1e309'] as $rateIndex => $inval
             check(ExtensionHelper::$fees === $fees,
                 'Unavailable fee conversion preserves existing or absent fee: ' . $feeIntent->id);
             check(ExtensionHelper::$payments['12:' . $feeIntent->id] === $payment
-                && $payment === ['gateway' => 'StripeSaved', 'amount' => 20.0, 'status' => 'succeeded']
+                && $payment === ['gateway' => 'AeStripe', 'amount' => 20.0, 'status' => 'succeeded']
                 && ExtensionHelper::$applications === $applications + 1,
                 'Unavailable fee conversion preserves the settled payment: ' . $feeIntent->id);
-            $pending = DB::$tables['stripe_saved_payment_fees'][$feeIntent->id];
+            $pending = DB::$tables['ae_stripe_payment_fees'][$feeIntent->id];
             check($pending['state'] === 'pending' && $pending['last_error'] === 'Fee conversion unavailable',
                 'Unavailable conversion persists a pending fee: ' . $feeIntent->id);
         }
@@ -210,6 +210,6 @@ $service->dirty = ['price'];
 Http::$handler = fn () => throw new RuntimeException('sensitive request payload');
 $service->properties->values['has_stripe_subscription'] = '1';
 Event::$listeners[0](new App\Events\Service\Updated($service));
-check(end(Log::$warnings) === ['StripeSaved subscription sync failed', ['service_id' => 41]], 'Listener failure logs service id only');
+check(end(Log::$warnings) === ['AeStripe subscription sync failed', ['service_id' => 41]], 'Listener failure logs service id only');
 Http::$handler = $oldHandler;
 Gateway::$enabled = false;

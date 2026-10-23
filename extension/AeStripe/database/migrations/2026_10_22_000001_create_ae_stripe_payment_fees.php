@@ -9,7 +9,7 @@ return new class extends Migration
     public function up(): void
     {
         try {
-            Schema::create('stripe_saved_payment_fees', function (Blueprint $table) {
+            Schema::create('ae_stripe_payment_fees', function (Blueprint $table) {
                 $table->string('payment_intent_id')->primary();
                 $table->unsignedBigInteger('invoice_id');
                 $table->string('charge_id')->nullable();
@@ -20,12 +20,12 @@ return new class extends Migration
                 $table->string('last_error')->nullable();
             });
         } catch (\Throwable $error) {
-            if (!Schema::hasTable('stripe_saved_payment_fees')) throw $error;
+            if (!Schema::hasTable('ae_stripe_payment_fees')) throw $error;
         }
     }
 
     public function down(): void
     {
-        Schema::dropIfExists('stripe_saved_payment_fees');
+        Schema::dropIfExists('ae_stripe_payment_fees');
     }
 };

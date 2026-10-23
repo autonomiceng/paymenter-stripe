@@ -2,18 +2,18 @@
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 if (!function_exists('check')) {
     require __DIR__ . '/fakes.php';
-    require __DIR__ . '/../extension/StripeSaved/StripeSaved.php';
+    require __DIR__ . '/../extension/AeStripe/AeStripe.php';
     $count = 0;
     function check($value, $label) { global $count; if (!$value) throw new RuntimeException($label); ++$count; }
 }
 
 use Illuminate\Console\Application;
 use Illuminate\Support\Facades\{DB, Schedule, Schema};
-use Paymenter\Extensions\Gateways\StripeSaved\StripeSaved;
+use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
 
 $resetFeeSchema = function () {
-    if (property_exists(StripeSaved::class, 'paymentFeeSchemaReady')) {
-        (new ReflectionProperty(StripeSaved::class, 'paymentFeeSchemaReady'))->setValue(null, false);
+    if (property_exists(AeStripe::class, 'paymentFeeSchemaReady')) {
+        (new ReflectionProperty(AeStripe::class, 'paymentFeeSchemaReady'))->setValue(null, false);
     }
 };
 $scenario = getenv('FEE_SCHEMA_SCENARIO') ?: 'all';
@@ -26,8 +26,8 @@ if (in_array($scenario, ['all', 'boot'], true)) {
     $reports = count($GLOBALS['reportedErrors'] ?? []);
     Schema::$beforeCheck = function () use ($schemaFailure) { throw $schemaFailure; };
     try {
-        (new StripeSaved)->boot();
-        (new StripeSaved)->boot();
+        (new AeStripe)->boot();
+        (new AeStripe)->boot();
         check(Schema::$checks === $schemaChecks, 'Boot never checks or migrates the fee schema');
         check(count($GLOBALS['reportedErrors'] ?? []) === $reports, 'Boot never reports fee schema failures');
         check(count(Schedule::$callbacks) === $beforeSchedules + 2, 'Boot registers fee recovery without schema access');
@@ -50,19 +50,19 @@ if (in_array($scenario, ['all', 'fee'], true)) {
         \App\Models\Gateway::$enabled = true;
         \App\Models\User::$row = new \App\Models\User(new \App\Models\Properties('cus_owner'));
         \App\Models\Invoice::$row = new \App\Models\Invoice(\App\Models\User::$row);
-        \App\Helpers\ExtensionHelper::$payments['12:pi_schema'] = ['gateway' => 'StripeSaved', 'amount' => 20.0, 'status' => 'succeeded'];
+        \App\Helpers\ExtensionHelper::$payments['12:pi_schema'] = ['gateway' => 'AeStripe', 'amount' => 20.0, 'status' => 'succeeded'];
         \Illuminate\Support\Facades\Http::$handler = function ($verb, $path) {
             check(!DB::$locked, 'First fee path resolves Stripe data before its transaction');
             if ($path === '/balance_transactions/bt_schema') return ['fee' => 42, 'currency' => 'usd'];
             throw new RuntimeException('Unexpected schema fixture request: ' . $path);
         };
         foreach (['webhook', 'scheduler'] as $entry) {
-            unset(DB::$tables['stripe_saved_payment_fees']);
+            unset(DB::$tables['ae_stripe_payment_fees']);
             \Illuminate\Database\Migrations\Migrator::$ran = [];
             $resetFeeSchema();
             Schema::$beforeCheck = function () { check(!DB::$locked, 'Fee schema check runs before DB transaction'); };
             Schema::$beforeCreate = function () { check(!DB::$locked, 'Fee table DDL runs before DB transaction'); };
-            $firstGateway = new StripeSaved(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
+            $firstGateway = new AeStripe(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
             if ($entry === 'webhook') {
                 $body = json_encode(['type' => 'charge.succeeded', 'data' => ['object' => [
                     'id' => 'ch_schema', 'payment_intent' => 'pi_schema', 'balance_transaction' => 'bt_schema',
@@ -72,14 +72,14 @@ if (in_array($scenario, ['all', 'fee'], true)) {
                 $firstGateway->webhook(new \Illuminate\Http\Request(body: $body,
                     signature: 't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.' . $body, 'whsec_test')));
                 check(count(\Illuminate\Database\Migrations\Migrator::$ran) === 1
-                    && (DB::$tables['stripe_saved_payment_fees']['pi_schema']['state'] ?? null) === 'completed',
+                    && (DB::$tables['ae_stripe_payment_fees']['pi_schema']['state'] ?? null) === 'completed',
                     'First charge fee path creates the table and records the fee');
             } else {
                 $firstGateway->retryPaymentFees();
-                check(isset(DB::$tables['stripe_saved_payment_fees']), 'First scheduled fee path creates the table');
+                check(isset(DB::$tables['ae_stripe_payment_fees']), 'First scheduled fee path creates the table');
             }
             $schemaChecks = Schema::$checks;
-            (new StripeSaved)->retryPaymentFees();
+            (new AeStripe)->retryPaymentFees();
             check(Schema::$checks === $schemaChecks, 'Successful fee schema check is reused across gateway instances: ' . $entry);
         }
     } finally {
@@ -93,19 +93,19 @@ if (in_array($scenario, ['all', 'fee'], true)) {
         $resetFeeSchema();
     }
 }
-$schemaTable = DB::$tables['stripe_saved_payment_fees'] ?? null;
-unset(DB::$tables['stripe_saved_payment_fees']);
-$migration = require __DIR__ . '/../extension/StripeSaved/database/migrations/2026_10_22_000001_create_stripe_saved_payment_fees.php';
-Schema::$beforeCreate = function () { DB::$tables['stripe_saved_payment_fees'] = []; };
+$schemaTable = DB::$tables['ae_stripe_payment_fees'] ?? null;
+unset(DB::$tables['ae_stripe_payment_fees']);
+$migration = require __DIR__ . '/../extension/AeStripe/database/migrations/2026_10_22_000001_create_ae_stripe_payment_fees.php';
+Schema::$beforeCreate = function () { DB::$tables['ae_stripe_payment_fees'] = []; };
 try {
     $migration->up();
-    check(isset(DB::$tables['stripe_saved_payment_fees']), 'Concurrent schema creator does not abort migration');
+    check(isset(DB::$tables['ae_stripe_payment_fees']), 'Concurrent schema creator does not abort migration');
 } finally {
     Schema::$beforeCreate = null;
-    if ($schemaTable !== null) DB::$tables['stripe_saved_payment_fees'] = $schemaTable;
-    else unset(DB::$tables['stripe_saved_payment_fees']);
+    if ($schemaTable !== null) DB::$tables['ae_stripe_payment_fees'] = $schemaTable;
+    else unset(DB::$tables['ae_stripe_payment_fees']);
 }
-unset(DB::$tables['stripe_saved_payment_fees']);
+unset(DB::$tables['ae_stripe_payment_fees']);
 Schema::$beforeCreate = function () use ($schemaFailure) { throw $schemaFailure; };
 try {
     $caught = null;
@@ -113,7 +113,7 @@ try {
     check($caught === $schemaFailure, 'Migration preserves failures when no table was created');
 } finally {
     Schema::$beforeCreate = null;
-    if ($schemaTable !== null) DB::$tables['stripe_saved_payment_fees'] = $schemaTable;
+    if ($schemaTable !== null) DB::$tables['ae_stripe_payment_fees'] = $schemaTable;
 }
 $resetFeeSchema();
 if (realpath($_SERVER['SCRIPT_FILENAME']) === __FILE__) echo "PASS: $count schema/scheduler assertions\n";
