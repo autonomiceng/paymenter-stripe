@@ -27,8 +27,9 @@ soft delete (`deleted_at`), which preserves the row for rollback.
    Keep both endpoints disabled during the database and redisplay steps.
    Each gateway needs its configured secret, publishable and webhook signing keys.
    Every invocation requires exactly one `GET /v1/account` with each secret key;
-   restricted keys must permit that read. The fork key also needs payment-method
-   write permission for optional redisplay. There is no bypass. Account IDs and key
+   restricted keys must permit that read. The fork key also needs `POST /v1/payment_methods/{id}`
+   write access for optional redisplay and the full [Stripe API permissions](settings.md#stripe-api-permissions)
+   for normal operation. There is no bypass. Account IDs and key
    test/live modes must match. The command never changes webhook configuration.
 3. From the Paymenter root, as its application user, review a dry run:
 

@@ -1,9 +1,7 @@
 # Settings and behavior
 
-- **Stripe Restricted key**: encrypted server key. Permit the upstream customer,
-  PaymentIntent, SetupIntent, payment-method, balance-transaction and webhook
-  operations, plus CustomerSession creation and payment-method updates. Confirm
-  exact permissions in a test account; this fork pins `2025-07-30.basil`.
+- **Stripe Restricted key**: encrypted server key. Grant the resource permissions
+  below and confirm access in a test account. This fork pins `2025-07-30.basil`.
 - **Stripe Publishable Key**: same account and test/live mode as the server key.
 - **Create detailed Stripe customers**: includes optional address, phone and
   company properties. Customer creation failures stop checkout rather than
@@ -11,6 +9,29 @@
 - **Stripe webhook secret**: encrypted endpoint signing secret; never expose it
   in browser markup. CustomerSession and intent client secrets are user-scoped
   capabilities supplied only to the invoice owner.
+
+## Stripe API permissions
+
+All paths start with `/v1`. Read uses `GET`; write uses `POST` unless marked `DELETE`.
+`{id}` is the resource ID. Migration account reads use both gateways' keys.
+
+| Resource | Read | Write |
+| --- | --- | --- |
+| Accounts (migration) | `/account` | None |
+| Balance transactions | `/balance_transactions/{id}` | None |
+| Charges | `/charges/{id}` | None |
+| Customer Sessions | None | `/customer_sessions` |
+| Customers | `/customers/{id}` | `/customers`, `/customers/{id}` |
+| Invoice Payments | `/invoice_payments` | None |
+| Invoices | `/invoices/{id}` | `/invoices/{id}`, `/invoices/{id}/finalize`, `/invoices/{id}/pay` |
+| PaymentIntents | `/payment_intents/{id}` | `/payment_intents`, `/payment_intents/{id}` |
+| Payment methods | `/payment_methods/{id}` | `/payment_methods/{id}`, `/payment_methods/{id}/detach` |
+| Products | `/products/search` | `/products` |
+| SetupIntents | `/setup_intents/{id}` | `/setup_intents`, `/setup_intents/{id}` |
+| Subscription items | None | `/subscription_items/{id}` |
+| Subscription schedules | `/subscription_schedules/{id}` | `/subscription_schedules`, `/subscription_schedules/{id}`, `/subscription_schedules/{id}/release` |
+| Subscriptions | `/subscriptions/{id}` | `/subscriptions/{id}`, `DELETE /subscriptions/{id}` |
+| Webhook endpoints | `/webhook_endpoints` | `/webhook_endpoints`, `DELETE /webhook_endpoints/{id}` |
 
 The Payment Element displays Stripe-eligible saved cards, wallets and Link.
 The **Save this card for future payments** checkbox starts unchecked; checking it sets

@@ -123,8 +123,12 @@ top-level `setup_future_usage` with an empty form value. During authentication,
 consent changes still return 409 and resuming performs no update. Include an
 unfinished intent from the earlier release in the sandbox consent checks.
 
+Fee recovery requires read access to Charges, PaymentIntents, Invoices, Invoice
+Payments and Balance Transactions. Check the full [Stripe API permissions](settings.md#stripe-api-permissions)
+with the configured restricted key in the sandbox.
+
 Fee recovery uses the `stripe_saved_payment_fees` extension table, created on install
-or the first boot after upgrading to 0.1.1. Keep Paymenter's scheduler running every minute. The hourly
+or upgrade, with a fallback on the first fee operation. Keep Paymenter's scheduler running every minute. The hourly
 recovery task checks pending fees in batches of 100, ordered by attempt count.
 A missing balance transaction, missing fee data or invalid conversion rate stays pending.
 Pending funds already have a final fee. No rate is estimated.
