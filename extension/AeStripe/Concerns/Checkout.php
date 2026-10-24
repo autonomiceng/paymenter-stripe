@@ -178,9 +178,10 @@ trait Checkout
         $this->persistAgreement($invoice->user, $method);
     }
 
-    private function methodCustomerMatches($user, $method): bool
+    private function methodCustomerMatches($user, $method, bool $current = false): bool
     {
-        $customer = $user->properties()->where('key', 'stripe_id')->first()?->value;
+        $property = $user->properties()->where('key', 'stripe_id');
+        $customer = ($current ? $property->lockForUpdate() : $property)->first()?->value;
         if (!$customer || ($method->customer ?? null) !== $customer) {
             \Illuminate\Support\Facades\Log::warning('AeStripe saved method customer mismatch', ['user_id' => $user->id]);
             return false;
@@ -188,17 +189,43 @@ trait Checkout
         return true;
     }
 
-    private function persistAgreement($user, $method)
+    private function persistAgreement($user, $method, bool $deduplicate = false)
     {
-        if (!$this->methodCustomerMatches($user, $method)) return false;
-        $data = $this->getPaymentDetails($method);
+        if (empty($method->id)) return false;
         // Native external_reference is globally unique, including soft-deleted rows.
-        DB::transaction(function () use ($user, $method, $data) {
+        $duplicate = DB::transaction(function () use ($user, $method, $deduplicate) {
             User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+            $method = $this->request('get', '/payment_methods/' . $method->id);
+            $receipt = $deduplicate ? $this->duplicateReceipt($user, $method) : null;
+            if (!(($method->customer ?? null) === null && $receipt)
+                && !$this->methodCustomerMatches($user, $method, current: true)) return false;
+            $data = $this->getPaymentDetails($method);
             $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
             // Locking reads see concurrent commits even under REPEATABLE READ.
             $find = fn () => BillingAgreement::withTrashed()->where('external_reference', $method->id)->lockForUpdate()->first();
             $agreement = $find();
+            if ($agreement && ($agreement->user_id != $user->id || $agreement->gateway_id != $gateway->id)) {
+                throw new DisplayException('This payment method belongs to another account or gateway.');
+            }
+            if ($agreement?->trashed() && !$receipt) {
+                throw new DisplayException('This payment method was removed. Add a new payment method.');
+            }
+            $duplicate = null;
+            if ($deduplicate) {
+                try {
+                    $duplicate = $this->duplicateCard($user, $method, $gateway, $agreement);
+                } catch (RequestException $e) {
+                    if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') throw $e;
+                    // A missing comparison card cannot prevent saving the verified incoming method.
+                    \Illuminate\Support\Facades\Log::warning('ae_stripe_duplicate_candidate_missing', ['error' => get_class($e)]);
+                }
+            }
+            if ($duplicate) {
+                [$kept] = $duplicate;
+                $this->rememberDuplicate($user, $method, $kept);
+                return [...$duplicate, $agreement?->id];
+            }
+            if (!$this->methodCustomerMatches($user, $method, current: true)) return false;
             if (!$agreement) {
                 try {
                     $agreement = ExtensionHelper::makeBillingAgreement($user, 'AeStripe', $data['name'],
@@ -216,10 +243,14 @@ trait Checkout
                 throw new DisplayException('This payment method was removed. Add a new payment method.');
             }
             $agreement->update(['name' => $data['name'], 'type' => $data['type'], 'expiry' => $data['expiry']]);
+            // Explicit checkout opt-in or account setup authorizes future redisplay.
+            $this->request('post', '/payment_methods/' . $method->id, ['allow_redisplay' => 'always']);
         });
-        // Explicit checkout opt-in or account setup authorizes future redisplay.
-        // https://docs.stripe.com/api/payment_methods/update#update_payment_method-allow_redisplay
-        $this->request('post', '/payment_methods/' . $method->id, ['allow_redisplay' => 'always']);
+        if ($duplicate === false) return false;
+        if ($duplicate) {
+            if ($this->finalizeDuplicate($user, $method, consented: true, incomingId: $duplicate[2])) return 'duplicate';
+            return $this->persistAgreement($user, $method);
+        }
         return true; // Never assign a service billing_agreement_id or enable Auto Pay.
     }
 }

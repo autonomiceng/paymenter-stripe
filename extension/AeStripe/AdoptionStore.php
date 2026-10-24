@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 namespace Paymenter\Extensions\Gateways\AeStripe;
 
-use App\Models\Gateway;
+use App\Models\{Gateway, User};
 use Illuminate\Support\Facades\{DB, Http};
 
 require_once __DIR__ . '/GatewayLifecycle.php';
@@ -65,6 +65,8 @@ final class AdoptionStore
     }
 
     public function transaction(callable $callback): mixed { return DB::transaction($callback); }
+
+    public function lockUser(int $id): void { User::where('id', $id)->lockForUpdate()->firstOrFail(); }
 
     private function rows(string $table, callable $filter): array
     {

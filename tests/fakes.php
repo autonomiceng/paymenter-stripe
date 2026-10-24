@@ -47,7 +47,7 @@ namespace App\Models {
         public function exists() { return (bool) $this->value; }
         public function firstOrFail() { return $this->value ?? throw new \RuntimeException('Missing row'); }
         public function where($key, $value) { return $this; }
-        public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $hook(); } \Illuminate\Support\Facades\DB::$locked = true; \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
+        public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $hook(); } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
     }
     class Properties {
         public array $values = [];
@@ -196,6 +196,8 @@ namespace App\Models {
         }
         public function __get($key) { return $this->attributes[$key] ?? null; }
         public function trashed() { return $this->deleted_at !== null; }
+        public function services() { return Service::whereIn('billing_agreement_id', [$this->id]); }
+        public function delete() { $this->update(['deleted_at' => '2026-10-23 12:00:00']); }
         public function update($data) {
             \App\Helpers\ExtensionHelper::$agreements[$this->attributes['external_reference']] = array_replace($this->attributes, $data);
         }
@@ -214,16 +216,17 @@ namespace App\Models {
         }
         public function exists() { return $this->nativeRows()->exists(); }
         public function pluck($key) { return $this->nativeRows()->pluck($key); }
-        public function first() {
+        public function get() {
             $rows = $this->current ? \App\Helpers\ExtensionHelper::$agreements : (BillingAgreement::$snapshot ?? \App\Helpers\ExtensionHelper::$agreements);
             foreach ($rows as $id => $row) {
                 $row += ['external_reference' => $id, 'deleted_at' => null];
                 if (!$this->trashed && $row['deleted_at'] !== null) continue;
                 foreach ($this->filters as $key => $value) if (($row[$key] ?? null) != $value) continue 2;
-                return new BillingAgreement($row);
+                $result[] = new BillingAgreement($row);
             }
-            return null;
+            return $result ?? [];
         }
+        public function first() { return $this->get()[0] ?? null; }
     }
     #[\AllowDynamicProperties]
     class Extension {
@@ -284,6 +287,10 @@ namespace App\Models {
 }
 namespace App\Helpers {
     class ExtensionHelper {
+        public static function getExtension($type, $extension, $config = []) {
+            $class = '\\Paymenter\\Extensions\\' . ucfirst($type) . 's\\' . $extension . '\\' . $extension;
+            return new $class($config);
+        }
         public static $agreements = [];
         public static $agreementFailure = false;
         public static $payments = [];
@@ -352,18 +359,21 @@ namespace Illuminate\Support\Facades {
         public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } }; }
         public static $concurrentAgreements = [];
         public static function table($name) { return $name === 'ae_stripe_payment_fees' ? new \FeeQuery : new \AdoptionQuery($name); }
-        public static $beforeUserLock = null;
-        public static $locked = false;
+        public static $beforeUserLock = null, $afterTransaction = null;
+        public static $locked = false, $userLocked = false;
         public static $modelLocks = [];
         public static function transaction($callback) {
+            $priorUserLock = self::$userLocked;
             $before = self::$tables;
             $agreements = \App\Helpers\ExtensionHelper::$agreements;
             $fees = \App\Helpers\ExtensionHelper::$fees;
             $audit = \App\Models\Audit::$rows;
             $notifications = \App\Models\Notification::$rows;
             self::$locked = true;
-            try { return $callback(); } catch (\Throwable $e) { self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
-            finally { self::$locked = false; }
+            try { $result = $callback(); } catch (\Throwable $e) { self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
+            finally { self::$locked = false; self::$userLocked = $priorUserLock; }
+            if ($hook = self::$afterTransaction) { self::$afterTransaction = null; $hook(); }
+            return $result;
         }
     }
     class Log { public static $lines = [], $contexts = [], $warnings = [], $errors = []; public static function info($message, $context = []) { self::$lines[] = $message; self::$contexts[] = $context; } public static function warning($message, $context = []) { self::$warnings[] = [$message, $context]; } public static function error($message, $context = []) { self::$errors[] = [$message, $context]; } }

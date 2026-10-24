@@ -29,6 +29,7 @@ class AdoptionFake
             'deleted_at' => $deleted, 'created_at' => '2020-01-01', 'updated_at' => '2020-01-01', 'name' => 'private fixture'];
     }
     public function selectSource(int $id): void {}
+    public function lockUser(int $id): void { check($this->locked && $id === 7, 'Redisplay locks the agreement owner'); }
     public function configuration(): array { return $this->config; }
     public function transaction($callback): mixed
     {
@@ -58,7 +59,7 @@ class AdoptionFake
             $index = count(array_filter($this->calls, fn ($c) => $c[1] === '/account')) - 1;
             return ['id' => $this->accounts[$index % 2]];
         }
-        check(!$this->locked, 'Redisplay happens after DB commit');
+        check($this->locked, 'Redisplay stays under the user lock through the Stripe update');
         check($verb === 'post' && str_starts_with($path, '/payment_methods/') && $data === ['allow_redisplay' => 'always'], 'Only redisplay writes');
         if ($this->fail && $path === '/payment_methods/pm_12') throw new RuntimeException('private transport error');
         return ['id' => basename($path)];

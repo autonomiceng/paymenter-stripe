@@ -29,6 +29,7 @@ use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\View;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\Amounts;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\Checkout;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\CardDuplicates;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\PaymentFees;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\CheckoutIntent;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SetupConsent;
@@ -43,6 +44,7 @@ require_once __DIR__ . '/GatewayLifecycle.php';
 require_once __DIR__ . '/Concerns/StripeMetadata.php';
 require_once __DIR__ . '/Concerns/Signature.php';
 require_once __DIR__ . '/Concerns/Checkout.php';
+require_once __DIR__ . '/Concerns/CardDuplicates.php';
 require_once __DIR__ . '/Concerns/Amounts.php';
 require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
 require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
@@ -60,7 +62,7 @@ require_once __DIR__ . '/Concerns/PaymentFees.php';
 )]
 class AeStripe extends Gateway
 {
-    use PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks, StripeMetadata;
+    use CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks, StripeMetadata;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -69,9 +71,11 @@ class AeStripe extends Gateway
         if (app()->runningInConsole()) {
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryPaymentFees())
                 ->name('ae-stripe:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
+            require_once __DIR__ . '/DeduplicateCardsCommand.php';
             require_once __DIR__ . '/AdoptBundledCommand.php';
             require_once __DIR__ . '/ConvertFromStripeSavedCommand.php';
             \Illuminate\Console\Application::starting(function ($artisan) {
+                $artisan->resolve(DeduplicateCardsCommand::class);
                 $artisan->resolve(AdoptBundledCommand::class);
                 $artisan->resolve(ConvertFromStripeSavedCommand::class);
             });
@@ -522,7 +526,15 @@ class AeStripe extends Gateway
      */
     private function createOrGetStripeCustomer($user, $includeDetails = true)
     {
-        $stripeCustomerId = $user->properties()->where('key', 'stripe_id')->first();
+        return \Illuminate\Support\Facades\DB::transaction(function () use ($user, $includeDetails) {
+            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+            return $this->lockedStripeCustomer($user, $includeDetails);
+        });
+    }
+
+    private function lockedStripeCustomer($user, bool $includeDetails)
+    {
+        $stripeCustomerId = $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first();
 
         if ($stripeCustomerId) {
             try {
@@ -601,13 +613,28 @@ class AeStripe extends Gateway
 
     public function cancelBillingAgreement(BillingAgreement $billingAgreement): bool
     {
-        try {
-            $request = $this->request('post', '/payment_methods/' . $billingAgreement->external_reference . '/detach');
-        } catch (Exception $e) {
-            // If the payment method is already removed, we still delete the billing agreement
-        }
-
-        return true;
+        return \Illuminate\Support\Facades\DB::transaction(function () use ($billingAgreement) {
+            $user = User::where('id', $billingAgreement->user_id)->lockForUpdate()->firstOrFail();
+            $current = BillingAgreement::withTrashed()->where('external_reference', $billingAgreement->external_reference)->lockForUpdate()->first();
+            if (!$current) return false;
+            $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail();
+            if ($current->id != $billingAgreement->id || $current->user_id != $user->id || $current->gateway_id != $gateway->id) return false;
+            if ($current->trashed()) return true;
+            try {
+                $method = $this->request('get', '/payment_methods/' . $current->external_reference);
+            } catch (Exception $e) {
+                \Illuminate\Support\Facades\Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
+                return true;
+            }
+            if (($method->customer ?? null) === null) return true;
+            if (!$this->methodCustomerMatches($user, $method, current: true)) return false;
+            try {
+                $this->request('post', '/payment_methods/' . $current->external_reference . '/detach');
+            } catch (Exception $e) {
+                // Native cancellation still removes the local agreement after a Stripe failure.
+            }
+            return true;
+        });
     }
 
     public function setupAgreement(Request $request)
@@ -631,7 +658,8 @@ class AeStripe extends Gateway
         }
 
         try {
-            abort_unless($this->setupBillingAgreement($setupIntent), 409);
+            $saved = $this->setupBillingAgreement($setupIntent);
+            abort_unless($saved, 409);
         } catch (DisplayException $e) {
             return redirect()->route('account.payment-methods')->with('notification', [
                 'type' => 'danger', 'message' => $e->getMessage(),
@@ -640,7 +668,7 @@ class AeStripe extends Gateway
 
         return redirect()->route('account.payment-methods')->with('notification', [
             'type' => 'success',
-            'message' => 'Payment method added successfully.',
+            'message' => $saved === 'duplicate' ? 'This card is already saved.' : 'Payment method added successfully.',
         ]);
     }
 
@@ -663,7 +691,7 @@ class AeStripe extends Gateway
         // Get the actual payment method that will be used for future charges
         $actualPaymentMethod = $this->getActualPaymentMethod($setupIntent);
 
-        return $this->persistAgreement($user, $actualPaymentMethod);
+        return $this->persistAgreement($user, $actualPaymentMethod, deduplicate: true);
     }
 
     private function getActualPaymentMethod($setupIntent)
