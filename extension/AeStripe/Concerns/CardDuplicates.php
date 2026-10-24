@@ -4,6 +4,7 @@ namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Exceptions\DisplayException;
 use App\Models\{BillingAgreement, Gateway, User};
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\{DB, Log};
 
 trait CardDuplicates
@@ -52,7 +53,13 @@ trait CardDuplicates
         usort($agreements, fn ($a, $b) => $a->id <=> $b->id);
         foreach ($agreements as $kept) {
             if ($kept->external_reference === $method->id || ($incoming && $kept->id >= $incoming->id)) continue;
-            $remote = $this->request('get', '/payment_methods/' . $kept->external_reference);
+            try {
+                $remote = $this->request('get', '/payment_methods/' . $kept->external_reference);
+            } catch (RequestException $e) {
+                if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') throw $e;
+                Log::warning('ae_stripe_duplicate_candidate_missing', ['error' => get_class($e)]);
+                continue;
+            }
             if (($remote->customer ?? null) !== $customer || $this->cardIdentity($remote) !== $identity) continue;
             return $this->duplicateIsBound($incoming, $report) ? null : [$kept, $remote];
         }
