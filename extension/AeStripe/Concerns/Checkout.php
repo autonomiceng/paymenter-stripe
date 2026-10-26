@@ -107,9 +107,11 @@ trait Checkout
         return response()->json(['ok' => true]);
     }
 
-    private function recordIntentPayment($intent, $status)
+    private function recordIntentPayment($intent, $status, bool $prepareMethod = true)
     {
-        $userId = Invoice::findOrFail($intent->metadata->invoice_id)->user_id;
+        $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
+        $userId = $invoice->user_id;
+        if ($prepareMethod) $intent = $this->prepareTransactionMethod($invoice, $intent, $status);
         DB::transaction(function () use ($intent, $status, $userId) {
             User::where('id', $userId)->lockForUpdate()->firstOrFail();
             $invoice = Invoice::where('id', $intent->metadata->invoice_id)->lockForUpdate()->firstOrFail();
@@ -136,7 +138,10 @@ trait Checkout
                 'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',
             };
             $amount = $status === 'succeeded' ? $intent->amount_received : $intent->amount;
-            ExtensionHelper::{$helper}($invoice, 'AeStripe', $this->fromMinorUnits($amount, $intent->currency), null, $intent->id);
+            $transaction = ExtensionHelper::{$helper}($invoice, 'AeStripe', $this->fromMinorUnits($amount, $intent->currency), null, $intent->id);
+            if (in_array($status, ['succeeded', 'processing'], true)) {
+                $this->recordTransactionMethod($transaction, $intent);
+            }
         });
     }
 

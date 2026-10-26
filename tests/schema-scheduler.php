@@ -58,7 +58,7 @@ if (in_array($scenario, ['all', 'fee'], true)) {
         };
         foreach (['webhook', 'scheduler'] as $entry) {
             unset(DB::$tables['ae_stripe_payment_fees']);
-            \Illuminate\Database\Migrations\Migrator::$ran = [];
+            \Illuminate\Database\Migrations\Migrator::$ran = array_filter(\Illuminate\Database\Migrations\Migrator::$ran, fn ($file) => str_contains($file, 'transaction_methods'), ARRAY_FILTER_USE_KEY);
             $resetFeeSchema();
             Schema::$beforeCheck = function () { check(!DB::$locked, 'Fee schema check runs before DB transaction'); };
             Schema::$beforeCreate = function () { check(!DB::$locked, 'Fee table DDL runs before DB transaction'); };
@@ -71,7 +71,7 @@ if (in_array($scenario, ['all', 'fee'], true)) {
                 $time = time();
                 $firstGateway->webhook(new \Illuminate\Http\Request(body: $body,
                     signature: 't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.' . $body, 'whsec_test')));
-                check(count(\Illuminate\Database\Migrations\Migrator::$ran) === 1
+                check(count(\Illuminate\Database\Migrations\Migrator::$ran) === 2
                     && (DB::$tables['ae_stripe_payment_fees']['pi_schema']['state'] ?? null) === 'completed',
                     'First charge fee path creates the table and records the fee');
             } else {

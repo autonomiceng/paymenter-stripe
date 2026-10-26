@@ -163,3 +163,18 @@ invoice before applying money. Refund and dispute events remain unsupported.
 Offline concurrency tests interleave deliveries before lock acquisition; validate
 real database exclusion, migration upgrades, scheduler discovery and staff inbox
 delivery in the Paymenter sandbox before release.
+
+Confirmed and processing payments retain a display label in the extension-owned
+`ae_stripe_transaction_methods` table, keyed by native invoice transaction ID.
+The install and upgrade hooks run its migration. Expanded latest-charge details
+need no lookup; an unexpanded charge needs one retrieve. Missing details or a
+failed lookup leave the label blank without changing settlement. The first stored
+label survives retries and later status updates. Link labels mask the email local
+part. No card numbers, fingerprints or complete provider objects are stored.
+Rendering never contacts Stripe. Earlier transactions are not backfilled.
+
+With a pristine Paymenter release's dependencies available, also run
+`PAYMENTER_TEST_APP=/path/to/pristine-release php tests/native-transaction-method.php`
+to verify the migration, upgrade, unique key, foreign key and rollback on SQLite.
+
+Optional transaction-method charge retrieval runs before settlement locks. Subscription PaymentIntent reads expand `latest_charge` before acquiring those locks. The locked handler rechecks customer, currency, invoice state and settled-payment replay before storing the label.

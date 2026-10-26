@@ -276,7 +276,7 @@ namespace App\Models {
             public function first() {
                 if ($this->status && !$this->currentRead) throw new \RuntimeException('Settlement guard must use a current read');
                 foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
-                if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return (object) [...$row, 'invoice' => Invoice::findOrFail(explode(':', $key)[0]), 'gateway' => (object) ['extension' => $row['gateway']]];
+                if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return (object) [...$row, 'id' => crc32($key), 'invoice' => Invoice::findOrFail(explode(':', $key)[0]), 'gateway' => (object) ['extension' => $row['gateway']]];
             } return null; }
             public function where($key, $value) { if ($key === 'status') $this->status = $value; return $this; }
             public function exists() { foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
@@ -317,9 +317,10 @@ namespace App\Helpers {
         public static function addPayment($invoice, $gateway, $amount, $fee, $id, $status = 'succeeded') {
             ++self::$applications;
             self::$payments[$invoice->id . ':' . $id] = compact('gateway', 'amount', 'status');
+            return (object) ['id' => crc32($invoice->id . ':' . $id), 'invoice_id' => $invoice->id];
         }
-        public static function addProcessingPayment(...$args) { self::addPayment(...[...$args, 'processing']); }
-        public static function addFailedPayment(...$args) { self::addPayment(...[...$args, 'failed']); }
+        public static function addProcessingPayment(...$args) { return self::addPayment(...[...$args, 'processing']); }
+        public static function addFailedPayment(...$args) { return self::addPayment(...[...$args, 'failed']); }
     }
 }
 namespace Illuminate\Http {
@@ -358,7 +359,7 @@ namespace Illuminate\Support\Facades {
         public static $tables = [], $locks = [], $updates = [];
         public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } }; }
         public static $concurrentAgreements = [];
-        public static function table($name) { return $name === 'ae_stripe_payment_fees' ? new \FeeQuery : new \AdoptionQuery($name); }
+        public static function table($name) { return match ($name) { 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
         public static $beforeUserLock = null, $afterTransaction = null;
         public static $locked = false, $userLocked = false;
         public static $modelLocks = [];
@@ -405,6 +406,15 @@ namespace Carbon {
     }
 }
 namespace {
+    class TransactionMethodQuery {
+        private $id;
+        public function where($key, $value) { $this->id = $value; return $this; }
+        public function exists() { return isset(\Illuminate\Support\Facades\DB::$tables['ae_stripe_transaction_methods'][$this->id]); }
+        public function insertOrIgnore($row) {
+            if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Method write requires settlement locks');
+            \Illuminate\Support\Facades\DB::$tables['ae_stripe_transaction_methods'][$row['invoice_transaction_id']] ??= $row;
+        }
+    }
     function report($error) { $GLOBALS['reportedErrors'][] = $error; }
     function now() { return new class { public $timestamp = 1700000000; public function startOfDay() { return $this; } }; }
     function base_path($path) { return ($GLOBALS['paymenterBase'] ?? dirname(__DIR__)) . '/' . (isset($GLOBALS['paymenterBase']) ? $path : str_replace('extensions/Gateways/', 'extension/', $path)); }

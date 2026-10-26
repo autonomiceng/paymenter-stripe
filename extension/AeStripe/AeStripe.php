@@ -39,6 +39,7 @@ use Paymenter\Extensions\Gateways\AeStripe\Concerns\SubscriptionAttempt;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SubscriptionPayments;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\Webhooks;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\StripeMetadata;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\TransactionMethod;
 use Str;
 
 require_once __DIR__ . '/GatewayLifecycle.php';
@@ -54,6 +55,7 @@ require_once __DIR__ . '/Concerns/SetupConsent.php';
 require_once __DIR__ . '/Concerns/SetupIntent.php';
 require_once __DIR__ . '/Concerns/Webhooks.php';
 require_once __DIR__ . '/Concerns/PaymentFees.php';
+require_once __DIR__ . '/Concerns/TransactionMethod.php';
 
 #[ExtensionMeta(
     name: 'AE Stripe',
@@ -64,7 +66,7 @@ require_once __DIR__ . '/Concerns/PaymentFees.php';
 )]
 class AeStripe extends Gateway
 {
-    use CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, SetupIntent, Webhooks, StripeMetadata;
+    use CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -717,6 +719,12 @@ class AeStripe extends Gateway
     private function getPaymentDetails($paymentMethod)
     {
         $linkEmail = $paymentMethod->link->email ?? $paymentMethod->billing_details->email ?? null;
+        if (is_string($linkEmail) && filter_var($linkEmail, FILTER_VALIDATE_EMAIL)) {
+            [$local, $domain] = explode('@', $linkEmail, 2);
+            $linkEmail = substr($local, 0, 1) . '***@' . $domain;
+        } else {
+            $linkEmail = null;
+        }
         $name = match ($paymentMethod->type) {
             'link' => $linkEmail ? 'Link · ' . $linkEmail : 'Link',
             'card' => match ($paymentMethod->card->brand) {
@@ -746,7 +754,7 @@ class AeStripe extends Gateway
             default => $paymentMethod->type,
         };
         $expiry = null;
-        if ($paymentMethod->type === 'card') {
+        if ($paymentMethod->type === 'card' && isset($paymentMethod->card->exp_year, $paymentMethod->card->exp_month)) {
             $expiry = Carbon::createFromDate(
                 $paymentMethod->card->exp_year,
                 $paymentMethod->card->exp_month,

@@ -79,9 +79,13 @@ $stripeInvoice = (object) ['id' => 'in_test', 'currency' => 'usd', 'amount_paid'
 $paymentRows = [];
 Http::$handler = function ($verb, $path, $data) use (&$paymentRows, $stripeInvoice) {
     if ($path === '/invoice_payments') return ['data' => $paymentRows];
-    if ($verb === 'get' && str_starts_with($path, '/payment_intents/')) return [
+    if ($verb === 'get' && str_starts_with($path, '/payment_intents/')) {
+        check(!DB::$locked && $data === ['expand' => ['latest_charge']], 'Subscription expands charge before settlement locks');
+        return [
         'id' => substr($path, strlen('/payment_intents/')), 'status' => 'succeeded', 'customer' => 'cus_owner',
-        'amount' => 2500, 'amount_received' => 1999, 'currency' => $stripeInvoice->currency];
+        'amount' => 2500, 'amount_received' => 1999, 'currency' => $stripeInvoice->currency,
+        'latest_charge' => ['payment_method_details' => ['type' => 'card', 'card' => ['brand' => 'visa', 'last4' => '4242']]]];
+    }
     throw new RuntimeException('Unexpected payment request: ' . $path);
 };
 $deliver = fn ($object) => $gateway->webhook(eventRequest($object, type: 'invoice.payment_succeeded'));
@@ -96,6 +100,7 @@ $paymentRows[0]->payment->payment_intent = 'pi_subscription_late';
 $before = ExtensionHelper::$applications;
 $deliver($stripeInvoice);
 check(ExtensionHelper::$applications === $before + 1 && $invoice->status === 'paid', 'Paid bound subscription invoice retains its late payment');
+check(DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_subscription_late')]['label'] === 'Visa **** 4242', 'Bound subscription payment captures its method through the shared handler');
 $before = ExtensionHelper::$applications;
 $paymentRows[0]->payment->payment_intent = 'pi_subscription';
 $invoice->status = 'pending';
