@@ -1,6 +1,6 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-// Static checks: Stripe.js runs only in a browser, so assert the view contract offline.
+// Static view contracts complement the offline browser lifecycle test.
 $views = __DIR__ . '/../extension/AeStripe/resources/views/';
 $theme = file_get_contents($views . 'stripe-theme.blade.php');
 foreach (['pay', 'billing-agreement'] as $name) {
@@ -8,28 +8,37 @@ foreach (['pay', 'billing-agreement'] as $name) {
     $scriptPosition = strpos($view, '<script>');
     check($scriptPosition !== false, "$name: payment script exists");
     $script = substr($view, $scriptPosition + strlen('<script>'));
-    $entry = strpos($script, 'async function initializePaymentForm() {');
-    check($entry !== false && !preg_match('/\b(?:getElementById|querySelector(?:All)?)\s*\(/', substr($script, 0, $entry)),
-        "$name: no DOM lookup runs before deferred initialization");
-    check(preg_match('/\n}\s*initializePaymentForm\(\);\s*<\/script>/', $script) === 1,
-        "$name: only the deferred entry point runs after its definition");
-    $readyPosition = strpos($script, 'let ready = false;');
-    check($readyPosition !== false && $entry < $readyPosition, "$name: readiness follows initialization");
-    $wait = substr($script, $entry, $readyPosition - $entry);
-    check(str_contains($wait, 'const deadline = performance.now() + 5000;')
-        && str_contains($wait, 'if (performance.now() >= deadline) return resolve(null);')
-        && str_contains($wait, 'requestAnimationFrame(findForm);')
-        && str_contains($wait, 'findForm();'), "$name: form lookup checks now and waits at most five seconds");
-    check(str_contains($wait, 'const paymentForm = await new Promise(')
-        && str_contains($wait, "if (!paymentForm) {")
-        && str_contains($wait, "console.error('AeStripe: payment form did not appear within 5 seconds.');")
-        && str_contains($wait, 'return;'), "$name: missing form logs once and stops initialization");
-    check(str_contains($view, "if (submit) submit.disabled = true;")
-        && str_contains($view, "if (message) message.textContent = 'Could not load the payment form. Reload to try again.';"),
-        "$name: initialization errors tolerate missing button and alert");
+    if ($name === 'pay') {
+        $entry = strpos($script, 'async function initializePaymentForm() {');
+        check($entry !== false && !preg_match('/\b(?:getElementById|querySelector(?:All)?)\s*\(/', substr($script, 0, $entry)),
+            "$name: no DOM lookup runs before deferred initialization");
+        check(preg_match('/\n}\s*initializePaymentForm\(\);\s*<\/script>/', $script) === 1,
+            "$name: only the deferred entry point runs after its definition");
+        $readyPosition = strpos($script, 'let ready = false;');
+        check($readyPosition !== false && $entry < $readyPosition, "$name: readiness follows initialization");
+        $wait = substr($script, $entry, $readyPosition - $entry);
+        check(str_contains($wait, 'const deadline = performance.now() + 5000;')
+            && str_contains($wait, 'if (performance.now() >= deadline) return resolve(null);')
+            && str_contains($wait, 'requestAnimationFrame(findForm);')
+            && str_contains($wait, 'findForm();'), "$name: form lookup checks now and waits at most five seconds");
+        check(str_contains($wait, 'const paymentForm = await new Promise(')
+            && str_contains($wait, "if (!paymentForm) {")
+            && str_contains($wait, "console.error('AeStripe: payment form did not appear within 5 seconds.');")
+            && str_contains($wait, 'return;'), "$name: missing form logs once and stops initialization");
+        check(str_contains($view, "if (submit) submit.disabled = true;")
+            && str_contains($view, "if (message) message.textContent = 'Could not load the payment form. Reload to try again.';"),
+            "$name: initialization errors tolerate missing button and alert");
+    } else {
+        check(str_contains($view, 'x-data="aeStripeSetup({') && str_contains($script, "Alpine.data('aeStripeSetup'"),
+            'Setup initializes for each Alpine form, including reopened modals');
+        check(str_contains($script, 'const form = this.$el;') && !str_contains($script, 'document.getElementById(')
+            && !str_contains($script, 'document.querySelector('), 'Setup DOM access stays scoped to its own form');
+        check(str_contains($script, 'destroy() {') && str_contains($script, 'controller.abort();')
+            && str_contains($script, 'paymentElement?.destroy();'), 'Setup form removal releases listeners and Elements');
+    }
     check(!str_contains($view, 'setTimeout'), "$name: payment errors are never hidden on a timer");
     check(str_contains($view, '<div id="error-message" role="alert"'), "$name: errors are announced and stay mounted");
-    check(preg_match('/preventDefault\(\);\s+(clearMessage\(\)|message\.replaceChildren\(\));\s+setLoading\(true\)/', $view) === 1,
+    check(preg_match('/preventDefault\(\);\s+(?:if \(disposed \|\| loading \|\| !ready\) return;\s+)?(clearMessage\(\)|message\.replaceChildren\(\));\s+setLoading\(true\)/', $view) === 1,
         "$name: the next submit clears the previous error");
     check(!preg_match("/theme:\s*'(night|stripe)'/", $view), "$name: Stripe theme is not hard-coded");
     check(str_contains($view, "@include('gateways.ae-stripe::stripe-theme')")
@@ -46,7 +55,7 @@ foreach (['pay', 'billing-agreement'] as $name) {
     $view = file_get_contents($views . $name . '.blade.php');
     check(str_contains($view, 'Js::from(auth()->user()->name)') && str_contains($view, 'Js::from(auth()->user()->email)'), "$name: customer details use script-safe values");
     check(str_contains($view, '<button id="submit" disabled'), "$name: submission starts disabled");
-    check(str_contains($view, "paymentElement.on('ready'") && str_contains($view, "script.onerror = initializationError"), "$name: readiness gates submission and script failure shows an error");
+    check(str_contains($view, "paymentElement.on('ready'") && str_contains($view, $name === 'pay' ? 'script.onerror = initializationError' : 'script.onerror = () => {'), "$name: readiness gates submission and script failure shows an error");
     $handlerPosition = strpos($view, "form.addEventListener('submit'");
     $mountPosition = strpos($view, "paymentElement.mount(");
     check($handlerPosition !== false && $mountPosition !== false && $handlerPosition < $mountPosition, "$name: submit handler is installed before mounting");
@@ -54,7 +63,7 @@ foreach (['pay', 'billing-agreement'] as $name) {
 $setupView = file_get_contents($views . 'billing-agreement.blade.php');
 check(str_contains($setupView, 'id="setup-consent" required disabled') && str_contains($setupView, 'I agree to save this payment method and allow charges to it for my future invoices, including renewals, when I am not present.')
     && str_contains($setupView, 'Saving does not turn on Auto Pay; you can choose it for a service later.'), 'Setup has an explicit future off-session opt-in');
-$recordConsentCall = "await fetch(@js(route('extensions.gateways.ae-stripe.setup-consent'))";
+$recordConsentCall = 'await fetch(config.consentUrl';
 $confirmSetupCall = 'await stripe.confirmSetup(';
 $recordsConsentBeforeConfirmation = static function ($view) use ($recordConsentCall, $confirmSetupCall) {
     $consentPosition = strpos($view, $recordConsentCall);

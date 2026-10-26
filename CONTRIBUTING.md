@@ -25,3 +25,8 @@ Contributions use the project's [MIT license](LICENSE).
 Optional command-registration check against an installed Paymenter 1.5.9 vendor tree:
 `php -n tests/conversion-bootstrap.php /path/to/paymenter`. It uses local database
 fakes and never boots the referenced application or connects to its database.
+
+The modal regression uses Playwright and an installed Paymenter Livewire script:
+`PLAYWRIGHT_MODULE=/path/to/playwright LIVEWIRE_SCRIPT=/path/to/paymenter/vendor/livewire/livewire/dist/livewire.js node tests/setup-modal.mjs`.
+It renders the setup view inside a teleported Livewire modal. Stripe.js, consent
+requests and Livewire responses are local fixtures; no server or Stripe account is needed.

@@ -23,6 +23,18 @@ agreements are unchanged; unconsented in-flight setups must restart with the opt
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.
 Browser-check both pay and setup views inside the theme's teleported modal (default theme `x-teleport="body"`).
+Offline browser coverage in `tests/setup-modal.mjs` checks repeated setup opens,
+declines, consent failures and closing during Stripe.js loading. Each form releases
+its Element and theme listeners when Alpine removes it. An unfinished account
+SetupIntent is reused across opens; only a confirmed `succeeded` or `canceled`
+intent permits a new attempt. A lost creation response retries the persisted key.
+An unresolved creation older than 23 hours requires reconciliation of the native
+`ae_stripe_setup` user property against Stripe before trying again. Do not clear an
+unfinished attempt to retry. SetupIntents created before this update have no stored
+retry key and cannot be recovered by the new property.
+A stored intent that cannot be retrieved, including a 404 after changing API keys,
+also needs reconciliation in its original Stripe account. Lookup failures never
+start a replacement intent.
 
 Tests execute the gateway with PHP-only model, lock and HTTP fakes; unexpected
 HTTP requests fail. No Stripe or application server is contacted. They verify

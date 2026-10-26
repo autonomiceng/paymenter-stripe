@@ -33,6 +33,7 @@ use Paymenter\Extensions\Gateways\AeStripe\Concerns\CardDuplicates;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\PaymentFees;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\CheckoutIntent;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SetupConsent;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\SetupIntent;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\Signature;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SubscriptionAttempt;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SubscriptionPayments;
@@ -50,6 +51,7 @@ require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
 require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
 require_once __DIR__ . '/Concerns/CheckoutIntent.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
+require_once __DIR__ . '/Concerns/SetupIntent.php';
 require_once __DIR__ . '/Concerns/Webhooks.php';
 require_once __DIR__ . '/Concerns/PaymentFees.php';
 
@@ -62,7 +64,7 @@ require_once __DIR__ . '/Concerns/PaymentFees.php';
 )]
 class AeStripe extends Gateway
 {
-    use CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, Webhooks, StripeMetadata;
+    use CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, SetupIntent, Webhooks, StripeMetadata;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -597,7 +599,7 @@ class AeStripe extends Gateway
         $includeDetails = (bool) $this->config('stripe_create_customers');
         $customer = $this->createOrGetStripeCustomer($user, $includeDetails);
 
-        $setupIntent = $this->request('post', '/setup_intents', [
+        $setupIntent = $this->accountSetupIntent($user, [
             'metadata' => [
                 'user_id' => $user->id,
                 'is_billing_agreement' => '1',

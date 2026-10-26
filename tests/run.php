@@ -61,6 +61,11 @@ if (in_array('--gateway-lifecycle', $argv, true)) {
     echo "PASS: $count gateway lifecycle assertions\n";
     return;
 }
+if (in_array('--setup-intents', $argv, true)) {
+    require __DIR__ . '/setup-intents.php';
+    echo "PASS: $count setup intent assertions\n";
+    return;
+}
 
 \Illuminate\Console\Application::$callbacks = [];
 $gateway->boot();
@@ -219,6 +224,7 @@ require __DIR__ . '/handlers.php';
 require __DIR__ . '/retries.php';
 require __DIR__ . '/subscription-attempts.php';
 require __DIR__ . '/setup-consent.php';
+require __DIR__ . '/setup-intents.php';
 require __DIR__ . '/ownership.php';
 require __DIR__ . '/checkout-owner.php';
 require __DIR__ . '/failures.php';
