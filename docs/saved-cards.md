@@ -21,10 +21,7 @@ Failed agreements are reported for manual review while the remaining rows contin
 If any agreements are skipped, the command reports the count and exits nonzero.
 Use a sandbox first. No cleanup has been run against a live installation.
 
-Invoice labels belong to the theme. The Beco `components/transaction-label.blade.php`
-line 21 renders the Stripe mark and “payment”; line 9 expects a `payment_method`
-transaction attribute. Native Paymenter 1.5.9 has no such column. The extension still
-provides the native `AeStripe` gateway and PaymentIntent reference, and saved-card
-agreement names such as `Visa **** 4242`. This change does not modify core or theme
-files or invent a transaction attribute. A theme/core integration is still needed
-for an invoice label such as “Visa ending 4242”.
+Invoice payment labels such as `Visa **** 4242` are stored in the extension-owned
+`ae_stripe_transaction_methods` table (see `verification.md`). Native Paymenter 1.5.9
+has no transaction attribute for them, so a theme that wants to show the label reads
+that table. This change does not modify core or theme files.
