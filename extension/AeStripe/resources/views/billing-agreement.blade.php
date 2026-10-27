@@ -21,14 +21,16 @@
 <script>
 // Livewire runs this registration once. Alpine owns each teleported form's lifetime.
 let stripeScript;
+const timedOutScripts = new WeakSet();
 function loadStripe() {
     if (window.Stripe) return Promise.resolve();
     if (!stripeScript) {
         stripeScript = new Promise((resolve, reject) => {
-            const existingScript = document.querySelector('script[src^="https://js.stripe.com/v3"]');
+            let existingScript = document.querySelector('script[src^="https://js.stripe.com/v3"]');
+            if (existingScript && timedOutScripts.has(existingScript)) existingScript = null;
             const script = existingScript || document.createElement('script');
             const cleanup = () => {
-                timeout.removeEventListener('abort', failed);
+                clearTimeout(timeout);
                 script.removeEventListener('load', loaded);
                 script.removeEventListener('error', failed);
                 if (!existingScript) {
@@ -46,12 +48,15 @@ function loadStripe() {
             const failed = () => {
                 cleanup();
                 stripeScript = null;
+                if (existingScript && !window.Stripe) timedOutScripts.add(existingScript);
                 if (!existingScript) script.remove();
                 reject(new Error('Could not load Stripe.js.'));
             };
             // An existing tag may have finished before these listeners were added.
-            const timeout = AbortSignal.timeout(5000);
-            timeout.addEventListener('abort', failed, {once: true});
+            // Give fresh requests more time, but allow retry if neither event fires.
+            const timeout = setTimeout(() => {
+                failed();
+            }, existingScript ? 5000 : 30000);
             if (existingScript) {
                 script.addEventListener('load', loaded, {once: true});
                 script.addEventListener('error', failed, {once: true});

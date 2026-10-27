@@ -36,7 +36,8 @@ foreach (['pay', 'billing-agreement'] as $name) {
         check(str_contains($script, 'destroy() {') && str_contains($script, 'controller.abort();')
             && str_contains($script, 'paymentElement?.destroy();'), 'Setup form removal releases listeners and Elements');
     }
-    check(!str_contains($view, 'setTimeout'), "$name: payment errors are never hidden on a timer");
+    $formScript = $name === 'pay' ? $script : substr($script, strpos($script, "Alpine.data('aeStripeSetup'"));
+    check(!str_contains($formScript, 'setTimeout'), "$name: payment errors are never hidden on a timer");
     check(str_contains($view, '<div id="error-message" role="alert"'), "$name: errors are announced and stay mounted");
     check(preg_match('/preventDefault\(\);\s+(?:if \(disposed \|\| loading \|\| !ready\) return;\s+)?(clearMessage\(\)|message\.replaceChildren\(\));\s+setLoading\(true\)/', $view) === 1,
         "$name: the next submit clears the previous error");
@@ -67,9 +68,8 @@ check(str_contains($setupView, "document.querySelector('script[src^=\"https://js
 check(str_contains($setupView, 'if (window.Stripe) {')
     && str_contains($setupView, 'stripeScript = null;')
     && !str_contains($setupView, 'script.onload = resolve;'), 'Setup checks the loaded Stripe global and clears failed cached loads');
-check(str_contains($setupView, 'AbortSignal.timeout(5000)')
-    && str_contains($setupView, "timeout.addEventListener('abort', failed, {once: true})")
-    && str_contains($setupView, "timeout.removeEventListener('abort', failed)"), 'Setup bounds already-finished script waits and releases the timeout listener');
+check(str_contains($setupView, '}, existingScript ? 5000 : 30000)')
+    && str_contains($setupView, 'clearTimeout(timeout)'), 'Setup allows fresh requests thirty seconds, bounds reused waits at five seconds and clears the timer');
 check(str_contains($setupView, 'if (!existingScript) script.remove();'), 'Setup removes failed scripts only when it owns them');
 $recordConsentCall = 'await fetch(config.consentUrl';
 $confirmSetupCall = 'await stripe.confirmSetup(';

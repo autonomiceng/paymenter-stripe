@@ -35,6 +35,7 @@ const render = (open) => `<div wire:id="setup" wire:snapshot="${escape(snapshot)
 const browser = await chromium.launch({ headless: true });
 try {
     const page = await browser.newPage();
+    await page.clock.install();
     const errors = [];
     let releaseStripe;
     let holdStripe = false;
@@ -76,7 +77,7 @@ try {
         const url = new URL(route.request().url());
         if (url.hostname === 'js.stripe.com') {
             await page.evaluate(() => probe.scripts++);
-            if (holdStripe) await new Promise((resolve) => { releaseStripe = resolve; });
+            if (holdStripe && await new Promise((resolve) => { releaseStripe = resolve; }) === false) return route.abort('failed');
             if (rejectStripe) return route.abort('failed');
             return route.fulfill({ contentType: 'text/javascript', body: omitStripe ? '' : 'window.installStripeStub();' });
         }
@@ -141,6 +142,50 @@ try {
     assert.equal(counts.themeListeners, 0, 'No leaked theme listeners');
     assert.equal(counts.scripts, 1, 'Stripe.js loads once across reopen cycles');
     assert.equal(counts.consent, 7, 'Repeated submits during a consent request are ignored');
+    // A fresh request can take longer than the bounded wait for a reused tag.
+    holdStripe = true;
+    await page.goto('http://setup.test/');
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.waitForFunction(() => probe.scripts === 1);
+    await page.waitForTimeout(5500);
+    assert.equal(await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).count(), 0, 'A fresh Stripe.js request is still loading after five seconds');
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'The fresh pending script is retained');
+    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    releaseStripe();
+    holdStripe = false;
+    await page.getByRole('textbox', { name: 'Card number' }).waitFor();
+    assert.equal(await page.getByRole('checkbox', { name: /I agree/ }).isEnabled(), true, 'The delayed fresh load enables consent');
+    assert.equal(await page.evaluate(() => probe.scripts), 1, 'The delayed fresh load succeeds without another request');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
+    // A fresh request that never finishes must time out and allow a new load.
+    holdStripe = true;
+    await page.goto('http://setup.test/');
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.waitForFunction(() => probe.scripts === 1);
+    const releaseStalledStripe = releaseStripe;
+    await page.clock.fastForward(29000);
+    assert.equal(await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).count(), 0, 'The fresh request gets a generous wait before timing out');
+    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    await page.clock.fastForward(1000);
+    await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor({ timeout: 1500 });
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, 'Timeout removes the stalled script owned by this form');
+    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    // Dispose the held network fixture after the timeout; Chromium otherwise coalesces
+    // another request for the same URL with it, even though its tag was removed.
+    const stalledRequestEnded = page.waitForEvent('requestfailed', { predicate: (request) => request.url() === 'https://js.stripe.com/v3/' });
+    releaseStalledStripe(false);
+    await stalledRequestEnded;
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    holdStripe = false;
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.getByRole('textbox', { name: 'Card number' }).waitFor();
+    assert.equal(await page.evaluate(() => probe.scripts), 2, 'Retry after the fresh timeout starts a new successful request');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
     // Close before Stripe.js finishes, then reopen while the original load is pending.
     holdStripe = true;
     await page.goto('http://setup.test/');
@@ -163,6 +208,7 @@ try {
     await page.getByRole('button', { name: 'Add payment method' }).click();
     await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor();
     assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, 'A fresh script that errors is removed');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     rejectStripe = false;
@@ -208,7 +254,43 @@ try {
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
-    // A reused pending tag remains owned by its caller after timeout and on retry.
+    // Failures observed while reusing a foreign tag must also allow an owned retry.
+    for (const failure of ['error', 'missing-global']) {
+        holdStripe = true;
+        rejectStripe = failure === 'error';
+        omitStripe = failure === 'missing-global';
+        await page.goto('http://setup.test/');
+        await page.evaluate(() => {
+            const existing = document.createElement('script');
+            existing.id = 'foreign-stripe';
+            existing.src = 'https://js.stripe.com/v3/';
+            existing.onload = () => { probe.ownerEvent = 'load'; };
+            existing.onerror = () => { probe.ownerEvent = 'error'; };
+            document.body.appendChild(existing);
+        });
+        await page.waitForFunction(() => probe.scripts === 1);
+        await page.getByRole('button', { name: 'Add payment method' }).click();
+        await page.getByRole('dialog').waitFor();
+        assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, `${failure}: the pending foreign tag is reused`);
+        releaseStripe();
+        holdStripe = false;
+        await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor({ timeout: 1500 });
+        assert.equal(await page.evaluate(() => probe.ownerEvent), failure === 'error' ? 'error' : 'load', `${failure}: the owner's handler runs`);
+        assert.equal(await page.locator('#foreign-stripe').count(), 1, `${failure}: failure preserves the foreign tag`);
+        await page.getByRole('button', { name: 'Close', exact: true }).click();
+        await page.getByRole('dialog').waitFor({ state: 'detached' });
+        rejectStripe = false;
+        omitStripe = false;
+        await page.getByRole('button', { name: 'Add payment method' }).click();
+        await page.getByRole('textbox', { name: 'Card number' }).waitFor({ timeout: 1500 });
+        assert.equal(await page.evaluate(() => probe.scripts), 2, `${failure}: retry starts a fresh successful load`);
+        assert.equal(await page.locator('#foreign-stripe').count(), 1, `${failure}: retry preserves the foreign tag`);
+        assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 2, `${failure}: the successful owned tag remains alongside it`);
+        await page.getByRole('button', { name: 'Close', exact: true }).click();
+        await page.getByRole('dialog').waitFor({ state: 'detached' });
+        assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
+    }
+    // A foreign tag that times out is retained while retry creates our own tag.
     holdStripe = true;
     await page.goto('http://setup.test/');
     await page.evaluate(() => {
@@ -225,19 +307,20 @@ try {
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     await page.getByRole('button', { name: 'Add payment method' }).click();
     await page.getByRole('dialog').waitFor();
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 2, 'Retry creates an owned tag alongside the timed-out foreign tag');
     releaseStripe();
     holdStripe = false;
     await page.getByRole('textbox', { name: 'Card number' }).waitFor();
-    assert.equal(await page.evaluate(() => probe.scripts), 1, 'Retry reuses the pending foreign tag without a second Stripe.js request');
     assert.equal(await page.evaluate(() => probe.existingLoaded), true, 'Its owner can finish loading after our timeout and retry');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
-    // Known limit: a foreign tag that already failed needs its owner to remove or repair it.
+    // A finished unusable foreign tag stays in place while retry loads our own tag.
     omitStripe = true;
     await page.goto('http://setup.test/');
     await page.evaluate(() => new Promise((resolve, reject) => {
         const existing = document.createElement('script');
+        existing.id = 'foreign-stripe';
         existing.src = 'https://js.stripe.com/v3/';
         existing.onload = resolve;
         existing.onerror = reject;
@@ -249,18 +332,24 @@ try {
     assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'An already-finished foreign script is preserved after a bounded wait');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
-    // The caller that created the unusable tag removes it before setup retries.
-    await page.evaluate(() => document.querySelector('script[src^="https://js.stripe.com/v3"]').remove());
     omitStripe = false;
+    holdStripe = true;
     await page.getByRole('button', { name: 'Add payment method' }).click();
-    await page.getByRole('textbox', { name: 'Card number' }).waitFor();
-    assert.equal(await page.evaluate(() => probe.scripts), 2, 'Owner removal of the unusable foreign tag allows a fresh successful retry');
+    await page.waitForFunction(() => probe.scripts === 2);
+    await page.clock.fastForward(5500);
+    assert.equal(await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).count(), 0, 'The replacement owned tag gets the longer fresh-load deadline');
+    releaseStripe();
+    holdStripe = false;
+    await page.getByRole('textbox', { name: 'Card number' }).waitFor({ timeout: 1500 });
+    assert.equal(await page.evaluate(() => probe.scripts), 2, 'Retry after the foreign tag times out starts a fresh successful request');
+    assert.equal(await page.locator('#foreign-stripe').count(), 1, 'Retry preserves the unusable tag owned by another caller');
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 2, 'Our successful tag loads alongside the unusable foreign tag');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
     assert.deepEqual(errors, [], 'No browser errors across delayed and failed loads');
     console.log(`PASS: 6 open/decline/close cycles; ${counts.confirms} confirmations; ${counts.destroyed} Elements disposed`);
-    console.log('PASS: failed consent retry; delayed script close/reopen; failed script close/reopen; missing-global retry; existing script reuse; foreign pending tag timeout/retry; owner repairs already-finished foreign tag; no leaked theme listeners');
+    console.log('PASS: failed consent retry; fresh script loads after five seconds; stalled fresh script timeout/removal/retry; delayed script close/reopen; failed script removal and retry; missing-global retry; existing script reuse; foreign error and missing-global retry; foreign pending tag timeout/retry; fresh retry preserves already-finished foreign tag; no leaked theme listeners');
 } finally {
     await browser.close();
 }
