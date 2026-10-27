@@ -65,7 +65,7 @@ $methodIntent->latest_charge = (object) ['payment_method_details' => (object) $f
 $gateway->webhook(eventRequest($methodIntent));
 $gateway->webhook(eventRequest($methodIntent));
 check(count(Http::$calls) === $before + 1, 'Unexpanded charge retrieves once across processing and success');
-check(DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_retrieved')]['label'] === 'Visa **** 4242', 'First captured label survives success and replay');
+check(DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_retrieved')]['label'] === $expected['link'], 'The successful charge replaces its processing label and survives replay');
 $methodIntent->id = 'pi_failedlabel';
 $methodIntent->latest_charge = 'ch_fixture';
 $before = count(Http::$calls);
@@ -107,6 +107,18 @@ $gateway->webhook(eventRequest($raceIntent));
 check((DB::$tables['ae_stripe_transaction_methods'][$raceId]['label'] ?? null) === 'Mastercard **** 4444', 'Success prepares its new card even when failure clears the old label while waiting for locks');
 $gateway->webhook(eventRequest($raceIntent));
 check((DB::$tables['ae_stripe_transaction_methods'][$raceId]['label'] ?? null) === 'Mastercard **** 4444', 'Concurrent retry retains its successful label on replay');
+// The failed attempt's webhook can arrive after a retry has already succeeded.
+$lateFailureIntent = clone $retryIntent;
+$lateFailureIntent->id = 'pi_latefailurelabel';
+$lateFailureId = crc32('12:pi_latefailurelabel');
+$gateway->webhook(eventRequest($lateFailureIntent, type: 'payment_intent.processing'));
+$successfulRetry = clone $lateFailureIntent;
+$successfulRetry->latest_charge = 'ch_retrycard';
+$gateway->webhook(eventRequest($successfulRetry));
+$gateway->webhook(eventRequest($lateFailureIntent, type: 'payment_intent.payment_failed'));
+check((DB::$tables['ae_stripe_transaction_methods'][$lateFailureId]['label'] ?? null) === 'Mastercard **** 4444', 'The successful charge replaces a processing label even when the old failure arrives later');
+$gateway->webhook(eventRequest($lateFailureIntent));
+check((DB::$tables['ae_stripe_transaction_methods'][$lateFailureId]['label'] ?? null) === 'Mastercard **** 4444', 'A replay cannot replace the first successful label with another method');
 foreach ([new ConnectionException('offline'), new RequestException(404)] as $index => $error) {
     $methodIntent->id = 'pi_lookupfailure' . $index;
     Http::$handler = fn () => throw $error;

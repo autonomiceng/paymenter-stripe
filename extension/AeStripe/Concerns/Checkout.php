@@ -140,7 +140,7 @@ trait Checkout
             $amount = $status === 'succeeded' ? $intent->amount_received : $intent->amount;
             $transaction = ExtensionHelper::{$helper}($invoice, 'AeStripe', $this->fromMinorUnits($amount, $intent->currency), null, $intent->id);
             if (in_array($status, ['succeeded', 'processing'], true)) {
-                $this->recordTransactionMethod($transaction, $intent);
+                $this->recordTransactionMethod($transaction, $intent, $status === 'succeeded');
             }
             if ($status === 'failed') {
                 // The locked success guard above preserves labels on settled payments.

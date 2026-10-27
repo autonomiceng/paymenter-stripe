@@ -169,7 +169,9 @@ Confirmed and processing payments retain a display label in the extension-owned
 The install and upgrade hooks run its migration. Expanded latest-charge details
 need no lookup; an unexpanded charge needs one retrieve. Missing details or a
 failed lookup leave the label blank without changing settlement. A failed attempt clears its
-label so a later retry can record its own method. The first successful label
+label so a later retry can record its own method. First successful settlement
+replaces any processing label with its own charge, even if the prior failure
+webhook has not arrived. The first successful label
 survives replayed success and late failure events. Link labels mask the email local
 part. No card numbers, fingerprints or complete provider objects are stored.
 Rendering never contacts Stripe. Earlier transactions are not backfilled.

@@ -33,10 +33,12 @@ trait TransactionMethod
         return $prepared;
     }
 
-    private function recordTransactionMethod($transaction, $intent): void
+    private function recordTransactionMethod($transaction, $intent, bool $succeeded): void
     {
-        $table = DB::table('ae_stripe_transaction_methods');
-        if ($table->where('invoice_transaction_id', $transaction->id)->exists()) return;
+        $table = DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $transaction->id);
+        // The locked success guard permits only the first successful settlement here.
+        if ($succeeded) $table->delete();
+        elseif ($table->exists()) return;
         $charge = $intent->latest_charge ?? null;
         $details = is_object($charge) ? ($charge->payment_method_details ?? null) : null;
         if (!is_object($details) || !is_string($details->type ?? null) || $details->type === '') return;
@@ -51,7 +53,7 @@ trait TransactionMethod
         if ($type === 'sofort' && !isset($details->sofort->country)) return;
         $label = $this->getPaymentDetails($details)['name'];
         if (strlen($label) > 255) return;
-        // The payment handler holds the customer and invoice locks. Keep the first label.
+        // The payment handler holds the customer and invoice locks.
         DB::table('ae_stripe_transaction_methods')->insertOrIgnore([
             'invoice_transaction_id' => $transaction->id, 'label' => $label,
         ]);
