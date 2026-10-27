@@ -39,6 +39,7 @@ try {
     let releaseStripe;
     let holdStripe = false;
     let rejectStripe = false;
+    let omitStripe = false;
     let holdConsent = false;
     const pendingConsent = [];
     page.on('pageerror', (error) => errors.push(error.message));
@@ -77,7 +78,7 @@ try {
             await page.evaluate(() => probe.scripts++);
             if (holdStripe) await new Promise((resolve) => { releaseStripe = resolve; });
             if (rejectStripe) return route.abort('failed');
-            return route.fulfill({ contentType: 'text/javascript', body: 'window.installStripeStub();' });
+            return route.fulfill({ contentType: 'text/javascript', body: omitStripe ? '' : 'window.installStripeStub();' });
         }
         assert.equal(url.hostname, 'setup.test', 'No external network calls');
         if (url.pathname === '/livewire.js') return route.fulfill({ contentType: 'text/javascript', body: livewire });
@@ -170,9 +171,69 @@ try {
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
+    // A successful script response without Stripe must also allow a fresh retry.
+    omitStripe = true;
+    await page.goto('http://setup.test/');
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor();
+    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, 'A script with no Stripe global is removed');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    omitStripe = false;
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.getByRole('textbox', { name: 'Card number' }).waitFor();
+    assert.equal(await page.evaluate(() => probe.scripts), 2, 'Missing global clears the cached promise for a new script load');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
+    // Another caller may already have appended a still-loading Stripe.js tag.
+    holdStripe = true;
+    await page.goto('http://setup.test/');
+    await page.evaluate(() => {
+        const existing = document.createElement('script');
+        existing.src = 'https://js.stripe.com/v3/';
+        existing.onload = () => { probe.existingLoaded = true; };
+        document.body.appendChild(existing);
+    });
+    await page.waitForFunction(() => probe.scripts === 1);
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.getByRole('dialog').waitFor();
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'Pending Stripe.js tag is reused');
+    releaseStripe();
+    holdStripe = false;
+    await page.getByRole('textbox', { name: 'Card number' }).waitFor();
+    assert.equal(await page.evaluate(() => probe.scripts), 1, 'Reusing a pending tag makes no second request');
+    assert.equal(await page.evaluate(() => probe.existingLoaded), true, 'Reusing a tag preserves its load handler');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
+    // A different caller's tag may have finished without the global before setup opens.
+    omitStripe = true;
+    await page.goto('http://setup.test/');
+    await page.evaluate(() => new Promise((resolve, reject) => {
+        const existing = document.createElement('script');
+        existing.src = 'https://js.stripe.com/v3/';
+        existing.onload = resolve;
+        existing.onerror = reject;
+        document.body.appendChild(existing);
+    }));
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor({timeout: 10000});
+    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, 'Already-finished script without a global is removed after a bounded wait');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    omitStripe = false;
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.getByRole('textbox', { name: 'Card number' }).waitFor();
+    assert.equal(await page.evaluate(() => probe.scripts), 2, 'Already-finished script allows a fresh successful retry');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
     assert.deepEqual(errors, [], 'No browser errors across delayed and failed loads');
     console.log(`PASS: 6 open/decline/close cycles; ${counts.confirms} confirmations; ${counts.destroyed} Elements disposed`);
-    console.log('PASS: failed consent retry; delayed script close/reopen; failed script close/reopen; no leaked theme listeners');
+    console.log('PASS: failed consent retry; delayed script close/reopen; failed script close/reopen; missing-global retry; existing script reuse; already-finished script retry; no leaked theme listeners');
 } finally {
     await browser.close();
 }

@@ -25,16 +25,43 @@ function loadStripe() {
     if (window.Stripe) return Promise.resolve();
     if (!stripeScript) {
         stripeScript = new Promise((resolve, reject) => {
-            const script = document.createElement('script');
-            script.src = 'https://js.stripe.com/v3/';
-            script.async = true;
-            script.onload = resolve;
-            script.onerror = () => {
+            const existingScript = document.querySelector('script[src^="https://js.stripe.com/v3"]');
+            const script = existingScript || document.createElement('script');
+            const cleanup = () => {
+                timeout.removeEventListener('abort', failed);
+                script.removeEventListener('load', loaded);
+                script.removeEventListener('error', failed);
+                if (!existingScript) {
+                    script.onload = null;
+                    script.onerror = null;
+                }
+            };
+            const loaded = () => {
+                if (window.Stripe) {
+                    cleanup();
+                    return resolve();
+                }
+                failed();
+            };
+            const failed = () => {
+                cleanup();
                 stripeScript = null;
                 script.remove();
                 reject(new Error('Could not load Stripe.js.'));
             };
-            document.body.appendChild(script);
+            // An existing tag may have finished before these listeners were added.
+            const timeout = AbortSignal.timeout(5000);
+            timeout.addEventListener('abort', failed, {once: true});
+            if (existingScript) {
+                script.addEventListener('load', loaded, {once: true});
+                script.addEventListener('error', failed, {once: true});
+            } else {
+                script.src = 'https://js.stripe.com/v3/';
+                script.async = true;
+                script.onload = loaded;
+                script.onerror = () => { failed(); };
+                document.body.appendChild(script);
+            }
         });
     }
     return stripeScript;

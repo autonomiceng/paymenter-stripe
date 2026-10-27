@@ -32,7 +32,7 @@ foreach (['pay', 'billing-agreement'] as $name) {
         check(str_contains($view, 'x-data="aeStripeSetup({') && str_contains($script, "Alpine.data('aeStripeSetup'"),
             'Setup initializes for each Alpine form, including reopened modals');
         check(str_contains($script, 'const form = this.$el;') && !str_contains($script, 'document.getElementById(')
-            && !str_contains($script, 'document.querySelector('), 'Setup DOM access stays scoped to its own form');
+            && !str_contains(substr($script, strpos($script, "Alpine.data('aeStripeSetup'")), 'document.querySelector('), 'Setup DOM access stays scoped to its own form');
         check(str_contains($script, 'destroy() {') && str_contains($script, 'controller.abort();')
             && str_contains($script, 'paymentElement?.destroy();'), 'Setup form removal releases listeners and Elements');
     }
@@ -63,6 +63,13 @@ foreach (['pay', 'billing-agreement'] as $name) {
 $setupView = file_get_contents($views . 'billing-agreement.blade.php');
 check(str_contains($setupView, 'id="setup-consent" required disabled') && str_contains($setupView, 'I agree to save this payment method and allow charges to it for my future invoices, including renewals, when I am not present.')
     && str_contains($setupView, 'Saving does not turn on Auto Pay; you can choose it for a service later.'), 'Setup has an explicit future off-session opt-in');
+check(str_contains($setupView, "document.querySelector('script[src^=\"https://js.stripe.com/v3\"]')"), 'Setup reuses an existing Stripe.js script');
+check(str_contains($setupView, 'if (window.Stripe) {')
+    && str_contains($setupView, 'stripeScript = null;')
+    && !str_contains($setupView, 'script.onload = resolve;'), 'Setup checks the loaded Stripe global and clears failed cached loads');
+check(str_contains($setupView, 'AbortSignal.timeout(5000)')
+    && str_contains($setupView, "timeout.addEventListener('abort', failed, {once: true})")
+    && str_contains($setupView, "timeout.removeEventListener('abort', failed)"), 'Setup bounds already-finished script waits and releases the timeout listener');
 $recordConsentCall = 'await fetch(config.consentUrl';
 $confirmSetupCall = 'await stripe.confirmSetup(';
 $recordsConsentBeforeConfirmation = static function ($view) use ($recordConsentCall, $confirmSetupCall) {
