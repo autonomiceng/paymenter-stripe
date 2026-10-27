@@ -67,9 +67,9 @@ check(str_contains($setupView, "document.querySelector('script[src^=\"https://js
 check(str_contains($setupView, 'if (window.Stripe) {')
     && str_contains($setupView, 'stripeScript = null;')
     && !str_contains($setupView, 'script.onload = resolve;'), 'Setup checks the loaded Stripe global and clears failed cached loads');
-check(str_contains($setupView, 'AbortSignal.timeout(5000)')
-    && str_contains($setupView, "timeout.addEventListener('abort', failed, {once: true})")
-    && str_contains($setupView, "timeout.removeEventListener('abort', failed)"), 'Setup bounds already-finished script waits and releases the timeout listener');
+check(str_contains($setupView, 'existingScript ? AbortSignal.timeout(5000) : null')
+    && str_contains($setupView, "timeout?.addEventListener('abort', failed, {once: true})")
+    && str_contains($setupView, "timeout?.removeEventListener('abort', failed)"), 'Setup bounds only reused script waits and releases the timeout listener');
 check(str_contains($setupView, 'if (!existingScript) script.remove();'), 'Setup removes failed scripts only when it owns them');
 $recordConsentCall = 'await fetch(config.consentUrl';
 $confirmSetupCall = 'await stripe.confirmSetup(';

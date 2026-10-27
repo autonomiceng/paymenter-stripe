@@ -28,7 +28,7 @@ function loadStripe() {
             const existingScript = document.querySelector('script[src^="https://js.stripe.com/v3"]');
             const script = existingScript || document.createElement('script');
             const cleanup = () => {
-                timeout.removeEventListener('abort', failed);
+                timeout?.removeEventListener('abort', failed);
                 script.removeEventListener('load', loaded);
                 script.removeEventListener('error', failed);
                 if (!existingScript) {
@@ -50,8 +50,8 @@ function loadStripe() {
                 reject(new Error('Could not load Stripe.js.'));
             };
             // An existing tag may have finished before these listeners were added.
-            const timeout = AbortSignal.timeout(5000);
-            timeout.addEventListener('abort', failed, {once: true});
+            const timeout = existingScript ? AbortSignal.timeout(5000) : null;
+            timeout?.addEventListener('abort', failed, {once: true});
             if (existingScript) {
                 script.addEventListener('load', loaded, {once: true});
                 script.addEventListener('error', failed, {once: true});

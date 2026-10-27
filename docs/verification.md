@@ -24,7 +24,10 @@ Both payment forms stay disabled until Stripe.js, Payment Element and submit han
 ready; initialization and confirmation errors remain in the alert for retry.
 Browser-check both pay and setup views inside the theme's teleported modal (default theme `x-teleport="body"`).
 Offline browser coverage in `tests/setup-modal.mjs` checks repeated setup opens,
-declines, consent failures and closing during Stripe.js loading. Each form releases
+declines, consent failures and closing during Stripe.js loading. Fresh Stripe.js
+loads wait for load/error events, including successful loads taking over five seconds.
+Reused tags retain a five-second bounded wait without removing the owner's tag.
+Each form releases
 its Element and theme listeners when Alpine removes it. An unfinished account
 SetupIntent is reused across opens; only a confirmed `succeeded` or `canceled`
 intent permits a new attempt. A lost creation response retries the persisted key.

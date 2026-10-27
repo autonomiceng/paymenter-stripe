@@ -141,6 +141,23 @@ try {
     assert.equal(counts.themeListeners, 0, 'No leaked theme listeners');
     assert.equal(counts.scripts, 1, 'Stripe.js loads once across reopen cycles');
     assert.equal(counts.consent, 7, 'Repeated submits during a consent request are ignored');
+    // A fresh request can take longer than the bounded wait for a reused tag.
+    holdStripe = true;
+    await page.goto('http://setup.test/');
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.waitForFunction(() => probe.scripts === 1);
+    await page.waitForTimeout(5500);
+    assert.equal(await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).count(), 0, 'A fresh Stripe.js request is still loading after five seconds');
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'The fresh pending script is retained');
+    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    releaseStripe();
+    holdStripe = false;
+    await page.getByRole('textbox', { name: 'Card number' }).waitFor();
+    assert.equal(await page.getByRole('checkbox', { name: /I agree/ }).isEnabled(), true, 'The delayed fresh load enables consent');
+    assert.equal(await page.evaluate(() => probe.scripts), 1, 'The delayed fresh load succeeds without another request');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
     // Close before Stripe.js finishes, then reopen while the original load is pending.
     holdStripe = true;
     await page.goto('http://setup.test/');
@@ -163,6 +180,7 @@ try {
     await page.getByRole('button', { name: 'Add payment method' }).click();
     await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor();
     assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, 'A fresh script that errors is removed');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     rejectStripe = false;
@@ -260,7 +278,7 @@ try {
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
     assert.deepEqual(errors, [], 'No browser errors across delayed and failed loads');
     console.log(`PASS: 6 open/decline/close cycles; ${counts.confirms} confirmations; ${counts.destroyed} Elements disposed`);
-    console.log('PASS: failed consent retry; delayed script close/reopen; failed script close/reopen; missing-global retry; existing script reuse; foreign pending tag timeout/retry; owner repairs already-finished foreign tag; no leaked theme listeners');
+    console.log('PASS: failed consent retry; fresh script loads after five seconds; delayed script close/reopen; failed script removal and retry; missing-global retry; existing script reuse; foreign pending tag timeout/retry; owner repairs already-finished foreign tag; no leaked theme listeners');
 } finally {
     await browser.close();
 }
