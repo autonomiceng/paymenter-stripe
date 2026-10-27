@@ -27,6 +27,7 @@ Offline browser coverage in `tests/setup-modal.mjs` checks repeated setup opens,
 declines, consent failures and closing during Stripe.js loading.
 Fresh Stripe.js loads have a 30-second bound; timed-out owned tags are removed for retry.
 Reused tags keep a five-second wait and preserve the owner's tag.
+After that wait times out without the library, retry skips the foreign tag and loads its own.
 Each form releases
 its Element and theme listeners when Alpine removes it. An unfinished account
 SetupIntent is reused across opens; only a confirmed `succeeded` or `canceled`

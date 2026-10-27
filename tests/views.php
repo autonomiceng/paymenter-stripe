@@ -68,7 +68,7 @@ check(str_contains($setupView, "document.querySelector('script[src^=\"https://js
 check(str_contains($setupView, 'if (window.Stripe) {')
     && str_contains($setupView, 'stripeScript = null;')
     && !str_contains($setupView, 'script.onload = resolve;'), 'Setup checks the loaded Stripe global and clears failed cached loads');
-check(str_contains($setupView, 'setTimeout(failed, existingScript ? 5000 : 30000)')
+check(str_contains($setupView, '}, existingScript ? 5000 : 30000)')
     && str_contains($setupView, 'clearTimeout(timeout)'), 'Setup allows fresh requests thirty seconds, bounds reused waits at five seconds and clears the timer');
 check(str_contains($setupView, 'if (!existingScript) script.remove();'), 'Setup removes failed scripts only when it owns them');
 $recordConsentCall = 'await fetch(config.consentUrl';
