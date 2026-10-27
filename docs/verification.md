@@ -168,8 +168,9 @@ Confirmed and processing payments retain a display label in the extension-owned
 `ae_stripe_transaction_methods` table, keyed by native invoice transaction ID.
 The install and upgrade hooks run its migration. Expanded latest-charge details
 need no lookup; an unexpanded charge needs one retrieve. Missing details or a
-failed lookup leave the label blank without changing settlement. The first stored
-label survives retries and later status updates. Link labels mask the email local
+failed lookup leave the label blank without changing settlement. A failed attempt clears its
+label so a later retry can record its own method. The first successful label
+survives replayed success and late failure events. Link labels mask the email local
 part. No card numbers, fingerprints or complete provider objects are stored.
 Rendering never contacts Stripe. Earlier transactions are not backfilled.
 

@@ -142,6 +142,10 @@ trait Checkout
             if (in_array($status, ['succeeded', 'processing'], true)) {
                 $this->recordTransactionMethod($transaction, $intent);
             }
+            if ($status === 'failed') {
+                // The locked success guard above preserves labels on settled payments.
+                DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $transaction->id)->delete();
+            }
         });
     }
 

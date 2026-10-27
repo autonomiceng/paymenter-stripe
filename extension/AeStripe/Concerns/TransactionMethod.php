@@ -18,7 +18,8 @@ trait TransactionMethod
             || ($status === 'succeeded' && !in_array($invoice->status, ['pending', 'paid'], true))
             || InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) return $intent;
         $existing = InvoiceTransaction::where('transaction_id', $intent->id)->first();
-        if ($existing && DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $existing->id)->exists()) return $intent;
+        // A failed attempt may clear this label before success acquires its locks.
+        if ($status === 'processing' && $existing && DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $existing->id)->exists()) return $intent;
         if (is_string($charge) && preg_match('/^ch_[a-zA-Z0-9]+$/D', $charge)) {
             try {
                 $charge = $this->request('get', '/charges/' . $charge);

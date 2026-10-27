@@ -410,6 +410,10 @@ namespace {
         private $id;
         public function where($key, $value) { $this->id = $value; return $this; }
         public function exists() { return isset(\Illuminate\Support\Facades\DB::$tables['ae_stripe_transaction_methods'][$this->id]); }
+        public function delete() {
+            if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Method deletion requires settlement locks');
+            unset(\Illuminate\Support\Facades\DB::$tables['ae_stripe_transaction_methods'][$this->id]);
+        }
         public function insertOrIgnore($row) {
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Method write requires settlement locks');
             \Illuminate\Support\Facades\DB::$tables['ae_stripe_transaction_methods'][$row['invoice_transaction_id']] ??= $row;

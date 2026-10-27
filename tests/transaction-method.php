@@ -71,6 +71,42 @@ $methodIntent->latest_charge = 'ch_fixture';
 $before = count(Http::$calls);
 $gateway->webhook(eventRequest($methodIntent, type: 'payment_intent.payment_failed'));
 check(count(Http::$calls) === $before && !isset(DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_failedlabel')]), 'Failed payment captures nothing');
+// A PaymentIntent can fail and then reuse its transaction for another card.
+$retryIntent = clone $methodIntent;
+$retryIntent->id = 'pi_labelretry';
+$retryIntent->latest_charge = (object) ['payment_method_details' => json_decode(json_encode($fixtures['card']))];
+$retryId = crc32('12:pi_labelretry');
+$gateway->webhook(eventRequest($retryIntent, type: 'payment_intent.processing'));
+check(DB::$tables['ae_stripe_transaction_methods'][$retryId]['label'] === 'Visa **** 4242', 'Processing records the first attempt card');
+$gateway->webhook(eventRequest($retryIntent, type: 'payment_intent.payment_failed'));
+$gateway->webhook(eventRequest($retryIntent, type: 'payment_intent.payment_failed'));
+check(!isset(DB::$tables['ae_stripe_transaction_methods'][$retryId]), 'Failure and its replay clear the failed attempt label');
+$retryIntent->latest_charge = 'ch_retrycard';
+Http::$handler = function ($verb, $path) {
+    check($verb === 'get' && $path === '/charges/ch_retrycard' && !DB::$locked, 'Retry retrieves its new charge before locking');
+    return ['payment_method_details' => ['type' => 'card', 'card' => ['brand' => 'mastercard', 'last4' => '4444']]];
+};
+$gateway->webhook(eventRequest($retryIntent));
+check(DB::$tables['ae_stripe_transaction_methods'][$retryId]['label'] === 'Mastercard **** 4444', 'Successful retry records its own card on the reused transaction');
+$retryIntent->latest_charge = (object) ['payment_method_details' => json_decode(json_encode($fixtures['card']))];
+$before = ExtensionHelper::$applications;
+$gateway->webhook(eventRequest($retryIntent));
+$gateway->webhook(eventRequest($retryIntent, type: 'payment_intent.payment_failed'));
+check(DB::$tables['ae_stripe_transaction_methods'][$retryId]['label'] === 'Mastercard **** 4444', 'Success replay and late failure keep the first successful label');
+check(ExtensionHelper::$applications === $before && ExtensionHelper::$payments['12:pi_labelretry']['status'] === 'succeeded', 'Replayed success and late failure never rewrite a settled transaction');
+// Failure can clear the processing label after success prepares, before it locks.
+$raceIntent = clone $retryIntent;
+$raceIntent->id = 'pi_labelretryrace';
+$raceId = crc32('12:pi_labelretryrace');
+$gateway->webhook(eventRequest($raceIntent, type: 'payment_intent.processing'));
+$raceIntent->latest_charge = 'ch_retrycard';
+DB::$beforeUserLock = function () use ($gateway, $raceIntent) {
+    $gateway->webhook(eventRequest($raceIntent, type: 'payment_intent.payment_failed'));
+};
+$gateway->webhook(eventRequest($raceIntent));
+check((DB::$tables['ae_stripe_transaction_methods'][$raceId]['label'] ?? null) === 'Mastercard **** 4444', 'Success prepares its new card even when failure clears the old label while waiting for locks');
+$gateway->webhook(eventRequest($raceIntent));
+check((DB::$tables['ae_stripe_transaction_methods'][$raceId]['label'] ?? null) === 'Mastercard **** 4444', 'Concurrent retry retains its successful label on replay');
 foreach ([new ConnectionException('offline'), new RequestException(404)] as $index => $error) {
     $methodIntent->id = 'pi_lookupfailure' . $index;
     Http::$handler = fn () => throw $error;
