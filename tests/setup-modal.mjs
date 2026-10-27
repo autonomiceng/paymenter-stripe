@@ -35,6 +35,7 @@ const render = (open) => `<div wire:id="setup" wire:snapshot="${escape(snapshot)
 const browser = await chromium.launch({ headless: true });
 try {
     const page = await browser.newPage();
+    await page.clock.install();
     const errors = [];
     let releaseStripe;
     let holdStripe = false;
@@ -76,7 +77,7 @@ try {
         const url = new URL(route.request().url());
         if (url.hostname === 'js.stripe.com') {
             await page.evaluate(() => probe.scripts++);
-            if (holdStripe) await new Promise((resolve) => { releaseStripe = resolve; });
+            if (holdStripe && await new Promise((resolve) => { releaseStripe = resolve; }) === false) return route.abort('failed');
             if (rejectStripe) return route.abort('failed');
             return route.fulfill({ contentType: 'text/javascript', body: omitStripe ? '' : 'window.installStripeStub();' });
         }
@@ -155,6 +156,33 @@ try {
     await page.getByRole('textbox', { name: 'Card number' }).waitFor();
     assert.equal(await page.getByRole('checkbox', { name: /I agree/ }).isEnabled(), true, 'The delayed fresh load enables consent');
     assert.equal(await page.evaluate(() => probe.scripts), 1, 'The delayed fresh load succeeds without another request');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
+    // A fresh request that never finishes must time out and allow a new load.
+    holdStripe = true;
+    await page.goto('http://setup.test/');
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.waitForFunction(() => probe.scripts === 1);
+    const releaseStalledStripe = releaseStripe;
+    await page.clock.fastForward(29000);
+    assert.equal(await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).count(), 0, 'The fresh request gets a generous wait before timing out');
+    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    await page.clock.fastForward(1000);
+    await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor({ timeout: 1500 });
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, 'Timeout removes the stalled script owned by this form');
+    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    // Dispose the held network fixture after the timeout; Chromium otherwise coalesces
+    // another request for the same URL with it, even though its tag was removed.
+    const stalledRequestEnded = page.waitForEvent('requestfailed', { predicate: (request) => request.url() === 'https://js.stripe.com/v3/' });
+    releaseStalledStripe(false);
+    await stalledRequestEnded;
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    holdStripe = false;
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.getByRole('textbox', { name: 'Card number' }).waitFor();
+    assert.equal(await page.evaluate(() => probe.scripts), 2, 'Retry after the fresh timeout starts a new successful request');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
@@ -278,7 +306,7 @@ try {
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
     assert.deepEqual(errors, [], 'No browser errors across delayed and failed loads');
     console.log(`PASS: 6 open/decline/close cycles; ${counts.confirms} confirmations; ${counts.destroyed} Elements disposed`);
-    console.log('PASS: failed consent retry; fresh script loads after five seconds; delayed script close/reopen; failed script removal and retry; missing-global retry; existing script reuse; foreign pending tag timeout/retry; owner repairs already-finished foreign tag; no leaked theme listeners');
+    console.log('PASS: failed consent retry; fresh script loads after five seconds; stalled fresh script timeout/removal/retry; delayed script close/reopen; failed script removal and retry; missing-global retry; existing script reuse; foreign pending tag timeout/retry; owner repairs already-finished foreign tag; no leaked theme listeners');
 } finally {
     await browser.close();
 }
