@@ -254,6 +254,42 @@ try {
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
+    // Failures observed while reusing a foreign tag must also allow an owned retry.
+    for (const failure of ['error', 'missing-global']) {
+        holdStripe = true;
+        rejectStripe = failure === 'error';
+        omitStripe = failure === 'missing-global';
+        await page.goto('http://setup.test/');
+        await page.evaluate(() => {
+            const existing = document.createElement('script');
+            existing.id = 'foreign-stripe';
+            existing.src = 'https://js.stripe.com/v3/';
+            existing.onload = () => { probe.ownerEvent = 'load'; };
+            existing.onerror = () => { probe.ownerEvent = 'error'; };
+            document.body.appendChild(existing);
+        });
+        await page.waitForFunction(() => probe.scripts === 1);
+        await page.getByRole('button', { name: 'Add payment method' }).click();
+        await page.getByRole('dialog').waitFor();
+        assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, `${failure}: the pending foreign tag is reused`);
+        releaseStripe();
+        holdStripe = false;
+        await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor({ timeout: 1500 });
+        assert.equal(await page.evaluate(() => probe.ownerEvent), failure === 'error' ? 'error' : 'load', `${failure}: the owner's handler runs`);
+        assert.equal(await page.locator('#foreign-stripe').count(), 1, `${failure}: failure preserves the foreign tag`);
+        await page.getByRole('button', { name: 'Close', exact: true }).click();
+        await page.getByRole('dialog').waitFor({ state: 'detached' });
+        rejectStripe = false;
+        omitStripe = false;
+        await page.getByRole('button', { name: 'Add payment method' }).click();
+        await page.getByRole('textbox', { name: 'Card number' }).waitFor({ timeout: 1500 });
+        assert.equal(await page.evaluate(() => probe.scripts), 2, `${failure}: retry starts a fresh successful load`);
+        assert.equal(await page.locator('#foreign-stripe').count(), 1, `${failure}: retry preserves the foreign tag`);
+        assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 2, `${failure}: the successful owned tag remains alongside it`);
+        await page.getByRole('button', { name: 'Close', exact: true }).click();
+        await page.getByRole('dialog').waitFor({ state: 'detached' });
+        assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
+    }
     // A foreign tag that times out is retained while retry creates our own tag.
     holdStripe = true;
     await page.goto('http://setup.test/');
@@ -313,7 +349,7 @@ try {
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
     assert.deepEqual(errors, [], 'No browser errors across delayed and failed loads');
     console.log(`PASS: 6 open/decline/close cycles; ${counts.confirms} confirmations; ${counts.destroyed} Elements disposed`);
-    console.log('PASS: failed consent retry; fresh script loads after five seconds; stalled fresh script timeout/removal/retry; delayed script close/reopen; failed script removal and retry; missing-global retry; existing script reuse; foreign pending tag timeout/retry; fresh retry preserves already-finished foreign tag; no leaked theme listeners');
+    console.log('PASS: failed consent retry; fresh script loads after five seconds; stalled fresh script timeout/removal/retry; delayed script close/reopen; failed script removal and retry; missing-global retry; existing script reuse; foreign error and missing-global retry; foreign pending tag timeout/retry; fresh retry preserves already-finished foreign tag; no leaked theme listeners');
 } finally {
     await browser.close();
 }

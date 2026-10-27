@@ -48,13 +48,13 @@ function loadStripe() {
             const failed = () => {
                 cleanup();
                 stripeScript = null;
+                if (existingScript && !window.Stripe) timedOutScripts.add(existingScript);
                 if (!existingScript) script.remove();
                 reject(new Error('Could not load Stripe.js.'));
             };
             // An existing tag may have finished before these listeners were added.
             // Give fresh requests more time, but allow retry if neither event fires.
             const timeout = setTimeout(() => {
-                if (existingScript && !window.Stripe) timedOutScripts.add(existingScript);
                 failed();
             }, existingScript ? 5000 : 30000);
             if (existingScript) {
