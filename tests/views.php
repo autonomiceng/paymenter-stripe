@@ -70,6 +70,7 @@ check(str_contains($setupView, 'if (window.Stripe) {')
 check(str_contains($setupView, 'AbortSignal.timeout(5000)')
     && str_contains($setupView, "timeout.addEventListener('abort', failed, {once: true})")
     && str_contains($setupView, "timeout.removeEventListener('abort', failed)"), 'Setup bounds already-finished script waits and releases the timeout listener');
+check(str_contains($setupView, 'if (!existingScript) script.remove();'), 'Setup removes failed scripts only when it owns them');
 $recordConsentCall = 'await fetch(config.consentUrl';
 $confirmSetupCall = 'await stripe.confirmSetup(';
 $recordsConsentBeforeConfirmation = static function ($view) use ($recordConsentCall, $confirmSetupCall) {

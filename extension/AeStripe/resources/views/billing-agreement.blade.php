@@ -46,7 +46,7 @@ function loadStripe() {
             const failed = () => {
                 cleanup();
                 stripeScript = null;
-                script.remove();
+                if (!existingScript) script.remove();
                 reject(new Error('Could not load Stripe.js.'));
             };
             // An existing tag may have finished before these listeners were added.

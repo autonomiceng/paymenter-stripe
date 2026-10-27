@@ -208,7 +208,32 @@ try {
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
-    // A different caller's tag may have finished without the global before setup opens.
+    // A reused pending tag remains owned by its caller after timeout and on retry.
+    holdStripe = true;
+    await page.goto('http://setup.test/');
+    await page.evaluate(() => {
+        const existing = document.createElement('script');
+        existing.src = 'https://js.stripe.com/v3/';
+        existing.onload = () => { probe.existingLoaded = true; };
+        document.body.appendChild(existing);
+    });
+    await page.waitForFunction(() => probe.scripts === 1);
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor({timeout: 10000});
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'Timeout preserves the pending script owned by another caller');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.getByRole('dialog').waitFor();
+    releaseStripe();
+    holdStripe = false;
+    await page.getByRole('textbox', { name: 'Card number' }).waitFor();
+    assert.equal(await page.evaluate(() => probe.scripts), 1, 'Retry reuses the pending foreign tag without a second Stripe.js request');
+    assert.equal(await page.evaluate(() => probe.existingLoaded), true, 'Its owner can finish loading after our timeout and retry');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('dialog').waitFor({ state: 'detached' });
+    assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
+    // Known limit: a foreign tag that already failed needs its owner to remove or repair it.
     omitStripe = true;
     await page.goto('http://setup.test/');
     await page.evaluate(() => new Promise((resolve, reject) => {
@@ -221,19 +246,21 @@ try {
     await page.getByRole('button', { name: 'Add payment method' }).click();
     await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor({timeout: 10000});
     assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
-    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, 'Already-finished script without a global is removed after a bounded wait');
+    assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'An already-finished foreign script is preserved after a bounded wait');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
+    // The caller that created the unusable tag removes it before setup retries.
+    await page.evaluate(() => document.querySelector('script[src^="https://js.stripe.com/v3"]').remove());
     omitStripe = false;
     await page.getByRole('button', { name: 'Add payment method' }).click();
     await page.getByRole('textbox', { name: 'Card number' }).waitFor();
-    assert.equal(await page.evaluate(() => probe.scripts), 2, 'Already-finished script allows a fresh successful retry');
+    assert.equal(await page.evaluate(() => probe.scripts), 2, 'Owner removal of the unusable foreign tag allows a fresh successful retry');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
     assert.deepEqual(errors, [], 'No browser errors across delayed and failed loads');
     console.log(`PASS: 6 open/decline/close cycles; ${counts.confirms} confirmations; ${counts.destroyed} Elements disposed`);
-    console.log('PASS: failed consent retry; delayed script close/reopen; failed script close/reopen; missing-global retry; existing script reuse; already-finished script retry; no leaked theme listeners');
+    console.log('PASS: failed consent retry; delayed script close/reopen; failed script close/reopen; missing-global retry; existing script reuse; foreign pending tag timeout/retry; owner repairs already-finished foreign tag; no leaked theme listeners');
 } finally {
     await browser.close();
 }
