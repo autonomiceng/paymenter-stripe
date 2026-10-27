@@ -1,8 +1,12 @@
-<form id="payment-form" class="mt-2">
+<form id="payment-form" class="mt-2" x-data="aeStripeSetup({
+    publishableKey: @js($stripePublishableKey), clientSecret: @js($intent->client_secret),
+    intent: @js($intent->id), consentUrl: @js(route('extensions.gateways.ae-stripe.setup-consent')),
+    returnUrl: @js(route('extensions.gateways.ae-stripe.setup-agreement')), csrf: @js(csrf_token()),
+    name: {{ \Illuminate\Support\Js::from(auth()->user()->name) }},
+    email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }}
+})">
     <div id="error-message" role="alert" class="text-red-600 dark:text-red-400"></div>
-    <div id="payment-element">
-
-    </div>
+    <div id="payment-element" wire:ignore></div>
     <label class="mt-4 block">
         <input type="checkbox" id="setup-consent" required disabled />
         I agree to save this payment method and allow charges to it for my future invoices, including renewals, when I am not present.
@@ -15,133 +19,142 @@
 </form>
 @script
 <script>
-    @include('gateways.ae-stripe::stripe-theme')
-async function initializePaymentForm() {
-    // Livewire effects run before Alpine teleports the modal into body.
-    const paymentForm = await new Promise((resolve) => {
-        const deadline = performance.now() + 5000;
-        function findForm() {
-            const form = document.getElementById('payment-form');
-            if (form) return resolve(form);
-            if (performance.now() >= deadline) return resolve(null);
-            requestAnimationFrame(findForm);
-        }
-        findForm();
-    });
-    if (!paymentForm) {
-        console.error('AeStripe: payment form did not appear within 5 seconds.');
-        return;
-    }
-    let ready = false;
-    paymentForm.addEventListener('submit', (event) => event.preventDefault());
-    function initializationError() {
-        ready = false;
-        const submit = paymentForm.querySelector('#submit');
-        const message = paymentForm.querySelector('#error-message');
-        if (submit) submit.disabled = true;
-        if (message) message.textContent = 'Could not load the payment form. Reload to try again.';
-    }
-    const script = document.createElement('script');
-        script.src = 'https://js.stripe.com/v3/';
-        script.async = true;
-        script.onerror = initializationError;
-        script.onload = () => {
-            try {
-
-            var stripe = Stripe(
-                @js($stripePublishableKey)
-            );
-
-            const consent = document.getElementById('setup-consent');
-            consent.addEventListener('change', () => setLoading(false));
-
-            const form = document.getElementById('payment-form');
-            const options = {
-                clientSecret: @js($intent->client_secret),
-                appearance: stripeAppearance(form),
+// Livewire runs this registration once. Alpine owns each teleported form's lifetime.
+let stripeScript;
+function loadStripe() {
+    if (window.Stripe) return Promise.resolve();
+    if (!stripeScript) {
+        stripeScript = new Promise((resolve, reject) => {
+            const existingScript = document.querySelector('script[src^="https://js.stripe.com/v3"]');
+            const script = existingScript || document.createElement('script');
+            const cleanup = () => {
+                timeout.removeEventListener('abort', failed);
+                script.removeEventListener('load', loaded);
+                script.removeEventListener('error', failed);
+                if (!existingScript) {
+                    script.onload = null;
+                    script.onerror = null;
+                }
             };
-
-            const paymentElementOptions = {
-                layout: {
-                    type: 'accordion',
-                    defaultCollapsed: false,
-                    radios: false,
-                    spacedAccordionItems: true
-                },
-                defaultValues: {
-                    billingDetails: {
-                        name: {{ \Illuminate\Support\Js::from(auth()->user()->name) }},
-                        email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }},
-                    }
+            const loaded = () => {
+                if (window.Stripe) {
+                    cleanup();
+                    return resolve();
                 }
+                failed();
+            };
+            const failed = () => {
+                cleanup();
+                stripeScript = null;
+                if (!existingScript) script.remove();
+                reject(new Error('Could not load Stripe.js.'));
+            };
+            // An existing tag may have finished before these listeners were added.
+            const timeout = AbortSignal.timeout(5000);
+            timeout.addEventListener('abort', failed, {once: true});
+            if (existingScript) {
+                script.addEventListener('load', loaded, {once: true});
+                script.addEventListener('error', failed, {once: true});
+            } else {
+                script.src = 'https://js.stripe.com/v3/';
+                script.async = true;
+                script.onload = loaded;
+                script.onerror = () => { failed(); };
+                document.body.appendChild(script);
             }
-
-            // Set up Stripe.js and Elements to use in checkout form, passing the client secret obtained in a previous step
-            const elements = stripe.elements(options);
-            const paymentElement = elements.create('payment', paymentElementOptions);
-            const message = document.getElementById('error-message');
+        });
+    }
+    return stripeScript;
+}
+Alpine.data('aeStripeSetup', (config) => {
+    @include('gateways.ae-stripe::stripe-theme')
+    let disposed = false;
+    let cleanup = () => {};
+    return {
+        async init() {
+            const form = this.$el;
+            const consent = form.querySelector('#setup-consent');
+            const submit = form.querySelector('#submit');
+            const message = form.querySelector('#error-message');
+            const container = form.querySelector('#payment-element');
+            const controller = new AbortController();
+            let paymentElement;
+            let stopThemeSync = () => {};
+            let ready = false;
             let loading = false;
-            // The alert region stays mounted so screen readers announce new text.
-            paymentElement.on('change', () => { if (!loading) message.replaceChildren(); });
-            const stopThemeSync = syncStripeTheme(form, elements);
-
-            form.addEventListener('submit', async (event) => {
-                event.preventDefault();
-                message.replaceChildren();
-                setLoading(true);
-                
-                try {
-                    if (!consent.checked) throw new Error('Agree to future charges before saving your payment method.');
-                    const result = await fetch(@js(route('extensions.gateways.ae-stripe.setup-consent')), {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
-                            'X-CSRF-TOKEN': @js(csrf_token())},
-                        body: JSON.stringify({intent: @js($intent->id), consent: consent.checked}),
-                    });
-                    if (!result.ok) throw new Error('Could not record your agreement. Try again.');
-                    const {error} = await stripe.confirmSetup({elements, confirmParams: {
-                        return_url: @js(route('extensions.gateways.ae-stripe.setup-agreement')),
-                    }});
-                    if (error) throw error;
-                } catch (error) {
-                    const text = document.createElement('p');
-                    text.className = 'mb-2';
-                    text.textContent = error.message || 'Could not save payment method.';
-                    message.replaceChildren(text);
-                } finally {
-                    setLoading(false);
-                }
-
-            });
-
-            // Show a spinner on payment submission
+            cleanup = () => {
+                controller.abort();
+                stopThemeSync();
+                paymentElement?.destroy();
+                paymentElement = null;
+                stopThemeSync = () => {};
+            };
             function setLoading(isLoading) {
                 loading = isLoading;
+                if (disposed) return;
                 consent.disabled = isLoading || !ready;
-                document.getElementById("payment-element").inert = isLoading;
-                if (isLoading) {
-                    // Disable the button and show a spinner
-                    document.querySelector("#submit").disabled = true;
-                    document.querySelector("#submit").classList.add("hidden");
-                } else {
-                    document.querySelector("#submit").disabled = !ready || !consent.checked;
-                    document.querySelector("#submit").classList.remove("hidden");
-                }
+                container.inert = isLoading;
+                submit.disabled = isLoading || !ready || !consent.checked;
+                submit.classList.toggle('hidden', isLoading);
             }
-
-            paymentElement.on('ready', () => { ready = true; setLoading(false); });
-            paymentElement.on('loaderror', initializationError);
-            paymentElement.mount('#payment-element');
-
-            $wire.on('invoice.payment.cancelled', () => {
-                // destroy the payment element
-                stopThemeSync();
-                paymentElement.destroy();
-            });
-            } catch (error) { initializationError(); }
-        };
-        document.body.appendChild(script);
-}
-initializePaymentForm();
+            function initializationError() {
+                ready = false;
+                setLoading(false);
+                if (!disposed) message.textContent = 'Could not load the payment form. Reload to try again.';
+            }
+            // Block native submits even while Stripe.js is loading.
+            form.addEventListener('submit', (event) => event.preventDefault(), {signal: controller.signal});
+            try {
+                await loadStripe();
+                if (disposed || !form.isConnected) return;
+                const stripe = Stripe(config.publishableKey);
+                const elements = stripe.elements({clientSecret: config.clientSecret, appearance: stripeAppearance(form)});
+                paymentElement = elements.create('payment', {
+                    layout: {type: 'accordion', defaultCollapsed: false, radios: false, spacedAccordionItems: true},
+                    defaultValues: {billingDetails: {name: config.name, email: config.email}},
+                });
+                stopThemeSync = syncStripeTheme(form, elements);
+                consent.addEventListener('change', () => { if (!loading) setLoading(false); }, {signal: controller.signal});
+                paymentElement.on('change', () => { if (!loading) message.replaceChildren(); });
+                form.addEventListener('submit', async (event) => {
+                    event.preventDefault();
+                    if (disposed || loading || !ready) return;
+                    message.replaceChildren();
+                    setLoading(true);
+                    try {
+                        if (!consent.checked) throw new Error('Agree to future charges before saving your payment method.');
+                        const result = await fetch(config.consentUrl, {
+                            method: 'POST', signal: controller.signal,
+                            headers: {'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': config.csrf},
+                            body: JSON.stringify({intent: config.intent, consent: consent.checked}),
+                        });
+                        if (!result.ok) throw new Error('Could not record your agreement. Try again.');
+                        if (disposed) return;
+                        const {error} = await stripe.confirmSetup({elements, confirmParams: {return_url: config.returnUrl}});
+                        if (error) throw error;
+                    } catch (error) {
+                        if (disposed) return;
+                        const text = document.createElement('p');
+                        text.className = 'mb-2';
+                        text.textContent = error.message || 'Could not save payment method.';
+                        message.replaceChildren(text);
+                    } finally {
+                        setLoading(false);
+                    }
+                }, {signal: controller.signal});
+                paymentElement.on('ready', () => { ready = true; setLoading(false); });
+                paymentElement.on('loaderror', initializationError);
+                paymentElement.mount(container);
+            } catch (error) {
+                cleanup();
+                initializationError();
+            }
+        },
+        destroy() {
+            disposed = true;
+            cleanup();
+        },
+    };
+});
 </script>
 @endscript

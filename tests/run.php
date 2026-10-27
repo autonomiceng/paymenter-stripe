@@ -29,6 +29,7 @@ function eventRequest($intent, $time = null, $type = 'payment_intent.succeeded')
 $user = User::$row = new User(new Properties('cus_owner'));
 $invoice = Invoice::$row = new Invoice($user);
 $gateway = new AeStripe(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
+$gateway->installed();
 $intent = (object) ['id' => 'pi_test', 'customer' => 'cus_owner', 'status' => 'requires_payment_method',
     'client_secret' => 'pi_test_secret', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 2000, 'payment_method' => 'pm_test',
     'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1']];
@@ -59,6 +60,11 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
 if (in_array('--gateway-lifecycle', $argv, true)) {
     require __DIR__ . '/gateway-lifecycle.php';
     echo "PASS: $count gateway lifecycle assertions\n";
+    return;
+}
+if (in_array('--setup-intents', $argv, true)) {
+    require __DIR__ . '/setup-intents.php';
+    echo "PASS: $count setup intent assertions\n";
     return;
 }
 
@@ -139,21 +145,21 @@ invoke($gateway, 'savePaidMethod', $intent);
 check(count(Http::$calls) === $before, 'Future usage without consent metadata cannot save');
 
 $method = (object) ['id' => 'pm_link', 'type' => 'link', 'customer' => 'cus_owner',
-    'link' => (object) ['email' => 'saved@example.test']];
+    'link' => (object) ['email' => 'saved@example.com']];
 $setup = (object) ['id' => 'seti_test', 'metadata' => (object) ['user_id' => 7, 'is_billing_agreement' => '1', 'ae_stripe_gateway' => '1']];
 $gateway->webhook(eventRequest($setup, type: 'setup_intent.succeeded'));
 $gateway->setupAgreement(new Request(['setup_intent' => 'seti_test']));
 check(count(ExtensionHelper::$agreements) === 2, 'Setup webhook plus redirect retry creates one agreement');
-check(ExtensionHelper::$agreements['pm_link']['name'] === 'Link · saved@example.test', 'Native setup labels Link truthfully');
+check(ExtensionHelper::$agreements['pm_link']['name'] === 'Link · s***@example.com', 'Native setup labels Link truthfully');
 check(end(Http::$calls)[2] === ['allow_redisplay' => 'always'], 'Account setup grants redisplay after authorization');
 Auth::$id = 99;
 rejects(fn () => $gateway->setupAgreement(new Request(['setup_intent' => 'seti_test'])), 'HTTP 403');
 Auth::$id = 7;
 
-$link = (object) ['type' => 'link', 'link' => (object) ['email' => 'link@example.test']];
-check(invoke($gateway, 'getPaymentDetails', $link)['name'] === 'Link · link@example.test', 'Stripe Link email');
-$link = (object) ['type' => 'link', 'billing_details' => (object) ['email' => 'bill@example.test']];
-check(invoke($gateway, 'getPaymentDetails', $link)['name'] === 'Link · bill@example.test', 'Stripe billing email fallback');
+$link = (object) ['type' => 'link', 'link' => (object) ['email' => 'link@example.com']];
+check(invoke($gateway, 'getPaymentDetails', $link)['name'] === 'Link · l***@example.com', 'Stripe Link email');
+$link = (object) ['type' => 'link', 'billing_details' => (object) ['email' => 'bill@example.com']];
+check(invoke($gateway, 'getPaymentDetails', $link)['name'] === 'Link · b***@example.com', 'Stripe billing email fallback');
 check(invoke($gateway, 'getPaymentDetails', (object) ['type' => 'link'])['name'] === 'Link', 'Missing email never invented');
 
 $valid = eventRequest($intent);
@@ -219,6 +225,7 @@ require __DIR__ . '/handlers.php';
 require __DIR__ . '/retries.php';
 require __DIR__ . '/subscription-attempts.php';
 require __DIR__ . '/setup-consent.php';
+require __DIR__ . '/setup-intents.php';
 require __DIR__ . '/ownership.php';
 require __DIR__ . '/checkout-owner.php';
 require __DIR__ . '/failures.php';
@@ -227,6 +234,7 @@ require __DIR__ . '/method-consent.php';
 require __DIR__ . '/fee-recovery.php';
 require __DIR__ . '/fee-recovery-review.php';
 require __DIR__ . '/schema-scheduler.php';
+require __DIR__ . '/transaction-method.php';
 require __DIR__ . '/native-upgrade.php';
 require __DIR__ . '/agreement-persistence.php';
 require __DIR__ . '/card-dedupe.php';

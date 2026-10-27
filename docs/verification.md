@@ -23,6 +23,18 @@ agreements are unchanged; unconsented in-flight setups must restart with the opt
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.
 Browser-check both pay and setup views inside the theme's teleported modal (default theme `x-teleport="body"`).
+Offline browser coverage in `tests/setup-modal.mjs` checks repeated setup opens,
+declines, consent failures and closing during Stripe.js loading. Each form releases
+its Element and theme listeners when Alpine removes it. An unfinished account
+SetupIntent is reused across opens; only a confirmed `succeeded` or `canceled`
+intent permits a new attempt. A lost creation response retries the persisted key.
+An unresolved creation older than 23 hours requires reconciliation of the native
+`ae_stripe_setup` user property against Stripe before trying again. Do not clear an
+unfinished attempt to retry. SetupIntents created before this update have no stored
+retry key and cannot be recovered by the new property.
+A stored intent that cannot be retrieved, including a 404 after changing API keys,
+also needs reconciliation in its original Stripe account. Lookup failures never
+start a replacement intent.
 
 Tests execute the gateway with PHP-only model, lock and HTTP fakes; unexpected
 HTTP requests fail. No Stripe or application server is contacted. They verify
@@ -151,3 +163,21 @@ invoice before applying money. Refund and dispute events remain unsupported.
 Offline concurrency tests interleave deliveries before lock acquisition; validate
 real database exclusion, migration upgrades, scheduler discovery and staff inbox
 delivery in the Paymenter sandbox before release.
+
+Confirmed and processing payments retain a display label in the extension-owned
+`ae_stripe_transaction_methods` table, keyed by native invoice transaction ID.
+The install and upgrade hooks run its migration. Expanded latest-charge details
+need no lookup; an unexpanded charge needs one retrieve. Missing details or a
+failed lookup leave the label blank without changing settlement. A failed attempt clears its
+label so a later retry can record its own method. First successful settlement
+replaces any processing label with its own charge, even if the prior failure
+webhook has not arrived. The first successful label
+survives replayed success and late failure events. Link labels mask the email local
+part. No card numbers, fingerprints or complete provider objects are stored.
+Rendering never contacts Stripe. Earlier transactions are not backfilled.
+
+With a pristine Paymenter release's dependencies available, also run
+`PAYMENTER_TEST_APP=/path/to/pristine-release php tests/native-transaction-method.php`
+to verify the migration, upgrade, unique key, foreign key and rollback on SQLite.
+
+Optional transaction-method charge retrieval runs before settlement locks. Subscription PaymentIntent reads expand `latest_charge` before acquiring those locks. The locked handler rechecks customer, currency, invoice state and settled-payment replay before storing the label.

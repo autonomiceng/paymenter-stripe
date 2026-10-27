@@ -74,7 +74,8 @@ trait SubscriptionPayments
             return;
         }
         $paymentId = $paymentIds[0];
-        $intent = $this->request('get', '/payment_intents/' . $paymentId);
+        // Expand before settlement locks; no optional charge request belongs inside them.
+        $intent = $this->request('get', '/payment_intents/' . $paymentId, ['expand' => ['latest_charge']]);
         abort_unless($intent->id === $paymentId && $intent->status === 'succeeded', 409);
         DB::transaction(function () use ($stripeInvoice, $subscriptionId, $paymentId, $intent) {
             $ownerId = Service::where('subscription_id', $subscriptionId)->first()?->user_id;
@@ -107,7 +108,7 @@ trait SubscriptionPayments
                 return;
             }
             // Use the same locked transaction path as PaymentIntent events, so either delivery order is safe.
-            $this->recordIntentPayment($intent, 'succeeded');
+            $this->recordIntentPayment($intent, 'succeeded', false);
         });
     }
 }
