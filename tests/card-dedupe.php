@@ -75,7 +75,7 @@ DB::$tables['services'] = [['id' => 41, 'billing_agreement_id' => 20, 'auto_pay'
 $serviceBefore = DB::$tables['services'];
 $lines = [];
 $gateway->deduplicateCards(false, function ($line) use (&$lines) { $lines[] = $line; });
-check(str_contains(implode(' ', $lines), 'bound to a service'), 'Cleanup lists service-bound duplicates with the reason they stay');
+check(str_contains(implode(' ', $lines), 'linked to a service'), 'Cleanup lists service-bound duplicates with the reason they stay');
 $gateway->deduplicateCards(true, fn ($line) => null);
 check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner'
     && DB::$tables['services'] === $serviceBefore, 'Cleanup preserves bound duplicates and every service preference');

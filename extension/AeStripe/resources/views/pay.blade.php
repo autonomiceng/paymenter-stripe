@@ -7,7 +7,7 @@
         <input type="checkbox" id="save-card" @checked($intent->status === 'requires_action' && ($intent->metadata->ae_stripe_consent ?? null) === '1') disabled />
         Save this card or Link for future payments
     </label>
-    <p class="text-sm">Saving does not enable Auto Pay.</p>
+    <p class="text-sm">Saving does not turn on Auto Pay.</p>
     <button id="submit" disabled
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
         Pay
@@ -109,16 +109,20 @@ async function initializePaymentForm() {
                         body: JSON.stringify({intent: @js($intent->id),
                             save: resuming ? savedConsent : canSave && saveCard.checked}),
                     });
-                    if (!result.ok) throw new Error('Could not update your payment preferences. Try again.');
+                    if (!result.ok) {
+                        showMessage('Could not update your payment preferences. Try again.');
+                        return;
+                    }
                     // https://docs.stripe.com/js/elements_object/fetch_updates
                     const update = await elements.fetchUpdates();
                     if (update.error) throw update.error;
                     const {error} = await stripe.confirmPayment({elements, confirmParams: {
                         return_url: @js(route('invoices.show', $invoice) . '?checkPayment=true'),
                     }});
-                    if (error) showMessage(error.message || 'Could not confirm payment.');
+                    if (error) throw error;
                 } catch (error) {
-                    showMessage(error.message || 'Could not confirm payment.');
+                    showMessage(['card_error', 'validation_error'].includes(error?.type) && error.message
+                        ? error.message : 'Could not confirm your payment. Try again.');
                 } finally {
                     setLoading(false);
                 }

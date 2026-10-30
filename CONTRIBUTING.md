@@ -30,3 +30,6 @@ The modal regression uses Playwright and an installed Paymenter Livewire script:
 `PLAYWRIGHT_MODULE=/path/to/playwright LIVEWIRE_SCRIPT=/path/to/paymenter/vendor/livewire/livewire/dist/livewire.js node tests/setup-modal.mjs`.
 It renders the setup view inside a teleported Livewire modal. Stripe.js, consent
 requests and Livewire responses are local fixtures; no server or Stripe account is needed.
+
+The payment error regression runs both production forms with offline Stripe and browser
+network failures: `PLAYWRIGHT_MODULE=/path/to/playwright node tests/payment-errors.mjs`.

@@ -34,7 +34,7 @@ All paths start with `/v1`. Read uses `GET`; write uses `POST` unless marked `DE
 | Webhook endpoints | `/webhook_endpoints` | `/webhook_endpoints`, `DELETE /webhook_endpoints/{id}` |
 
 The Payment Element displays Stripe-eligible saved cards, wallets and Link.
-The **Save this card for future payments** checkbox starts unchecked; checking it sets
+The **Save this card or Link for future payments** checkbox starts unchecked; checking it sets
 `setup_future_usage=off_session` only after the owner submits consent. Unchecked
 submission clears it. The save control is available only when the Element
 reports a card or Link selection; changing to another method clears the opt-in. Stripe's own saving control is disabled to keep this one

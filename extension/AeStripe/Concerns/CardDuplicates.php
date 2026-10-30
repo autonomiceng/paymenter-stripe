@@ -70,7 +70,7 @@ trait CardDuplicates
     {
         if (!$incoming || !$incoming->services()->lockForUpdate()->first()) return false;
         Log::info('AeStripe duplicate card kept: agreement is bound to a service', ['agreement_id' => $incoming->id]);
-        if ($report) $report('Agreement #' . $incoming->id . ' retained: duplicate is bound to a service.');
+        if ($report) $report('Saved card #' . $incoming->id . ' kept: the duplicate is linked to a service.');
         return true;
     }
 
@@ -99,7 +99,7 @@ trait CardDuplicates
             $this->finishDuplicate($fresh, $kept, $remote, $consented);
             if ($incoming && !$incoming->trashed()) {
                 $incoming->delete();
-                if ($report) $report('Removed duplicate agreement #' . $incoming->id . '.');
+                if ($report) $report('Removed duplicate saved card #' . $incoming->id . '.');
             }
             return true;
         });
@@ -131,7 +131,7 @@ trait CardDuplicates
                     $duplicate = $this->duplicateCard($user, $method, $gateway, $incoming, report: $report);
                     if (!$duplicate) return null;
                     [$kept, $remote] = $duplicate;
-                    $report('Agreement #' . $incoming->id . ' duplicates #' . $kept->id . ' (customer #' . $user->id . ').');
+                    $report('Saved card #' . $incoming->id . ' duplicates #' . $kept->id . ' (customer #' . $user->id . ').');
                     if (!$apply) return null;
                     $this->rememberDuplicate($user, $method, $kept);
                     return [$user, $method];
@@ -142,7 +142,7 @@ trait CardDuplicates
             } catch (\Throwable $e) {
                 ++$skipped;
                 Log::warning('ae_stripe_deduplicate_agreement_skipped', ['agreement_id' => $row->id, 'error' => get_class($e)]);
-                $report('Agreement #' . $row->id . ' skipped. Review it manually.');
+                $report('Saved card #' . $row->id . ' skipped. Review it manually.');
             }
         }
         return $skipped;

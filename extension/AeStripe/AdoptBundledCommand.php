@@ -12,7 +12,7 @@ final class AdoptBundledCommand extends Command
 {
     protected $signature = 'ae-stripe:adopt-bundled {--apply} {--plan=} {--confirm-paused}
         {--source-gateway=} {--rollback=} {--redisplay=} {--confirm-setup-consent}';
-    protected $description = 'Review, adopt or restore bundled Stripe agreements; default is dry run';
+    protected $description = 'Review, import or restore saved cards from bundled Stripe; default is dry run';
 
     public function handle(): int
     {
@@ -61,7 +61,7 @@ final class AdoptBundledCommand extends Command
             Log::error('AE Stripe adoption failed.', ['exception' => $e::class, 'code' => 'adoption_failed']);
             // Do not render HTTP exceptions or row contents: either may contain credentials or PII.
             $safe = $e instanceof AdoptionRefusal;
-            $this->error($safe ? $e->getMessage() : 'Operation failed; keep writers paused and inspect protected manifest/database state before retrying');
+            $this->error($safe ? $e->getMessage() : 'Command failed; keep writers paused and check the manifest and database before trying again');
             return self::FAILURE;
         }
     }

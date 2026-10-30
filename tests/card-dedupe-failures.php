@@ -96,8 +96,8 @@ foreach (['read 404', 'read 503', 'retained read', 'finalize read', 'removed rec
         $command->options = ['apply' => $apply];
         check($command->handle() === 1, "Cleanup reports failure after isolating $case");
         $output = implode(' ', $command->output);
-        check(str_contains($output, 'Agreement #21 skipped. Review it manually.')
-            && str_contains($output, '1 agreement(s) skipped.'), 'Cleanup identifies the skipped row and total');
+        check(str_contains($output, 'Saved card #21 skipped. Review it manually.')
+            && str_contains($output, '1 saved card(s) skipped.'), 'Cleanup identifies the skipped row and total');
         check(str_contains($output, '#20 duplicates #19') && str_contains($output, '#22 duplicates #19'),
             'Cleanup processes healthy rows before and after the failing row');
         check(serialize(ExtensionHelper::$agreements['pm_failed']) === $failedBefore,
@@ -128,12 +128,12 @@ $failedBefore = ExtensionHelper::$agreements['pm_failed'];
 $lines = [];
 $skipped = $gateway->deduplicateCards(true, function ($line) use (&$lines) {
     $lines[] = $line;
-    if ($line === 'Removed duplicate agreement #21.') throw new RuntimeException('Synthetic report failure');
+    if ($line === 'Removed duplicate saved card #21.') throw new RuntimeException('Synthetic report failure');
 });
 check($skipped === 1 && ExtensionHelper::$agreements['pm_failed'] === $failedBefore,
     'An exception after local removal rolls back the entire agreement transaction');
 check(ExtensionHelper::$agreements['pm_after']['deleted_at'] !== null
-    && in_array('Agreement #21 skipped. Review it manually.', $lines), 'Cleanup continues after a transaction rollback');
+    && in_array('Saved card #21 skipped. Review it manually.', $lines), 'Cleanup continues after a transaction rollback');
 check(isset($user->props->values['ae_stripe_duplicate_pm_failed']) && $gateway->deduplicateCards(true, fn ($line) => null) === 0
     && ExtensionHelper::$agreements['pm_failed']['deleted_at'] !== null,
     'The committed receipt lets a skipped detached card finish safely on retry');
@@ -142,7 +142,7 @@ ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_failed' => $
 Http::$handler = fn () => throw new RequestException(503);
 Gateway::$rows = ['AeStripe' => [new \App\Models\Extension(['id' => 2, 'settings' => ['stripe_secret_key' => 'fake-secret']])]];
 $command = new DeduplicateCardsCommand;
-check($command->handle() === 1 && in_array('2 agreement(s) skipped. Review them manually.', $command->output),
+check($command->handle() === 1 && in_array('2 saved card(s) skipped. Review them manually.', $command->output),
     'Cleanup reports the total when more than one agreement is skipped');
 Gateway::$rows = null;
 

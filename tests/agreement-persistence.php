@@ -112,7 +112,7 @@ if ($scenario === 'all') {
         ExtensionHelper::$agreements = [$agreementMethod->id => $conflict];
         $before = count(Http::$calls);
         $result = $entries['redirect']();
-        check($result['type'] === 'danger' && str_contains($result['message'], $field === 'deleted_at' ? 'removed' : 'another account or gateway'),
+        check($result['type'] === 'danger' && str_contains($result['message'], $field === 'deleted_at' ? 'removed' : "can't be used on this account"),
             "Redirect renders a clear refusal for $field");
         foreach (['setup webhook', 'payment webhook'] as $entry) {
             $warnings = count(Log::$warnings);

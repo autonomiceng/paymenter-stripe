@@ -87,7 +87,7 @@ check(!$recordsConsentBeforeConfirmation(str_replace($confirmSetupCall, '', $set
     'Setup order check rejects missing confirmation');
 check(!$recordsConsentBeforeConfirmation(strtr($setupView, [$recordConsentCall => $confirmSetupCall, $confirmSetupCall => $recordConsentCall])),
     'Setup order check rejects confirmation before consent recording');
-$consentFailureGuard = "if (!result.ok) throw new Error('Could not record your agreement. Try again.');";
+$consentFailureGuard = "if (!result.ok) {\n                            showMessage('Could not record your agreement. Try again.');\n                            return;\n                        }";
 $guardsConsentBeforeConfirmation = static function ($view) use ($recordConsentCall, $consentFailureGuard, $confirmSetupCall) {
     $consentPosition = strpos($view, $recordConsentCall);
     $guardPosition = strpos($view, $consentFailureGuard);

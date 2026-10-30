@@ -25,7 +25,7 @@ final class AdoptionStore
             if ($directory === $existing) break;
         }
         $this->lock = fopen($this->directory . '/command.lock', 'c');
-        if (!$this->lock || !flock($this->lock, LOCK_EX | LOCK_NB)) throw new AdoptionRefusal('Another adoption command is running');
+        if (!$this->lock || !flock($this->lock, LOCK_EX | LOCK_NB)) throw new AdoptionRefusal('Another import command is running');
         chmod($this->directory . '/command.lock', 0600);
     }
 

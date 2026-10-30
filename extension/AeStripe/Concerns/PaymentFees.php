@@ -203,8 +203,8 @@ trait PaymentFees
         foreach (User::whereNotNull('role_id')->get() as $staff) {
             Notification::create([
                 'user_id' => $staff->id, 'title' => 'Stripe payment fee needs review',
-                'body' => 'Fee unavailable for invoice ' . $row->invoice_id . ', PaymentIntent ' . $row->payment_intent_id
-                    . '. Review the invoice Audit Log and the balance transaction in Stripe.',
+                'body' => 'Stripe fee missing for invoice ' . $row->invoice_id . ', PaymentIntent ' . $row->payment_intent_id
+                    . '. Check the invoice Audit Log and the balance transaction in Stripe.',
             ]);
         }
         $this->feeRows()->where('payment_intent_id', $row->payment_intent_id)->update(['state' => 'review', 'last_error' => $row->last_error]);
