@@ -85,7 +85,10 @@ trait SubscriptionPayments
             $service = Service::where('subscription_id', $subscriptionId)->lockForUpdate()->first();
             if ($service) abort_unless($service->user_id === $ownerId, 409);
             if (!$service) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
-            if (InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first()) return;
+            if ($settled = InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first()) {
+                $this->schedulePaymentReviewAlert($settled->invoice, $paymentId);
+                return;
+            }
             $invoiceId = $stripeInvoice->metadata->ae_stripe_invoice_id ?? null;
             $invoice = $invoiceId ? $service->invoiceItems()->where('invoice_id', $invoiceId)->first()?->invoice : null;
             if (!$invoice) {
@@ -99,12 +102,12 @@ trait SubscriptionPayments
             $intent->metadata = (object) ['invoice_id' => $invoice->id];
             if (!in_array($invoice->status, ['pending', 'paid'], true)) {
                 Log::warning('AeStripe subscription invoice needs reconciliation', ['service_id' => $service->id]);
-                $this->recordRefusedPayment($invoice, $intent, 'invoice not pending');
+                $this->recordPaymentReview($invoice, $intent, 'invoice not pending');
                 return;
             }
             if (strtolower($invoice->currency_code) !== strtolower($stripeInvoice->currency ?? '')) {
                 Log::warning('AeStripe subscription payment currency mismatch', ['service_id' => $service->id]);
-                $this->recordRefusedPayment($invoice, $intent, 'currency mismatch');
+                $this->recordPaymentReview($invoice, $intent, 'currency mismatch');
                 return;
             }
             // Use the same locked transaction path as PaymentIntent events, so either delivery order is safe.

@@ -1,12 +1,13 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 use App\Helpers\ExtensionHelper;
-use App\Models\Gateway;
+use App\Models\{Gateway, Invoice};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Support\Facades\{Http, Log};
 
 Gateway::$enabled = true;
 $oldHandler = Http::$handler;
+$originalInvoice = $invoice; $invoice = clone $invoice; $invoice->id = 916; Invoice::$rows[916] = $invoice;
 $oldProps = $user->props->values;
 $user->props->values = [];
 Http::$handler = function ($verb, $path) {
@@ -17,7 +18,7 @@ $before = count(Http::$calls);
 rejects(fn () => $gateway->pay($invoice, 20), 'Could not prepare your payment. Try again.');
 check(count(array_filter(array_slice(Http::$calls, $before), fn ($call) => $call[1] === '/payment_intents')) === 0,
     'Customer failure never creates an anonymous intent');
-check(end(Log::$warnings) === ['AeStripe customer setup failed', ['invoice_id' => 12, 'error' => RequestException::class]],
+check(end(Log::$warnings) === ['AeStripe customer setup failed', ['invoice_id' => 916, 'error' => RequestException::class]],
     'Customer failure logs the invoice and error class only');
 Http::$handler = function ($verb, $path) {
     if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
@@ -28,7 +29,7 @@ Http::$handler = function ($verb, $path) {
 $view = $gateway->pay($invoice, 20);
 check($view['data']['customerSessionSecret'] === null && $view['data']['intent']->id === 'pi_session',
     'Session request failure still renders a customer-bound intent for a new method');
-check(end(Log::$warnings) === ['AeStripe customer session unavailable', ['invoice_id' => 12, 'http_status' => 503]],
+check(end(Log::$warnings) === ['AeStripe customer session unavailable', ['invoice_id' => 916, 'http_status' => 503]],
     'Session failure logs no request payload or secrets');
 $user->props->values = [];
 Http::$handler = function ($verb, $path) {
@@ -43,7 +44,7 @@ check($view['data']['customerSessionSecret'] === null && $view['data']['intent']
     'Customer Session connection failure still renders checkout');
 check(($view['data']['intent']->client_secret ?? null) === 'pi_connection_secret',
     'Customer Session connection failure passes the PaymentIntent client secret to checkout unchanged');
-check(end(Log::$warnings) === ['AeStripe customer session unavailable', ['invoice_id' => 12, 'http_status' => null]],
+check(end(Log::$warnings) === ['AeStripe customer session unavailable', ['invoice_id' => 916, 'http_status' => null]],
     'Connection failure logs invoice and absent status without exception payload');
 $user->props->values = [];
 Http::$handler = function ($verb, $path) {
@@ -53,6 +54,7 @@ Http::$handler = function ($verb, $path) {
 };
 rejects(fn () => $gateway->pay($invoice, 20), 'Unexpected programming failure');
 $user->props->values = $oldProps;
+unset(Invoice::$rows[916]); $invoice = $originalInvoice;
 
 $paid = (object) ['id' => 'pi_save_retry', 'amount' => 2000, 'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner',
     'payment_method' => 'pm_retry', 'payment_method_options' => (object) ['link' => (object) ['setup_future_usage' => 'off_session']],

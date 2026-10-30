@@ -102,7 +102,9 @@ if ($scenario === 'all') {
     $gateway->setupConsent(new Request(['intent' => $agreementSetup->id, 'consent' => true]));
     $agreementPaid->status = 'requires_payment_method';
     $user->props->values = [];
-    $gateway->pay($invoice, 20);
+    $checkoutInvoice = clone $invoice; $checkoutInvoice->id = 915; Invoice::$rows[915] = $checkoutInvoice;
+    $gateway->pay($checkoutInvoice, 20);
+    unset(Invoice::$rows[915]);
     $gateway->webhook(eventRequest($agreementMethod, type: 'payment_method.attached'));
     check(ExtensionHelper::$agreements === $unchanged,
         'Creating setup, consenting, rendering pay and ignored payment_method.attached do not persist agreements');

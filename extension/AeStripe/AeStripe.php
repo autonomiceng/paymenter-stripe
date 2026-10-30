@@ -40,7 +40,6 @@ use Paymenter\Extensions\Gateways\AeStripe\Concerns\SubscriptionPayments;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\Webhooks;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\StripeMetadata;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\TransactionMethod;
-use Str;
 
 require_once __DIR__ . '/GatewayLifecycle.php';
 require_once __DIR__ . '/Concerns/StripeMetadata.php';
@@ -772,38 +771,28 @@ class AeStripe extends Gateway
 
     public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement)
     {
-        $user = $invoice->user;
-        $stripeCustomerId = $user->properties->where('key', 'stripe_id')->first();
-        // Create customer if not exists
-        if (!$stripeCustomerId) {
+        abort_unless($this->gatewayEnabled(), 409);
+        $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
+        if (!$customer) {
             throw new DisplayException('Could not find your saved payment details. Add a new payment method.');
-        } else {
-            $customer = $this->request('get', '/customers/' . $stripeCustomerId->value);
         }
-
-        // Create payment intent
-        try {
-            $intent = $this->request('post', '/payment_intents', [
-                'amount' => $this->toMinorUnits($amount, $invoice->currency_code),
-                'currency' => $invoice->currency_code,
-                'customer' => $customer->id,
-                'payment_method' => $billingAgreement->external_reference,
-                'off_session' => 'true',
-                'confirm' => 'true',
-                'metadata' => ['invoice_id' => $invoice->id, 'billing_agreement_id' => $billingAgreement->id, 'ae_stripe_gateway' => '1'],
-            ]);
-        } catch (Exception $e) {
-            if ($e instanceof RequestException && $e->response->status() === 400) {
-                $error = $e->response->object()->error;
-                // If error is invalid_request_error and message contains "The provided currency" we can show the message
-                if ($error->type === 'invalid_request_error' && Str::contains($error->message, 'The currency provided')) {
-                    throw new DisplayException('This card can\'t be charged in ' . $invoice->currency_code . '. Use another payment method.');
-                }
-            }
-            throw new DisplayException('Could not process your payment. Try again or use another payment method.');
+        $intent = $this->checkoutIntent($invoice, [
+            'amount' => $this->toMinorUnits($amount, $invoice->currency_code),
+            'currency' => $invoice->currency_code,
+            'customer' => $customer,
+            'payment_method' => $billingAgreement->external_reference,
+            'off_session' => 'true', 'confirm' => 'true',
+            'metadata' => ['invoice_id' => $invoice->id, 'billing_agreement_id' => $billingAgreement->id, 'ae_stripe_gateway' => '1'],
+        ]);
+        if ($intent->status === 'succeeded') {
+            $this->recordIntentPayment($intent, 'succeeded');
+            if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) return true;
+            $this->paymentReconcileMessage('Stripe received the payment, but it could not be applied to this invoice.');
         }
-
-        return true;
+        if ($intent->status === 'processing' || $intent->status === 'requires_capture') {
+            throw new DisplayException('Payment pending. Refresh the invoice to check its status.');
+        }
+        throw new DisplayException('Open Stripe checkout to finish this payment. It will use the same payment.');
     }
 
 }

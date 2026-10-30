@@ -7,31 +7,36 @@ use Illuminate\Support\Facades\{DB, Event, Http, Log};
 Gateway::$enabled = true;
 $oldHandler = Http::$handler;
 $user->props->values = [];
+$checkoutIntent = clone $intent; $checkoutIntent->amount = 29;
 $posts = 0;
 $lost = true;
-Http::$handler = function ($verb, $path, $data) use (&$posts, &$lost, $intent) {
+Http::$handler = function ($verb, $path, $data) use (&$posts, &$lost, $checkoutIntent) {
     if ($path === '/payment_intents' && $verb === 'post') {
         ++$posts;
         if ($lost) { $lost = false; throw new RuntimeException('Lost response'); }
-        return $intent;
+        return $checkoutIntent;
     }
-    if ($path === '/payment_intents/pi_test') return $intent;
+    if ($path === '/payment_intents/pi_test') return $checkoutIntent;
     throw new RuntimeException('Unexpected intent request');
 };
+$checkoutInvoice = clone $invoice; $checkoutInvoice->id = 919; $checkoutInvoice->total = 0.29; Invoice::$rows[919] = $checkoutInvoice;
 $data = ['amount' => 29, 'currency' => 'usd', 'customer' => 'cus_owner'];
-rejects(fn () => invoke($gateway, 'checkoutIntent', $invoice, $data), 'Lost response');
+rejects(fn () => invoke($gateway, 'checkoutIntent', $checkoutInvoice, $data), 'Lost response');
 $key = end(Http::$calls)[3]['Idempotency-Key'];
-invoke($gateway, 'checkoutIntent', $invoice, $data);
+invoke($gateway, 'checkoutIntent', $checkoutInvoice, $data);
 check(end(Http::$calls)[3]['Idempotency-Key'] === $key, 'Lost response retries persisted checkout key');
-$intent->status = 'requires_payment_method';
-invoke($gateway, 'checkoutIntent', $invoice, $data);
+$checkoutIntent->status = 'requires_payment_method';
+invoke($gateway, 'checkoutIntent', $checkoutInvoice, $data);
 check($posts === 2 && end(Http::$calls)[0] === 'get', 'Later render retrieves the same intent');
-rejects(fn () => invoke($gateway, 'checkoutIntent', $invoice, ['amount' => 30]), 'HTTP 409');
-$stored = json_decode($user->props->values['ae_stripe_checkout_12'], true);
+invoke($gateway, 'checkoutIntent', $checkoutInvoice, ['amount' => 30]);
+check($posts === 2, 'Stale caller amount cannot create a different intent');
+$stored = json_decode($user->props->values['ae_stripe_checkout_919'], true);
 unset($stored['intent']);
 $stored['created'] = time() - 86400;
-$user->props->values['ae_stripe_checkout_12'] = json_encode($stored);
-rejects(fn () => invoke($gateway, 'checkoutIntent', $invoice, $data), 'HTTP 409');
+$user->props->values['ae_stripe_checkout_919'] = json_encode($stored);
+paymentStops(fn () => invoke($gateway, 'checkoutIntent', $checkoutInvoice, $data));
+
+unset(Invoice::$rows[919]);
 
 $service = Service::$row = new Service;
 $service->subscription_id = null;

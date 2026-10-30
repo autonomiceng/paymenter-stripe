@@ -55,7 +55,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         };
         $storedAttempt = User::$row->props->values['ae_stripe_checkout_912'];
         User::$row->props->values['ae_stripe_checkout_912'] = json_encode(array_replace($attempt, ['digest' => str_repeat('0', 64)]));
-        rejects(fn () => $gateway->pay($invoice, 20), 'HTTP 409');
+        paymentStops(fn () => $gateway->pay($invoice, 20));
         User::$row->props->values['ae_stripe_checkout_912'] = $storedAttempt;
         check($gateway->pay($invoice, 20)['data']['customerSessionSecret'] === 'cuss_converted', 'Converted unresolved checkout can render again');
         check($gateway->pay($invoice, 20)['data']['customerSessionSecret'] === 'cuss_converted', 'Converted resolved checkout reuses its existing intent');

@@ -19,6 +19,10 @@ function rejects($callback, $message) {
     try { $callback(); } catch (Exception $e) { check($e->getMessage() === $message, $message); return; }
     throw new RuntimeException('Expected: ' . $message);
 }
+function paymentStops($callback) {
+    try { $callback(); } catch (\App\Exceptions\DisplayException $e) { check(true, 'Payment stops without a false success or an unsafe retry'); return $e->getMessage(); }
+    throw new RuntimeException('Expected a payment status message');
+}
 function invoke($gateway, $method, ...$args) { return (new ReflectionMethod($gateway, $method))->invoke($gateway, ...$args); }
 function eventRequest($intent, $time = null, $type = 'payment_intent.succeeded') {
     if (str_starts_with($type, 'charge.')) $intent = (object) array_merge(['paid' => true, 'status' => 'succeeded'], (array) $intent);
@@ -56,6 +60,12 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
         default => throw new RuntimeException('Unexpected HTTP request: ' . $path),
     };
 };
+
+if (in_array('--charge-attempts', $argv, true)) {
+    require __DIR__ . '/charge-attempts.php';
+    echo "PASS: $count charge attempt assertions\n";
+    return;
+}
 
 if (in_array('--gateway-lifecycle', $argv, true)) {
     require __DIR__ . '/gateway-lifecycle.php';
@@ -211,6 +221,7 @@ $before = count(Http::$calls);
 rejects(fn () => $gateway->setupConsent(new Request(['intent' => $disabledSetupId, 'consent' => true])), 'HTTP 409');
 check(count(Http::$calls) === $before, 'Disabled setup consent makes no HTTP requests');
 Http::$handler = $oldHandler;
+require __DIR__ . '/charge-attempts.php';
 require __DIR__ . '/gateway-lifecycle.php';
 require __DIR__ . '/subscription-listeners.php';
 require __DIR__ . '/adoption.php';

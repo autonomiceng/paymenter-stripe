@@ -68,14 +68,25 @@ deletion conflicts. Request and database failures remain retryable. Offline test
 cover stale snapshots and insert conflicts with fakes; real MariaDB concurrency
 still needs the sandbox checks below.
 
-Checkout renders persist a retry key and PaymentIntent ID in native user properties
-before and after creation. Reopening retrieves the same unfinished intent. A changed
-invoice payload, finished/cancelled intent, or unresolved creation older than 23 hours
-returns 409; reconcile the stored `ae_stripe_checkout_<invoice-id>` property
-against Stripe before clearing it for a new attempt. Never clear an unresolved or
-settled payment to retry. Reconcile `ae_stripe_subscription_<service-id>`
-in the same way before removing an unresolved schedule attempt. This intentionally requires operator reconciliation rather
-than creating a second charge after Stripe's idempotency retention window. Fakes do not
+Saved-card Pay, checkout and cron share `ae_stripe_checkout_<invoice-id>` in native
+user properties. The customer and invoice locks protect a fresh unpaid balance and
+one committed request, retry key and intent ID. A lost response replays that exact
+request and key, including across date changes. Known intents are retrieved;
+processing shows pending, and HTTP 402 authentication resumes the same intent in
+Stripe checkout. Only confirmed success returns true to Paymenter.
+
+Only a Stripe-confirmed cancellation allows a new attempt. A changed invoice first
+cancels its known unfinished intent. Received funds prevent automatic cancellation
+or replacement. Unknown creations older than 23 hours stay in
+`reconcile`, with one `ae_stripe_attempt_review` entry in the invoice Audit Log.
+Contact support because Stripe could not confirm whether the payment charged.
+Staff must establish the outcome in Stripe before repairing the property; an empty
+invoice-metadata search is not proof that nothing charged. Never clear an unknown or
+settled attempt to retry. Reconcile `ae_stripe_subscription_<service-id>` in the same way before
+removing an unresolved schedule attempt. Upgrades need no schema change: existing
+checkout records keep their key and intent ID. Digest-only records gain immutable
+parameters only when the original AE Stripe or converted StripeSaved request can
+be reconstructed exactly; otherwise they stay held for review. Fakes do not
 prove real database isolation, native uploader/route behavior or Stripe.js/API
 compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
 
@@ -108,23 +119,15 @@ and clears top-level future usage left by earlier versions. Saving requires
 consent metadata and `off_session` for the actual method type. Bank debits are not saved by this checkout opt-in.
 Verify both method-specific options against pinned Basil before release.
 
-A successful checkout or bound subscription charge on an already paid invoice is recorded as another
-native successful transaction. The invoice stays paid. Paymenter 1.5.9 keeps the
-extra amount in the invoice transactions; it does not automatically create credit.
-Staff should review the transaction ID in Stripe and either refund the extra
-charge there or add the agreed credit under the user's **Credits** page in
-Paymenter. No refund or credit is created automatically.
-
-A successful charge refused for a customer or currency mismatch, or a subscription
-charge on a cancelled invoice, is not applied to the invoice. A record in Paymenter's native invoice **Audit Log** retains the
-PaymentIntent ID, invoice ID, received amount in Stripe minor units, currency and
-reason. Open the invoice's **Audit Log** action, or **System > Audits**, to read
-the `ae_stripe_payment_review` entry and reconcile the charge in Stripe before
-refunding or crediting the correct customer. These records use the native audit
-table, with no retention limit in Paymenter 1.5.9's default audit configuration.
-Retries reuse the same record. Failure to store it leaves the webhook retryable.
-These records contain no customer details or client secrets. Verify the native
-page and concurrent delivery behavior in the sandbox.
+A successful checkout or bound subscription charge on an already paid invoice is
+recorded as another successful transaction. The invoice stays paid; Paymenter does
+not automatically create account credit. Refused successes and extra paid-invoice
+charges retain one `ae_stripe_payment_review` invoice Audit Log entry and one staff
+inbox alert per payment. Alerts run after the settlement commits; a durable pending
+marker retries a failed alert on the next delivery without duplicating it. Check
+Stripe and choose a refund or account credit; this needs a staff decision. No money
+moves automatically. The audit identifies the intent, received amount, currency
+and reason without customer details or client secrets.
 
 Successful transactions and review records use the PaymentIntent's `amount_received`,
 in its original currency. Subscription settlement retrieves the PaymentIntent before
