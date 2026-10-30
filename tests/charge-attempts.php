@@ -50,6 +50,7 @@ use Illuminate\Support\Facades\{DB, Http};
                 $intent = $this->intents[$match[1]] ?? throw new RequestException(404);
                 if ($verb === 'get') return clone $intent;
                 if (($match[2] ?? '') === '/confirm') {
+                    if (!in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) throw new RequestException(400, ['error' => ['code' => 'payment_intent_unexpected_state']]);
                     if ($this->beforeConfirm) ($this->beforeConfirm)($intent, $data);
                     $this->confirms[] = [$key, $data, $intent->amount];
                     $this->settle($intent, $data);
@@ -57,8 +58,12 @@ use Illuminate\Support\Facades\{DB, Http};
                     if ($this->loseConfirm) { $this->loseConfirm = false; throw new ConnectionException('Lost confirm'); }
                     return clone $intent;
                 }
-                if (($match[2] ?? '') === '/cancel') $intent->status = 'canceled';
+                if (($match[2] ?? '') === '/cancel') {
+                    if (!in_array($intent->status, ['requires_payment_method', 'requires_confirmation', 'requires_action', 'requires_capture'], true)) throw new RequestException(400);
+                    $intent->status = 'canceled';
+                }
                 else foreach ($data as $field => $value) {
+                    if ($field === 'amount' && $intent->currency === 'usd' && $value < 50) throw new RequestException(400, ['error' => ['code' => 'amount_too_small']]);
                     if ($field === 'metadata') $intent->metadata = (object) array_replace((array) $intent->metadata, $value);
                     else $intent->$field = is_array($value) ? json_decode(json_encode($value)) : $value;
                 }
@@ -74,6 +79,156 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        $run('no-redebit', function ($invoice, $stripe) use ($gateway) {
+            $stripe->status = 'processing';
+            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $intent = $stripe->intents['pi_test1']; $intent->status = 'requires_payment_method';
+            $intent->last_payment_error = (object) ['code' => 'payment_method_provider_decline'];
+            $gateway->webhook(eventRequest($intent, type: 'payment_intent.payment_failed'));
+            $stripe->status = 'succeeded';
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            check(count($stripe->confirms) === 1 && !$stripe->charges, 'A failed saved debit is never retried by recovery after its failure webhook');
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(empty($attempt['agreement_id']) && empty($attempt['confirmation']), 'A definite debit result removes automatic charge instructions');
+            check($gateway->charge($invoice, 20, new BillingAgreement) === true, 'A customer can explicitly pay after a failed debit');
+        });
+        $run('old-redebit', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $intent = $stripe->intents['pi_test1']; $intent->status = 'requires_payment_method';
+            $intent->last_payment_error = (object) ['code' => 'card_declined'];
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            $attempt['agreement_id'] = 4; $attempt['retry'] = true;
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            check(!$stripe->confirms, 'An older failed saved-card record cannot trigger recovery confirmation');
+        });
+        $run('missing-release', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $stripe->failure = fn ($verb, $path) => $verb === 'get' && $path === '/payment_intents/pi_test1' ? throw new RequestException(404) : null;
+            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $gateway->resolveChargeAttempt($invoice, null, 'Original Stripe account support case confirms no charge');
+            check(!isset(User::$row->props->values['ae_stripe_checkout_920']), 'A permanently missing ID has an audited no-charge release');
+            check(end(Audit::$rows)['new_values']['payment_intent_id'] === 'pi_test1', 'Missing-ID release audits the original identity');
+        });
+        $run('missing-release-money', function ($invoice, $stripe) use ($gateway) {
+            $stripe->status = 'processing'; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $stripe->failure = fn ($verb, $path) => $verb === 'get' && $path === '/payment_intents/pi_test1' ? throw new RequestException(404) : null;
+            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            rejects(fn () => $gateway->resolveChargeAttempt($invoice, null, 'Support case in the original account says no charge'),
+                'This payment may still hold money. Restore access to its Stripe account and account for the funds first.');
+            check(isset(User::$row->props->values['ae_stripe_checkout_920']), 'A missing ID cannot release an observed debit that may still hold money');
+        });
+        $run('refusal-read-outage', function ($invoice, $stripe) use ($gateway) {
+            $refused = false;
+            $stripe->failure = function ($verb, $path) use (&$refused) {
+                if (str_ends_with($path, '/confirm')) { $refused = true; throw new RequestException(400); }
+                if ($refused && $verb === 'get') throw new ConnectionException('Cannot check actual outcome');
+            };
+            $GLOBALS['fakeConsole'] = true;
+            check($gateway->charge($invoice, 20, new BillingAgreement) === true, 'A refusal whose status read fails stays pending in cron');
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check($attempt['retry'] && !empty($attempt['agreement_id']) && !ExtensionHelper::$payments, 'An unknown post-refusal read retains recovery and cannot record failure');
+        });
+        $run('recovery-decline-body', function ($invoice, $stripe) use ($gateway) {
+            $stripe->beforeConfirm = fn () => throw new ConnectionException('Confirm not sent');
+            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)); $stripe->beforeConfirm = null;
+            $stripe->failure = function ($verb, $path) use ($stripe) {
+                if (str_ends_with($path, '/confirm')) {
+                    $intent = $stripe->intents['pi_test1']; $intent->last_payment_error = (object) ['code' => 'card_declined'];
+                    throw new RequestException(402, ['error' => ['payment_intent' => json_decode(json_encode($intent), true)]]);
+                }
+            };
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            check(count(Notification::$rows) === 1 && str_contains(Notification::$rows[0]['body'], 'declined')
+                && ExtensionHelper::$payments['920:pi_test1']['status'] === 'failed' && !$stripe->confirms,
+                'A recovery decline with a Stripe intent body records failure and tells the customer without another debit');
+        });
+        $run('intent-swap', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); $intent = $stripe->intents['pi_test1']; $intent->amount_received = 500;
+            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $other = clone $intent; $other->id = 'pi_other'; $other->amount_received = 0; $other->status = 'canceled'; $stripe->intents['pi_other'] = $other;
+            try { $gateway->resolveChargeAttempt($invoice, 'pi_other'); }
+            catch (\App\Exceptions\DisplayException $e) { check(str_contains($e->getMessage(), 'held payment'), 'Staff cannot hide held money by swapping identities'); return; }
+            check(false, 'Staff cannot replace a held payment with an unrelated canceled intent');
+        });
+        $run('minimum', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); $invoice->total = 0.25;
+            $stripe->failure = function ($verb, $path) { if ($verb === 'post' && $path === '/payment_intents/pi_test1') throw new RequestException(400, ['error' => ['code' => 'amount_too_small']]); };
+            $message = paymentStops(fn () => $gateway->charge($invoice, 0.25, new BillingAgreement));
+            check(str_contains($message, 'minimum') && str_contains($message, 'support') && !str_contains($message, 'unavailable'), 'A below-minimum balance has a real reason and next step');
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(empty($attempt['retry']) && empty($attempt['agreement_id']), 'A permanent amount refusal cannot loop through recovery');
+        });
+        $run('changed-customer', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); User::$row->props->customer = 'cus_new';
+            $handler = Http::$handler;
+            Http::$handler = fn ($verb, $path, $data) => $path === '/customers/cus_new' ? ['id' => 'cus_new'] : $handler($verb, $path, $data);
+            $view = $gateway->pay($invoice, 20);
+            check($view['data']['intent']->customer === 'cus_new' && $stripe->intents['pi_test1']->status === 'canceled', 'An untouched intent follows a changed Stripe customer automatically');
+            check(!$stripe->charges && count($stripe->intents) === 2, 'Customer repair cancels before replacement and takes no money');
+        });
+        $run('recovery-decline', function ($invoice, $stripe) use ($gateway) {
+            $stripe->beforeConfirm = fn () => throw new ConnectionException('Confirm not sent');
+            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)); $stripe->beforeConfirm = null;
+            $stripe->failure = function ($verb, $path) { if (str_ends_with($path, '/confirm')) throw new RequestException(402, ['error' => ['code' => 'card_declined']]); };
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            $customer = array_filter(Notification::$rows, fn ($notice) => $notice['user_id'] == $invoice->user_id);
+            check(count($customer) === 1 && str_contains(reset($customer)['body'], 'declined'), 'Recovery decline tells the customer the reason once');
+            check(count(Notification::$rows) === 1, 'A card decline gives staff no task');
+            check((ExtensionHelper::$payments['920:pi_test1']['status'] ?? null) === 'failed', 'Recovery records a definite decline for the native failed-payment notice');
+            $stripe->failure = null;
+            check($gateway->charge($invoice, 20, new BillingAgreement) === true, 'Recovery decline leaves the invoice payable');
+        });
+        $run('confirm-processing-refusal', function ($invoice, $stripe) use ($gateway) {
+            $stripe->failure = function ($verb, $path) use ($stripe) {
+                if (str_ends_with($path, '/confirm')) { $stripe->intents['pi_test1']->status = 'processing'; throw new RequestException(400, ['error' => ['code' => 'payment_intent_unexpected_state']]); }
+            };
+            check(str_contains(paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)), 'pending'), 'A confirm refusal re-reads Stripe and shows its processing status');
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check($attempt['retry'] && empty($attempt['agreement_id']), 'Processing after confirm refusal remains polled without re-debit instructions');
+        });
+        $run('confirm-processing-402', function ($invoice, $stripe) use ($gateway) {
+            $stripe->failure = function ($verb, $path) use ($stripe) {
+                if (str_ends_with($path, '/confirm')) {
+                    $stale = clone $stripe->intents['pi_test1']; $stale->last_payment_error = (object) ['code' => 'card_declined'];
+                    $stripe->intents['pi_test1']->status = 'processing';
+                    throw new RequestException(402, ['error' => ['payment_intent' => json_decode(json_encode($stale), true)]]);
+                }
+            };
+            check(str_contains(paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)), 'pending') && !ExtensionHelper::$payments,
+                'A stale 402 body cannot override a fresh processing status or send a failure notice');
+        });
+        $run('adopted-no-redebit', function ($invoice, $stripe) use ($gateway) {
+            $stripe->intents['pi_old'] = (object) ['id' => 'pi_old', 'status' => 'processing', 'customer' => 'cus_owner', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 0, 'metadata' => (object) ['invoice_id' => 920]];
+            ExtensionHelper::$payments['920:pi_old'] = ['status' => 'processing', 'amount' => 20, 'gateway' => 'AeStripe'];
+            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $stripe->intents['pi_old']->status = 'requires_payment_method';
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            check(!$stripe->confirms && !$stripe->charges, 'An adopted old debit that fails without a webhook is never debited again by recovery');
+        });
+        $run('return-outage', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); $stripe->failure = fn () => throw new ConnectionException('Outage');
+            $result = $gateway->finishPayment(new Request(['payment_intent' => 'pi_test1', 'invoice' => 920]));
+            check($result['name'] === 'gateways.ae-stripe::payment-return' && str_contains($result['data']['message'], 'check'), 'A return-page outage shows a message and a link back to the invoice');
+        });
+        $run('bounded-http', function ($invoice, $stripe) use ($gateway) {
+            $gateway->charge($invoice, 20, new BillingAgreement);
+            check(end(Http::$calls)[4] === 5, 'Stripe calls have a short explicit timeout while locks are held');
+        });
+        $run('lock-timeout', function ($invoice, $stripe) use ($gateway) {
+            $GLOBALS['fakeConsole'] = true;
+            DB::$beforeUserLock = fn () => throw new \Illuminate\Database\QueryException('Lock wait timeout', 1205);
+            check($gateway->charge($invoice, 20, new BillingAgreement) === true && !$stripe->charges, 'Cron lock contention cannot send a false payment-failed email');
+        });
+        $run('customer-words', function ($invoice, $stripe) use ($gateway) {
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode(['key' => 'legacy', 'created' => time() - 90000, 'params' => ['confirm' => 'true']]);
+            $message = paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            check(!str_contains($message, 'request log') && !str_contains($message, 'releasing') && str_contains($message, 'support'), 'Customers never receive staff reconciliation instructions');
+        });
+        $run('documented-elements', function () {
+            $source = file_get_contents(__DIR__ . '/../extension/AeStripe/resources/views/pay.blade.php');
+            check(str_contains($source, "mode: 'payment'") && str_contains($source, 'amount: @js($intent->amount)') && str_contains($source, 'currency: @js(strtolower($intent->currency))') && !str_contains($source, 'clientSecret: @js($intent->client_secret)'), 'Checkout uses the documented deferred form with matching minor amount and currency');
+        });
         $run('lost-response', function ($invoice, $stripe) use ($gateway) {
             $stripe->loseConfirm = true;
             $message = paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
@@ -270,7 +425,7 @@ use Illuminate\Support\Facades\{DB, Http};
             $gateway->confirmPayment(new Request(['intent' => 'pi_test1', 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
             $stripe->intents['pi_test1']->status = 'requires_confirmation'; $invoice->total = 30;
             $gateway->pay($invoice, 30); $stripe->status = 'succeeded';
-            check(str_contains(paymentStops(fn () => $gateway->finishPayment(new Request(['payment_intent' => 'pi_test1']))), 'amount due changed')
+            check(str_contains($gateway->finishPayment(new Request(['payment_intent' => 'pi_test1']))['data']['message'], 'amount due changed')
                 && !$stripe->charges, 'A bank redirect preserves the amount authorized before authentication even if another tab updated the intent');
         });
         $run('decimal-charge', function ($invoice, $stripe) use ($gateway) {

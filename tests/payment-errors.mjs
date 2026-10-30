@@ -43,7 +43,7 @@ try {
             window.$wire = { on() {} };
             window.Alpine = { data: (_, factory) => { window.setupFactory = factory; } };
             window.Stripe = () => ({
-                elements: () => ({ update() {}, async submit() {
+                elements: (options) => { window.elementOptions = options; return { update() {}, async submit() {
                     if (failure === 'updates') return { error: { type: 'api_connection_error' } };
                     return {};
                 }, async fetchUpdates() {
@@ -52,7 +52,7 @@ try {
                 }, create() {
                     const handlers = {};
                     return { on: (name, fn) => { handlers[name] = fn; }, mount() { handlers.ready(); }, destroy() {} };
-                } }),
+                } }; },
                 async createConfirmationToken() {
                     if (failure === 'confirmation') throw new TypeError('Failed to tokenize');
                     if (failure === 'decline') return {error: {type: 'card_error', message: 'Your card was declined.'}};
@@ -71,6 +71,12 @@ try {
         if (name === 'pay') {
             await page.waitForFunction(() => !!document.querySelector('script[src]'));
             await page.evaluate(() => document.querySelector('script[src]').onload());
+            const options = await page.evaluate(() => elementOptions);
+            assert.equal(options.mode, 'payment');
+            assert.equal(options.amount, 2000);
+            assert.equal(options.currency, 'usd');
+            assert.equal(options.clientSecret, undefined);
+            assert.deepEqual(options.excludedPaymentMethodTypes, ['blik', 'acss_debit', 'customer_balance']);
         } else {
             await page.evaluate(async () => {
                 window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf' });

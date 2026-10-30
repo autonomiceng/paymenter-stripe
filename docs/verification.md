@@ -72,10 +72,16 @@ Saved-card Pay, checkout and cron share `ae_stripe_checkout_<invoice-id>` in nat
 user properties. New records have `version: 2`. Creation reserves a key and immutable
 parameters before HTTP and never confirms or supplies a card. The intent uses manual
 confirmation: its client secret cannot start a payment from an old tab. Opening checkout
-only prepares the form. Submission sends a ConfirmationToken to the authenticated,
+only prepares the form. Elements uses deferred `mode: payment` with the intent's integer amount and lowercase currency,
+plus manual payment-method creation. BLIK, ACSS and customer-balance methods are excluded
+from Elements because Stripe does not support them on this server-confirmation path.
+Submission sends a ConfirmationToken to the authenticated,
 CSRF-protected confirm endpoint. Under user then invoice locks, the server retrieves
 the intent, rechecks the balance, customer and active saved agreement, updates the amount,
-and confirms. Locks remain held through this bounded Stripe request. A changed checkout
+and confirms. Locks remain held through confirmation to keep the balance and card checks valid.
+Every Stripe request has a five-second timeout and a two-second connection timeout;
+the four-call confirmation section is bounded by those individual request limits.
+A Stripe timeout or cron database lock timeout stays pending, without a failed-payment email. A changed checkout
 amount requires a refresh because the customer has not agreed to the new total.
 3DS uses `handleNextAction`; its second confirmation and bank redirects return through
 the same server checks, preserving the amount agreed before authentication. Card/Link saving consent remains explicit and method-specific.
@@ -83,6 +89,10 @@ the same server checks, preserving the amount agreed before authentication. Card
 A lost confirm response is recovered by intent ID, beyond key expiry. An unconfirmed
 creation can be abandoned after 23 hours because it cannot have taken money. No frozen
 confirmation is replayed. Bank verification that finishes later is polled and reconfirmed without replaying its consumed token.
+Definite results clear the saved agreement instruction. Recovery never repeats a failed
+card or bank debit; only a new Pay can send another debit. Authentication resumes keep
+the agreement in the separate confirmation record. Recovery records definite declines
+for native failed-payment notices and adds one plain customer notice with the invoice link.
 Processing bank debits show pending and block another payment,
 including pre-upgrade Processing transactions with no attempt property. Recorded successes
 with an unpaid remainder finish their attempt so the rest can be paid. Fully settled
@@ -120,8 +130,12 @@ php artisan ae-stripe:resolve-charge INVOICE_ID --accounted-proof="Verified refu
 ```
 
 The first action validates invoice and customer ownership and resumes automatic checks.
-The second is allowed only without a known ID and records the operator's proof in the
-invoice Audit Log before releasing the attempt. An empty search is not proof. The third
+It cannot swap out a different held intent; account for that payment first.
+The second requires proof from the original Stripe account. With a known ID it also
+requires a fresh 404 and refuses observed funds, processing debits or recorded payments.
+It records the original ID and proof in the invoice Audit Log before releasing the attempt.
+A 404 or an empty search alone is not proof. Stripe cannot verify a permanently inaccessible
+account, so staff must check that evidence. The third
 requires a known succeeded or canceled intent and records staff evidence that its funds
 were refunded or credited; late deliveries then cannot apply those funds again. Processing
 intents cannot be released this way. Stripe cannot choose how to account for these funds,
@@ -141,10 +155,10 @@ compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
   redirect and webhook retries, and setup errors permit retry.
 - Verify own-customer isolation, legacy unspecified-redisplay exclusions and
   account setup redisplay. Test card, wallet and Link with saving checked/clear.
-- Verify ConfirmationTokens with intent-backed Elements, Customer Sessions and manual confirmation
+- First verify ConfirmationTokens with deferred Elements (`mode`, amount, currency), Customer Sessions and manual confirmation
   on pinned Basil, including card, Link, SEPA/ACH mandates, declines, 3DS and bank redirects.
-  Stripe's server-confirmation guide excludes ACSS and BLIK; verify available methods before release.
-  Check clearing method-specific future usage with `''` and preserving consent after authentication.
+  Check the client exclusions for ACSS, BLIK and customer balance; verify available methods before release.
+  Check the bank/3DS error page and its invoice link. Check clearing method-specific future usage with `''` and preserving consent after authentication.
 - Run concurrent success deliveries/setup redirects against the real database;
   assert one agreement/transaction, preserved success after late failed/processing
   events, no automatic service assignment, and unchanged Auto Pay.
@@ -233,3 +247,11 @@ With a pristine Paymenter release's dependencies available, also run
 to verify the migration, upgrade, unique key, foreign key and rollback on SQLite.
 
 Optional transaction-method charge retrieval runs before settlement locks. Subscription PaymentIntent reads expand `latest_charge` before acquiring those locks. The locked handler rechecks customer, currency, invoice state and settled-payment replay before storing the label.
+
+Checkout references (read for the deferred integration):
+- https://docs.stripe.com/payments/finalize-payments-on-the-server?platform=web&type=payment
+- https://docs.stripe.com/js/elements_object/create_without_intent
+- https://docs.stripe.com/payments/payment-element/migration-ct
+- https://docs.stripe.com/api/payment_intents/confirm
+- https://docs.stripe.com/api/payment_intents/update
+- https://docs.stripe.com/api/payment_intents/cancel

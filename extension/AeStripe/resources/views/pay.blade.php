@@ -54,7 +54,10 @@ async function initializePaymentForm() {
 
             const form = document.getElementById('payment-form');
             const options = {
-                clientSecret: @js($intent->client_secret),
+                mode: 'payment',
+                amount: @js($intent->amount),
+                currency: @js(strtolower($intent->currency)),
+                excludedPaymentMethodTypes: ['blik', 'acss_debit', 'customer_balance'],
                 paymentMethodCreation: 'manual',
                 appearance: stripeAppearance(form),
             };
@@ -77,7 +80,8 @@ async function initializePaymentForm() {
                 }
             }
 
-            // Set up Stripe.js and Elements to use in checkout form, passing the client secret obtained in a previous step
+            // Deferred Elements + ConfirmationToken: the server checks the balance before confirming.
+            // https://docs.stripe.com/payments/finalize-payments-on-the-server
             const elements = stripe.elements(options);
             const paymentElement = elements.create('payment', paymentElementOptions);
             const resuming = @js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true));

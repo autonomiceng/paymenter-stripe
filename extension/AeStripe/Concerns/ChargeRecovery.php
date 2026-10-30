@@ -24,7 +24,7 @@ trait ChargeRecovery
     {
         $this->storePaymentAttempt($invoice, $attempt, ['state' => 'reconcile', 'reason' => $reason, 'retry' => true]);
         try { $this->sendAttemptReview($invoice); } catch (\Throwable $e) { report($e); }
-        $this->paymentReconcileMessage($reason);
+        $this->paymentReconcileMessage();
     }
 
     private function sendAttemptReview($invoice): void
@@ -87,7 +87,7 @@ trait ChargeRecovery
                     try { $intent = $this->request('get', '/payment_intents/' . $attempt['intent']); }
                     catch (\Illuminate\Http\Client\RequestException $e) {
                         if ($e->response->status() !== 404) throw $e;
-                        $this->holdPaymentAttempt($invoice, $attempt, 'Stripe cannot find this payment. Restore access to its Stripe account or link the verified payment.');
+                        $this->holdPaymentAttempt($invoice, $attempt, 'Stripe cannot find this payment. Restore access to its Stripe account or verify that no charge was made before releasing it.');
                     }
                     if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
                     elseif (in_array($intent->status, ['requires_payment_method', 'requires_confirmation', 'requires_action'], true) && ($intent->amount_received ?? 0) === 0) {
@@ -98,11 +98,24 @@ trait ChargeRecovery
                     continue;
                 }
                 $this->sendAttemptReview($invoice);
+                if (!empty($attempt['failure_reason']) && empty($attempt['failure_notified'])) {
+                    $this->notifyRecoveryRefusal($invoice, $attempt['failure_reason']);
+                    continue;
+                }
                 // Recovery never replays a frozen charge. Every confirmation uses today's balance
                 // and an active agreement; checkout tokens resume only at the same displayed amount.
-                $intent = $this->checkoutIntent($invoice, $attempt['params'] ?? $this->checkoutPaymentData($invoice, 0,
-                    $invoice->user->properties()->where('key', 'stripe_id')->firstOrFail()->value));
+                $data = $attempt['params'] ?? $this->checkoutPaymentData($invoice, 0,
+                    $invoice->user->properties()->where('key', 'stripe_id')->firstOrFail()->value);
+                if (!isset($attempt['intent']) && !empty($attempt['agreement_id'])) $data['agreement_id'] = $attempt['agreement_id'];
+                $intent = $this->checkoutIntent($invoice, $data);
                 if ($intent->status === 'succeeded') { $this->recordIntentPayment($intent, 'succeeded'); continue; }
+                $attempt = $this->withPaymentLock($invoice, fn ($user, $current) => $this->readPaymentAttempt($user, $current));
+                if (($attempt['intent'] ?? null) !== $intent->id) continue;
+                if ($intent->status === 'requires_payment_method' && !empty($intent->last_payment_error)) {
+                    $this->recordIntentPayment($intent, 'failed');
+                    $this->notifyRecoveryRefusal($invoice, $this->paymentFailureReason($intent->last_payment_error->code ?? null));
+                    continue;
+                }
                 $confirmation = $attempt['confirmation'] ?? null;
                 if ($confirmation && !empty($attempt['agreement_id']) && ($confirmation['agreement'] ?? null) != $attempt['agreement_id']) $confirmation = null;
                 if (!$confirmation && !empty($attempt['agreement_id']) && in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
@@ -120,9 +133,33 @@ trait ChargeRecovery
             } catch (PaymentPendingException $e) {
                 if ($this->paymentStripeUnavailable) break; // One outage does not make the worker wait on every customer.
                 // The durable retry marker survives an outage. Other invoices still get their turn.
+            } catch (\App\Exceptions\DisplayException $e) {
+                $this->notifyRecoveryRefusal($invoice, $e->getMessage());
             } catch (\Illuminate\Http\Client\RequestException | \Illuminate\Http\Client\ConnectionException $e) { report($e); break; }
             catch (\Throwable $e) { report($e); }
         }
+    }
+
+    private function notifyRecoveryRefusal($invoice, string $reason): void
+    {
+        $this->withPaymentLock($invoice, function ($user, $current) use ($reason) {
+            $attempt = $this->readPaymentAttempt($user, $current);
+            if (!$attempt || !empty($attempt['failure_notified'])) return;
+            $this->writePaymentAttempt($user, $current, array_replace($attempt, [
+                'agreement_id' => null, 'confirmation' => null, 'retry' => true, 'failure_reason' => $reason,
+            ]));
+            DB::afterCommit(function () use ($current, $reason) {
+                try {
+                    $this->withPaymentLock($current, function ($user, $invoice) use ($reason) {
+                        $attempt = $this->readPaymentAttempt($user, $invoice);
+                        if (!$attempt || ($attempt['failure_reason'] ?? null) !== $reason || !empty($attempt['failure_notified'])) return;
+                        Notification::create(['user_id' => $user->id, 'title' => 'Payment not completed',
+                            'body' => $reason, 'url' => route('invoices.show', $invoice)]);
+                        $this->writePaymentAttempt($user, $invoice, array_replace($attempt, ['failure_notified' => true, 'retry' => false]));
+                    });
+                } catch (\Throwable $e) { report($e); }
+            });
+        });
     }
 
     private function retryPaymentReviewAlerts(): void
@@ -139,30 +176,46 @@ trait ChargeRecovery
 
     public function resolveChargeAttempt($invoice, ?string $intentId, string $evidence = '', string $accountedEvidence = ''): void
     {
+        $held = $this->withPaymentLock($invoice, fn ($user, $current) => $this->readPaymentAttempt($user, $current));
         if ($accountedEvidence !== '') {
-            $intentId = $this->withPaymentLock($invoice, fn ($user, $current) => $this->readPaymentAttempt($user, $current)['intent'] ?? null);
-            if (!$intentId) throw new \RuntimeException('Link the verified payment before accounting for its funds.');
+            $intentId = $held['intent'] ?? null;
+            if (!$intentId) throw new \App\Exceptions\DisplayException('Link the verified payment before accounting for its funds.');
         }
         $intent = $intentId ? $this->request('get', '/payment_intents/' . $intentId) : null;
-        $this->withPaymentLock($invoice, function ($user, $current) use ($intent, $evidence, $accountedEvidence) {
+        $missingId = null;
+        if (!$intentId && !empty($held['intent']) && $evidence !== '') {
+            try { $this->request('get', '/payment_intents/' . $held['intent']); }
+            catch (\Illuminate\Http\Client\RequestException $e) {
+                if ($e->response->status() !== 404) throw $e;
+                $missingId = $held['intent'];
+            }
+        }
+        $this->withPaymentLock($invoice, function ($user, $current) use ($intent, $evidence, $accountedEvidence, $held, $missingId) {
             $attempt = $this->readPaymentAttempt($user, $current);
-            if (($attempt['state'] ?? null) !== 'reconcile') throw new \RuntimeException('This payment does not need staff review.');
+            if (($attempt['key'] ?? null) !== ($held['key'] ?? null) || ($attempt['intent'] ?? null) !== ($held['intent'] ?? null)) throw new \App\Exceptions\DisplayException('The held payment changed. Check it again.');
+            if (($attempt['state'] ?? null) !== 'reconcile') throw new \App\Exceptions\DisplayException('This payment does not need staff review.');
             if ($accountedEvidence !== '') {
                 if (($attempt['intent'] ?? null) !== $intent->id || !in_array($intent->status, ['succeeded', 'canceled'], true)
-                    || strlen(trim($accountedEvidence)) < 12) throw new \RuntimeException('Finish or cancel the Stripe payment and provide proof that its funds were refunded or credited.');
+                    || strlen(trim($accountedEvidence)) < 12) throw new \App\Exceptions\DisplayException('Finish or cancel the Stripe payment and provide proof that its funds were refunded or credited.');
                 $user->properties()->where('key', 'ae_stripe_checkout_' . $current->id)->delete();
             } elseif ($intent) {
+                if (!empty($attempt['intent']) && $attempt['intent'] !== $intent->id) throw new \App\Exceptions\DisplayException('Account for the held payment before linking a different payment.');
                 abort_unless(($intent->metadata->invoice_id ?? null) == $current->id
                     && ($intent->customer ?? null) === $user->properties()->where('key', 'stripe_id')->first()?->value, 409);
                 $attempt = array_replace($attempt, ['intent' => $intent->id, 'state' => null, 'retry' => true]);
                 $this->writePaymentAttempt($user, $current, $attempt);
             } else {
-                if (isset($attempt['intent']) || strlen(trim($evidence)) < 12) throw new \RuntimeException('Link the payment, or provide proof from the original Stripe account that no charge was made.');
+                if (!empty($attempt['funds_pending'])
+                    || \App\Models\InvoiceTransaction::where('transaction_id', $attempt['intent'] ?? '')->where('status', 'processing')->exists()
+                    || \App\Models\InvoiceTransaction::where('transaction_id', $attempt['intent'] ?? '')->where('status', 'succeeded')->exists()) {
+                    throw new \App\Exceptions\DisplayException('This payment may still hold money. Restore access to its Stripe account and account for the funds first.');
+                }
+                if (isset($attempt['intent']) && $missingId !== $attempt['intent'] || strlen(trim($evidence)) < 12) throw new \App\Exceptions\DisplayException('Link the payment, or provide proof from the original Stripe account that no charge was made.');
                 $user->properties()->where('key', 'ae_stripe_checkout_' . $current->id)->delete();
             }
             Audit::create(['event' => 'ae_stripe_attempt_resolved', 'auditable_type' => $current->getMorphClass(),
                 'auditable_id' => $current->id, 'old_values' => [], 'new_values' => [
-                    'attempt_key' => $attempt['key'], 'payment_intent_id' => $intent?->id, 'evidence' => $accountedEvidence ?: $evidence,
+                    'attempt_key' => $attempt['key'], 'payment_intent_id' => $intent?->id ?? $missingId, 'evidence' => $accountedEvidence ?: $evidence,
                     'funds_accounted' => $accountedEvidence !== '',
                 ]]);
         });

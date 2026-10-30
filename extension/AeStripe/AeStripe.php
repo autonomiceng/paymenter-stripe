@@ -286,7 +286,7 @@ class AeStripe extends Gateway
             'Stripe-Version' => self::API_VERSION,
         ];
         if ($idempotencyKey !== null) $headers['Idempotency-Key'] = $idempotencyKey;
-        return $this->readStripeObject(Http::withHeaders($headers)->asForm()->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object());
+        return $this->readStripeObject(Http::withHeaders($headers)->asForm()->connectTimeout(2)->timeout(5)->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object());
     }
 
     private function setupSubscription($setupIntent)
@@ -778,12 +778,12 @@ class AeStripe extends Gateway
 
     public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement)
     {
-        abort_unless($this->gatewayEnabled(), 409);
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
         if (!$customer) {
             throw new DisplayException('Could not find your saved payment details. Add a new payment method.');
         }
         try {
+            if (!$this->gatewayEnabled()) $this->paymentPending('Payments are paused. Please check back later.');
             $intent = $this->checkoutIntent($invoice, $this->checkoutPaymentData($invoice,
                 $this->toMinorUnits($amount, $invoice->currency_code), $customer) + ['agreement_id' => $billingAgreement->id]);
             if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
@@ -800,11 +800,15 @@ class AeStripe extends Gateway
                     }
                 }
                 if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) return true;
-                $this->paymentReconcileMessage('Stripe received the payment, but it could not be applied to this invoice.');
+                $this->paymentReconcileMessage();
             }
             if (in_array($intent->status, ['processing', 'requires_capture'], true)) $this->paymentPending();
             if ($intent->status === 'requires_action') throw new DisplayException('This payment needs authentication. Use the one-time payment option to finish it.');
             throw new DisplayException('This card was declined. Choose another payment method.');
+        } catch (\Illuminate\Database\QueryException $e) {
+            if (!in_array((int) ($e->errorInfo[1] ?? $e->getCode()), [1205, 1213], true)) throw $e;
+            if (app()->runningInConsole()) return true;
+            $this->paymentPending('Payment is busy. Refresh the invoice to check its status.');
         } catch (PaymentPendingException $e) {
             // Core cron ignores the bool and emails failure for every thrown exception.
             if (app()->runningInConsole()) return true;

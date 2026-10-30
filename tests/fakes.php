@@ -12,7 +12,7 @@ namespace Illuminate\Console {
     class Application { public static $callbacks = []; public static function starting($callback) { self::$callbacks[] = $callback; } }
 }
 namespace App\Exceptions { class DisplayException extends \Exception {} }
-namespace Illuminate\Database { class UniqueConstraintViolationException extends \RuntimeException {} }
+namespace Illuminate\Database { class UniqueConstraintViolationException extends \RuntimeException {} class QueryException extends \RuntimeException {} }
 namespace Illuminate\Http\Client {
     class ConnectionException extends \RuntimeException {}
     class RequestException extends \RuntimeException {
@@ -311,7 +311,7 @@ namespace App\Models {
             } return null; }
             public function where($key, $value) { if ($key === 'status') $this->status = $value; return $this; }
             public function exists() { foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
-                if (str_ends_with($key, ':' . $this->id) && $row['status'] === 'succeeded') return true;
+                if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return true;
             } return false; }
         }; }
     }
@@ -420,13 +420,15 @@ namespace Illuminate\Support\Facades {
         public static $calls = [];
         public static $handler;
         private $headers = [];
+        private $timeoutSeconds = null;
         public static function withHeaders($headers) { $http = new self; $http->headers = $headers; return $http; }
         public function asForm() { return $this; }
-        public function timeout($seconds) { return $this; }
+        public function timeout($seconds) { $this->timeoutSeconds = $seconds; return $this; }
+        public function connectTimeout($seconds) { return $this; }
         public function __call($verb, $args) {
             [$url, $data] = $args;
             $path = substr($url, strlen('https://api.stripe.com/v1'));
-            self::$calls[] = [$verb, $path, $data, $this->headers];
+            self::$calls[] = [$verb, $path, $data, $this->headers, $this->timeoutSeconds];
             $value = (self::$handler)($verb, $path, $data);
             return new class($value) {
                 public function __construct(private $value) {}

@@ -37,7 +37,7 @@ trait Checkout
         if ($intent->status === 'succeeded') {
             $this->recordIntentPayment($intent, 'succeeded');
             if (!InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) {
-                $this->paymentReconcileMessage('Stripe received the payment, but it could not be applied to this invoice.');
+                $this->paymentReconcileMessage();
             }
             return view('gateways.ae-stripe::payment-status', ['message' => 'Payment received. Refresh the invoice to check its status.']);
         }
@@ -144,7 +144,7 @@ trait Checkout
             abort_unless(Auth::id() == $invoice->user_id && $customer && $intent->customer === $customer
                 && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 403);
             $agreement = null;
-            $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return'), 'use_stripe_sdk' => 'true'];
+            $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id]), 'use_stripe_sdk' => 'true'];
             if ($request->input('confirmation_token')) {
                 $params += ['confirmation_token' => $request->input('confirmation_token'), 'setup_future_usage' => '',
                     'payment_method_options' => ['card' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : ''],
@@ -168,29 +168,50 @@ trait Checkout
 
     public function finishPayment(Request $request)
     {
-        abort_unless($this->gatewayEnabled(), 409);
-        // Redirect methods and 3DS can return with a manual intent awaiting server confirmation.
-        $id = $request->input('payment_intent');
-        abort_unless(is_string($id) && preg_match('/^pi_[a-zA-Z0-9]+$/', $id), 400);
-        $intent = $this->request('get', '/payment_intents/' . $id);
-        $invoice = Invoice::findOrFail($intent->metadata->invoice_id ?? null);
-        abort_unless(Auth::id() == $invoice->user_id && $intent->customer === $invoice->user->properties()->where('key', 'stripe_id')->first()?->value
-            && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 403);
-        if ($intent->status === 'requires_confirmation') {
-            $amount = $this->withPaymentLock($invoice, fn ($user, $current) => $this->readPaymentAttempt($user, $current)['checkout_amount'] ?? null);
-            if ($amount === null) throw new DisplayException('Refresh the invoice before finishing this payment.');
-            $agreement = $this->paymentResumeAgreement($invoice);
-            $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return'), 'use_stripe_sdk' => 'true'];
-            if ($agreement) $params['payment_method'] = $agreement->external_reference;
-            $intent = $this->confirmAttempt($invoice, $id, $params, $agreement, expectedAmount: $amount);
+        // Keep a local invoice link even when Stripe cannot be reached on the bank return.
+        $invoice = null;
+        if ($request->input('invoice')) {
+            $invoice = Invoice::findOrFail($request->input('invoice'));
+            abort_unless(Auth::id() == $invoice->user_id, 403);
         }
-        if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
-        return redirect()->to(route('invoices.show', $invoice) . '?checkPayment=true');
+        try {
+            if (!$this->gatewayEnabled()) throw new DisplayException('Payments are paused. Please check back later.');
+            $id = $request->input('payment_intent');
+            if (!is_string($id) || !preg_match('/^pi_[a-zA-Z0-9]+$/', $id)) throw new DisplayException('Could not check this payment. Open the invoice to check its status.');
+            $intent = $this->request('get', '/payment_intents/' . $id);
+            $owner = Invoice::findOrFail($intent->metadata->invoice_id ?? null);
+            abort_unless(Auth::id() == $owner->user_id && (!$invoice || $invoice->id === $owner->id)
+                && $intent->customer === $owner->user->properties()->where('key', 'stripe_id')->first()?->value
+                && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 403);
+            $invoice = $owner;
+            if ($intent->status === 'requires_confirmation') {
+                $amount = $this->withPaymentLock($invoice, fn ($user, $current) => $this->readPaymentAttempt($user, $current)['checkout_amount'] ?? null);
+                if ($amount === null) throw new DisplayException('Refresh the invoice before finishing this payment.');
+                $agreement = $this->paymentResumeAgreement($invoice);
+                $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id]), 'use_stripe_sdk' => 'true'];
+                if ($agreement) $params['payment_method'] = $agreement->external_reference;
+                $intent = $this->confirmAttempt($invoice, $id, $params, $agreement, expectedAmount: $amount);
+            }
+            if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
+            if ($intent->status === 'requires_payment_method') throw new DisplayException('This payment was not completed. Choose another payment method on the invoice.');
+            if ($intent->status === 'requires_action') throw new DisplayException('This payment still needs authentication. Open the invoice to finish it.');
+            return redirect()->to(route('invoices.show', $invoice) . '?checkPayment=true');
+        } catch (DisplayException $e) {
+            $message = $e->getMessage();
+        } catch (RequestException | ConnectionException $e) {
+            $message = 'We are checking this payment automatically. Open the invoice for its status.';
+        } catch (\Throwable $e) {
+            if ($e instanceof \Symfony\Component\HttpKernel\Exception\HttpExceptionInterface) throw $e;
+            report($e);
+            $message = 'Could not finish checking this payment. Open the invoice to check its status.';
+        }
+        return view('gateways.ae-stripe::payment-return', ['message' => $message,
+            'invoiceUrl' => $invoice ? route('invoices.show', $invoice) : route('invoices')]);
     }
 
     private function paymentResumeAgreement($invoice): ?BillingAgreement
     {
-        $id = $this->withPaymentLock($invoice, fn ($user, $current) => $this->readPaymentAttempt($user, $current)['agreement_id'] ?? null);
+        $id = $this->withPaymentLock($invoice, fn ($user, $current) => $this->readPaymentAttempt($user, $current)['confirmation']['agreement'] ?? null);
         if (!$id) return null;
         $agreement = BillingAgreement::where('id', $id)->first();
         if (!$agreement) throw new DisplayException('This payment method was removed. Choose another payment method.');
@@ -245,6 +266,11 @@ trait Checkout
                     else $this->writePaymentAttempt($user, $invoice, ['version' => 2, 'key' => $attempt['key'],
                         'created' => $attempt['created'], 'intent' => $intent->id, 'retry' => false]);
                 }
+            }
+            if (in_array($status, ['processing', 'failed'], true)) {
+                $attempt = $this->readPaymentAttempt($user, $invoice);
+                if (($attempt['intent'] ?? null) === $intent->id) $this->writePaymentAttempt($user, $invoice,
+                    array_replace($attempt, ['agreement_id' => null, 'confirmation' => null, 'retry' => $status === 'processing', 'funds_pending' => $status === 'processing' || ($intent->amount_received ?? 0) > 0]));
             }
             if ($status === 'failed') {
                 // The locked success guard above preserves labels on settled payments.
