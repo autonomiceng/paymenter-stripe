@@ -33,7 +33,7 @@ trait Checkout
             throw new DisplayException('Could not prepare your payment. Try again.');
         }
         $intentData = $this->checkoutPaymentData($invoice, $this->toMinorUnits($total, $invoice->currency_code), $customer->id);
-        $intent = $this->checkoutIntent($invoice, $intentData);
+        $intent = $this->checkoutIntent($invoice, $intentData, elements: true);
         if ($intent->status === 'succeeded') {
             $this->recordIntentPayment($intent, 'succeeded');
             if (!InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) {
@@ -101,7 +101,8 @@ trait Checkout
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
         abort_unless(Auth::id() == $invoice->user_id && $customer && $intent->customer === $customer
             && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 403);
-        if (($intent->confirmation_method ?? 'automatic') !== 'manual') {
+        $elements = $this->withPaymentLock($invoice, fn ($user, $current) => $this->isElementsAttempt($this->readPaymentAttempt($user, $current) ?? [], $intent));
+        if (($intent->confirmation_method ?? 'automatic') !== 'manual' && !$elements) {
             // An already-open legacy tab must not confirm outside the invoice lock.
             $this->withPaymentLock($invoice, function () use ($intent) {
                 if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation', 'requires_action'], true)
@@ -143,6 +144,8 @@ trait Checkout
             $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
             abort_unless(Auth::id() == $invoice->user_id && $customer && $intent->customer === $customer
                 && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 403);
+            $intent = $this->retireFailedElementsPayment($invoice, $intent);
+            if ($intent->status === 'canceled') throw new DisplayException('This payment was not completed. Refresh the invoice to try another payment.');
             $agreement = null;
             $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id]), 'use_stripe_sdk' => 'true'];
             if ($request->input('confirmation_token')) {
@@ -156,9 +159,12 @@ trait Checkout
                 $agreement = $this->paymentResumeAgreement($invoice);
                 if ($agreement) $params['payment_method'] = $agreement->external_reference;
             }
-            $intent = $this->confirmAttempt($invoice, $intent->id, $params, $agreement, expectedAmount: (int) $request->input('amount'));
+            // Automatic authentication completes in Stripe.js. Only native manual payments reconfirm.
+            if ($request->input('confirmation_token') || $intent->status === 'requires_confirmation' && ($intent->confirmation_method ?? null) === 'manual') {
+                $intent = $this->confirmAttempt($invoice, $intent->id, $params, $agreement, expectedAmount: (int) $request->input('amount'));
+            }
             if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
-            return response()->json(['status' => $intent->status, 'client_secret' => $intent->client_secret]);
+            return response()->json(['status' => $intent->status, 'client_secret' => $intent->status === 'requires_action' ? $intent->client_secret : null]);
         } catch (DisplayException $e) {
             return response()->json(['message' => $e->getMessage()], 409);
         } catch (RequestException | ConnectionException $e) {
@@ -184,8 +190,12 @@ trait Checkout
                 && $intent->customer === $owner->user->properties()->where('key', 'stripe_id')->first()?->value
                 && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 403);
             $invoice = $owner;
+            $intent = $this->retireFailedElementsPayment($invoice, $intent);
             if ($intent->status === 'requires_confirmation') {
-                $amount = $this->withPaymentLock($invoice, fn ($user, $current) => $this->readPaymentAttempt($user, $current)['checkout_amount'] ?? null);
+                $amount = $this->withPaymentLock($invoice, function ($user, $current) {
+                    $attempt = $this->readPaymentAttempt($user, $current);
+                    return $attempt['checkout_amount'] ?? $attempt['confirmation']['amount'] ?? null;
+                });
                 if ($amount === null) throw new DisplayException('Refresh the invoice before finishing this payment.');
                 $agreement = $this->paymentResumeAgreement($invoice);
                 $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id]), 'use_stripe_sdk' => 'true'];
@@ -193,7 +203,7 @@ trait Checkout
                 $intent = $this->confirmAttempt($invoice, $id, $params, $agreement, expectedAmount: $amount);
             }
             if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
-            if ($intent->status === 'requires_payment_method') throw new DisplayException('This payment was not completed. Choose another payment method on the invoice.');
+            if (in_array($intent->status, ['requires_payment_method', 'canceled'], true)) throw new DisplayException('This payment was not completed. Choose another payment method on the invoice.');
             if ($intent->status === 'requires_action') throw new DisplayException('This payment still needs authentication. Open the invoice to finish it.');
             return redirect()->to(route('invoices.show', $invoice) . '?checkPayment=true');
         } catch (DisplayException $e) {

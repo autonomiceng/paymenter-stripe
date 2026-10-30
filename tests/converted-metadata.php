@@ -38,17 +38,23 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
             'automatic_payment_methods' => ['enabled' => 'true'], 'metadata' => ['invoice_id' => 912, 'stripe_saved_gateway' => '1'], 'customer' => 'cus_owner'];
         $attempt = ['key' => 'checkout_converted', 'digest' => hash('sha256', json_encode($legacyData, JSON_THROW_ON_ERROR)), 'created' => time()];
         User::$row->props->values['ae_stripe_checkout_912'] = json_encode($attempt);
-        $intent = (object) ['id' => 'pi_converted', 'confirmation_method' => 'manual', 'currency' => 'usd', 'amount' => 2000, 'status' => 'requires_payment_method', 'customer' => 'cus_owner', 'client_secret' => 'pi_converted_secret',
+        $intent = (object) ['id' => 'pi_converted', 'confirmation_method' => 'automatic', 'currency' => 'usd', 'amount' => 2000, 'status' => 'requires_payment_method', 'customer' => 'cus_owner', 'client_secret' => 'pi_converted_secret',
             'metadata' => (object) ['invoice_id' => 912, 'stripe_saved_gateway' => '1', 'stripe_saved_consent' => '1']];
-        Http::$handler = function ($verb, $path, $data) use ($intent, $legacyData) {
+        Http::$handler = function ($verb, $path, $data) use (&$intent, $legacyData) {
             if ($path === '/payment_intents/search') return ['data' => []];
             if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
             if ($path === '/customer_sessions') return ['client_secret' => 'cuss_converted'];
             if ($path === '/payment_intents') {
-                check($data === $legacyData && end(Http::$calls)[3]['Idempotency-Key'] === 'checkout_converted', 'Converted unresolved checkout retries its exact original Stripe payload and key');
+                if (end(Http::$calls)[3]['Idempotency-Key'] === 'checkout_converted') {
+                    check($data === $legacyData, 'Converted unresolved checkout retries its exact original Stripe payload and key');
+                    return $intent;
+                }
+                check($intent->status === 'canceled' && !isset($data['confirmation_method']), 'Converted checkout is canceled before replacement with the automatic Elements flow');
+                $intent = (object) array_replace((array) $intent, ['id' => 'pi_replacement', 'status' => 'requires_payment_method', 'metadata' => (object) $data['metadata']]);
                 return $intent;
             }
-            if ($path === '/payment_intents/pi_converted') {
+            if ($path === '/payment_intents/' . $intent->id . '/cancel') { $intent->status = 'canceled'; return $intent; }
+            if ($path === '/payment_intents/' . $intent->id) {
                 if ($verb === 'post') check($data['metadata'] === ['ae_stripe_consent' => '0'], 'New consent writes use only AE Stripe metadata');
                 return $intent;
             }
@@ -60,12 +66,12 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         User::$row->props->values['ae_stripe_checkout_912'] = $storedAttempt;
         check($gateway->pay($invoice, 20)['data']['customerSessionSecret'] === 'cuss_converted', 'Converted unresolved checkout can render again');
         check($gateway->pay($invoice, 20)['data']['customerSessionSecret'] === 'cuss_converted', 'Converted resolved checkout reuses its existing intent');
-        $gateway->consent(new Request(['intent' => 'pi_converted', 'save' => false]));
+        $gateway->consent(new Request(['intent' => $intent->id, 'save' => false]));
         $intent->metadata->ae_stripe_gateway = '0';
-        rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_converted', 'save' => true])), 'HTTP 403');
+        rejects(fn () => $gateway->consent(new Request(['intent' => $intent->id, 'save' => true])), 'HTTP 403');
         unset($intent->metadata->ae_stripe_gateway);
         $intent->metadata->stripe_saved_gateway = '0';
-        rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_converted', 'save' => true])), 'HTTP 403');
+        rejects(fn () => $gateway->consent(new Request(['intent' => $intent->id, 'save' => true])), 'HTTP 403');
         $intent->metadata->stripe_saved_gateway = '1';
         $intent->id = 'pi_converted_subscription'; $intent->status = 'succeeded';
         $intent->amount = $intent->amount_received = 2000; $intent->currency = 'usd';

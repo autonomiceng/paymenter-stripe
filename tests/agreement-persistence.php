@@ -100,7 +100,7 @@ if ($scenario === 'all') {
     $agreementSetup->status = 'requires_payment_method';
     $gateway->createBillingAgreement($user);
     $gateway->setupConsent(new Request(['intent' => $agreementSetup->id, 'consent' => true]));
-    $agreementPaid->status = 'requires_payment_method'; $agreementPaid->amount_received = 0; $agreementPaid->confirmation_method = 'manual';
+    $agreementPaid->status = 'requires_payment_method'; $agreementPaid->amount_received = 0; $agreementPaid->confirmation_method = 'automatic';
     $user->props->values = [];
     $checkoutInvoice = clone $invoice; $checkoutInvoice->id = 915; Invoice::$rows[915] = $checkoutInvoice;
     $gateway->pay($checkoutInvoice, 20);

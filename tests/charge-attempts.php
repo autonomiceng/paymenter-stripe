@@ -52,6 +52,8 @@ use Illuminate\Support\Facades\{DB, Http};
                 $intent = $this->intents[$match[1]] ?? throw new RequestException(404);
                 if ($verb === 'get') return clone $intent;
                 if (($match[2] ?? '') === '/confirm') {
+                    // Observed on Stripe TEST / 2025-07-30.basil in the live pass; this is only a regression fixture.
+                    if (isset($data['confirmation_token']) && $intent->confirmation_method === 'manual') throw new RequestException(400, ['error' => ['param' => 'confirmation_method', 'message' => 'Payment details were collected through Stripe Elements and cannot be confirmed with a Payment Intent configured with manual confirmation_method.']]);
                     if (!in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) throw new RequestException(400, ['error' => ['code' => 'payment_intent_unexpected_state']]);
                     if ($this->beforeConfirm) ($this->beforeConfirm)($intent, $data);
                     $this->confirms[] = [$key, $data, $intent->amount];
@@ -158,14 +160,60 @@ use Illuminate\Support\Facades\{DB, Http};
                 ExtensionHelper::$agreements = ['pm_test' => ['id' => 4, 'user_id' => 7, 'gateway_id' => 3]];
             }
         });
-        $run('create-manual', function ($invoice, $stripe) use ($gateway) {
+        $run('create-elements', function ($invoice, $stripe) use ($gateway) {
             $view = $gateway->pay($invoice, 20);
-            check($view['data']['intent']->confirmation_method === 'manual' && !$stripe->charges, 'A new checkout creates an unconfirmed manual intent with Stripe-compatible parameters');
+            check($view['data']['intent']->confirmation_method === 'automatic' && !$stripe->charges, 'Opening Elements reserves an unconfirmed automatic intent without a debit');
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(!empty($attempt['elements']) && !isset($attempt['params']['confirmation_method']), 'Elements uses the default confirmation method in its durable create parameters');
+            $gateway->consent(new Request(['intent' => $view['data']['intent']->id, 'save' => false]));
+            check($stripe->intents['pi_test1']->status === 'requires_payment_method', 'The old consent endpoint recognizes a current Elements attempt');
+            $gateway->charge($invoice, 20, new BillingAgreement);
+            check($stripe->intents['pi_test1']->status === 'canceled' && $stripe->intents['pi_test2']->confirmation_method === 'manual' && count($stripe->charges) === 1, 'Native Pay cancels the open Elements intent before creating its manual attempt');
+        });
+        $run('manual-elements-tab', function ($invoice, $stripe) use ($gateway) {
+            $intent = invoke($gateway, 'checkoutIntent', $invoice, invoke($gateway, 'checkoutPaymentData', $invoice, 2000, 'cus_owner'));
+            $response = $gateway->confirmPayment(new Request(['intent' => $intent->id, 'save' => false, 'confirmation_token' => 'ctoken_oldtab', 'amount' => 2000]));
+            check($response['status'] === 409 && str_contains($response['data']['message'], 'form changed') && !$stripe->confirms,
+                'An older manual checkout tab must refresh before it can send an Elements token');
+        });
+        $run('elements-authentication', function ($invoice, $stripe) use ($gateway) {
+            $stripe->loseCreate = true; paymentStops(fn () => $gateway->pay($invoice, 20));
+            $view = $gateway->pay($invoice, 20); $id = $view['data']['intent']->id;
+            check(count($stripe->intents) === 1 && !$stripe->charges, 'A lost Elements create reuses its reserved identity without charging');
+            $stripe->status = 'requires_action';
+            $stripe->beforeConfirm = function ($intent) { check(DB::$locked && DB::$userLocked && $intent->amount === 2000, 'Elements first confirm holds both locks and uses the current amount'); };
+            $result = $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
+            check($result['data']['client_secret'] === $id . '_secret', 'Only an authentication response exposes the PaymentIntent secret');
+            $gateway->pay($invoice, 20);
+            check($stripe->intents[$id]->status === 'requires_action', 'Reopening checkout preserves a current automatic authentication attempt');
+            // Model an already-started authentication completing after an invoice change.
+            // This boundary fixture does not execute or validate Stripe.js authentication.
+            $invoice->total = 10; $stripe->intents[$id]->status = 'succeeded'; $stripe->intents[$id]->amount_received = 2000;
+            $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'amount' => 2000]));
+            check(count($stripe->confirms) === 1 && ExtensionHelper::$payments['920:' . $id]['amount'] === 20.0
+                && count(array_filter(Audit::$rows, fn ($row) => $row['event'] === 'ae_stripe_payment_review')) === 1,
+                'Automatic authentication is not reconfirmed; a later balance change records the funds and opens payment review');
+        });
+        $run('elements-failed-authentication', function ($invoice, $stripe) use ($gateway) {
+            foreach (['page', 'return', 'webhook'] as $contact) {
+                $view = $gateway->pay($invoice, 20); $id = $view['data']['intent']->id; $stripe->status = 'requires_action';
+                $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
+                $intent = $stripe->intents[$id]; $intent->status = 'requires_payment_method';
+                $intent->last_payment_error = (object) ['code' => 'payment_intent_authentication_failure'];
+                if ($contact === 'page') $gateway->pay($invoice, 20);
+                elseif ($contact === 'return') $gateway->finishPayment(new Request(['payment_intent' => $id]));
+                else $gateway->webhook(eventRequest($intent, type: 'payment_intent.payment_failed'));
+                check($intent->status === 'canceled', 'Failed Elements authentication is canceled on ' . $contact);
+                $view = $gateway->pay($invoice, 20); $stripe->status = 'succeeded';
+                $result = $gateway->confirmPayment(new Request(['intent' => $view['data']['intent']->id, 'save' => false, 'confirmation_token' => 'ctoken_retry', 'amount' => 2000]));
+                check($view['data']['intent']->id !== $id && $result['data']['status'] === 'succeeded', 'After failed authentication a fresh attempt can pay on ' . $contact);
+                $invoice->id++; Invoice::$rows[$invoice->id] = $invoice;
+            }
         });
         $run('r3-invalid-create', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20);
             $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
-            unset($attempt['intent']); $attempt['params']['automatic_payment_methods'] = ['enabled' => 'true'];
+            unset($attempt['intent']); $attempt['params']['confirmation_method'] = 'manual'; $attempt['params']['automatic_payment_methods'] = ['enabled' => 'true'];
             $attempt['agreement_id'] = 4; $attempt['retry'] = true;
             User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
             $gateway->retryChargeAttempts();
@@ -479,7 +527,7 @@ use Illuminate\Support\Facades\{DB, Http};
             $invoice->total = 11; $gateway->pay($invoice, 20);
             check(!$stripe->charges, 'Opening checkout never replays an uncertain confirmation');
             $gateway->charge($invoice, 20, new BillingAgreement(['id' => 5, 'external_reference' => 'pm_other']));
-            check(count($stripe->intents) === 1 && $stripe->charges[0][1] === 1100 && $stripe->charges[0][2] === 'pm_other', 'Confirm recovery reads the known intent and checks the new balance and card');
+            check(count($stripe->charges) === 1 && $stripe->intents['pi_test1']->status === 'canceled' && $stripe->charges[0][1] === 1100 && $stripe->charges[0][2] === 'pm_other', 'Confirm recovery reads the known intent and checks the new balance and card');
         });
         $run('between-locks', function ($invoice, $stripe) use ($gateway) {
             $stripe->beforeCreate = function () use ($invoice) { $invoice->total = 12; };
@@ -489,7 +537,7 @@ use Illuminate\Support\Facades\{DB, Http};
         });
         $run('old-tab', function ($invoice, $stripe) use ($gateway) {
             $view = $gateway->pay($invoice, 20); $id = $view['data']['intent']->id; $invoice->total = 10;
-            check($stripe->intents[$id]->confirmation_method === 'manual', 'Client secret cannot authorize an old tab to confirm directly');
+            check(!str_contains(file_get_contents(__DIR__ . '/../extension/AeStripe/resources/views/pay.blade.php'), '$intent->client_secret'), 'Rendering checkout never exposes its PaymentIntent client secret');
             $result = $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
             check($result['status'] === 409 && $stripe->charges === [], 'Old checkout must refresh the changed amount before confirmation');
         });
@@ -594,7 +642,9 @@ use Illuminate\Support\Facades\{DB, Http};
             check($result['data']['status'] === 'succeeded' && count($stripe->charges) === 1, 'After 3DS the server rechecks and confirms the same intent');
         });
         $run('legacy-tab', function ($invoice, $stripe) use ($gateway) {
-            $gateway->pay($invoice, 20); $intent = $stripe->intents['pi_test1']; $intent->confirmation_method = 'automatic';
+            $gateway->pay($invoice, 20); $intent = $stripe->intents['pi_test1'];
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); unset($attempt['elements']);
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
             $invoice->total = 10;
             $response = $gateway->consent(new Request(['intent' => $intent->id, 'save' => false]));
             check($response['status'] === 409 && $intent->status === 'canceled' && !$stripe->charges,
@@ -604,9 +654,9 @@ use Illuminate\Support\Facades\{DB, Http};
             $view = $gateway->pay($invoice, 20); $intent = $stripe->intents[$view['data']['intent']->id];
             $stripe->status = 'requires_action';
             $gateway->confirmPayment(new Request(['intent' => $intent->id, 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
-            $stripe->status = 'succeeded'; $intent->status = 'requires_confirmation';
+            $intent->status = 'succeeded'; $intent->amount_received = $intent->amount;
             check(str_contains($gateway->finishPayment(new Request(['payment_intent' => $intent->id])), 'checkPayment=true')
-                && count($stripe->charges) === 1, 'A bank or 3DS redirect completes server confirmation without another Pay');
+                && count($stripe->confirms) === 1, 'An automatic redirect reads settlement without confirming again');
         });
         $run('checkout-consent', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20);
@@ -616,11 +666,10 @@ use Illuminate\Support\Facades\{DB, Http};
                     'Server confirmation updates consent first and sends only supported confirmation parameters');
             };
             $response = $gateway->confirmPayment(new Request(['intent' => 'pi_test1', 'save' => true, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
-            check($response['data']['status'] === 'succeeded' && count($stripe->charges) === 1, 'Checkout token confirms once with explicit saving consent');
+            check($response['data']['status'] === 'succeeded' && $response['data']['client_secret'] === null && count($stripe->charges) === 1, 'Checkout token confirms once with explicit saving consent and no client secret on success');
         });
         $run('bank-verification', function ($invoice, $stripe) use ($gateway) {
-            $gateway->pay($invoice, 20); $stripe->status = 'requires_action';
-            $gateway->confirmPayment(new Request(['intent' => 'pi_test1', 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
+            $stripe->status = 'requires_action'; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
             $stripe->intents['pi_test1']->status = 'requires_confirmation'; $stripe->status = 'succeeded';
             $stripe->beforeConfirm = function ($intent, $params) { check(!isset($params['confirmation_token']), 'Async bank verification does not replay a consumed token'); };
             $gateway->retryChargeAttempts();
@@ -634,8 +683,7 @@ use Illuminate\Support\Facades\{DB, Http};
                 'Authentication cannot revive a saved card removed before reconfirmation');
         });
         $run('redirect-amount', function ($invoice, $stripe) use ($gateway) {
-            $gateway->pay($invoice, 20); $stripe->status = 'requires_action';
-            $gateway->confirmPayment(new Request(['intent' => 'pi_test1', 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
+            $stripe->status = 'requires_action'; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
             $stripe->intents['pi_test1']->status = 'requires_confirmation'; $invoice->total = 30;
             $gateway->pay($invoice, 30); $stripe->status = 'succeeded';
             check(str_contains($gateway->finishPayment(new Request(['payment_intent' => 'pi_test1']))['data']['message'], 'amount due changed')
@@ -653,8 +701,8 @@ use Illuminate\Support\Facades\{DB, Http};
             };
             $gateway->charge($invoice, 20, new BillingAgreement);
             $creates = array_values(array_filter(array_slice(Http::$calls, $calls), fn ($call) => $call[1] === '/payment_intents'));
-            check(count($stripe->intents) === 1 && count($stripe->charges) === 1 && $creates[0][3]['Idempotency-Key'] === $creates[1][3]['Idempotency-Key'],
-                'Checkout overlapping saved-card or cron creation shares the committed key and one intent');
+            check(count($stripe->charges) === 1 && $stripe->intents['pi_test1']->status === 'canceled' && $creates[0][3]['Idempotency-Key'] === $creates[1][3]['Idempotency-Key'],
+                'Overlapping checkout shares the create key; a native caller follows proven replacements and charges once');
         });
         $run('expired-create', function ($invoice, $stripe) use ($gateway) {
             $stripe->loseCreate = true; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
@@ -673,7 +721,9 @@ use Illuminate\Support\Facades\{DB, Http};
                 '409 keeps the known intent and gives an automatic recovery path');
         });
         $run('cancel-retry', function ($invoice, $stripe) use ($gateway) {
-            $gateway->pay($invoice, 20); $stripe->intents['pi_test1']->confirmation_method = 'automatic'; $invoice->total = 10;
+            $gateway->pay($invoice, 20); $invoice->total = 10;
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); unset($attempt['elements']);
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
             $keys = []; $failedKey = null;
             $stripe->failure = function ($verb, $path) use (&$keys, &$failedKey) {
                 if (!str_ends_with($path, '/cancel')) return;
@@ -687,7 +737,8 @@ use Illuminate\Support\Facades\{DB, Http};
                 && $keys === [null, null] && !$stripe->charges, 'A failed cancellation is retried without replaying a cached failure or charging');
         });
         $run('confirm-lookup-outage', function ($invoice, $stripe) use ($gateway) {
-            $gateway->pay($invoice, 20); $gets = 0; $GLOBALS['fakeConsole'] = true;
+            invoke($gateway, 'checkoutIntent', $invoice, invoke($gateway, 'checkoutPaymentData', $invoice, 2000, 'cus_owner'));
+            $gets = 0; $GLOBALS['fakeConsole'] = true;
             $stripe->failure = function ($verb, $path) use (&$gets) {
                 if ($verb === 'get' && $path === '/payment_intents/pi_test1' && ++$gets === 2) throw new RequestException(403);
             };
@@ -715,7 +766,7 @@ use Illuminate\Support\Facades\{DB, Http};
             paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
             check(count(Notification::$rows) === 1, 'Known-ID 404 alerts staff to restore the original Stripe account');
             $stripe->failure = null; $gateway->retryChargeAttempts();
-            check(count($stripe->charges) === 1 && count($stripe->intents) === 1, 'Restored access automatically resolves a known-ID hold');
+            check(count($stripe->charges) === 1 && $stripe->intents['pi_test1']->status === 'canceled', 'Restored access resolves the known-ID hold and retires Elements before native Pay');
         });
         $run('webhook-identity', function ($invoice, $stripe) use ($gateway) {
             $stripe->loseCreate = true; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));

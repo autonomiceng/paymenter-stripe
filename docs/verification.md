@@ -70,12 +70,15 @@ still needs the sandbox checks below.
 
 Saved-card Pay, checkout and cron share `ae_stripe_checkout_<invoice-id>` in native
 user properties. New records have `version: 2`. Creation reserves a key and immutable
-parameters before HTTP and never confirms or supplies a card. The intent uses manual
-confirmation: its client secret cannot start a payment from an old tab. Opening checkout
-only prepares the form. Elements uses deferred `mode: payment` with the intent's integer amount and lowercase currency,
+parameters before HTTP and never confirms or supplies a card. Elements attempts use default
+automatic confirmation; native saved-method and bank-debit attempts use manual confirmation.
+The rendered checkout never includes the PaymentIntent client secret. Only a locked confirm
+result requiring authentication returns it. Opening checkout only prepares the form. Elements uses deferred `mode: payment` with the intent's integer amount and lowercase currency,
 plus manual payment-method creation. BLIK and ACSS are excluded because this integration path does not support them; this form also excludes customer balance.
 Ilya checked creation in Stripe test mode on 2026-10-30 at 12:00 PM PT (2025-07-30.basil): manual confirmation alone returned 200; adding automatic_payment_methods returned 400.
-The returned card, Klarna, Link and Cash App defaults are all allowed by the form's exclusions; their token confirmation still needs the live checks below.
+The live pass on 2026-10-30 then proved Elements tokens are rejected on manual intents.
+Elements now uses the documented automatic flow; its real Stripe acceptance must be checked again.
+Klarna, Cash App, Link and bank methods remain available under the same exclusions.
 Submission sends a ConfirmationToken to the authenticated,
 CSRF-protected confirm endpoint. Under user then invoice locks, the server retrieves
 the intent, rechecks the balance, customer and active saved agreement, updates the amount,
@@ -84,12 +87,16 @@ Every Stripe request has a five-second timeout and a two-second connection timeo
 the four-call confirmation section is bounded by those individual request limits.
 A Stripe timeout stays pending. After a saved instruction commits, statement errors and raw PDO commit errors also stay pending for automatic recovery, without a failed-payment email. A first-lock failure before reservation surfaces as a failure because nothing was saved to retry. Paused saved charges are reserved without HTTP and resume when the gateway is enabled. A changed checkout
 amount requires a refresh because the customer has not agreed to the new total.
-3DS uses `handleNextAction`; its second confirmation and bank redirects return through
-the same server checks, preserving the amount agreed before authentication. Card/Link saving consent remains explicit and method-specific.
+Elements 3DS uses `handleNextAction` and completes without another server confirmation.
+The first confirm rechecks the balance; if the invoice changes after authentication starts,
+the original amount can complete and any excess enters the existing payment review.
+Failed Elements authentication is canceled on the next page load, return or failure webhook,
+after retrieving the current status; a fresh attempt then permits another payment.
+Native manual authentication and bank verification still reconfirm under the server checks. Card/Link saving consent remains explicit and method-specific.
 
 A lost confirm response is recovered by intent ID, beyond key expiry. An unconfirmed
 creation can be abandoned after 23 hours because it cannot have taken money. No frozen
-confirmation is replayed. Bank verification that finishes later is polled and reconfirmed without replaying its consumed token.
+confirmation is replayed. Native bank verification that finishes later is polled and reconfirmed without replaying a consumed token. Automatic Elements payments are read after authentication, not reconfirmed.
 Definite results clear the saved agreement instruction. New confirmations retain the preceding charge ID so an earlier failed row or error cannot cancel a later unknown confirmation. Older confirmations without that baseline honor a known failure and do not retry that debit. Recovery never repeats a failed
 card or bank debit; only a new Pay can send another debit. Authentication resumes keep
 the agreement in the separate confirmation record. Recovery records definite declines
@@ -112,7 +119,7 @@ Cancellation requests have no persistent failure-cache key; replacement still ne
 Stripe-confirmed cancellation with no received funds.
 
 No schema migration is needed. Existing known IDs are retrieved. Existing unfinished
-automatic intents are canceled before replacement, invalidating old tabs. Processing
+automatic intents without the new durable `elements` marker are canceled before replacement, invalidating old tabs. Unconfirmed manual checkout intents are canceled before changing to Elements; existing native authentication stays manual. Switching to native Pay cancels an unfinished Elements intent before creating a manual replacement. Concurrent callers follow the current reservation after a proven replacement. Processing
 intents remain protected until Stripe settles or fails them. Old no-ID records with
 nonconfirming parameters can replay creation safely; digest-only records do so only when
 an exact AE Stripe or converted StripeSaved checkout payload can be reconstructed.
@@ -158,7 +165,7 @@ compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
   redirect and webhook retries, and setup errors permit retry.
 - Verify own-customer isolation, legacy unspecified-redisplay exclusions and
   account setup redisplay. Test card, wallet and Link with saving checked/clear.
-- First verify ConfirmationTokens with deferred Elements (`mode`, amount, currency), Customer Sessions and manual confirmation
+- First verify ConfirmationTokens with deferred Elements (`mode`, amount, currency), Customer Sessions and automatic confirmation
   on pinned Basil, including card, Link, SEPA/ACH mandates, declines, 3DS and bank redirects.
   Check the client exclusions for ACSS, BLIK and customer balance; verify available methods before release.
   Check the bank/3DS error page and its invoice link. Check clearing method-specific future usage with `''` and preserving consent after authentication.
@@ -259,4 +266,4 @@ Checkout references (read for the deferred integration):
 - https://docs.stripe.com/api/payment_intents/update
 - https://docs.stripe.com/api/payment_intents/cancel
 
-Offline Elements checks inspect options and use local Stripe.js stubs; they do not prove Stripe accepts a token on a persisted manual intent, CustomerSession tokens, saving options, token reuse, 3DS reconfirmation or redirects. Validate those combinations in test mode on the pinned API version before release.
+Offline Elements checks use local Stripe.js and HTTP fixtures. They do not prove Stripe accepts the new automatic token flow, CustomerSession tokens, saving options, 3DS completion or redirects. A fixture rejects the manual/Elements pairing using the observed live error; it is not provider acceptance evidence. Validate those combinations in test mode on the pinned API version before release.

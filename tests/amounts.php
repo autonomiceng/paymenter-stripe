@@ -30,7 +30,7 @@ Gateway::$enabled = true;
 Http::$handler = function ($verb, $path, $data) {
     return match (true) {
         $path === '/customers/cus_owner' => ['id' => 'cus_owner'],
-        $path === '/payment_intents' => ['id' => 'pi_amount', 'status' => 'requires_payment_method', 'confirmation_method' => 'manual', 'currency' => $data['currency'], 'customer' => $data['customer'], 'client_secret' => 'pi_secret'],
+        $path === '/payment_intents' => ['id' => 'pi_amount', 'status' => 'requires_payment_method', 'confirmation_method' => 'automatic', 'currency' => $data['currency'], 'customer' => $data['customer'], 'client_secret' => 'pi_secret'],
         $path === '/customer_sessions' => ['client_secret' => 'cuss_secret'],
         $path === '/subscriptions/sub_test' => ['schedule' => null, 'items' => ['data' => [
             ['id' => 'si_test', 'price' => ['product' => 'prod_test']]]]],

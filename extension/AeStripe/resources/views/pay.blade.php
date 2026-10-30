@@ -114,7 +114,8 @@ async function initializePaymentForm() {
                         if (created.error) throw created.error;
                         token = created.confirmationToken.id;
                     }
-                    // Every confirmation, including after 3DS, rechecks the invoice on the server.
+                    // The first confirmation checks the balance. Automatic 3DS completes at that amount;
+                    // the next server call reads its result. Native manual payments may need reconfirmation.
                     for (let step = 0; step < 3; step++) {
                         const response = await fetch(@js(route('extensions.gateways.ae-stripe.confirm')), {
                             method: 'POST',

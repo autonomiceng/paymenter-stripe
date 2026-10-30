@@ -12,10 +12,10 @@ trait CheckoutIntent
 {
     private bool $paymentStripeUnavailable = false;
     private bool $paymentRetryReserved = false;
-    private function checkoutIntent($invoice, array $data)
+    private function checkoutIntent($invoice, array $data, bool $elements = false)
     {
         for ($round = 0; $round < 4; ++$round) {
-            $attempt = $this->reservePaymentAttempt($invoice, $data);
+            $attempt = $this->reservePaymentAttempt($invoice, $data, $elements);
             if (!empty($attempt['agreement_id'])) $data['agreement_id'] ??= $attempt['agreement_id'];
             $creating = false;
             try {
@@ -54,7 +54,8 @@ trait CheckoutIntent
             if (empty($intent->id) || isset($attempt['intent']) && $intent->id !== $attempt['intent']) {
                 $this->holdPaymentAttempt($invoice, $attempt, 'Stripe returned a different payment ID. Link the verified payment before continuing.');
             }
-            $this->rememberPaymentIntent($invoice, $attempt, $intent);
+            // A concurrent page load may have retired this unconfirmed native intent for Elements.
+            if (!$this->rememberPaymentIntent($invoice, $attempt, $intent)) continue;
             if ($intent->status === 'succeeded') {
                 $recorded = InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists();
                 if (!$recorded) return $intent;
@@ -75,9 +76,19 @@ trait CheckoutIntent
                 }
             }
             if ($intent->status === 'canceled') { $this->replacePaymentAttempt($invoice, $attempt); continue; }
-            if (($intent->confirmation_method ?? 'automatic') !== 'manual' || strtolower($intent->currency) !== strtolower($invoice->currency_code)
+            if ($this->paymentAttemptFailed($attempt, $intent)) {
+                if (!$elements) return $intent; // Recovery must report the refusal, never replace its debit instruction.
+                unset($data['agreement_id']);
+            }
+            $usesElements = $this->isElementsAttempt($attempt, $intent);
+            $legacyAutomatic = ($intent->confirmation_method ?? 'automatic') !== 'manual' && !$usesElements;
+            $changeFlow = $usesElements && !$elements && isset($data['agreement_id'])
+                || $elements && !$usesElements && $intent->status === 'requires_payment_method';
+            $failedElements = $usesElements && $intent->status === 'requires_payment_method' && !empty($intent->last_payment_error);
+            if ($legacyAutomatic || $changeFlow || $failedElements
+                || strtolower($intent->currency) !== strtolower($invoice->currency_code)
                 || $intent->customer !== $invoice->user->properties()->where('key', 'stripe_id')->first()?->value) {
-                // An older tab can confirm an automatic intent without our balance check.
+                // Retire legacy tabs, failed Elements authentication and changes between native Pay and Elements.
                 try {
                     $this->withPaymentLock($invoice, function ($user, $current) use ($intent) {
                         $fresh = $this->request('get', '/payment_intents/' . $intent->id);
@@ -122,10 +133,10 @@ trait CheckoutIntent
         $this->paymentPending('Payment changed while loading. Refresh the invoice.');
     }
 
-    private function reservePaymentAttempt($invoice, array $data): array
+    private function reservePaymentAttempt($invoice, array $data, bool $elements = false): array
     {
         $this->paymentRetryReserved = false;
-        $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($data) {
+        $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($data, $elements) {
             $amount = $this->paymentBalance($current);
             if ($current->status !== 'pending' || $amount <= 0) throw new DisplayException('This invoice has no payment due. Refresh the invoice.');
             $attempt = $this->readPaymentAttempt($user, $current);
@@ -149,7 +160,7 @@ trait CheckoutIntent
             }
             if (!$attempt) $attempt = $this->newPaymentAttempt($current, array_replace($data, [
                 'customer' => $user->properties()->where('key', 'stripe_id')->firstOrFail()->value,
-            ]), $amount);
+            ]), $amount, $elements);
             if (isset($data['agreement_id'])) {
                 $attempt['agreement_id'] = $data['agreement_id'];
                 $attempt['agreement_pending'] = true;
@@ -162,7 +173,7 @@ trait CheckoutIntent
         return $attempt;
     }
 
-    private function rememberPaymentIntent($invoice, array $attempt, $intent): void
+    private function rememberPaymentIntent($invoice, array $attempt, $intent): bool
     {
         $values = [
             'intent' => $intent->id,
@@ -176,7 +187,7 @@ trait CheckoutIntent
             $values += ['agreement_id' => null, 'confirmation' => null];
             $values['retry'] = false;
         }
-        $this->storePaymentAttempt($invoice, $attempt, $values);
+        return $this->storePaymentAttempt($invoice, $attempt, $values);
     }
 
     private function paymentAttemptFailed(array $attempt, $intent): bool
@@ -193,16 +204,38 @@ trait CheckoutIntent
             || InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->exists();
     }
 
-    private function newPaymentAttempt($invoice, array $data, int $amount): array
+    private function newPaymentAttempt($invoice, array $data, int $amount, bool $elements = false): array
     {
         $params = $this->checkoutPaymentData($invoice, $amount, $data['customer']);
         // Stripe rejects automatic_payment_methods together with confirmation_method.
         // Keep checkoutPaymentData unchanged for legacy digest reconstruction.
-        unset($params['automatic_payment_methods']);
-        $params['confirmation_method'] = 'manual';
+        if (!$elements) {
+            unset($params['automatic_payment_methods']);
+            $params['confirmation_method'] = 'manual';
+        }
         $key = 'checkout_' . bin2hex(random_bytes(16));
         $params['metadata']['ae_stripe_attempt'] = $key;
-        return ['version' => 2, 'key' => $key, 'created' => time(), 'params' => $params];
+        return ['version' => 2, 'key' => $key, 'created' => time(), 'params' => $params, 'elements' => $elements];
+    }
+
+    private function isElementsAttempt(array $attempt, $intent): bool
+    {
+        return !empty($attempt['elements']) && ($attempt['intent'] ?? $intent->id) === $intent->id
+            && ($intent->confirmation_method ?? null) === 'automatic';
+    }
+
+    private function retireFailedElementsPayment($invoice, $intent)
+    {
+        if (($intent->status ?? null) !== 'requires_payment_method' || empty($intent->last_payment_error)) return $intent;
+        return $this->withPaymentLock($invoice, function ($user, $current) use ($intent) {
+            $attempt = $this->readPaymentAttempt($user, $current);
+            if (!$this->isElementsAttempt($attempt ?? [], $intent)) return $intent;
+            $fresh = $this->request('get', '/payment_intents/' . $intent->id);
+            if ($fresh->status === 'requires_payment_method' && !empty($fresh->last_payment_error) && ($fresh->amount_received ?? 0) === 0) {
+                return $this->request('post', '/payment_intents/' . $fresh->id . '/cancel');
+            }
+            return $fresh;
+        });
     }
 
     private function withPaymentLock($invoice, callable $callback)
@@ -242,12 +275,14 @@ trait CheckoutIntent
         });
     }
 
-    private function storePaymentAttempt($invoice, array $attempt, array $values, bool $confirmationOnly = false): void
+    private function storePaymentAttempt($invoice, array $attempt, array $values, bool $confirmationOnly = false): bool
     {
-        $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $values, $confirmationOnly) {
+        return $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $values, $confirmationOnly) {
             $stored = $this->readPaymentAttempt($user, $current);
-            if ($confirmationOnly && ($stored['confirmation']['key'] ?? null) !== ($attempt['confirmation']['key'] ?? null)) return;
-            if (($stored['key'] ?? null) === $attempt['key']) $this->writePaymentAttempt($user, $current, array_replace($stored, $values));
+            if ($confirmationOnly && ($stored['confirmation']['key'] ?? null) !== ($attempt['confirmation']['key'] ?? null)) return false;
+            if (($stored['key'] ?? null) !== $attempt['key']) return false;
+            $this->writePaymentAttempt($user, $current, array_replace($stored, $values));
+            return true;
         });
     }
 
@@ -307,7 +342,8 @@ trait CheckoutIntent
                     if (($method->customer ?? null) !== $intent->customer) return new DisplayException('This payment method is no longer saved. Choose another payment method.');
                 }
                 if ($intent->customer !== $user->properties()->where('key', 'stripe_id')->first()?->value) return new DisplayException('The payment account changed. Refresh the invoice before paying.');
-                if (($intent->confirmation_method ?? null) !== 'manual') return new DisplayException('The payment form changed. Refresh the invoice before paying.');
+                if (($intent->confirmation_method ?? null) !== 'manual' && !$this->isElementsAttempt($stored, $intent)) return new DisplayException('The payment form changed. Refresh the invoice before paying.');
+                if (isset($params['confirmation_token']) && !$this->isElementsAttempt($stored, $intent)) return new DisplayException('The payment form changed. Refresh the invoice before paying.');
                 $updates = ['amount' => $amount];
                 foreach (['metadata', 'setup_future_usage'] as $field) {
                     if (array_key_exists($field, $params)) { $updates[$field] = $params[$field]; unset($params[$field]); }

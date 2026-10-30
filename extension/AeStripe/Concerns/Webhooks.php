@@ -77,6 +77,8 @@ trait Webhooks
                     break;
                 }
                 $this->recordIntentPayment($paymentIntent, 'failed');
+                $invoice = \App\Models\Invoice::findOrFail($paymentIntent->metadata->invoice_id);
+                $this->retireFailedElementsPayment($invoice, $paymentIntent);
                 break;
             case 'charge.succeeded':
             case 'charge.updated':
