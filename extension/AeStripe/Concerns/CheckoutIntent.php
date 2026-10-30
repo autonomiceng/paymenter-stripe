@@ -16,6 +16,7 @@ trait CheckoutIntent
     {
         for ($round = 0; $round < 4; ++$round) {
             $attempt = $this->reservePaymentAttempt($invoice, $data);
+            if (!empty($attempt['agreement_id'])) $data['agreement_id'] ??= $attempt['agreement_id'];
             $creating = false;
             try {
                 if (isset($attempt['intent'])) $intent = $this->request('get', '/payment_intents/' . $attempt['intent']);
@@ -29,12 +30,14 @@ trait CheckoutIntent
                     if (!$intent) $this->holdPaymentAttempt($invoice, $attempt, 'Stripe has no payment ID for this older attempt. Check its request log before releasing it.');
                 }
             } catch (RequestException | ConnectionException $e) {
-                if ($e instanceof RequestException && $this->definitePaymentRefusal($e) && $creating) {
+                if ($e instanceof RequestException && $this->definitePaymentRefusal($e) && $creating && !in_array($e->response->status(), [401, 403], true)) {
                     $this->replacePaymentAttempt($invoice, $attempt);
                     throw new DisplayException($this->paymentRefusalReason($e, $invoice));
                 }
                 if ($e instanceof RequestException && $this->definitePaymentRefusal($e) && $e->response->status() !== 404) {
                     $this->storePaymentAttempt($invoice, $attempt, ['retry' => true]);
+                    $this->paymentStripeUnavailable = true;
+                    if (($attempt['checks'] ?? 0) >= 2) $this->notifyPaymentAccessRefusal();
                     $this->paymentPending($this->paymentRefusalReason($e, $invoice));
                 }
                 $this->paymentStripeUnavailable = true;
@@ -118,6 +121,7 @@ trait CheckoutIntent
 
     private function reservePaymentAttempt($invoice, array $data): array
     {
+        $this->paymentRetryReserved = false;
         $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($data) {
             $amount = $this->paymentBalance($current);
             if ($current->status !== 'pending' || $amount <= 0) throw new DisplayException('This invoice has no payment due. Refresh the invoice.');
@@ -343,7 +347,7 @@ trait CheckoutIntent
             // token must not be replayed; Stripe already holds the authenticated payment method.
             $resumeParams = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id]), 'use_stripe_sdk' => 'true'];
             if ($agreement) $resumeParams['payment_method'] = $agreement->external_reference;
-            $resume = ['params' => $resumeParams, 'agreement' => $agreement?->id, 'amount' => $expectedAmount ?? $result->amount];
+            $resume = ['key' => $attempt['confirmation']['key'], 'params' => $resumeParams, 'agreement' => $agreement?->id, 'amount' => $expectedAmount ?? $result->amount];
         }
         $this->storePaymentAttempt($invoice, $attempt, ['retry' => !($result instanceof DisplayException)
             && in_array($result->status, ['succeeded', 'processing', 'requires_capture', 'requires_action'], true), 'confirmation' => $resume, 'agreement_id' => null, 'funds_pending' => !($result instanceof DisplayException)

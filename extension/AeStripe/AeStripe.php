@@ -810,7 +810,7 @@ class AeStripe extends Gateway
             if (in_array($intent->status, ['processing', 'requires_capture'], true)) $this->paymentPending();
             if ($intent->status === 'requires_action') throw new DisplayException('This payment needs authentication. Use the one-time payment option to finish it.');
             throw new DisplayException('This card was declined. Choose another payment method.');
-        } catch (\Illuminate\Database\QueryException $e) {
+        } catch (\PDOException | \Illuminate\Database\QueryException $e) {
             // Before reservation there is no durable retry: let core surface that failure.
             // Afterwards even a lost DB connection may follow a landed Stripe confirm.
             if (!$this->paymentRetryReserved) throw $e;

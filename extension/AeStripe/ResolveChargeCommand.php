@@ -8,7 +8,7 @@ use Illuminate\Console\Command;
 
 final class ResolveChargeCommand extends Command
 {
-    protected $signature = 'ae-stripe:resolve-charge {invoice} {--intent= : Verified Stripe payment ID} {--no-charge-proof= : Evidence from Stripe request logs or support; an empty search is not proof} {--checked-confirm-key= : Confirm key verified absent from the original Stripe account request log} {--accounted-proof= : Proof that final payment funds were refunded or credited}';
+    protected $signature = 'ae-stripe:resolve-charge {invoice} {--intent= : Verified Stripe payment ID} {--no-charge-proof= : Evidence from Stripe request logs or support; an empty search is not proof} {--checked-confirm-key= : Confirm key proven not sent by original-account logs covering the attempt dates, or Stripe support} {--accounted-proof= : Proof that final payment funds were refunded or credited}';
     protected $description = 'Resolve a payment Stripe could not recover automatically';
 
     public function handle(): int
@@ -17,7 +17,9 @@ final class ResolveChargeCommand extends Command
             $row = Gateway::where('extension', 'AeStripe')->firstOrFail();
             $gateway = ExtensionHelper::getExtension('gateway', 'AeStripe', $row->settings);
             $gateway->resolveChargeAttempt(Invoice::findOrFail($this->argument('invoice')), $this->option('intent'), $this->option('no-charge-proof') ?? '', $this->option('accounted-proof') ?? '', $this->option('checked-confirm-key') ?? '');
-            $this->info('Payment review resolved. Automatic checks will continue.');
+            $this->info($this->option('intent') && !$this->option('accounted-proof')
+                ? 'Payment linked. Automatic checks will continue.'
+                : 'Payment review resolved. Any remaining balance stays unpaid; the customer can pay it.');
             return self::SUCCESS;
         } catch (\App\Exceptions\DisplayException $e) {
             $this->error($e->getMessage());

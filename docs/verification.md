@@ -82,7 +82,7 @@ the intent, rechecks the balance, customer and active saved agreement, updates t
 and confirms. Locks remain held through confirmation to keep the balance and card checks valid.
 Every Stripe request has a five-second timeout and a two-second connection timeout;
 the four-call confirmation section is bounded by those individual request limits.
-A Stripe timeout stays pending. After a saved instruction commits, database errors also stay pending for automatic recovery, without a failed-payment email. A first-lock failure before reservation surfaces as a failure because nothing was saved to retry. Paused saved charges are reserved without HTTP and resume when the gateway is enabled. A changed checkout
+A Stripe timeout stays pending. After a saved instruction commits, statement errors and raw PDO commit errors also stay pending for automatic recovery, without a failed-payment email. A first-lock failure before reservation surfaces as a failure because nothing was saved to retry. Paused saved charges are reserved without HTTP and resume when the gateway is enabled. A changed checkout
 amount requires a refresh because the customer has not agreed to the new total.
 3DS uses `handleNextAction`; its second confirmation and bank redirects return through
 the same server checks, preserving the amount agreed before authentication. Card/Link saving consent remains explicit and method-specific.
@@ -106,7 +106,7 @@ The five-minute recovery task reads unresolved payments and retries interrupted 
 using the current balance and active agreement. It stops its batch on a Stripe outage and
 rotates checked records so one outage does not hold the whole queue. Keep Paymenter's
 scheduler running. Notification failures are retried separately after settlement commits.
-Only definite write refusals clear a no-ID creation; lookup errors never prove a charge failed.
+A definite create refusal clears a no-ID creation and tells the customer how to pay. A 401/403 retains the unsent instruction; recovery resumes after access is fixed. Refused reads also retain recovery. A repeated refusal stops the batch and alerts staff once per configured key across invoices, after commit; only staff can restore Stripe access. Lookup errors never prove a charge failed.
 Currency and card refusals explain the reason and permit another method or a repaired setup.
 Cancellation requests have no persistent failure-cache key; replacement still needs a
 Stripe-confirmed cancellation with no received funds.
@@ -136,7 +136,8 @@ The first action validates invoice and customer ownership and resumes automatic 
 It cannot swap out a different held intent; account for that payment first.
 The second requires proof from the original Stripe account. With a known ID it also
 requires a fresh 404 and refuses observed funds, processing debits or recorded payments.
-A sent or unknown confirmation also refuses free-text proof alone. Staff must check the exact confirm key in the original account's request log and name it with `--checked-confirm-key`, only if the request never reached Stripe. The review Audit Log and refusal show the key; resolution audits that key, the original ID and the evidence. Known funds remain blocked even with that key.
+A sent or unknown confirmation also refuses free-text proof alone. Staff must open the named payment in the original account's Workbench Inspector > Logs and compare the confirm key in request details. Logs must cover the attempt date onward; missing or aged-out logs prove nothing. If they cannot establish that the request never reached Stripe, obtain Stripe support proof covering that account, payment, key and dates. Only then name the key with `--checked-confirm-key`. The review Audit Log and refusal show the key; resolution audits that key, the original ID and the evidence. Known funds remain blocked even with that key.
+No-charge release ends the saved instruction and sends the customer an invoice pay link; it never automatically re-debits on a person's evidence. Requires-action resume records keep the sent confirm key.
 A 404 or an empty search cannot establish that a confirm never arrived. The extension cannot read an inaccessible original account's request log, so staff must verify that evidence. `--accounted-proof`
 requires a known succeeded or canceled intent and records staff evidence that its funds
 were refunded or credited; late deliveries then cannot apply those funds again. Processing

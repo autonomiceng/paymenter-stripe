@@ -2,7 +2,7 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
-use App\Models\{Audit, BillingAgreement, Invoice, Notification, Property, User};
+use App\Models\{Audit, BillingAgreement, Gateway, Invoice, Notification, Property, User};
 use Illuminate\Support\Facades\DB;
 use Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException;
 
@@ -23,7 +23,7 @@ trait ChargeRecovery
     private function missingPaymentReason(array $attempt): string
     {
         return !empty($attempt['confirmation'])
-            ? 'Stripe cannot find this payment. A debit was sent. Restore access to its Stripe account or check the confirm key in that account’s request log.'
+            ? 'Stripe cannot find payment ' . ($attempt['intent'] ?? '(missing ID)') . '. A debit was sent. Restore access to its original Stripe account or verify its confirm key before releasing it.'
             : 'Stripe cannot find this payment. Restore access to its Stripe account or verify that no charge was made before releasing it.';
     }
 
@@ -130,12 +130,16 @@ trait ChargeRecovery
                 if (!$confirmation && !empty($attempt['agreement_id']) && in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
                     $agreement = BillingAgreement::where('id', $attempt['agreement_id'])->first();
                     if ($agreement) $this->charge($invoice, 0, $agreement);
+                    else $this->notifyRecoveryRefusal($invoice, 'This payment method was removed. Choose another payment method.');
                     if ($this->paymentStripeUnavailable) break;
                     continue;
                 }
                 if ($confirmation && in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
                     $agreement = !empty($confirmation['agreement']) ? BillingAgreement::where('id', $confirmation['agreement'])->first() : null;
-                    if (!empty($confirmation['agreement']) && !$agreement) continue;
+                    if (!empty($confirmation['agreement']) && !$agreement) {
+                        $this->notifyRecoveryRefusal($invoice, 'This payment method was removed. Choose another payment method.');
+                        continue;
+                    }
                     $intent = $this->confirmAttempt($invoice, $intent->id, $confirmation['params'], $agreement, $confirmation['amount'] ?? null);
                     if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
                 }
@@ -153,7 +157,11 @@ trait ChargeRecovery
     {
         $this->withPaymentLock($invoice, function ($user, $current) use ($reason) {
             $attempt = $this->readPaymentAttempt($user, $current);
-            if (!$attempt || !empty($attempt['failure_notified'])) return;
+            if (!$attempt) {
+                DB::afterCommit(fn () => $this->notifyUnpaidInvoice($current, $reason));
+                return;
+            }
+            if (!empty($attempt['failure_notified'])) return;
             $this->writePaymentAttempt($user, $current, array_replace($attempt, [
                 'agreement_id' => null, 'confirmation' => null, 'retry' => true, 'failure_reason' => $reason,
             ]));
@@ -168,6 +176,40 @@ trait ChargeRecovery
                     });
                 } catch (\Throwable $e) { report($e); }
             });
+        });
+    }
+
+    private function notifyUnpaidInvoice($invoice, string $reason): void
+    {
+        try {
+            $this->withPaymentLock($invoice, function ($user, $current) use ($reason) {
+                if ($current->status === 'pending' && $this->paymentBalance($current) > 0) Notification::create([
+                    'user_id' => $user->id, 'title' => 'Payment not completed',
+                    'body' => $reason, 'url' => route('invoices.show', $current),
+                ]);
+            });
+        } catch (\Throwable $e) { report($e); }
+    }
+
+    private function notifyPaymentAccessRefusal(): void
+    {
+        // Only staff can restore Stripe access. One alert per configured key, across invoices.
+        DB::afterCommit(function () {
+            try {
+                DB::transaction(function () {
+                    $gateway = Gateway::where('extension', 'AeStripe')->lockForUpdate()->firstOrFail();
+                    $fingerprint = hash('sha256', $this->config('stripe_secret_key'));
+                    if (Audit::where('auditable_type', $gateway->getMorphClass())->where('auditable_id', $gateway->id)
+                        ->where('event', 'ae_stripe_access_refused')->where('new_values->key_fingerprint', $fingerprint)->lockForUpdate()->first()) return;
+                    Audit::create(['event' => 'ae_stripe_access_refused', 'auditable_type' => $gateway->getMorphClass(),
+                        'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => ['key_fingerprint' => $fingerprint]]);
+                    foreach (User::whereNotNull('role_id')->get() as $staff) Notification::create([
+                        'user_id' => $staff->id, 'title' => 'Stripe access needs attention',
+                        'body' => 'Stripe refused payment checks. Check the API key and its permissions.',
+                        'url' => url('/admin/gateways/' . $gateway->id . '/edit'),
+                    ]);
+                });
+            } catch (\Throwable $e) { report($e); } // Failed delivery rolls back the marker; the next refused check retries.
         });
     }
 
@@ -216,7 +258,7 @@ trait ChargeRecovery
             } else {
                 if (!empty($attempt['confirmation']) && (empty($attempt['confirmation']['key'])
                     || !hash_equals($attempt['confirmation']['key'], $checkedConfirmKey))) {
-                    throw new \App\Exceptions\DisplayException('A debit was sent. Restore access to its Stripe account, or check confirm key ' . ($attempt['confirmation']['key'] ?? '(missing)') . ' in that account’s request log before using --checked-confirm-key.');
+                    throw new \App\Exceptions\DisplayException('A debit was sent for ' . ($attempt['intent'] ?? '(missing ID)') . '. In the original Stripe account, open it in Workbench Inspector > Logs and read request details for confirm key ' . ($attempt['confirmation']['key'] ?? '(missing)') . '. Logs must cover ' . gmdate('Y-m-d H:i', $attempt['created']) . ' UTC onward. If you cannot verify the key there, get Stripe support proof for that account, payment, key and dates. Use --checked-confirm-key only with proof it never reached Stripe.');
                 }
                 if (!empty($attempt['funds_pending'])
                     || Audit::where('auditable_type', $current->getMorphClass())->where('auditable_id', $current->id)
@@ -233,6 +275,7 @@ trait ChargeRecovery
                     'attempt_key' => $attempt['key'], 'payment_intent_id' => $intent?->id ?? $missingId, 'evidence' => $accountedEvidence ?: $evidence,
                     'funds_accounted' => $accountedEvidence !== '', 'checked_confirm_key' => $checkedConfirmKey ?: null,
                 ]]);
+            if (!$intent || $accountedEvidence !== '') DB::afterCommit(fn () => $this->notifyUnpaidInvoice($current, 'Payment not completed. Open the invoice to pay the amount still due.'));
         });
     }
 

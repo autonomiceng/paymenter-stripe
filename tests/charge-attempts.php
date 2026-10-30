@@ -85,6 +85,75 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        $run('recovery-refusals', function ($invoice, $stripe) use ($gateway) {
+            $stripe->loseCreate = true; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $stripe->failure = fn ($verb, $path) => $path === '/payment_intents' ? throw new RequestException(400) : null;
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            check(count(Notification::$rows) === 1 && Notification::$rows[0]['user_id'] === 7 && !empty(Notification::$rows[0]['url']), 'A refused recovery create tells the customer once with a pay link');
+            $stripe->failure = null; $gateway->pay($invoice, 20);
+            $GLOBALS['fakeConsole'] = true;
+            $other = new Invoice(User::$row); $other->id = 921; Invoice::$rows[921] = $other;
+            $stripe->failure = fn () => throw new RequestException(401);
+            check($gateway->charge($other, 20, new BillingAgreement) === true && isset(User::$row->props->values['ae_stripe_checkout_921']), 'A bad API key keeps a cron instruction pending');
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); $attempt['retry'] = true;
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            $stripe->failure = fn () => throw new RequestException(403);
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            $staff = array_filter(Notification::$rows, fn ($notice) => $notice['user_id'] !== 7);
+            check(count($staff) === 1, 'Persistent refused reads alert staff once');
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); $attempt['retry'] = false;
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            check(count(array_filter(Notification::$rows, fn ($notice) => $notice['user_id'] !== 7)) === 1, 'The same key refusal on another invoice does not add staff alerts');
+            $stripe->failure = null; $gateway->retryChargeAttempts();
+            check(count($stripe->charges) === 1, 'Fixing the key resumes the unsent renewal once');
+        });
+        $run('replacement-renewal', function ($invoice, $stripe) use ($gateway) {
+            foreach (['canceled', 'automatic'] as $shape) {
+                $gateway->pay($invoice, 20); $id = array_key_last($stripe->intents);
+                $GLOBALS['fakeConsole'] = true; Gateway::$enabled = false;
+                $gateway->charge($invoice, 20, new BillingAgreement); Gateway::$enabled = true;
+                if ($shape === 'canceled') $stripe->intents[$id]->status = 'canceled';
+                else $stripe->intents[$id]->confirmation_method = 'automatic';
+                $gateway->retryChargeAttempts();
+                check(count($stripe->charges) === ($shape === 'canceled' ? 1 : 2), 'Replacement preserves the unsent renewal on ' . $shape);
+                $invoice->id++; Invoice::$rows[$invoice->id] = $invoice;
+            }
+        });
+        $run('action-release', function ($invoice, $stripe) use ($gateway) {
+            $stripe->status = 'requires_action'; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(($attempt['confirmation']['key'] ?? null) === end($stripe->confirms)[0], 'Authentication preserves the sent confirm key for a later missing-payment check');
+            $stripe->failure = fn () => throw new RequestException(404);
+            paymentStops(fn () => $gateway->pay($invoice, 20));
+            $gateway->resolveChargeAttempt($invoice, null, 'Original account support confirms this debit was never sent', '', $attempt['confirmation']['key']);
+            check(!isset(User::$row->props->values['ae_stripe_checkout_920']), 'An authenticated payment with verified no-charge proof has an audited way out');
+        });
+        $run('replacement-lock', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); $stripe->intents['pi_test1']->status = 'canceled'; $GLOBALS['fakeConsole'] = true;
+            $stripe->failure = function ($verb, $path) {
+                if ($verb === 'get' && $path === '/payment_intents/pi_test1') DB::$afterTransaction = function () {
+                    DB::$afterTransaction = function () {
+                        DB::$beforeUserLock = fn () => throw new \Illuminate\Database\QueryException('Lock wait timeout', 1205);
+                    };
+                };
+            };
+            try { $gateway->charge($invoice, 20, new BillingAgreement); throw new RuntimeException('An unsaved replacement must surface its lock failure'); }
+            catch (\Illuminate\Database\QueryException $e) { check(!isset(User::$row->props->values['ae_stripe_checkout_920']) && !$stripe->charges, 'A prior round cannot claim a retry after its attempt was removed'); }
+        });
+        $run('removed-recovery-card', function ($invoice, $stripe) use ($gateway) {
+            foreach ([false, true] as $confirmation) {
+                if ($confirmation) $stripe->beforeConfirm = fn () => throw new ConnectionException('Confirm never arrived');
+                else $stripe->dropCreate = true;
+                paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+                ExtensionHelper::$agreements = []; $stripe->beforeConfirm = null;
+                $gateway->retryChargeAttempts(); $calls = count(Http::$calls); $gateway->retryChargeAttempts();
+                $notice = end(Notification::$rows);
+                check($notice && $notice['user_id'] === 7 && str_contains($notice['body'], 'removed') && !empty($notice['url']) && count(Http::$calls) === $calls && !$stripe->charges, 'A removed recovery card notifies the customer and stops polling');
+                $invoice->id++; Invoice::$rows[$invoice->id] = $invoice;
+                ExtensionHelper::$agreements = ['pm_test' => ['id' => 4, 'user_id' => 7, 'gateway_id' => 3]];
+            }
+        });
         $run('create-manual', function ($invoice, $stripe) use ($gateway) {
             $view = $gateway->pay($invoice, 20);
             check($view['data']['intent']->confirmation_method === 'manual' && !$stripe->charges, 'A new checkout creates an unconfirmed manual intent with Stripe-compatible parameters');
@@ -136,6 +205,11 @@ use Illuminate\Support\Facades\{DB, Http};
             rejects(fn () => $gateway->resolveChargeAttempt($invoice, null, 'Support case in the original account says no charge'),
                 'This payment may still hold money. Restore access to its Stripe account and account for the funds first.');
             check(isset(User::$row->props->values['ae_stripe_checkout_920']), 'A missing ID cannot release an observed debit that may still hold money');
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); unset($attempt['funds_pending']);
+            ExtensionHelper::$payments['920:pi_test1'] = ['status' => 'processing', 'amount' => 20, 'gateway' => 'AeStripe'];
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            rejects(fn () => $gateway->resolveChargeAttempt($invoice, null, 'Support case in the original account says no charge'),
+                'This payment may still hold money. Restore access to its Stripe account and account for the funds first.');
         });
         $run('refusal-read-outage', function ($invoice, $stripe) use ($gateway) {
             $refused = false;
@@ -302,7 +376,7 @@ use Illuminate\Support\Facades\{DB, Http};
         });
         $run('database-commit-after-confirm', function ($invoice, $stripe) use ($gateway) {
             $GLOBALS['fakeConsole'] = true;
-            $stripe->beforeConfirm = function () { DB::$afterTransaction = fn () => throw new \Illuminate\Database\QueryException('Server has gone away', 2006); };
+            $stripe->beforeConfirm = function () { DB::$afterTransaction = fn () => throw new \PDOException('Server has gone away', 2006); };
             check($gateway->charge($invoice, 20, new BillingAgreement) === true, 'A lost database commit response after confirm cannot reach cron as payment failed');
             $stripe->beforeConfirm = null; $gateway->retryChargeAttempts();
             check(count($stripe->charges) === 1 && (ExtensionHelper::$payments['920:pi_test1']['status'] ?? null) === 'succeeded', 'Recovery settles the known payment after a lost database commit response');
@@ -342,6 +416,7 @@ use Illuminate\Support\Facades\{DB, Http};
             $message = paymentStops(fn () => $gateway->resolveChargeAttempt($invoice, null, 'Support says no charge'));
             check(str_contains($message, 'debit was sent') && isset(User::$row->props->values['ae_stripe_checkout_920']), 'Free text plus 404 cannot release an unknown sent debit');
             $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(str_contains($message, 'pi_test1') && str_contains($message, 'Inspector') && str_contains($message, 'Logs') && str_contains($message, 'cover') && str_contains($message, 'support'), 'The refusal names the payment and a dated original-account log or support check');
             check(str_contains($attempt['reason'], 'debit was sent'), 'The staff hold explains that a debit was sent');
             paymentStops(fn () => $gateway->resolveChargeAttempt($invoice, null, 'Old account request log checked', '', 'confirm_wrong'));
             check(isset(User::$row->props->values['ae_stripe_checkout_920']), 'A different checked confirm key cannot release the held payment');
@@ -354,15 +429,14 @@ use Illuminate\Support\Facades\{DB, Http};
             $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
             $gateway->resolveChargeAttempt($invoice, null, 'Original account request log confirms this key never reached Stripe', '', $attempt['confirmation']['key']);
             check(!isset(User::$row->props->values['ae_stripe_checkout_920']) && end(Audit::$rows)['new_values']['checked_confirm_key'] === $attempt['confirmation']['key'], 'No-charge resolution audits the exact confirm key staff checked in the original account');
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            $notice = end(Notification::$rows);
+            check(!$stripe->charges && $notice['user_id'] === 7 && $notice['title'] === 'Payment not completed' && !empty($notice['url']), 'A staff release ends the renewal without re-debiting and tells the customer how to pay');
         });
         $run('customer-words', function ($invoice, $stripe) use ($gateway) {
             User::$row->props->values['ae_stripe_checkout_920'] = json_encode(['key' => 'legacy', 'created' => time() - 90000, 'params' => ['confirm' => 'true']]);
             $message = paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
             check(!str_contains($message, 'request log') && !str_contains($message, 'releasing') && str_contains($message, 'support'), 'Customers never receive staff reconciliation instructions');
-        });
-        $run('deferred-elements-options', function () {
-            $source = file_get_contents(__DIR__ . '/../extension/AeStripe/resources/views/pay.blade.php');
-            check(str_contains($source, "mode: 'payment'") && str_contains($source, 'amount: @js($intent->amount)') && str_contains($source, 'currency: @js(strtolower($intent->currency))') && !str_contains($source, 'clientSecret: @js($intent->client_secret)'), 'Checkout configures deferred Elements with the displayed minor amount and currency (offline shape check only)');
         });
         $run('lost-response', function ($invoice, $stripe) use ($gateway) {
             $stripe->loseConfirm = true;

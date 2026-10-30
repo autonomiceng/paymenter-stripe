@@ -261,6 +261,7 @@ namespace App\Models {
     }
     #[\AllowDynamicProperties]
     class Extension {
+        public function getMorphClass() { return Extension::class; }
         public function __construct(array $values = []) { foreach ($values as $k => $v) $this->$k = $v; }
         public function settings() { return new class { public function where($k, $v) { return new Query((object) ['value' => 'whsec_test']); } }; }
         public function wasChanged($key) { return $this->changed ?? false; }
