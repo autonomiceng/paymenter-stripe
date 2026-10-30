@@ -69,7 +69,7 @@ try {
                     };
                 } };
             },
-            async confirmSetup() { probe.confirms++; return { error: { message: 'Test decline. Try again.' } }; },
+            async confirmSetup() { probe.confirms++; return { error: { type: 'card_error', message: 'Test decline. Try again.' } }; },
         }); };
         function assertTarget(target) { if (!target?.isConnected) throw new Error('Stripe mounted into a detached form'); }
     });
@@ -114,7 +114,7 @@ try {
         await page.locator('#setup-consent').check();
         if (cycle === 1) {
             await page.evaluate(() => { probe.failConsent = true; });
-            await page.getByRole('button', { name: 'Authorize' }).click();
+            await page.getByRole('button', { name: 'Save payment method' }).click();
             await page.getByRole('alert').filter({ hasText: 'Could not record your agreement' }).waitFor();
             assert.equal(await page.evaluate(() => probe.confirms), 0, 'Failed consent cannot reach confirmation');
             await page.evaluate(() => { probe.failConsent = false; });
@@ -128,7 +128,7 @@ try {
             holdConsent = false;
             pendingConsent.splice(0).forEach((resolve) => resolve());
         } else {
-            await page.getByRole('button', { name: 'Authorize' }).click();
+            await page.getByRole('button', { name: 'Save payment method' }).click();
         }
         await page.getByRole('alert').filter({ hasText: 'Test decline' }).waitFor();
         assert.equal(await page.evaluate(() => probe.confirms), cycle, `cycle ${cycle}: exactly one submit handler`);
@@ -150,7 +150,7 @@ try {
     await page.waitForTimeout(5500);
     assert.equal(await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).count(), 0, 'A fresh Stripe.js request is still loading after five seconds');
     assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'The fresh pending script is retained');
-    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    assert.equal(await page.getByRole('button', { name: 'Save payment method' }).isDisabled(), true);
     releaseStripe();
     holdStripe = false;
     await page.getByRole('textbox', { name: 'Card number' }).waitFor();
@@ -167,11 +167,11 @@ try {
     const releaseStalledStripe = releaseStripe;
     await page.clock.fastForward(29000);
     assert.equal(await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).count(), 0, 'The fresh request gets a generous wait before timing out');
-    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    assert.equal(await page.getByRole('button', { name: 'Save payment method' }).isDisabled(), true);
     await page.clock.fastForward(1000);
     await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor({ timeout: 1500 });
     assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, 'Timeout removes the stalled script owned by this form');
-    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    assert.equal(await page.getByRole('button', { name: 'Save payment method' }).isDisabled(), true);
     // Dispose the held network fixture after the timeout; Chromium otherwise coalesces
     // another request for the same URL with it, even though its tag was removed.
     const stalledRequestEnded = page.waitForEvent('requestfailed', { predicate: (request) => request.url() === 'https://js.stripe.com/v3/' });
@@ -207,7 +207,7 @@ try {
     await page.goto('http://setup.test/');
     await page.getByRole('button', { name: 'Add payment method' }).click();
     await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor();
-    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    assert.equal(await page.getByRole('button', { name: 'Save payment method' }).isDisabled(), true);
     assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, 'A fresh script that errors is removed');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
@@ -222,7 +222,7 @@ try {
     await page.goto('http://setup.test/');
     await page.getByRole('button', { name: 'Add payment method' }).click();
     await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor();
-    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    assert.equal(await page.getByRole('button', { name: 'Save payment method' }).isDisabled(), true);
     assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, 'A script with no Stripe global is removed');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });
@@ -328,7 +328,7 @@ try {
     }));
     await page.getByRole('button', { name: 'Add payment method' }).click();
     await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor({timeout: 10000});
-    assert.equal(await page.getByRole('button', { name: 'Authorize' }).isDisabled(), true);
+    assert.equal(await page.getByRole('button', { name: 'Save payment method' }).isDisabled(), true);
     assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'An already-finished foreign script is preserved after a bounded wait');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });

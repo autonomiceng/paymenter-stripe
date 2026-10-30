@@ -59,7 +59,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 
 #[ExtensionMeta(
     name: 'AE Stripe',
-    description: 'Stripe Payment Element with saved methods and optional card saving.',
+    description: 'Stripe payments with saved cards.',
     version: '0.1.1',
     author: 'Autonomic Engineering',
     icon: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgZmlsbD0iIzUzM0FGRCIvPjxwYXRoIGQ9Ik0xMjAgMzkyTDM5MiAzMzRWMTEyTDEyMCAxNz hWMzk yWiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg=='
@@ -198,7 +198,7 @@ class AeStripe extends Gateway
                 'label' => 'Stripe webhook signing secret',
                 'type' => 'text',
                 'encrypted' => true,
-                'description' => 'Created automatically when you enable the gateway. Refresh the page to see it.',
+                'description' => 'Created automatically when you enable the gateway.',
                 'required' => false,
             ],
         ];
@@ -267,7 +267,7 @@ class AeStripe extends Gateway
         Notification::make()
             ->success()
             ->title('Webhook created')
-            ->body('We\'ve created a webhook for you on Stripe (refresh the page to see the secret)')
+            ->body('We created a webhook on Stripe and saved its signing secret here.')
             ->send();
 
         if ($gateway->enabled && $gateway->wasChanged('enabled')) $this->disableEmptyBundled();
@@ -653,7 +653,7 @@ class AeStripe extends Gateway
         if ($setupIntent->status !== 'succeeded') {
             return redirect()->route('account.payment-methods')->with('notification', [
                 'type' => 'danger',
-                'message' => 'Could not add payment method, setup not completed successfully.',
+                'message' => 'Could not add your payment method. Try again.',
             ]);
         }
         // Validate if user id matches
@@ -776,7 +776,7 @@ class AeStripe extends Gateway
         $stripeCustomerId = $user->properties->where('key', 'stripe_id')->first();
         // Create customer if not exists
         if (!$stripeCustomerId) {
-            throw new DisplayException('Stripe customer not found');
+            throw new DisplayException('Could not find your saved payment details. Add a new payment method.');
         } else {
             $customer = $this->request('get', '/customers/' . $stripeCustomerId->value);
         }
@@ -797,10 +797,10 @@ class AeStripe extends Gateway
                 $error = $e->response->object()->error;
                 // If error is invalid_request_error and message contains "The provided currency" we can show the message
                 if ($error->type === 'invalid_request_error' && Str::contains($error->message, 'The currency provided')) {
-                    throw new DisplayException('Cannot charge the billing agreement because the card does not support the invoice currency (' . $invoice->currency_code . '). Please use another payment method.');
+                    throw new DisplayException('This card can\'t be charged in ' . $invoice->currency_code . '. Use another payment method.');
                 }
             }
-            throw new DisplayException('Could not process payment');
+            throw new DisplayException('Could not process your payment. Try again or use another payment method.');
         }
 
         return true;

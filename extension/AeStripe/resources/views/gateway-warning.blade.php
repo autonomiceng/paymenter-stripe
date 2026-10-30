@@ -5,7 +5,7 @@
         <div class="mt-2">
             <p>Core Stripe #{{ $gateway['id'] }}</p>
             @if ($gateway['hasReferences'])
-                <p>Pause checkout, collection and webhook delivery, then review the adoption plan:</p>
+                <p>Pause checkout, collection and webhook delivery, then review the import plan:</p>
                 <code>php artisan ae-stripe:adopt-bundled --confirm-paused --source-gateway={{ $gateway['id'] }}</code>
             @elseif ($gateway['canUpdate'])
                 <form method="POST" action="{{ route('extensions.gateways.ae-stripe.disable-core') }}">

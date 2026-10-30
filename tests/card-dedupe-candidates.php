@@ -59,7 +59,7 @@ foreach (['setup', 'cleanup', 'server failure', 'receipt'] as $case) {
     if ($case === 'cleanup') {
         $lines = [];
         $skipped = $gateway->deduplicateCards(true, function ($line) use (&$lines) { $lines[] = $line; });
-        check(in_array('Agreement #21 duplicates #20 (customer #7).', $lines)
+        check(in_array('Saved card #21 duplicates #20 (customer #7).', $lines)
             && ExtensionHelper::$agreements['pm_new']['deleted_at'] !== null && $methods['pm_new']->customer === null,
             'Cleanup finds a later duplicate after a missing older candidate');
         check($skipped === 1 && ExtensionHelper::$agreements['pm_kept']['deleted_at'] === null,

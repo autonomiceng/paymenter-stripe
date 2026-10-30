@@ -37,7 +37,7 @@ trait Checkout
             \Illuminate\Support\Facades\Log::warning('AeStripe customer setup failed', [
                 'invoice_id' => $invoice->id, 'error' => get_class($e),
             ]);
-            throw new DisplayException('Could not prepare your payment. Please try again.');
+            throw new DisplayException('Could not prepare your payment. Try again.');
         }
         $intentData['customer'] = $customer->id;
         $intent = $this->checkoutIntent($invoice, $intentData);
@@ -162,7 +162,7 @@ trait Checkout
                 'payment_intent_id' => $intent->id,
                 'amount_minor' => $intent->amount_received,
                 'currency' => $intent->currency ?? '', 'reason' => $reason,
-                'resolution' => 'Payment was not applied. Review the charge in Stripe for a refund or record the correct customer credit in Paymenter.',
+                'resolution' => 'Payment was not applied. Review the charge in Stripe for a refund, or add the correct account credit in Paymenter.',
             ],
         ]);
     }
@@ -214,7 +214,7 @@ trait Checkout
             $find = fn () => BillingAgreement::withTrashed()->where('external_reference', $method->id)->lockForUpdate()->first();
             $agreement = $find();
             if ($agreement && ($agreement->user_id != $user->id || $agreement->gateway_id != $gateway->id)) {
-                throw new DisplayException('This payment method belongs to another account or gateway.');
+                throw new DisplayException('This payment method can\'t be used on this account. Add a new payment method.');
             }
             if ($agreement?->trashed() && !$receipt) {
                 throw new DisplayException('This payment method was removed. Add a new payment method.');
@@ -246,7 +246,7 @@ trait Checkout
                 }
             }
             if ($agreement->user_id != $user->id || $agreement->gateway_id != $gateway->id) {
-                throw new DisplayException('This payment method belongs to another account or gateway.');
+                throw new DisplayException('This payment method can\'t be used on this account. Add a new payment method.');
             }
             if ($agreement->trashed()) {
                 throw new DisplayException('This payment method was removed. Add a new payment method.');

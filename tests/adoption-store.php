@@ -138,7 +138,7 @@ check(array_unique(DB::$locks) === ['extensions', 'settings', 'billing_agreement
 $manifest = $store->load($result['manifest']);
 check($manifest === $plan, 'JSON manifest round trips with exact types and digest');
 check((fileperms($adoptionStorage . '/app/ae-stripe-adoption/' . $result['manifest']) & 0777) === 0600, 'Manifest permissions private');
-rejects(fn () => new AdoptionStore, 'Another adoption command is running');
+rejects(fn () => new AdoptionStore, 'Another import command is running');
 $engine->rollback($manifest);
 check(DB::$tables === $original, 'Production updates restore exact raw tables');
 $engine->run($plan['digest']);
@@ -248,7 +248,7 @@ $failureHandler = Http::$handler;
 $errors = \Illuminate\Support\Facades\Log::$errors;
 Http::$handler = fn () => throw new RuntimeException('Synthetic adoption failure');
 try {
-    check($command->handle() === 1 && end($command->output) === 'Operation failed; keep writers paused and inspect protected manifest/database state before retrying', 'Unexpected adoption failures keep the existing safe console message');
+    check($command->handle() === 1 && end($command->output) === 'Command failed; keep writers paused and check the manifest and database before trying again', 'Unexpected adoption failures keep the existing safe console message');
     check(!str_contains(implode("\n", $command->output), 'Synthetic adoption failure'), 'Adoption does not print the raw exception');
     check(array_slice(\Illuminate\Support\Facades\Log::$errors, count($errors)) === [['AE Stripe adoption failed.', ['exception' => RuntimeException::class, 'code' => 'adoption_failed']]], 'Adoption logs the exception class and a fixed code, not the message');
 } finally { Http::$handler = $failureHandler; }

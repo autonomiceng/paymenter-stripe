@@ -14,7 +14,7 @@
     <p class="text-sm">Saving does not turn on Auto Pay; you can choose it for a service later.</p>
     <button id="submit" disabled
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
-        Authorize
+        Save payment method
     </button>
 </form>
 @script
@@ -127,26 +127,36 @@ Alpine.data('aeStripeSetup', (config) => {
                     message.replaceChildren();
                     setLoading(true);
                     try {
-                        if (!consent.checked) throw new Error('Agree to future charges before saving your payment method.');
+                        if (!consent.checked) {
+                            showMessage('Agree to future charges before saving your payment method.');
+                            return;
+                        }
                         const result = await fetch(config.consentUrl, {
                             method: 'POST', signal: controller.signal,
                             headers: {'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': config.csrf},
                             body: JSON.stringify({intent: config.intent, consent: consent.checked}),
                         });
-                        if (!result.ok) throw new Error('Could not record your agreement. Try again.');
+                        if (!result.ok) {
+                            showMessage('Could not record your agreement. Try again.');
+                            return;
+                        }
                         if (disposed) return;
                         const {error} = await stripe.confirmSetup({elements, confirmParams: {return_url: config.returnUrl}});
                         if (error) throw error;
                     } catch (error) {
                         if (disposed) return;
-                        const text = document.createElement('p');
-                        text.className = 'mb-2';
-                        text.textContent = error.message || 'Could not save payment method.';
-                        message.replaceChildren(text);
+                        showMessage(['card_error', 'validation_error'].includes(error?.type) && error.message
+                            ? error.message : 'Could not save your payment method. Try again.');
                     } finally {
                         setLoading(false);
                     }
                 }, {signal: controller.signal});
+                function showMessage(value) {
+                    const text = document.createElement('p');
+                    text.className = 'mb-2';
+                    text.textContent = value;
+                    message.replaceChildren(text);
+                }
                 paymentElement.on('ready', () => { ready = true; setLoading(false); });
                 paymentElement.on('loaderror', initializationError);
                 paymentElement.mount(container);

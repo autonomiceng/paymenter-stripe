@@ -14,7 +14,7 @@ Http::$handler = function ($verb, $path) {
     throw new RequestException(503);
 };
 $before = count(Http::$calls);
-rejects(fn () => $gateway->pay($invoice, 20), 'Could not prepare your payment. Please try again.');
+rejects(fn () => $gateway->pay($invoice, 20), 'Could not prepare your payment. Try again.');
 check(count(array_filter(array_slice(Http::$calls, $before), fn ($call) => $call[1] === '/payment_intents')) === 0,
     'Customer failure never creates an anonymous intent');
 check(end(Log::$warnings) === ['AeStripe customer setup failed', ['invoice_id' => 12, 'error' => RequestException::class]],

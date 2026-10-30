@@ -17,13 +17,13 @@ final class DeduplicateCardsCommand extends Command
             $gateway = ExtensionHelper::getExtension('gateway', 'AeStripe', $row->settings);
             $skipped = $gateway->deduplicateCards((bool) $this->option('apply'), fn ($line) => $this->line($line));
             if ($skipped > 0) {
-                $this->error($skipped . ' agreement(s) skipped. Review them manually.');
+                $this->error($skipped . ' saved card(s) skipped. Review them manually.');
                 return self::FAILURE;
             }
             $this->info($this->option('apply') ? 'Duplicate cleanup completed.' : 'Dry run. No changes. Use --apply to remove unbound duplicates.');
             return self::SUCCESS;
         } catch (\Throwable $e) {
-            $this->error('Duplicate cleanup failed. Review the agreements and retry.');
+            $this->error('Duplicate cleanup failed. Review the saved cards and try again.');
             return self::FAILURE;
         }
     }

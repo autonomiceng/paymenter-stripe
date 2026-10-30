@@ -1,0 +1,90 @@
+// Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
+// Exercise the production submit handlers with offline browser/Stripe boundaries.
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const views = new URL('../extension/AeStripe/resources/views/', import.meta.url);
+const theme = readFileSync(new URL('stripe-theme.blade.php', views), 'utf8');
+function render(name) {
+    let source = readFileSync(new URL(`${name}.blade.php`, views), 'utf8')
+        .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
+        .replace(/@js\(route\('([^']+)'\)\)/g, (_, route) => JSON.stringify('/' + route))
+        .replace("@js(route('invoices.show', $invoice) . '?checkPayment=true')", "'/return'")
+        .replace('@js(csrf_token())', "'fixture-csrf'")
+        .replaceAll('@js($stripePublishableKey)', "'fixture-key'")
+        .replaceAll('@js($intent->client_secret)', "'fixture-secret'")
+        .replaceAll('@js($intent->id)', "'fixture-intent'")
+        .replace('@js($customerSessionSecret)', 'null')
+        .replace("@js($intent->status === 'requires_action')", 'false')
+        .replace("@js(($intent->metadata->ae_stripe_consent ?? null) === '1')", 'false')
+        .replace(/@checked\([^\n]+? disabled/, 'disabled')
+        .replace(/\{\{[^\n]+?\}\}/g, "'Fixture'")
+        .replaceAll('@script', '').replaceAll('@endscript', '');
+    assert(!/@js|@checked|\{\{|@include/.test(source), 'Blade expressions are rendered');
+    return source;
+}
+const browser = await chromium.launch({ headless: true });
+try {
+    for (const name of (process.argv.slice(2).length ? process.argv.slice(2) : ['pay', 'billing-agreement'])) {
+        const page = await browser.newPage();
+        await page.route('**/*', route => route.fulfill({ contentType: 'text/javascript', body: '' }));
+        page.setDefaultTimeout(5000);
+        await page.setContent('<html><body></body></html>');
+        await page.evaluate(() => {
+            window.failure = 'network';
+            window.confirms = 0;
+            window.fetch = async () => {
+                if (failure === 'network') throw new TypeError('Failed to fetch');
+                return { ok: failure !== 'consent' };
+            };
+            window.$wire = { on() {} };
+            window.Alpine = { data: (_, factory) => { window.setupFactory = factory; } };
+            window.Stripe = () => ({
+                elements: () => ({ update() {}, async fetchUpdates() {
+                    if (failure === 'updates') return { error: { type: 'api_connection_error', message: 'Raw update detail' } };
+                    return {};
+                }, create() {
+                    const handlers = {};
+                    return { on: (name, fn) => { handlers[name] = fn; }, mount() { handlers.ready(); }, destroy() {} };
+                } }),
+                async confirmPayment() { return confirm(); },
+                async confirmSetup() { return confirm(); },
+            });
+            function confirm() {
+                confirms++;
+                if (failure === 'confirmation') throw new TypeError('NetworkError when attempting to fetch resource.');
+                return { error: { type: 'card_error', message: 'Your card was declined.' } };
+            }
+        });
+        await page.setContent(render(name));
+        if (name === 'pay') {
+            await page.waitForFunction(() => !!document.querySelector('script[src]'));
+            await page.evaluate(() => document.querySelector('script[src]').onload());
+        } else {
+            await page.evaluate(async () => {
+                window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf' });
+                component.$el = document.querySelector('form');
+                await component.init();
+            });
+            await page.locator('#setup-consent').check();
+        }
+        const fallback = name === 'pay' ? 'Could not confirm your payment. Try again.' : 'Could not save your payment method. Try again.';
+        for (const failure of ['network', 'confirmation', ...(name === 'pay' ? ['updates'] : []), 'consent', 'decline']) {
+            await page.evaluate(value => { window.failure = value; }, failure);
+            const before = await page.evaluate(() => confirms);
+            await page.locator('#submit').click();
+            const expected = failure === 'decline' ? 'Your card was declined.' : failure === 'consent'
+                ? (name === 'pay' ? 'Could not update your payment preferences. Try again.' : 'Could not record your agreement. Try again.') : fallback;
+            await page.waitForFunction(() => document.querySelector('[role=alert]').textContent.length > 0);
+            assert.equal(await page.locator('[role=alert]').textContent(), expected, `${name}: ${failure}`);
+            assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: retry stays available after ${failure}`);
+            if (['network', 'consent', 'updates'].includes(failure)) assert.equal(await page.evaluate(() => confirms), before, 'Failed preparation cannot confirm');
+        }
+        await page.close();
+    }
+    console.log('Pay and setup network failures, retry and card declines passed.');
+} finally {
+    await browser.close();
+}
