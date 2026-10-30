@@ -93,6 +93,7 @@ the original amount can complete and any excess enters the existing payment revi
 Failed Elements authentication is canceled on the next page load, return or failure webhook,
 after retrieving the current status; a fresh attempt then permits another payment.
 Native manual authentication and bank verification still reconfirm under the server checks. Card/Link saving consent remains explicit and method-specific.
+The GET payment return compares Stripe's redirect secret before any write. Missing or wrong secrets show read-only status with an invoice link; the webhook, recovery or authenticated payment form can still finish it.
 
 A lost confirm response is recovered by intent ID, beyond key expiry. An unconfirmed
 creation can be abandoned after 23 hours because it cannot have taken money. No frozen
@@ -113,6 +114,7 @@ The five-minute recovery task reads unresolved payments and retries interrupted 
 using the current balance and active agreement. It stops its batch on a Stripe outage and
 rotates checked records so one outage does not hold the whole queue. Keep Paymenter's
 scheduler running. Notification failures are retried separately after settlement commits.
+Known, unfunded automatic Elements payments awaiting authentication stop polling because only the customer can authenticate. Their resume evidence stays stored; webhooks and page contact still settle them. Manual bank verification and unknown or money-bearing outcomes keep recovery.
 A definite create refusal clears a no-ID creation and tells the customer how to pay. A 401/403 retains the unsent instruction; recovery resumes after access is fixed. Refused reads also retain recovery. A repeated refusal stops the batch and alerts staff once per configured key across invoices, after commit; only staff can restore Stripe access. Lookup errors never prove a charge failed.
 Currency and card refusals explain the reason and permit another method or a repaired setup.
 Cancellation requests have no persistent failure-cache key; replacement still needs a

@@ -87,6 +87,31 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        $run('resolve-command-error', function () {
+            require_once __DIR__ . '/../extension/AeStripe/ResolveChargeCommand.php';
+            $rows = Gateway::$rows; Gateway::$rows = [];
+            $reported = count($GLOBALS['reportedErrors'] ?? []);
+            try {
+                $command = new \Paymenter\Extensions\Gateways\AeStripe\ResolveChargeCommand;
+                check($command->handle() === 1 && count($GLOBALS['reportedErrors'] ?? []) === $reported + 1
+                    && str_contains(implode(' ', $command->output), \RuntimeException::class)
+                    && !str_contains(implode(' ', $command->output), 'Missing row'),
+                    'An unexpected resolve-command failure is reported and identifies its class without printing its message');
+            } finally { Gateway::$rows = $rows; }
+        });
+        $run('return-secret', function ($invoice, $stripe) use ($gateway) {
+            $stripe->status = 'requires_action'; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $intent = $stripe->intents['pi_test1']; $intent->status = 'requires_confirmation'; $stripe->status = 'succeeded';
+            $attempt = User::$row->props->values['ae_stripe_checkout_920'];
+            foreach ([null, 'wrong-secret'] as $secret) {
+                $result = $gateway->finishPayment(new Request(['payment_intent' => $intent->id, 'payment_intent_client_secret' => $secret]));
+                check(is_array($result) && !empty($result['data']['invoiceUrl']) && !$stripe->charges
+                    && User::$row->props->values['ae_stripe_checkout_920'] === $attempt,
+                    'A missing or wrong redirect secret shows a next step without changing the payment');
+            }
+            $gateway->finishPayment(new Request(['payment_intent' => $intent->id, 'payment_intent_client_secret' => $intent->client_secret]));
+            check(count($stripe->charges) === 1 && isset(ExtensionHelper::$payments['920:' . $intent->id]), 'A bound bank return can finish its original manual payment');
+        });
         $run('recovery-refusals', function ($invoice, $stripe) use ($gateway) {
             $stripe->loseCreate = true; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
             $stripe->failure = fn ($verb, $path) => $path === '/payment_intents' ? throw new RequestException(400) : null;
@@ -186,6 +211,9 @@ use Illuminate\Support\Facades\{DB, Http};
             check($result['data']['client_secret'] === $id . '_secret', 'Only an authentication response exposes the PaymentIntent secret');
             $gateway->pay($invoice, 20);
             check($stripe->intents[$id]->status === 'requires_action', 'Reopening checkout preserves a current automatic authentication attempt');
+            $gateway->retryChargeAttempts(); $calls = count(Http::$calls); $gateway->retryChargeAttempts();
+            check(count(Http::$calls) === $calls && !json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['retry'],
+                'Automatic authentication awaiting the customer stops polling without discarding its resume evidence');
             // Model an already-started authentication completing after an invoice change.
             // This boundary fixture does not execute or validate Stripe.js authentication.
             $invoice->total = 10; $stripe->intents[$id]->status = 'succeeded'; $stripe->intents[$id]->amount_received = 2000;
@@ -201,7 +229,11 @@ use Illuminate\Support\Facades\{DB, Http};
                 $intent = $stripe->intents[$id]; $intent->status = 'requires_payment_method';
                 $intent->last_payment_error = (object) ['code' => 'payment_intent_authentication_failure'];
                 if ($contact === 'page') $gateway->pay($invoice, 20);
-                elseif ($contact === 'return') $gateway->finishPayment(new Request(['payment_intent' => $id]));
+                elseif ($contact === 'return') {
+                    $gateway->finishPayment(new Request(['payment_intent' => $id]));
+                    check($intent->status === 'requires_payment_method', 'A return without its secret cannot cancel failed authentication');
+                    $gateway->finishPayment(new Request(['payment_intent' => $id, 'payment_intent_client_secret' => $intent->client_secret]));
+                }
                 else $gateway->webhook(eventRequest($intent, type: 'payment_intent.payment_failed'));
                 check($intent->status === 'canceled', 'Failed Elements authentication is canceled on ' . $contact);
                 $view = $gateway->pay($invoice, 20); $stripe->status = 'succeeded';
@@ -655,7 +687,11 @@ use Illuminate\Support\Facades\{DB, Http};
             $stripe->status = 'requires_action';
             $gateway->confirmPayment(new Request(['intent' => $intent->id, 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
             $intent->status = 'succeeded'; $intent->amount_received = $intent->amount;
-            check(str_contains($gateway->finishPayment(new Request(['payment_intent' => $intent->id])), 'checkPayment=true')
+            $gateway->finishPayment(new Request(['payment_intent' => $intent->id]));
+            check(!ExtensionHelper::$payments, 'A read-only successful return leaves settlement to the webhook or recovery');
+            $gateway->webhook(eventRequest($intent));
+            check(isset(ExtensionHelper::$payments['920:' . $intent->id]), 'The webhook settles a payment after an unbound read-only return');
+            check(str_contains($gateway->finishPayment(new Request(['payment_intent' => $intent->id, 'payment_intent_client_secret' => $intent->client_secret])), 'checkPayment=true')
                 && count($stripe->confirms) === 1, 'An automatic redirect reads settlement without confirming again');
         });
         $run('checkout-consent', function ($invoice, $stripe) use ($gateway) {
@@ -670,7 +706,10 @@ use Illuminate\Support\Facades\{DB, Http};
         });
         $run('bank-verification', function ($invoice, $stripe) use ($gateway) {
             $stripe->status = 'requires_action'; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $gateway->retryChargeAttempts();
+            check(json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['retry'], 'Manual bank authentication keeps automatic recovery');
             $stripe->intents['pi_test1']->status = 'requires_confirmation'; $stripe->status = 'succeeded';
+            $gateway->finishPayment(new Request(['payment_intent' => 'pi_test1']));
             $stripe->beforeConfirm = function ($intent, $params) { check(!isset($params['confirmation_token']), 'Async bank verification does not replay a consumed token'); };
             $gateway->retryChargeAttempts();
             check(count($stripe->charges) === 1 && isset(ExtensionHelper::$payments['920:pi_test1']), 'Bank verification finishes through recovery without another customer Pay or browser return');
@@ -686,7 +725,7 @@ use Illuminate\Support\Facades\{DB, Http};
             $stripe->status = 'requires_action'; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
             $stripe->intents['pi_test1']->status = 'requires_confirmation'; $invoice->total = 30;
             $gateway->pay($invoice, 30); $stripe->status = 'succeeded';
-            check(str_contains($gateway->finishPayment(new Request(['payment_intent' => 'pi_test1']))['data']['message'], 'amount due changed')
+            check(str_contains($gateway->finishPayment(new Request(['payment_intent' => 'pi_test1', 'payment_intent_client_secret' => $stripe->intents['pi_test1']->client_secret]))['data']['message'], 'amount due changed')
                 && !$stripe->charges, 'A bank redirect preserves the amount authorized before authentication even if another tab updated the intent');
         });
         $run('decimal-charge', function ($invoice, $stripe) use ($gateway) {

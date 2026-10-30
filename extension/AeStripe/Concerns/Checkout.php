@@ -190,6 +190,16 @@ trait Checkout
                 && $intent->customer === $owner->user->properties()->where('key', 'stripe_id')->first()?->value
                 && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 403);
             $invoice = $owner;
+            $secret = $request->input('payment_intent_client_secret');
+            if (!is_string($secret) || !is_string($intent->client_secret ?? null) || !hash_equals($intent->client_secret, $secret)) {
+                // A link without Stripe's redirect binding may read status, but cannot change it.
+                throw new DisplayException(match ($intent->status) {
+                    'succeeded' => 'Payment received. Open the invoice to check its status.',
+                    'requires_action', 'requires_confirmation' => 'This payment is not finished. Open the invoice to continue.',
+                    'requires_payment_method', 'canceled' => 'This payment was not completed. Choose another payment method on the invoice.',
+                    default => 'Payment pending. Open the invoice to check its status.',
+                });
+            }
             $intent = $this->retireFailedElementsPayment($invoice, $intent);
             if ($intent->status === 'requires_confirmation') {
                 $amount = $this->withPaymentLock($invoice, function ($user, $current) {

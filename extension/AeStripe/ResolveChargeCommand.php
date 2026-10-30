@@ -25,7 +25,8 @@ final class ResolveChargeCommand extends Command
             $this->error($e->getMessage());
             return self::FAILURE;
         } catch (\Throwable $e) {
-            $this->error('Payment review was not resolved. Check the payment ID or proof in the original Stripe account.');
+            report($e);
+            $this->error('Payment review was not resolved (' . get_class($e) . '). Check the payment ID or proof in the original Stripe account.');
             return self::FAILURE;
         }
     }

@@ -120,6 +120,16 @@ trait ChargeRecovery
                 if ($intent->status === 'succeeded') { $this->recordIntentPayment($intent, 'succeeded'); continue; }
                 $attempt = $this->withPaymentLock($invoice, fn ($user, $current) => $this->readPaymentAttempt($user, $current));
                 if (($attempt['intent'] ?? null) !== $intent->id) continue;
+                if ($this->isElementsAttempt($attempt, $intent) && $intent->status === 'requires_action' && ($intent->amount_received ?? 0) === 0) {
+                    // Automatic authentication needs the customer; webhook or page contact resumes it.
+                    $this->withPaymentLock($invoice, function ($user, $current) use ($attempt) {
+                        $stored = $this->readPaymentAttempt($user, $current);
+                        if (($stored['intent'] ?? null) === $attempt['intent'] && empty($stored['funds_pending']) && empty($stored['failure_reason'])
+                            && ($stored['confirmation']['key'] ?? null) === ($attempt['confirmation']['key'] ?? null))
+                            $this->writePaymentAttempt($user, $current, array_replace($stored, ['retry' => false]));
+                    });
+                    continue;
+                }
                 if ($this->paymentAttemptFailed($attempt, $intent)) {
                     $this->recordIntentPayment($intent, 'failed');
                     $this->notifyRecoveryRefusal($invoice, $this->paymentFailureReason($intent->last_payment_error->code ?? null));
