@@ -88,8 +88,12 @@ use Illuminate\Support\Facades\{DB, Http};
         $run('recovery-refusals', function ($invoice, $stripe) use ($gateway) {
             $stripe->loseCreate = true; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
             $stripe->failure = fn ($verb, $path) => $path === '/payment_intents' ? throw new RequestException(400) : null;
+            Notification::$fail = true; $gateway->retryChargeAttempts();
+            $notice = json_decode(User::$row->props->values['ae_stripe_checkout_920'] ?? 'null', true);
+            check(!empty($notice['retry']) && !empty($notice['failure_reason']) && empty($notice['agreement_id']) && empty($notice['confirmation']) && !Notification::$rows, 'A failed refusal notice keeps a durable reminder without a saved debit instruction');
+            Notification::$fail = false; $stripe->failure = null; $calls = count(Http::$calls);
             $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
-            check(count(Notification::$rows) === 1 && Notification::$rows[0]['user_id'] === 7 && !empty(Notification::$rows[0]['url']), 'A refused recovery create tells the customer once with a pay link');
+            check(count(Notification::$rows) === 1 && Notification::$rows[0]['user_id'] === 7 && !empty(Notification::$rows[0]['url']) && !isset(User::$row->props->values['ae_stripe_checkout_920']) && !$stripe->charges && count(Http::$calls) === $calls, 'A later pass delivers the refused-create notice once, removes its reminder and never re-debits');
             $stripe->failure = null; $gateway->pay($invoice, 20);
             $GLOBALS['fakeConsole'] = true;
             $other = new Invoice(User::$row); $other->id = 921; Invoice::$rows[921] = $other;

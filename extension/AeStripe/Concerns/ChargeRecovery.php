@@ -172,7 +172,8 @@ trait ChargeRecovery
                         if (!$attempt || ($attempt['failure_reason'] ?? null) !== $reason || !empty($attempt['failure_notified'])) return;
                         Notification::create(['user_id' => $user->id, 'title' => 'Payment not completed',
                             'body' => $reason, 'url' => route('invoices.show', $invoice)]);
-                        $this->writePaymentAttempt($user, $invoice, array_replace($attempt, ['failure_notified' => true, 'retry' => false]));
+                        if (!empty($attempt['notice_only'])) $user->properties()->where('key', 'ae_stripe_checkout_' . $invoice->id)->delete();
+                        else $this->writePaymentAttempt($user, $invoice, array_replace($attempt, ['failure_notified' => true, 'retry' => false]));
                     });
                 } catch (\Throwable $e) { report($e); }
             });

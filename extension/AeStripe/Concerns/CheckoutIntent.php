@@ -31,7 +31,10 @@ trait CheckoutIntent
                 }
             } catch (RequestException | ConnectionException $e) {
                 if ($e instanceof RequestException && $this->definitePaymentRefusal($e) && $creating && !in_array($e->response->status(), [401, 403], true)) {
-                    $this->replacePaymentAttempt($invoice, $attempt);
+                    $this->storePaymentAttempt($invoice, $attempt, [
+                        'notice_only' => true, 'retry' => true, 'failure_reason' => $this->paymentRefusalReason($e, $invoice),
+                        'agreement_id' => null, 'confirmation' => null,
+                    ]);
                     throw new DisplayException($this->paymentRefusalReason($e, $invoice));
                 }
                 if ($e instanceof RequestException && $this->definitePaymentRefusal($e) && $e->response->status() !== 404) {
@@ -126,6 +129,7 @@ trait CheckoutIntent
             $amount = $this->paymentBalance($current);
             if ($current->status !== 'pending' || $amount <= 0) throw new DisplayException('This invoice has no payment due. Refresh the invoice.');
             $attempt = $this->readPaymentAttempt($user, $current);
+            if (!empty($attempt['notice_only'])) $attempt = null; // A new Pay starts fresh; this marker can only notify.
             if (!$attempt) {
                 // Earlier bank debits have a transaction ID but no attempt property.
                 $processing = $current->transactions()->where('status', 'processing')->lockForUpdate()->get();
