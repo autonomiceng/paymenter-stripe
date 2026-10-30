@@ -212,11 +212,16 @@ use Illuminate\Support\Facades\{DB, Http};
             $gateway->pay($invoice, 20);
             check($stripe->intents[$id]->status === 'requires_action', 'Reopening checkout preserves a current automatic authentication attempt');
             $gateway->retryChargeAttempts(); $calls = count(Http::$calls); $gateway->retryChargeAttempts();
-            check(count(Http::$calls) === $calls && !json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['retry'],
-                'Automatic authentication awaiting the customer stops polling without discarding its resume evidence');
+            check(count(Http::$calls) === $calls && json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['retry'],
+                'Automatic authentication backs off repeated reads while keeping status recovery enabled');
             // Model an already-started authentication completing after an invoice change.
             // This boundary fixture does not execute or validate Stripe.js authentication.
             $invoice->total = 10; $stripe->intents[$id]->status = 'succeeded'; $stripe->intents[$id]->amount_received = 2000;
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            $attempt['authentication_check']['at'] = time() - 3601;
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            $gateway->retryChargeAttempts();
+            check(isset(ExtensionHelper::$payments['920:' . $id]), 'Status recovery settles completed authentication without a webhook or customer return');
             $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'amount' => 2000]));
             check(count($stripe->confirms) === 1 && ExtensionHelper::$payments['920:' . $id]['amount'] === 20.0
                 && count(array_filter(Audit::$rows, fn ($row) => $row['event'] === 'ae_stripe_payment_review')) === 1,

@@ -111,6 +111,9 @@ trait ChargeRecovery
                     $this->notifyRecoveryRefusal($invoice, $attempt['failure_reason']);
                     continue;
                 }
+                if (!empty($attempt['authentication_check']) && empty($attempt['funds_pending'])
+                    && $attempt['authentication_check']['key'] === ($attempt['confirmation']['key'] ?? null)
+                    && $attempt['authentication_check']['at'] > time() - 3600) continue;
                 // Recovery never replays a frozen charge. Every confirmation uses today's balance
                 // and an active agreement; checkout tokens resume only at the same displayed amount.
                 $data = $attempt['params'] ?? $this->checkoutPaymentData($invoice, 0,
@@ -121,13 +124,10 @@ trait ChargeRecovery
                 $attempt = $this->withPaymentLock($invoice, fn ($user, $current) => $this->readPaymentAttempt($user, $current));
                 if (($attempt['intent'] ?? null) !== $intent->id) continue;
                 if ($this->isElementsAttempt($attempt, $intent) && $intent->status === 'requires_action' && ($intent->amount_received ?? 0) === 0) {
-                    // Automatic authentication needs the customer; webhook or page contact resumes it.
-                    $this->withPaymentLock($invoice, function ($user, $current) use ($attempt) {
-                        $stored = $this->readPaymentAttempt($user, $current);
-                        if (($stored['intent'] ?? null) === $attempt['intent'] && empty($stored['funds_pending']) && empty($stored['failure_reason'])
-                            && ($stored['confirmation']['key'] ?? null) === ($attempt['confirmation']['key'] ?? null))
-                            $this->writePaymentAttempt($user, $current, array_replace($stored, ['retry' => false]));
-                    });
+                    // Only the customer can authenticate; hourly reads recover a missed webhook.
+                    $this->storePaymentAttempt($invoice, $attempt, ['authentication_check' => [
+                        'key' => $attempt['confirmation']['key'] ?? null, 'at' => time(),
+                    ]], confirmationOnly: true);
                     continue;
                 }
                 if ($this->paymentAttemptFailed($attempt, $intent)) {

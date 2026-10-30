@@ -102,9 +102,9 @@ try {
             const requests = [], actions = [];
             await page.exposeFunction('onRequest', body => requests.push(body));
             await page.exposeFunction('onAction', options => actions.push(options));
-            await page.route('https://fixture.test/return', route => route.fulfill({contentType: 'text/html', body: 'Returned'}));
+            await page.route('https://example.com/return', route => route.fulfill({contentType: 'text/html', body: 'Returned'}));
             await page.evaluate(() => {
-                const base = document.createElement('base'); base.href = 'https://fixture.test/'; document.head.append(base);
+                const base = document.createElement('base'); base.href = 'https://example.com/'; document.head.append(base);
                 window.failure = 'action-success';
                 let calls = 0;
                 window.fetch = async (_, options) => {
@@ -114,7 +114,7 @@ try {
                 };
             });
             await page.locator('#submit').click();
-            await page.waitForURL('https://fixture.test/return');
+            await page.waitForURL('https://example.com/return');
             assert.deepEqual(actions, [{clientSecret: 'fixture-secret'}]);
             assert.deepEqual(requests, [
                 {intent: 'fixture-intent', confirmation_token: 'ctoken_fixture', amount: 2000, save: false},
