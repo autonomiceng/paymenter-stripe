@@ -104,8 +104,10 @@ use Illuminate\Support\Facades\{DB, Http};
             $intent = $stripe->intents['pi_test1']; $intent->status = 'requires_confirmation'; $stripe->status = 'succeeded';
             $attempt = User::$row->props->values['ae_stripe_checkout_920'];
             foreach ([null, 'wrong-secret'] as $secret) {
+                $calls = count(Http::$calls);
                 $result = $gateway->finishPayment(new Request(['payment_intent' => $intent->id, 'payment_intent_client_secret' => $secret]));
                 check(is_array($result) && !empty($result['data']['invoiceUrl']) && !$stripe->charges
+                    && $intent->status === 'requires_confirmation' && !array_filter(array_slice(Http::$calls, $calls), fn ($call) => $call[0] !== 'get')
                     && User::$row->props->values['ae_stripe_checkout_920'] === $attempt,
                     'A missing or wrong redirect secret shows a next step without changing the payment');
             }
