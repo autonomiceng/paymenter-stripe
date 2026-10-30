@@ -32,6 +32,7 @@ use Paymenter\Extensions\Gateways\AeStripe\Concerns\Checkout;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\CardDuplicates;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\PaymentFees;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\CheckoutIntent;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\ChargeRecovery;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SetupConsent;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SetupIntent;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\Signature;
@@ -50,6 +51,8 @@ require_once __DIR__ . '/Concerns/Amounts.php';
 require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
 require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
 require_once __DIR__ . '/Concerns/CheckoutIntent.php';
+require_once __DIR__ . '/PaymentPendingException.php';
+require_once __DIR__ . '/Concerns/ChargeRecovery.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
 require_once __DIR__ . '/Concerns/SetupIntent.php';
 require_once __DIR__ . '/Concerns/Webhooks.php';
@@ -65,19 +68,23 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
     public function boot()
     {
         if (app()->runningInConsole()) {
+            app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryChargeAttempts())
+                ->name('ae-stripe:charge-attempts')->everyFiveMinutes()->onOneServer()->withoutOverlapping(60));
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryPaymentFees())
                 ->name('ae-stripe:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
+            require_once __DIR__ . '/ResolveChargeCommand.php';
             require_once __DIR__ . '/DeduplicateCardsCommand.php';
             require_once __DIR__ . '/AdoptBundledCommand.php';
             require_once __DIR__ . '/ConvertFromStripeSavedCommand.php';
             \Illuminate\Console\Application::starting(function ($artisan) {
+                $artisan->resolve(ResolveChargeCommand::class);
                 $artisan->resolve(DeduplicateCardsCommand::class);
                 $artisan->resolve(AdoptBundledCommand::class);
                 $artisan->resolve(ConvertFromStripeSavedCommand::class);
@@ -776,23 +783,33 @@ class AeStripe extends Gateway
         if (!$customer) {
             throw new DisplayException('Could not find your saved payment details. Add a new payment method.');
         }
-        $intent = $this->checkoutIntent($invoice, [
-            'amount' => $this->toMinorUnits($amount, $invoice->currency_code),
-            'currency' => $invoice->currency_code,
-            'customer' => $customer,
-            'payment_method' => $billingAgreement->external_reference,
-            'off_session' => 'true', 'confirm' => 'true',
-            'metadata' => ['invoice_id' => $invoice->id, 'billing_agreement_id' => $billingAgreement->id, 'ae_stripe_gateway' => '1'],
-        ]);
-        if ($intent->status === 'succeeded') {
-            $this->recordIntentPayment($intent, 'succeeded');
-            if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) return true;
-            $this->paymentReconcileMessage('Stripe received the payment, but it could not be applied to this invoice.');
+        try {
+            $intent = $this->checkoutIntent($invoice, $this->checkoutPaymentData($invoice,
+                $this->toMinorUnits($amount, $invoice->currency_code), $customer) + ['agreement_id' => $billingAgreement->id]);
+            if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
+                $intent = $this->confirmAttempt($invoice, $intent->id, [
+                    'payment_method' => $billingAgreement->external_reference, 'off_session' => 'true',
+                ], $billingAgreement);
+            }
+            if ($intent->status === 'succeeded') {
+                try { $this->recordIntentPayment($intent, 'succeeded'); }
+                catch (\Throwable $e) {
+                    report($e);
+                    if (!InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) {
+                        $this->paymentPending('Stripe received this payment. We will finish recording it automatically.');
+                    }
+                }
+                if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) return true;
+                $this->paymentReconcileMessage('Stripe received the payment, but it could not be applied to this invoice.');
+            }
+            if (in_array($intent->status, ['processing', 'requires_capture'], true)) $this->paymentPending();
+            if ($intent->status === 'requires_action') throw new DisplayException('This payment needs authentication. Use the one-time payment option to finish it.');
+            throw new DisplayException('This card was declined. Choose another payment method.');
+        } catch (PaymentPendingException $e) {
+            // Core cron ignores the bool and emails failure for every thrown exception.
+            if (app()->runningInConsole()) return true;
+            throw $e;
         }
-        if ($intent->status === 'processing' || $intent->status === 'requires_capture') {
-            throw new DisplayException('Payment pending. Refresh the invoice to check its status.');
-        }
-        throw new DisplayException('Open Stripe checkout to finish this payment. It will use the same payment.');
     }
 
 }

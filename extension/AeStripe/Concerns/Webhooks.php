@@ -44,6 +44,11 @@ trait Webhooks
             return response()->json(['ignored' => true]);
         }
 
+        if (str_starts_with($event->type, 'payment_intent.') && isset($object->metadata->invoice_id, $event->request->idempotency_key)) {
+            $invoice = \App\Models\Invoice::findOrFail($object->metadata->invoice_id);
+            $this->withPaymentLock($invoice, fn ($user, $current) => $this->bindWebhookAttempt($user, $current, $object, $event->request->idempotency_key));
+        }
+
         // Handle the event
         switch ($event->type) {
             case 'payment_intent.processing':

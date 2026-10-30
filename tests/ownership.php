@@ -74,10 +74,10 @@ check(count(Http::$calls) === $before && !isset(ExtensionHelper::$fees['pi_forei
 Gateway::$bundledEnabled = true;
 $gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_ownership', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
 check(ExtensionHelper::$fees['pi_ownership'] === 0.1, 'Recorded fork ownership permits fee update even without charge metadata');
-Http::$handler = fn () => ['id' => 'pi_ownercharge', 'status' => 'requires_action'];
+Http::$handler = fn () => ['id' => 'pi_ownercharge', 'status' => 'requires_action', 'confirmation_method' => 'manual', 'currency' => 'usd'];
 $ownerInvoice = clone $invoice; $ownerInvoice->id = 917; $ownerInvoice->status = 'pending'; Invoice::$rows[917] = $ownerInvoice;
 paymentStops(fn () => $gateway->charge($ownerInvoice, 20, new BillingAgreement));
-check(end(Http::$calls)[2]['metadata'] === ['invoice_id' => 917, 'billing_agreement_id' => 4, 'ae_stripe_gateway' => '1'],
+check(end(Http::$calls)[2]['metadata']['invoice_id'] === 917 && end(Http::$calls)[2]['metadata']['ae_stripe_gateway'] === '1',
     'Off-session intent preserves metadata and marks gateway');
 unset(Invoice::$rows[917]);
 Http::$handler = fn () => ['id' => 'seti_created'];

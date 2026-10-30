@@ -7,7 +7,7 @@ use Illuminate\Support\Facades\Http;
 
 Gateway::$enabled = true;
 $oldHandler = Http::$handler;
-$optIntent = (object) ['id' => 'pi_options', 'status' => 'requires_confirmation', 'customer' => 'cus_owner',
+$optIntent = (object) ['id' => 'pi_options', 'confirmation_method' => 'manual', 'status' => 'requires_confirmation', 'customer' => 'cus_owner',
     'payment_method' => 'pm_options', 'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1']];
 Http::$handler = fn () => $optIntent;
 foreach ([true, false] as $save) {

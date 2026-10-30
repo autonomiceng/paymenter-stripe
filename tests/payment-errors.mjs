@@ -17,7 +17,8 @@ function render(name) {
         .replaceAll('@js($intent->client_secret)', "'fixture-secret'")
         .replaceAll('@js($intent->id)', "'fixture-intent'")
         .replace('@js($customerSessionSecret)', 'null')
-        .replace("@js($intent->status === 'requires_action')", 'false')
+        .replace("@js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true))", 'false')
+        .replaceAll('@js($intent->amount)', '2000').replace("@js(strtolower($intent->currency))", "'usd'")
         .replace("@js(($intent->metadata->ae_stripe_consent ?? null) === '1')", 'false')
         .replace(/@checked\([^\n]+? disabled/, 'disabled')
         .replace(/\{\{[^\n]+?\}\}/g, "'Fixture'")
@@ -37,19 +38,27 @@ try {
             window.confirms = 0;
             window.fetch = async () => {
                 if (failure === 'network') throw new TypeError('Failed to fetch');
-                return { ok: failure !== 'consent' };
+                return { ok: failure !== 'consent', async json() { return {message: 'Could not record payment preferences. Refresh the invoice.', status: 'requires_action', client_secret: 'fixture-secret'}; } };
             };
             window.$wire = { on() {} };
             window.Alpine = { data: (_, factory) => { window.setupFactory = factory; } };
             window.Stripe = () => ({
-                elements: () => ({ update() {}, async fetchUpdates() {
+                elements: () => ({ update() {}, async submit() {
+                    if (failure === 'updates') return { error: { type: 'api_connection_error' } };
+                    return {};
+                }, async fetchUpdates() {
                     if (failure === 'updates') return { error: { type: 'api_connection_error', message: 'Raw update detail' } };
                     return {};
                 }, create() {
                     const handlers = {};
                     return { on: (name, fn) => { handlers[name] = fn; }, mount() { handlers.ready(); }, destroy() {} };
                 } }),
-                async confirmPayment() { return confirm(); },
+                async createConfirmationToken() {
+                    if (failure === 'confirmation') throw new TypeError('Failed to tokenize');
+                    if (failure === 'decline') return {error: {type: 'card_error', message: 'Your card was declined.'}};
+                    return {confirmationToken: {id: 'ctoken_fixture'}};
+                },
+                async handleNextAction() { return confirm(); },
                 async confirmSetup() { return confirm(); },
             });
             function confirm() {
@@ -70,13 +79,13 @@ try {
             });
             await page.locator('#setup-consent').check();
         }
-        const fallback = name === 'pay' ? 'Could not confirm your payment. Try again.' : 'Could not save your payment method. Try again.';
+        const fallback = name === 'pay' ? 'Could not check the payment. Refresh the invoice for its status.' : 'Could not save your payment method. Try again.';
         for (const failure of ['network', 'confirmation', ...(name === 'pay' ? ['updates'] : []), 'consent', 'decline']) {
             await page.evaluate(value => { window.failure = value; }, failure);
             const before = await page.evaluate(() => confirms);
             await page.locator('#submit').click();
             const expected = failure === 'decline' ? 'Your card was declined.' : failure === 'consent'
-                ? (name === 'pay' ? 'Could not update your payment preferences. Try again.' : 'Could not record your agreement. Try again.') : fallback;
+                ? (name === 'pay' ? 'Could not record payment preferences. Refresh the invoice.' : 'Could not record your agreement. Try again.') : fallback;
             await page.waitForFunction(() => document.querySelector('[role=alert]').textContent.length > 0);
             assert.equal(await page.locator('[role=alert]').textContent(), expected, `${name}: ${failure}`);
             assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: retry stays available after ${failure}`);

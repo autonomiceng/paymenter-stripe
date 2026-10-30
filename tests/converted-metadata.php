@@ -38,9 +38,10 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
             'automatic_payment_methods' => ['enabled' => 'true'], 'metadata' => ['invoice_id' => 912, 'stripe_saved_gateway' => '1'], 'customer' => 'cus_owner'];
         $attempt = ['key' => 'checkout_converted', 'digest' => hash('sha256', json_encode($legacyData, JSON_THROW_ON_ERROR)), 'created' => time()];
         User::$row->props->values['ae_stripe_checkout_912'] = json_encode($attempt);
-        $intent = (object) ['id' => 'pi_converted', 'status' => 'requires_payment_method', 'customer' => 'cus_owner', 'client_secret' => 'pi_converted_secret',
+        $intent = (object) ['id' => 'pi_converted', 'confirmation_method' => 'manual', 'currency' => 'usd', 'amount' => 2000, 'status' => 'requires_payment_method', 'customer' => 'cus_owner', 'client_secret' => 'pi_converted_secret',
             'metadata' => (object) ['invoice_id' => 912, 'stripe_saved_gateway' => '1', 'stripe_saved_consent' => '1']];
         Http::$handler = function ($verb, $path, $data) use ($intent, $legacyData) {
+            if ($path === '/payment_intents/search') return ['data' => []];
             if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
             if ($path === '/customer_sessions') return ['client_secret' => 'cuss_converted'];
             if ($path === '/payment_intents') {

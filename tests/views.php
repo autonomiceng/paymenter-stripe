@@ -107,7 +107,7 @@ check(str_contains($setupView, 'if (error) throw error;') && str_contains($setup
     && str_contains($setupView, 'finally {') && str_contains($setupView, 'setLoading(false);'), 'Setup errors remain in alert and unlock retry');
 
 $payView = file_get_contents($views . 'pay.blade.php');
-check(str_contains($payView, "@checked($" . "intent->status === 'requires_action'")
+check(str_contains($payView, "@checked(in_array($" . "intent->status, ['requires_action', 'requires_confirmation']")
     && str_contains($payView, 'save: resuming ? savedConsent :')
     && str_contains($payView, 'saveCard.disabled = resuming ||'), '3DS resume visibly preserves its recorded save choice');
 

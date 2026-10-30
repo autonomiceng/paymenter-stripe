@@ -24,3 +24,11 @@ Route::post('/extensions/ae-stripe/setup-consent', [AeStripe::class, 'setupConse
 Route::post('/extensions/ae-stripe/disable-core', [AeStripe::class, 'disableCore'])
     ->middleware(['web', 'auth'])
     ->name('extensions.gateways.ae-stripe.disable-core');
+
+Route::post('/extensions/ae-stripe/confirm', [AeStripe::class, 'confirmPayment'])
+    ->middleware(['web', 'auth'])
+    ->name('extensions.gateways.ae-stripe.confirm');
+
+Route::get('/extensions/ae-stripe/payment-return', [AeStripe::class, 'finishPayment'])
+    ->middleware(['web', 'auth'])
+    ->name('extensions.gateways.ae-stripe.payment-return');

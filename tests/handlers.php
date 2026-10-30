@@ -7,7 +7,7 @@ use Illuminate\Support\Facades\{DB, Event, Http, Log};
 Gateway::$enabled = true;
 $oldHandler = Http::$handler;
 $user->props->values = [];
-$checkoutIntent = clone $intent; $checkoutIntent->amount = 29;
+$checkoutIntent = clone $intent; $checkoutIntent->amount = 29; $checkoutIntent->amount_received = 0; $checkoutIntent->status = 'requires_payment_method';
 $posts = 0;
 $lost = true;
 Http::$handler = function ($verb, $path, $data) use (&$posts, &$lost, $checkoutIntent) {
@@ -34,7 +34,8 @@ $stored = json_decode($user->props->values['ae_stripe_checkout_919'], true);
 unset($stored['intent']);
 $stored['created'] = time() - 86400;
 $user->props->values['ae_stripe_checkout_919'] = json_encode($stored);
-paymentStops(fn () => invoke($gateway, 'checkoutIntent', $checkoutInvoice, $data));
+invoke($gateway, 'checkoutIntent', $checkoutInvoice, $data);
+check($posts === 3, 'An expired unconfirmed creation can safely start again without a hold');
 
 unset(Invoice::$rows[919]);
 

@@ -22,7 +22,7 @@ check(end(Log::$warnings) === ['AeStripe customer setup failed', ['invoice_id' =
     'Customer failure logs the invoice and error class only');
 Http::$handler = function ($verb, $path) {
     if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
-    if ($path === '/payment_intents') return ['id' => 'pi_session', 'status' => 'requires_payment_method', 'client_secret' => 'pi_secret'];
+    if ($path === '/payment_intents') return ['id' => 'pi_session', 'status' => 'requires_payment_method', 'confirmation_method' => 'manual', 'currency' => 'usd', 'client_secret' => 'pi_secret'];
     if ($path === '/customer_sessions') throw new RequestException(503);
     throw new RuntimeException('Unexpected request: ' . $path);
 };
@@ -34,7 +34,7 @@ check(end(Log::$warnings) === ['AeStripe customer session unavailable', ['invoic
 $user->props->values = [];
 Http::$handler = function ($verb, $path) {
     if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
-    if ($path === '/payment_intents') return ['id' => 'pi_connection', 'status' => 'requires_payment_method',
+    if ($path === '/payment_intents') return ['id' => 'pi_connection', 'status' => 'requires_payment_method', 'confirmation_method' => 'manual', 'currency' => 'usd',
         'client_secret' => 'pi_connection_secret'];
     if ($path === '/customer_sessions') throw new ConnectionException('private connection error');
     throw new RuntimeException('Unexpected request: ' . $path);

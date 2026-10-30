@@ -30,7 +30,7 @@ Gateway::$enabled = true;
 Http::$handler = function ($verb, $path, $data) {
     return match (true) {
         $path === '/customers/cus_owner' => ['id' => 'cus_owner'],
-        $path === '/payment_intents' => ['id' => 'pi_amount', 'status' => 'requires_payment_method', 'client_secret' => 'pi_secret'],
+        $path === '/payment_intents' => ['id' => 'pi_amount', 'status' => 'requires_payment_method', 'confirmation_method' => 'manual', 'currency' => $data['currency'], 'client_secret' => 'pi_secret'],
         $path === '/customer_sessions' => ['client_secret' => 'cuss_secret'],
         $path === '/subscriptions/sub_test' => ['schedule' => null, 'items' => ['data' => [
             ['id' => 'si_test', 'price' => ['product' => 'prod_test']]]]],
@@ -46,8 +46,8 @@ $service = new Service;
 $gateway->updateSubscription($service);
 check(end(Http::$calls)[2]['price_data']['unit_amount'] === 5997, 'Subscription update retains quantity > 1');
 $user->props->values = []; $amountInvoice->total = '19.99';
-paymentStops(fn () => $gateway->charge($amountInvoice, '19.99', new BillingAgreement));
-check(end(Http::$calls)[2]['amount'] === 1999, 'Off-session charge sends integer cents');
+$gateway->pay($amountInvoice, '19.99');
+check(Http::$calls[count(Http::$calls) - 2][2]['amount'] === 1999, 'Checkout retains decimal invoice cents');
 $user->props->values = [];
 $amountInvoice->currency_code = 'JPY'; $amountInvoice->total = 123;
 $gateway->pay($amountInvoice, 123);

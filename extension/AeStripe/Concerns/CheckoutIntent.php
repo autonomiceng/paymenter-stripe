@@ -3,141 +3,292 @@
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Exceptions\DisplayException;
-use App\Models\{Audit, Invoice, User};
+use App\Models\{BillingAgreement, Invoice, InvoiceTransaction, User};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Support\Facades\DB;
+use Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException;
 
 trait CheckoutIntent
 {
+    private bool $paymentStripeUnavailable = false;
     private function checkoutIntent($invoice, array $data)
     {
-        $replace = null;
-        // Replacement is allowed only after Stripe proves the old intent canceled.
-        for ($round = 0; $round < 3; ++$round) {
-            $attempt = $this->reservePaymentAttempt($invoice, $data, $replace);
-            if (($attempt['state'] ?? null) === 'reconcile' && !isset($attempt['intent'])) $this->paymentReconcileMessage();
-            if (!isset($attempt['intent']) && time() - $attempt['created'] >= 23 * 3600) {
-                $this->storePaymentAttempt($invoice, $attempt, ['state' => 'reconcile']);
-                $this->paymentReconcileMessage();
-            }
-            try {
-                $intent = isset($attempt['intent'])
-                    ? $this->request('get', '/payment_intents/' . $attempt['intent'])
-                    : $this->createAttemptIntent($attempt);
-            } catch (RequestException | ConnectionException $e) {
-                throw new DisplayException('Payment status is unknown. Open Stripe checkout to check it, or contact support.');
-            }
-            if (empty($intent->id) || isset($attempt['intent']) && $intent->id !== $attempt['intent']) $this->paymentReconcileMessage();
-            $this->storePaymentAttempt($invoice, $attempt, ['intent' => $intent->id]);
-            $changed = in_array($intent->status, ['requires_payment_method', 'requires_confirmation', 'requires_action'], true)
-                && (isset($intent->amount) && $intent->amount !== $attempt['due_amount']
-                    || isset($intent->currency) && strtolower($intent->currency) !== strtolower($attempt['due_currency']));
-            // A canceled or partially funded intent is not proof that no money was received.
-            if (($changed || $intent->status === 'canceled') && ($intent->amount_received ?? 0) > 0) {
-                $this->paymentReconcileMessage('Stripe received a payment, so it cannot be replaced automatically.');
-            }
-            if ($changed) {
-                // An old browser can still confirm an unfinished intent. Invalidate it before replacing.
-                try {
-                    $intent = $this->request('post', '/payment_intents/' . $intent->id . '/cancel', [], 'cancel_' . $attempt['key']);
-                } catch (RequestException | ConnectionException $e) {
-                    throw new DisplayException('Payment changed. Open Stripe checkout to check it before paying.');
-                }
-            }
-            if (($intent->status ?? null) !== 'canceled') return $intent;
-            $replace = $attempt['key'];
-        }
-        throw new DisplayException('Payment changed while loading. Open Stripe checkout again.');
-    }
-
-    private function createAttemptIntent(array $attempt)
-    {
-        try {
-            return $this->request('post', '/payment_intents', $attempt['params'], $attempt['key']);
-        } catch (RequestException $e) {
-            // Off-session authentication commonly returns HTTP 402 with the same intent.
-            $intent = $e->response->json('error.payment_intent');
-            if ($e->response->status() !== 402 || !$intent) throw $e;
-            return is_string($intent) ? $this->request('get', '/payment_intents/' . $intent)
-                : $this->readStripeObject(json_decode(json_encode($intent, JSON_THROW_ON_ERROR)));
-        }
-    }
-
-    private function reservePaymentAttempt($invoice, array $data, ?string $replace): array
-    {
-        // Keep the original property name: upgrades must share in-flight checkout attempts.
-        return DB::transaction(function () use ($invoice, $data, $replace) {
-            $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
-            $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
-            abort_unless($current->user_id === $user->id, 403);
-            // Locking current reads avoid a stale caller balance or an older transaction snapshot.
-            $paid = $current->transactions()->where('status', 'succeeded')->lockForUpdate()->get()->sum('amount');
-            $amount = $this->toMinorUnits($current->total - $paid, $current->currency_code);
-            if ($current->status !== 'pending' || $amount <= 0) {
-                throw new DisplayException('This invoice has no payment due. Refresh the invoice.');
-            }
-            $data['amount'] = $amount;
-            $data['currency'] = $current->currency_code;
-            $property = 'ae_stripe_checkout_' . $invoice->id;
-            $stored = $user->properties()->where('key', $property)->lockForUpdate()->first()?->value;
-            $attempt = $stored ? json_decode($stored, true, flags: JSON_THROW_ON_ERROR) : null;
-            if (!$attempt || ($replace !== null && $attempt['key'] === $replace)) {
-                $attempt = ['key' => 'checkout_' . bin2hex(random_bytes(16)),
-                    'digest' => hash('sha256', json_encode($data, JSON_THROW_ON_ERROR)),
-                    'created' => time(), 'params' => $data];
-            } elseif (!isset($attempt['intent']) && time() - $attempt['created'] >= 23 * 3600) {
-                $attempt['state'] = 'reconcile';
-            } elseif (!isset($attempt['params']) && !isset($attempt['intent'])) {
-                // Older releases stored a digest only. Both callers first try the original
-                // checkout shape; converted sandbox keys must also retain their old metadata.
-                $candidates = [$data, $this->checkoutPaymentData($current, $amount, $data['customer'])];
-                foreach ($candidates as $params) {
-                    $legacy = $params;
-                    $legacy['metadata'] = [];
-                    foreach ($params['metadata'] ?? [] as $key => $value) {
-                        $legacy['metadata'][$key === 'ae_stripe_gateway' ? 'stripe_saved_gateway' : $key] = $value;
-                    }
-                    foreach ([$params, $legacy] as $candidate) {
-                        if (($attempt['digest'] ?? null) === hash('sha256', json_encode($candidate, JSON_THROW_ON_ERROR))) {
-                            $attempt['params'] = $candidate;
-                            break 2;
+        for ($round = 0; $round < 4; ++$round) {
+            $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($data) {
+                $amount = $this->paymentBalance($current);
+                if ($current->status !== 'pending' || $amount <= 0) throw new DisplayException('This invoice has no payment due. Refresh the invoice.');
+                $attempt = $this->readPaymentAttempt($user, $current);
+                if (!$attempt) {
+                    // Earlier bank debits have a transaction ID but no attempt property.
+                    $processing = $current->transactions()->where('status', 'processing')->lockForUpdate()->get();
+                    foreach ($processing as $transaction) {
+                        if (($transaction->gateway->extension ?? null) === 'AeStripe') {
+                            $attempt = ['key' => 'adopt_' . $transaction->transaction_id, 'created' => time(), 'intent' => $transaction->transaction_id];
+                            break;
                         }
                     }
                 }
-                if (!isset($attempt['params'])) $attempt['state'] = 'reconcile';
+                if (!$attempt) $attempt = $this->newPaymentAttempt($current, $data, $amount);
+                if (isset($data['agreement_id'])) $attempt['agreement_id'] = $data['agreement_id'];
+                $this->writePaymentAttempt($user, $current, $attempt);
+                return $attempt + ['due_amount' => $amount];
+            });
+            $creating = false;
+            try {
+                if (isset($attempt['intent'])) $intent = $this->request('get', '/payment_intents/' . $attempt['intent']);
+                elseif (($attempt['version'] ?? 1) === 2 || $this->legacyUnconfirmedAttempt($invoice, $attempt, array_replace($data, ['amount' => $attempt['due_amount']]))) {
+                    // Creation never confirms. After key expiry an orphan cannot have charged.
+                    if (time() - $attempt['created'] >= 23 * 3600) { $this->replacePaymentAttempt($invoice, $attempt); continue; }
+                    $creating = true;
+                    $intent = $this->request('post', '/payment_intents', $attempt['params'], $attempt['key']);
+                } else {
+                    $intent = $this->findLegacyPayment($invoice, $attempt);
+                    if (!$intent) $this->holdPaymentAttempt($invoice, $attempt, 'Stripe has no payment ID for this older attempt. Check its request log before releasing it.');
+                }
+            } catch (RequestException | ConnectionException $e) {
+                if ($e instanceof RequestException && $this->definitePaymentRefusal($e) && $creating) {
+                    $this->replacePaymentAttempt($invoice, $attempt);
+                    throw new DisplayException($this->paymentRefusalReason($e, $invoice));
+                }
+                if ($e instanceof RequestException && $this->definitePaymentRefusal($e) && $e->response->status() !== 404) {
+                    $this->storePaymentAttempt($invoice, $attempt, ['retry' => true]);
+                    $this->paymentPending($this->paymentRefusalReason($e, $invoice));
+                }
+                $this->paymentStripeUnavailable = true;
+                if ($e instanceof RequestException && $e->response->status() === 404 && isset($attempt['intent'])) {
+                    $this->paymentStripeUnavailable = false;
+                    $this->holdPaymentAttempt($invoice, $attempt, 'Stripe cannot find this payment. Restore access to its Stripe account or link the verified payment.');
+                }
+                $this->storePaymentAttempt($invoice, $attempt, ['retry' => true]);
+                $this->paymentPending('Stripe is unavailable. We will check this payment automatically.');
             }
-            if (($attempt['state'] ?? null) === 'reconcile' && !isset($attempt['intent'])
-                && !Audit::where('auditable_type', $current->getMorphClass())->where('auditable_id', $current->id)
-                    ->where('event', 'ae_stripe_attempt_review')->where('new_values->attempt_key', $attempt['key'])->lockForUpdate()->first()) {
-                Audit::create([
-                    'event' => 'ae_stripe_attempt_review', 'auditable_type' => $current->getMorphClass(),
-                    'auditable_id' => $current->id, 'old_values' => [], 'new_values' => [
-                        'attempt_key' => $attempt['key'], 'created' => $attempt['created'], 'state' => 'reconcile',
-                        'reason' => 'Stripe could not confirm whether this payment charged.',
-                        'resolution' => 'Check Stripe before clearing this attempt; a search alone cannot prove it did not charge.',
-                    ],
-                ]);
+            if (empty($intent->id) || isset($attempt['intent']) && $intent->id !== $attempt['intent']) {
+                $this->holdPaymentAttempt($invoice, $attempt, 'Stripe returned a different payment ID. Link the verified payment before continuing.');
             }
-            $user->properties()->updateOrCreate(['key' => $property], ['value' => json_encode($attempt, JSON_THROW_ON_ERROR)]);
-            return $attempt + ['due_amount' => $amount, 'due_currency' => $current->currency_code];
+            $this->storePaymentAttempt($invoice, $attempt, ['intent' => $intent->id, 'retry' => !empty($attempt['confirmation']) || in_array($intent->status, ['succeeded', 'processing', 'requires_capture'], true)]);
+            if ($intent->status === 'succeeded') {
+                $recorded = InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists();
+                if (!$recorded) return $intent;
+                // A completed charge is not a new payment of a later balance.
+                $this->replacePaymentAttempt($invoice, $attempt);
+                continue;
+            }
+            if (in_array($intent->status, ['processing', 'requires_capture'], true)) {
+                $this->storePaymentAttempt($invoice, $attempt, ['retry' => true]);
+                return $intent;
+            }
+            if (($intent->amount_received ?? 0) > 0) {
+                $this->holdPaymentAttempt($invoice, $attempt, 'Stripe received part of this payment. Check the funds before replacing it.');
+            }
+            if (in_array($intent->status, ['requires_payment_method', 'canceled'], true)) {
+                foreach ($invoice->transactions()->where('status', 'processing')->get() as $transaction) {
+                    if ($transaction->transaction_id === $intent->id) { $this->recordIntentPayment($intent, 'failed'); break; }
+                }
+            }
+            if ($intent->status === 'canceled') { $this->replacePaymentAttempt($invoice, $attempt); continue; }
+            if (($intent->confirmation_method ?? 'automatic') !== 'manual' || strtolower($intent->currency) !== strtolower($invoice->currency_code)) {
+                // An older tab can confirm an automatic intent without our balance check.
+                try { $this->request('post', '/payment_intents/' . $intent->id . '/cancel'); }
+                catch (RequestException | ConnectionException $e) {
+                    $this->paymentStripeUnavailable = true;
+                    $this->storePaymentAttempt($invoice, $attempt, ['retry' => true]);
+                    $this->paymentPending('We are checking the earlier payment before replacing it.');
+                }
+                // Read Stripe again: only a proven cancellation permits replacement.
+                continue;
+            }
+            try {
+                if (isset($intent->amount) && $intent->amount !== $attempt['due_amount']) {
+                    $intent = $this->withPaymentLock($invoice, function ($user, $current) use ($intent) {
+                        $fresh = $this->request('get', '/payment_intents/' . $intent->id);
+                        if (in_array($fresh->status, ['requires_payment_method', 'requires_confirmation'], true) && ($fresh->amount_received ?? 0) === 0) {
+                            return $this->request('post', '/payment_intents/' . $fresh->id, ['amount' => $this->paymentBalance($current)]);
+                        }
+                        if ($fresh->status === 'requires_action' && ($fresh->amount_received ?? 0) === 0) {
+                            return $this->request('post', '/payment_intents/' . $fresh->id . '/cancel');
+                        }
+                        return $fresh;
+                    });
+                    if ($intent->status === 'canceled') continue;
+                }
+            } catch (RequestException | ConnectionException $e) {
+                $this->storePaymentAttempt($invoice, $attempt, ['retry' => true]);
+                $this->paymentStripeUnavailable = true;
+                $this->paymentPending('Stripe is unavailable. We will check this payment automatically.');
+            }
+            return $intent;
+        }
+        $this->paymentPending('Payment changed while loading. Refresh the invoice.');
+    }
+
+    private function newPaymentAttempt($invoice, array $data, int $amount): array
+    {
+        $params = $this->checkoutPaymentData($invoice, $amount, $data['customer']);
+        $params['confirmation_method'] = 'manual';
+        $key = 'checkout_' . bin2hex(random_bytes(16));
+        $params['metadata']['ae_stripe_attempt'] = $key;
+        return ['version' => 2, 'key' => $key, 'created' => time(), 'params' => $params];
+    }
+
+    private function withPaymentLock($invoice, callable $callback)
+    {
+        return DB::transaction(function () use ($invoice, $callback) {
+            $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
+            $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
+            abort_unless($current->user_id === $user->id, 403);
+            return $callback($user, $current);
+        });
+    }
+
+    private function paymentBalance($invoice): int
+    {
+        $paid = $invoice->transactions()->where('status', 'succeeded')->lockForUpdate()->get()->sum('amount');
+        return $this->toMinorUnits($invoice->total - $paid, $invoice->currency_code);
+    }
+
+    private function readPaymentAttempt($user, $invoice): ?array
+    {
+        $stored = $user->properties()->where('key', 'ae_stripe_checkout_' . $invoice->id)->lockForUpdate()->first()?->value;
+        return $stored ? json_decode($stored, true, flags: JSON_THROW_ON_ERROR) : null;
+    }
+
+    private function writePaymentAttempt($user, $invoice, array $attempt): void
+    {
+        $user->properties()->updateOrCreate(['key' => 'ae_stripe_checkout_' . $invoice->id], ['value' => json_encode($attempt, JSON_THROW_ON_ERROR)]);
+    }
+
+    private function replacePaymentAttempt($invoice, array $attempt): void
+    {
+        $this->withPaymentLock($invoice, function ($user, $current) use ($attempt) {
+            if (($this->readPaymentAttempt($user, $current)['key'] ?? null) === $attempt['key']) {
+                $user->properties()->where('key', 'ae_stripe_checkout_' . $current->id)->delete();
+            }
         });
     }
 
     private function storePaymentAttempt($invoice, array $attempt, array $values): void
     {
-        DB::transaction(function () use ($invoice, $attempt, $values) {
-            $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
-            Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
-            $property = 'ae_stripe_checkout_' . $invoice->id;
-            $stored = $user->properties()->where('key', $property)->lockForUpdate()->firstOrFail();
-            $current = json_decode($stored->value, true, flags: JSON_THROW_ON_ERROR);
-            if ($current['key'] !== $attempt['key']) return;
-            $user->properties()->updateOrCreate(['key' => $property], ['value' => json_encode(array_replace($current, $values), JSON_THROW_ON_ERROR)]);
+        $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $values) {
+            $stored = $this->readPaymentAttempt($user, $current);
+            if (($stored['key'] ?? null) === $attempt['key']) $this->writePaymentAttempt($user, $current, array_replace($stored, $values));
         });
+    }
+
+    private function legacyUnconfirmedAttempt($invoice, array &$attempt, array $data): bool
+    {
+        if (isset($attempt['params'])) return empty($attempt['params']['confirm']);
+        $params = $this->checkoutPaymentData($invoice, $data['amount'], $data['customer']);
+        $legacy = $params;
+        $legacy['metadata'] = ['invoice_id' => $invoice->id, 'stripe_saved_gateway' => '1'];
+        foreach ([$params, $legacy] as $candidate) {
+            if (($attempt['digest'] ?? null) === hash('sha256', json_encode($candidate, JSON_THROW_ON_ERROR))) {
+                $attempt['params'] = $candidate;
+                $this->storePaymentAttempt($invoice, $attempt, ['params' => $candidate]);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function confirmAttempt($invoice, string $intentId, array $params, ?BillingAgreement $agreement = null, ?int $expectedAmount = null)
+    {
+        // Persist the confirmation identity before HTTP. The second transaction keeps credits,
+        // card removal and other callers out until Stripe responds (or the request times out).
+        $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($intentId, $params, $agreement, $expectedAmount) {
+            $attempt = $this->readPaymentAttempt($user, $current);
+            abort_unless(($attempt['intent'] ?? null) === $intentId, 409);
+            $attempt['confirmation'] = ['key' => 'confirm_' . bin2hex(random_bytes(16)), 'params' => $params, 'agreement' => $agreement?->id, 'amount' => $expectedAmount];
+            $attempt['retry'] = true;
+            if ($expectedAmount !== null) $attempt['checkout_amount'] = $expectedAmount;
+            if (isset($params['confirmation_token'])) $attempt['agreement_id'] = null;
+            $this->writePaymentAttempt($user, $current, $attempt);
+            return $attempt;
+        });
+        $refusalIsSafe = false;
+        $result = $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intentId, $params, $agreement, $expectedAmount, &$refusalIsSafe) {
+            $stored = $this->readPaymentAttempt($user, $current);
+            if (($stored['confirmation']['key'] ?? null) !== $attempt['confirmation']['key']) return null;
+            try {
+                $intent = $this->request('get', '/payment_intents/' . $intentId);
+                if (!in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) return $intent;
+                $refusalIsSafe = ($intent->amount_received ?? 0) === 0;
+                $amount = $this->paymentBalance($current);
+                if ($current->status !== 'pending' || $amount <= 0) return new DisplayException('This invoice has no payment due. Refresh the invoice.');
+                if (strtolower($intent->currency) !== strtolower($current->currency_code) || $expectedAmount !== null && $amount !== $expectedAmount) {
+                    return new DisplayException('The amount due changed. Refresh the invoice before paying.');
+                }
+                if ($agreement) {
+                    if (($stored['agreement_id'] ?? $agreement->id) != $agreement->id) return new DisplayException('The payment method changed. Choose your payment method again.');
+                    $active = BillingAgreement::where('id', $agreement->id)->lockForUpdate()->first();
+                    if (!$active || $active->user_id != $user->id || ($active->gateway->extension ?? null) !== 'AeStripe'
+                        || $active->external_reference !== $params['payment_method']) {
+                        return new DisplayException('This payment method was removed. Choose another payment method.');
+                    }
+                    $method = $this->request('get', '/payment_methods/' . $active->external_reference);
+                    if (($method->customer ?? null) !== $intent->customer) return new DisplayException('This payment method is no longer saved. Choose another payment method.');
+                }
+                if ($intent->customer !== $user->properties()->where('key', 'stripe_id')->first()?->value) return new DisplayException('The payment account changed. Refresh the invoice before paying.');
+                if (($intent->confirmation_method ?? null) !== 'manual') return new DisplayException('The payment form changed. Refresh the invoice before paying.');
+                $updates = ['amount' => $amount];
+                foreach (['metadata', 'setup_future_usage'] as $field) {
+                    if (array_key_exists($field, $params)) { $updates[$field] = $params[$field]; unset($params[$field]); }
+                }
+                $this->request('post', '/payment_intents/' . $intentId, $updates);
+                try { return $this->request('post', '/payment_intents/' . $intentId . '/confirm', $params, $attempt['confirmation']['key']); }
+                catch (RequestException $e) {
+                    $remote = $e->response->json('error.payment_intent');
+                    if ($e->response->status() !== 402 || !$remote) throw $e;
+                    return is_string($remote) ? $this->request('get', '/payment_intents/' . $remote)
+                        : $this->readStripeObject(json_decode(json_encode($remote, JSON_THROW_ON_ERROR)));
+                }
+            } catch (RequestException | ConnectionException $e) { return $e; }
+        });
+        if ($result instanceof RequestException || $result instanceof ConnectionException || $result === null) {
+            if ($result instanceof RequestException && $refusalIsSafe && $this->definitePaymentRefusal($result)) {
+                $this->storePaymentAttempt($invoice, $attempt, ['retry' => false, 'confirmation' => null]);
+                throw new DisplayException($this->paymentRefusalReason($result, $invoice));
+            }
+            $this->paymentStripeUnavailable = true;
+            $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
+        }
+        $resume = null;
+        if (!($result instanceof DisplayException) && $result->status === 'requires_action') {
+            // Bank verification may finish days later, without a browser return. The consumed
+            // token must not be replayed; Stripe already holds the authenticated payment method.
+            $resumeParams = ['return_url' => route('extensions.gateways.ae-stripe.payment-return'), 'use_stripe_sdk' => 'true'];
+            if ($agreement) $resumeParams['payment_method'] = $agreement->external_reference;
+            $resume = ['params' => $resumeParams, 'agreement' => $agreement?->id, 'amount' => $expectedAmount ?? $result->amount];
+        }
+        $this->storePaymentAttempt($invoice, $attempt, ['retry' => !($result instanceof DisplayException)
+            && in_array($result->status, ['succeeded', 'processing', 'requires_capture', 'requires_action'], true), 'confirmation' => $resume]);
+        if ($result instanceof DisplayException) throw $result;
+        return $result;
+    }
+
+    private function definitePaymentRefusal(RequestException $e): bool
+    {
+        return $e->response->status() >= 400 && $e->response->status() < 500 && !in_array($e->response->status(), [409, 429], true);
+    }
+
+    private function paymentRefusalReason(RequestException $e, $invoice): string
+    {
+        if (str_contains($e->response->json('error.message') ?? '', 'The currency provided')) return "This card can't be charged in " . $invoice->currency_code . '. Use another payment method.';
+        if (in_array($e->response->status(), [401, 403], true)) return 'Stripe access was refused. Contact support to check the Stripe setup.';
+        return match ($e->response->json('error.code')) {
+            'card_declined' => 'This card was declined. Choose another payment method.',
+            'expired_card' => 'This card has expired. Choose another payment method.',
+            'resource_missing' => 'The saved payment details are no longer available. Choose another payment method.',
+            default => 'Stripe refused this payment. Choose another payment method or contact support to check the setup.',
+        };
+    }
+
+    private function paymentPending(string $message = 'Payment pending. Refresh the invoice to check its status.'): never
+    {
+        throw new PaymentPendingException($message);
     }
 
     private function paymentReconcileMessage(string $reason = 'Stripe could not confirm whether this payment charged.'): never
     {
-        throw new DisplayException('Payment needs review. Contact support: ' . $reason);
+        $this->paymentPending('Payment needs review. Contact support: ' . $reason);
     }
 }

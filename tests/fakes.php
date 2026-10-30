@@ -47,7 +47,26 @@ namespace App\Models {
         public function exists() { return (bool) $this->value; }
         public function firstOrFail() { return $this->value ?? throw new \RuntimeException('Missing row'); }
         public function where($key, $value) { return $this; }
-        public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $hook(); } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
+        public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $hook(); } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
+    }
+    class Property {
+        public static function where(...$args) { return new class($args[2] ?? '') {
+            public function __construct(private string $pattern) {}
+            public function where(...$args) { return $this; }
+            public function orderBy($key) { return $this; }
+            public function limit($n) { return $this; }
+            public function get() {
+                $result = [];
+                foreach (User::$row->props->values as $key => $value) {
+                    $record = json_decode($value, true);
+                    $selected = str_contains($this->pattern, 'payment_alert')
+                        ? str_starts_with($key, 'ae_stripe_payment_alert_') && !($record['sent'] ?? true)
+                        : str_starts_with($key, 'ae_stripe_checkout_') && (($record['retry'] ?? false) || !isset($record['version']));
+                    if ($selected) $result[] = (object) ['key' => $key, 'value' => $value, 'model_type' => User::class, 'model_id' => User::$row->id];
+                }
+                return $result;
+            }
+        }; }
     }
     class Properties {
         public array $values = [];
@@ -74,6 +93,7 @@ namespace App\Models {
         public $email = 'user@example.test';
         public function __construct(public Properties $props) {}
         public function properties() { return $this->props; }
+        public function getMorphClass() { return self::class; }
         public function __get($key) { return $this->props; }
         public static function where($key, $id) { return new Query(self::$row, User::class); }
         public static function findOrFail($id) { return self::$row; }
@@ -98,8 +118,9 @@ namespace App\Models {
             public function lockForUpdate() { return $this; }
             public function get() {
                 $rows = array_filter(\App\Helpers\ExtensionHelper::$payments, fn ($row, $key) => str_starts_with($key, $this->invoiceId . ':') && (!$this->status || $row['status'] === $this->status), ARRAY_FILTER_USE_BOTH);
-                return new class($rows) {
+                return new class($rows) implements \IteratorAggregate {
                     public function __construct(private $rows) {}
+                    public function getIterator(): \Traversable { foreach ($this->rows as $key => $row) yield (object) [...$row, "transaction_id" => substr($key, strpos($key, ":") + 1), "gateway" => (object) ["extension" => $row["gateway"] ?? "AeStripe"]]; }
                     public function sum($field) { return array_sum(array_column($this->rows, $field)); }
                 };
             }
@@ -204,7 +225,7 @@ namespace App\Models {
             $this->external_reference = $attributes['external_reference'] ?? 'pm_test';
             $this->id = $attributes['id'] ?? 4;
         }
-        public function __get($key) { return $this->attributes[$key] ?? null; }
+        public function __get($key) { if ($key === 'gateway') return (object) ['extension' => 'AeStripe']; return $this->attributes[$key] ?? null; }
         public function trashed() { return $this->deleted_at !== null; }
         public function services() { return Service::whereIn('billing_agreement_id', [$this->id]); }
         public function delete() { $this->update(['deleted_at' => '2026-10-23 12:00:00']); }
@@ -358,6 +379,7 @@ namespace Illuminate\Support\Facades {
         public static function call($callback) { self::$callbacks[] = $callback; return self::$events[] = new self; }
         public function name($value) { return $this; }
         public function hourly() { return $this; }
+        public function everyFiveMinutes() { return $this; }
         public $singleServer = false, $overlapMinutes = null;
         public function onOneServer() { $this->singleServer = true; return $this; }
         public function withoutOverlapping($minutes = 1440) { $this->overlapMinutes = $minutes; return $this; }
@@ -439,14 +461,14 @@ namespace {
     function now() { return new class { public $timestamp = 1700000000; public function startOfDay() { return $this; } }; }
     function base_path($path) { return ($GLOBALS['paymenterBase'] ?? dirname(__DIR__)) . '/' . (isset($GLOBALS['paymenterBase']) ? $path : str_replace('extensions/Gateways/', 'extension/', $path)); }
     function storage_path($path) { return $GLOBALS['adoptionStorage'] . '/' . $path; }
-    function app($class = null) { if ($class) return new $class; return new class { public function runningInConsole() { return true; } public function booted($callback) { $callback(); } }; }
+    function app($class = null) { if ($class) return new $class; return new class { public function runningInConsole() { return $GLOBALS['fakeConsole'] ?? true; } public function booted($callback) { $callback(); } }; }
     function abort($status, $message = '') { throw new \RuntimeException('HTTP ' . $status); }
     function abort_unless($condition, $status) { if (!$condition) throw new \RuntimeException('HTTP ' . $status); }
     function __($key, $values = []) { return $key; }
     function view($name, $data) { return compact('name', 'data'); }
     function url($path) { return 'https://paymenter.example.com' . $path; }
-    function route($name) { return url(\Illuminate\Support\Facades\Route::$names[$name]); }
-    function redirect() { return new class { public function route($name) { return $this; } public function with($key, $value) { return $value; } }; }
+    function route($name, $model = null) { return url(\Illuminate\Support\Facades\Route::$names[$name] ?? '/invoices/' . ($model->id ?? '')); }
+    function redirect() { return new class { public function to($url) { return $url; } public function route($name) { return $this; } public function with($key, $value) { return $value; } }; }
     function response() { return new class { public function json($data, $status = 200) { return compact('data', 'status'); } }; }
 }
 
