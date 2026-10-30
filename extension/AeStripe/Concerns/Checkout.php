@@ -285,7 +285,7 @@ trait Checkout
         if (in_array($reason, ['customer mismatch', 'currency mismatch', 'invoice not pending'], true)) {
             $attempt = $this->readPaymentAttempt($invoice->user, $invoice);
             if (($attempt['intent'] ?? null) === $intent->id) $this->writePaymentAttempt($invoice->user, $invoice,
-                array_replace($attempt, ['state' => 'reconcile', 'reason' => $reason, 'retry' => true, 'alert_sent' => true]));
+                array_replace($attempt, ['state' => 'reconcile', 'reason' => $reason, 'retry' => true, 'alert_sent' => true, 'funds_pending' => true]));
         }
         $this->schedulePaymentReviewAlert($invoice, $intent->id);
         $review = Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)

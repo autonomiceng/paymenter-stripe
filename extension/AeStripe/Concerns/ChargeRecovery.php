@@ -206,6 +206,8 @@ trait ChargeRecovery
                 $this->writePaymentAttempt($user, $current, $attempt);
             } else {
                 if (!empty($attempt['funds_pending'])
+                    || Audit::where('auditable_type', $current->getMorphClass())->where('auditable_id', $current->id)
+                        ->where('event', 'ae_stripe_payment_review')->where('new_values->payment_intent_id', $attempt['intent'] ?? '')->lockForUpdate()->first()
                     || \App\Models\InvoiceTransaction::where('transaction_id', $attempt['intent'] ?? '')->where('status', 'processing')->exists()
                     || \App\Models\InvoiceTransaction::where('transaction_id', $attempt['intent'] ?? '')->where('status', 'succeeded')->exists()) {
                     throw new \App\Exceptions\DisplayException('This payment may still hold money. Restore access to its Stripe account and account for the funds first.');

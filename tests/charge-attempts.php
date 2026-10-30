@@ -143,6 +143,20 @@ use Illuminate\Support\Facades\{DB, Http};
                 && ExtensionHelper::$payments['920:pi_test1']['status'] === 'failed' && !$stripe->confirms,
                 'A recovery decline with a Stripe intent body records failure and tells the customer without another debit');
         });
+        $run('missing-refused-success', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); $intent = $stripe->intents['pi_test1'];
+            $intent->status = 'succeeded'; $intent->amount_received = 2000; $intent->customer = 'cus_other';
+            $gateway->webhook(eventRequest($intent));
+            $stripe->failure = fn ($verb, $path) => $verb === 'get' && $path === '/payment_intents/pi_test1' ? throw new RequestException(404) : null;
+            rejects(fn () => $gateway->resolveChargeAttempt($invoice, null, 'Original account support evidence says no charge'),
+                'This payment may still hold money. Restore access to its Stripe account and account for the funds first.');
+            check(isset(User::$row->props->values['ae_stripe_checkout_920']), 'A refused success still protects known funds when Stripe later answers 404');
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); unset($attempt['funds_pending']);
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            rejects(fn () => $gateway->resolveChargeAttempt($invoice, null, 'Original account support evidence says no charge'),
+                'This payment may still hold money. Restore access to its Stripe account and account for the funds first.');
+            check(isset(User::$row->props->values['ae_stripe_checkout_920']), 'An older refused-success audit protects funds without the new property field');
+        });
         $run('intent-swap', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20); $intent = $stripe->intents['pi_test1']; $intent->amount_received = 500;
             paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
