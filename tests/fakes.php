@@ -11,6 +11,7 @@ namespace Illuminate\Console {
     }
     class Application { public static $callbacks = []; public static function starting($callback) { self::$callbacks[] = $callback; } }
 }
+namespace { if (!class_exists('PDOException')) { class PDOException extends \RuntimeException {} } }
 namespace App\Exceptions { class DisplayException extends \Exception {} }
 namespace Illuminate\Database { class UniqueConstraintViolationException extends \RuntimeException {} class QueryException extends \RuntimeException {} }
 namespace Illuminate\Http\Client {
