@@ -778,14 +778,19 @@ class AeStripe extends Gateway
 
     public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement)
     {
+        $this->paymentRetryReserved = false;
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
         if (!$customer) {
             throw new DisplayException('Could not find your saved payment details. Add a new payment method.');
         }
         try {
-            if (!$this->gatewayEnabled()) $this->paymentPending('Payments are paused. Please check back later.');
-            $intent = $this->checkoutIntent($invoice, $this->checkoutPaymentData($invoice,
-                $this->toMinorUnits($amount, $invoice->currency_code), $customer) + ['agreement_id' => $billingAgreement->id]);
+            $data = $this->checkoutPaymentData($invoice, $this->toMinorUnits($amount, $invoice->currency_code), $customer)
+                + ['agreement_id' => $billingAgreement->id];
+            if (!$this->gatewayEnabled()) {
+                $this->reservePaymentAttempt($invoice, $data);
+                $this->paymentPending('Payments are paused. We will check this payment when payments resume.');
+            }
+            $intent = $this->checkoutIntent($invoice, $data);
             if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
                 $intent = $this->confirmAttempt($invoice, $intent->id, [
                     'payment_method' => $billingAgreement->external_reference, 'off_session' => 'true',
@@ -806,9 +811,12 @@ class AeStripe extends Gateway
             if ($intent->status === 'requires_action') throw new DisplayException('This payment needs authentication. Use the one-time payment option to finish it.');
             throw new DisplayException('This card was declined. Choose another payment method.');
         } catch (\Illuminate\Database\QueryException $e) {
-            if (!in_array((int) ($e->errorInfo[1] ?? $e->getCode()), [1205, 1213], true)) throw $e;
+            // Before reservation there is no durable retry: let core surface that failure.
+            // Afterwards even a lost DB connection may follow a landed Stripe confirm.
+            if (!$this->paymentRetryReserved) throw $e;
+            report($e);
             if (app()->runningInConsole()) return true;
-            $this->paymentPending('Payment is busy. Refresh the invoice to check its status.');
+            $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
         } catch (PaymentPendingException $e) {
             // Core cron ignores the bool and emails failure for every thrown exception.
             if (app()->runningInConsole()) return true;

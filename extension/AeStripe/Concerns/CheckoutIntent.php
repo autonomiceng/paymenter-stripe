@@ -11,30 +11,11 @@ use Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException;
 trait CheckoutIntent
 {
     private bool $paymentStripeUnavailable = false;
+    private bool $paymentRetryReserved = false;
     private function checkoutIntent($invoice, array $data)
     {
         for ($round = 0; $round < 4; ++$round) {
-            $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($data) {
-                $amount = $this->paymentBalance($current);
-                if ($current->status !== 'pending' || $amount <= 0) throw new DisplayException('This invoice has no payment due. Refresh the invoice.');
-                $attempt = $this->readPaymentAttempt($user, $current);
-                if (!$attempt) {
-                    // Earlier bank debits have a transaction ID but no attempt property.
-                    $processing = $current->transactions()->where('status', 'processing')->lockForUpdate()->get();
-                    foreach ($processing as $transaction) {
-                        if (($transaction->gateway->extension ?? null) === 'AeStripe') {
-                            $attempt = ['key' => 'adopt_' . $transaction->transaction_id, 'created' => time(), 'intent' => $transaction->transaction_id];
-                            break;
-                        }
-                    }
-                }
-                if (!$attempt) $attempt = $this->newPaymentAttempt($current, array_replace($data, [
-                    'customer' => $user->properties()->where('key', 'stripe_id')->firstOrFail()->value,
-                ]), $amount);
-                if (isset($data['agreement_id'])) $attempt['agreement_id'] = $data['agreement_id'];
-                $this->writePaymentAttempt($user, $current, $attempt);
-                return $attempt + ['due_amount' => $amount];
-            });
+            $attempt = $this->reservePaymentAttempt($invoice, $data);
             $creating = false;
             try {
                 if (isset($attempt['intent'])) $intent = $this->request('get', '/payment_intents/' . $attempt['intent']);
@@ -59,7 +40,7 @@ trait CheckoutIntent
                 $this->paymentStripeUnavailable = true;
                 if ($e instanceof RequestException && $e->response->status() === 404 && isset($attempt['intent'])) {
                     $this->paymentStripeUnavailable = false;
-                    $this->holdPaymentAttempt($invoice, $attempt, 'Stripe cannot find this payment. Restore access to its Stripe account or verify that no charge was made before releasing it.');
+                    $this->holdPaymentAttempt($invoice, $attempt, $this->missingPaymentReason($attempt));
                 }
                 $this->storePaymentAttempt($invoice, $attempt, ['retry' => true]);
                 $this->paymentPending('Stripe is unavailable. We will check this payment automatically.');
@@ -135,26 +116,81 @@ trait CheckoutIntent
         $this->paymentPending('Payment changed while loading. Refresh the invoice.');
     }
 
+    private function reservePaymentAttempt($invoice, array $data): array
+    {
+        $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($data) {
+            $amount = $this->paymentBalance($current);
+            if ($current->status !== 'pending' || $amount <= 0) throw new DisplayException('This invoice has no payment due. Refresh the invoice.');
+            $attempt = $this->readPaymentAttempt($user, $current);
+            if (!$attempt) {
+                // Earlier bank debits have a transaction ID but no attempt property.
+                $processing = $current->transactions()->where('status', 'processing')->lockForUpdate()->get();
+                foreach ($processing as $transaction) {
+                    if (($transaction->gateway->extension ?? null) === 'AeStripe') {
+                        $attempt = ['key' => 'adopt_' . $transaction->transaction_id, 'created' => time(), 'intent' => $transaction->transaction_id];
+                        break;
+                    }
+                }
+            }
+            // R3 could reserve an invalid pair, but its creation never confirmed.
+            if (($attempt['version'] ?? null) === 2 && empty($attempt['intent'])
+                && empty($attempt['confirmation']) && empty($attempt['params']['confirm'])
+                && isset($attempt['params']['automatic_payment_methods'], $attempt['params']['confirmation_method'])) {
+                if (!isset($data['agreement_id']) && !empty($attempt['agreement_id'])) $data['agreement_id'] = $attempt['agreement_id'];
+                $attempt = null;
+            }
+            if (!$attempt) $attempt = $this->newPaymentAttempt($current, array_replace($data, [
+                'customer' => $user->properties()->where('key', 'stripe_id')->firstOrFail()->value,
+            ]), $amount);
+            if (isset($data['agreement_id'])) {
+                $attempt['agreement_id'] = $data['agreement_id'];
+                $attempt['agreement_pending'] = true;
+                $attempt['retry'] = true;
+            }
+            $this->writePaymentAttempt($user, $current, $attempt);
+            return $attempt + ['due_amount' => $amount];
+        });
+        $this->paymentRetryReserved = !empty($attempt['retry']);
+        return $attempt;
+    }
+
     private function rememberPaymentIntent($invoice, array $attempt, $intent): void
     {
         $values = [
             'intent' => $intent->id,
+            'latest_charge' => $intent->latest_charge ?? null,
             'funds_pending' => ($intent->amount_received ?? 0) > 0 || in_array($intent->status, ['succeeded', 'processing', 'requires_capture'], true),
-            'retry' => !empty($attempt['confirmation']) || in_array($intent->status, ['succeeded', 'processing', 'requires_capture'], true),
+            'retry' => !empty($attempt['confirmation']) || !empty($attempt['agreement_id']) || in_array($intent->status, ['succeeded', 'processing', 'requires_capture'], true),
         ];
         // An agreement is an interrupted instruction, never permission to repeat a debit.
         if (in_array($intent->status, ['succeeded', 'processing', 'requires_capture', 'requires_action'], true)) $values['agreement_id'] = null;
-        if ($intent->status === 'requires_payment_method' && (!empty($intent->last_payment_error)
-            || InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->exists())) {
+        if ($this->paymentAttemptFailed($attempt, $intent)) {
             $values += ['agreement_id' => null, 'confirmation' => null];
             $values['retry'] = false;
         }
         $this->storePaymentAttempt($invoice, $attempt, $values);
     }
 
+    private function paymentAttemptFailed(array $attempt, $intent): bool
+    {
+        if ($intent->status !== 'requires_payment_method') return false;
+        // A new explicit Pay is still unsent; an earlier decline cannot cancel that instruction.
+        if (empty($attempt['confirmation']) && !empty($attempt['agreement_id']) && !empty($attempt['agreement_pending'])) return false;
+        if (!empty($attempt['confirmation']) && array_key_exists('previous_charge', $attempt['confirmation'])) {
+            // A previous failed row/error says nothing about this later unknown confirm.
+            if (empty($intent->latest_charge) || $intent->latest_charge === $attempt['confirmation']['previous_charge']) return false;
+        }
+        // Older confirmations have no baseline: honor a known failure rather than risk repeating a failed debit.
+        return !empty($intent->last_payment_error)
+            || InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->exists();
+    }
+
     private function newPaymentAttempt($invoice, array $data, int $amount): array
     {
         $params = $this->checkoutPaymentData($invoice, $amount, $data['customer']);
+        // Stripe rejects automatic_payment_methods together with confirmation_method.
+        // Keep checkoutPaymentData unchanged for legacy digest reconstruction.
+        unset($params['automatic_payment_methods']);
         $params['confirmation_method'] = 'manual';
         $key = 'checkout_' . bin2hex(random_bytes(16));
         $params['metadata']['ae_stripe_attempt'] = $key;
@@ -185,6 +221,7 @@ trait CheckoutIntent
 
     private function writePaymentAttempt($user, $invoice, array $attempt): void
     {
+        if (empty($attempt['agreement_id'])) unset($attempt['agreement_pending']);
         $user->properties()->updateOrCreate(['key' => 'ae_stripe_checkout_' . $invoice->id], ['value' => json_encode($attempt, JSON_THROW_ON_ERROR)]);
     }
 
@@ -229,7 +266,8 @@ trait CheckoutIntent
         $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($intentId, $params, $agreement, $expectedAmount) {
             $attempt = $this->readPaymentAttempt($user, $current);
             if (($attempt['intent'] ?? null) !== $intentId) $this->paymentPending('Payment changed. Refresh the invoice to check its status.');
-            $attempt['confirmation'] = ['key' => 'confirm_' . bin2hex(random_bytes(16)), 'params' => $params, 'agreement' => $agreement?->id, 'amount' => $expectedAmount];
+            $attempt['confirmation'] = ['key' => 'confirm_' . bin2hex(random_bytes(16)), 'params' => $params, 'agreement' => $agreement?->id, 'amount' => $expectedAmount, 'previous_charge' => $attempt['latest_charge'] ?? null];
+            unset($attempt['agreement_pending']); // The confirmation now owns this instruction.
             $attempt['retry'] = true;
             $attempt['failure_reason'] = null;
             $attempt['failure_notified'] = false;

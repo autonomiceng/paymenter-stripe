@@ -73,15 +73,16 @@ user properties. New records have `version: 2`. Creation reserves a key and immu
 parameters before HTTP and never confirms or supplies a card. The intent uses manual
 confirmation: its client secret cannot start a payment from an old tab. Opening checkout
 only prepares the form. Elements uses deferred `mode: payment` with the intent's integer amount and lowercase currency,
-plus manual payment-method creation. BLIK, ACSS and customer-balance methods are excluded
-from Elements because Stripe does not support them on this server-confirmation path.
+plus manual payment-method creation. BLIK and ACSS are excluded because this integration path does not support them; this form also excludes customer balance.
+Ilya checked creation in Stripe test mode on 2026-10-30 at 12:00 PM PT (2025-07-30.basil): manual confirmation alone returned 200; adding automatic_payment_methods returned 400.
+The returned card, Klarna, Link and Cash App defaults are all allowed by the form's exclusions; their token confirmation still needs the live checks below.
 Submission sends a ConfirmationToken to the authenticated,
 CSRF-protected confirm endpoint. Under user then invoice locks, the server retrieves
 the intent, rechecks the balance, customer and active saved agreement, updates the amount,
 and confirms. Locks remain held through confirmation to keep the balance and card checks valid.
 Every Stripe request has a five-second timeout and a two-second connection timeout;
 the four-call confirmation section is bounded by those individual request limits.
-A Stripe timeout or cron database lock timeout stays pending, without a failed-payment email. A changed checkout
+A Stripe timeout stays pending. After a saved instruction commits, database errors also stay pending for automatic recovery, without a failed-payment email. A first-lock failure before reservation surfaces as a failure because nothing was saved to retry. Paused saved charges are reserved without HTTP and resume when the gateway is enabled. A changed checkout
 amount requires a refresh because the customer has not agreed to the new total.
 3DS uses `handleNextAction`; its second confirmation and bank redirects return through
 the same server checks, preserving the amount agreed before authentication. Card/Link saving consent remains explicit and method-specific.
@@ -89,7 +90,7 @@ the same server checks, preserving the amount agreed before authentication. Card
 A lost confirm response is recovered by intent ID, beyond key expiry. An unconfirmed
 creation can be abandoned after 23 hours because it cannot have taken money. No frozen
 confirmation is replayed. Bank verification that finishes later is polled and reconfirmed without replaying its consumed token.
-Definite results clear the saved agreement instruction. Recovery never repeats a failed
+Definite results clear the saved agreement instruction. New confirmations retain the preceding charge ID so an earlier failed row or error cannot cancel a later unknown confirmation. Older confirmations without that baseline honor a known failure and do not retry that debit. Recovery never repeats a failed
 card or bank debit; only a new Pay can send another debit. Authentication resumes keep
 the agreement in the separate confirmation record. Recovery records definite declines
 for native failed-payment notices and adds one plain customer notice with the invoice link.
@@ -115,9 +116,10 @@ automatic intents are canceled before replacement, invalidating old tabs. Proces
 intents remain protected until Stripe settles or fails them. Old no-ID records with
 nonconfirming parameters can replay creation safely; digest-only records do so only when
 an exact AE Stripe or converted StripeSaved checkout payload can be reconstructed.
+R3 version-2 creations with no ID and the invalid automatic/manual parameter pair are replaced automatically: their creation could not charge. The pending saved instruction survives replacement. Known IDs are unchanged.
 Old `confirm=true` payloads are never replayed. A matching attempt metadata key or webhook
 request idempotency key can supply their identity; an invoice metadata search alone cannot.
-Older unresolved records are included in automatic recovery without a manual property edit.
+Older unresolved records and saved instructions stranded without retry:true are included in automatic recovery without a manual property edit. A failed result still clears the old saved instruction; it never starts another debit.
 
 An unresolved legacy identity, missing known intent or partially received payment keeps
 its attempt and sends one staff alert linked to the invoice, after commit. Stripe cannot
@@ -126,6 +128,7 @@ safely replace it because the earlier funds have not been accounted for. Staff c
 ```sh
 php artisan ae-stripe:resolve-charge INVOICE_ID --intent=pi_VERIFIED
 php artisan ae-stripe:resolve-charge INVOICE_ID --no-charge-proof="Stripe request log or support evidence"
+php artisan ae-stripe:resolve-charge INVOICE_ID --no-charge-proof="Original account request log confirms this key never reached Stripe" --checked-confirm-key=confirm_VERIFIED
 php artisan ae-stripe:resolve-charge INVOICE_ID --accounted-proof="Verified refund or credit reference"
 ```
 
@@ -133,9 +136,8 @@ The first action validates invoice and customer ownership and resumes automatic 
 It cannot swap out a different held intent; account for that payment first.
 The second requires proof from the original Stripe account. With a known ID it also
 requires a fresh 404 and refuses observed funds, processing debits or recorded payments.
-It records the original ID and proof in the invoice Audit Log before releasing the attempt.
-A 404 or an empty search alone is not proof. Stripe cannot verify a permanently inaccessible
-account, so staff must check that evidence. The third
+A sent or unknown confirmation also refuses free-text proof alone. Staff must check the exact confirm key in the original account's request log and name it with `--checked-confirm-key`, only if the request never reached Stripe. The review Audit Log and refusal show the key; resolution audits that key, the original ID and the evidence. Known funds remain blocked even with that key.
+A 404 or an empty search cannot establish that a confirm never arrived. The extension cannot read an inaccessible original account's request log, so staff must verify that evidence. `--accounted-proof`
 requires a known succeeded or canceled intent and records staff evidence that its funds
 were refunded or credited; late deliveries then cannot apply those funds again. Processing
 intents cannot be released this way. Stripe cannot choose how to account for these funds,
@@ -255,3 +257,5 @@ Checkout references (read for the deferred integration):
 - https://docs.stripe.com/api/payment_intents/confirm
 - https://docs.stripe.com/api/payment_intents/update
 - https://docs.stripe.com/api/payment_intents/cancel
+
+Offline Elements checks inspect options and use local Stripe.js stubs; they do not prove Stripe accepts a token on a persisted manual intent, CustomerSession tokens, saving options, token reuse, 3DS reconfirmation or redirects. Validate those combinations in test mode on the pinned API version before release.
