@@ -4,7 +4,7 @@
 
     </div>
     <label class="mt-4 block">
-        <input type="checkbox" id="save-card" @checked($intent->status === 'requires_action' && ($intent->metadata->ae_stripe_consent ?? null) === '1') disabled />
+        <input type="checkbox" id="save-card" @checked(in_array($intent->status, ['requires_action', 'requires_confirmation'], true) && ($intent->metadata->ae_stripe_consent ?? null) === '1') disabled />
         Save this card or Link for future payments
     </label>
     <p class="text-sm">Saving does not turn on Auto Pay.</p>
@@ -54,7 +54,11 @@ async function initializePaymentForm() {
 
             const form = document.getElementById('payment-form');
             const options = {
-                clientSecret: @js($intent->client_secret),
+                mode: 'payment',
+                amount: @js($intent->amount),
+                currency: @js(strtolower($intent->currency)),
+                excludedPaymentMethodTypes: ['blik', 'acss_debit', 'customer_balance'],
+                paymentMethodCreation: 'manual',
                 appearance: stripeAppearance(form),
             };
 
@@ -76,10 +80,11 @@ async function initializePaymentForm() {
                 }
             }
 
-            // Set up Stripe.js and Elements to use in checkout form, passing the client secret obtained in a previous step
+            // Deferred Elements + ConfirmationToken: the server checks the balance before confirming.
+            // https://docs.stripe.com/payments/finalize-payments-on-the-server
             const elements = stripe.elements(options);
             const paymentElement = elements.create('payment', paymentElementOptions);
-            const resuming = @js($intent->status === 'requires_action');
+            const resuming = @js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true));
             const savedConsent = @js(($intent->metadata->ae_stripe_consent ?? null) === '1');
             let canSave = resuming && savedConsent;
             let loading = false;
@@ -101,28 +106,43 @@ async function initializePaymentForm() {
                 setLoading(true);
                 
                 try {
-                    // The authenticated, CSRF-protected endpoint binds consent to this intent.
-                    const result = await fetch(@js(route('extensions.gateways.ae-stripe.consent')), {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
-                            'X-CSRF-TOKEN': @js(csrf_token())},
-                        body: JSON.stringify({intent: @js($intent->id),
-                            save: resuming ? savedConsent : canSave && saveCard.checked}),
-                    });
-                    if (!result.ok) {
-                        showMessage('Could not update your payment preferences. Try again.');
+                    let token = null;
+                    if (!resuming) {
+                        const submitted = await elements.submit();
+                        if (submitted.error) throw submitted.error;
+                        const created = await stripe.createConfirmationToken({elements});
+                        if (created.error) throw created.error;
+                        token = created.confirmationToken.id;
+                    }
+                    // The first confirmation checks the balance. Automatic 3DS completes at that amount;
+                    // the next server call reads its result. Native manual payments may need reconfirmation.
+                    for (let step = 0; step < 3; step++) {
+                        const response = await fetch(@js(route('extensions.gateways.ae-stripe.confirm')), {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
+                                'X-CSRF-TOKEN': @js(csrf_token())},
+                            body: JSON.stringify({intent: @js($intent->id), confirmation_token: token,
+                                amount: @js($intent->amount), save: resuming ? savedConsent : canSave && saveCard.checked}),
+                        });
+                        const result = await response.json();
+                        if (!response.ok) { showMessage(result.message || 'Could not confirm your payment. Refresh the invoice for its status.'); return; }
+                        if (result.status === 'requires_action') {
+                            const next = await stripe.handleNextAction({clientSecret: result.client_secret});
+                            if (next.error) throw next.error;
+                            token = null;
+                            continue;
+                        }
+                        if (['succeeded', 'processing', 'requires_capture'].includes(result.status)) {
+                            window.location.assign(@js(route('invoices.show', $invoice) . '?checkPayment=true'));
+                            return;
+                        }
+                        showMessage('This payment was declined. Choose another payment method.');
                         return;
                     }
-                    // https://docs.stripe.com/js/elements_object/fetch_updates
-                    const update = await elements.fetchUpdates();
-                    if (update.error) throw update.error;
-                    const {error} = await stripe.confirmPayment({elements, confirmParams: {
-                        return_url: @js(route('invoices.show', $invoice) . '?checkPayment=true'),
-                    }});
-                    if (error) throw error;
+                    showMessage('Payment still needs authentication. Refresh the invoice to continue.');
                 } catch (error) {
                     showMessage(['card_error', 'validation_error'].includes(error?.type) && error.message
-                        ? error.message : 'Could not confirm your payment. Try again.');
+                        ? error.message : 'Could not check the payment. Refresh the invoice for its status.');
                 } finally {
                     setLoading(false);
                 }

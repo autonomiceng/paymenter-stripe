@@ -19,6 +19,10 @@ function rejects($callback, $message) {
     try { $callback(); } catch (Exception $e) { check($e->getMessage() === $message, $message); return; }
     throw new RuntimeException('Expected: ' . $message);
 }
+function paymentStops($callback) {
+    try { $callback(); } catch (\App\Exceptions\DisplayException $e) { check(true, 'Payment stops without a false success or an unsafe retry'); return $e->getMessage(); }
+    throw new RuntimeException('Expected a payment status message');
+}
 function invoke($gateway, $method, ...$args) { return (new ReflectionMethod($gateway, $method))->invoke($gateway, ...$args); }
 function eventRequest($intent, $time = null, $type = 'payment_intent.succeeded') {
     if (str_starts_with($type, 'charge.')) $intent = (object) array_merge(['paid' => true, 'status' => 'succeeded'], (array) $intent);
@@ -31,7 +35,7 @@ $invoice = Invoice::$row = new Invoice($user);
 $gateway = new AeStripe(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
 $gateway->installed();
 $intent = (object) ['id' => 'pi_test', 'customer' => 'cus_owner', 'status' => 'requires_payment_method',
-    'client_secret' => 'pi_test_secret', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 2000, 'payment_method' => 'pm_test',
+    'confirmation_method' => 'automatic', 'client_secret' => 'pi_test_secret', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 0, 'payment_method' => 'pm_test',
     'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1']];
 $method = (object) ['id' => 'pm_test', 'customer' => 'cus_owner', 'type' => 'card',
     'card' => (object) ['brand' => 'visa', 'last4' => '4242', 'exp_year' => 2030, 'exp_month' => 5]];
@@ -57,6 +61,12 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
     };
 };
 
+if (in_array('--charge-attempts', $argv, true)) {
+    require __DIR__ . '/charge-attempts.php';
+    echo "PASS: $count charge attempt assertions\n";
+    return;
+}
+
 if (in_array('--gateway-lifecycle', $argv, true)) {
     require __DIR__ . '/gateway-lifecycle.php';
     echo "PASS: $count gateway lifecycle assertions\n";
@@ -73,7 +83,7 @@ $gateway->boot();
 check(Event::$listeners === [], 'Bundled row retains subscription callbacks even when disabled');
 check(Route::$routes === ['/extensions/ae-stripe/webhook', '/extensions/stripe-saved/webhook',
     '/extensions/ae-stripe/setup-agreement', '/extensions/stripe-saved/setup-agreement',
-    '/extensions/ae-stripe/consent', '/extensions/ae-stripe/setup-consent', '/extensions/ae-stripe/disable-core'], 'Distinct routes are still registered');
+    '/extensions/ae-stripe/consent', '/extensions/ae-stripe/setup-consent', '/extensions/ae-stripe/disable-core', '/extensions/ae-stripe/confirm', '/extensions/ae-stripe/payment-return'], 'Distinct routes are still registered');
 $legacyWebhook = Route::$definitions['/extensions/stripe-saved/webhook'];
 check($legacyWebhook === Route::$definitions['/extensions/ae-stripe/webhook'], 'Legacy webhook shares the POST handler and CSRF exemption');
 [$handlerClass, $handlerMethod] = $legacyWebhook['action'];
@@ -96,6 +106,8 @@ check(!isset($calls[1][2]['setup_future_usage']), 'No saving on initial intent')
 check($calls[2][2]['components']['payment_element']['features'] === [
     'payment_method_redisplay' => 'enabled', 'payment_method_save' => 'disabled', 'payment_method_remove' => 'disabled',
 ], 'Stripe draws saved methods; native consent/removal disabled');
+// The remaining consent endpoint checks exercise an older manual intent.
+$intent->confirmation_method = 'manual';
 Auth::$id = 99;
 rejects(fn () => $gateway->pay($invoice, 20), 'HTTP 403');
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 403');
@@ -108,6 +120,7 @@ rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' =>
 $intent->metadata->ae_stripe_gateway = '1';
 $gateway->consent(new Request(['intent' => 'pi_test', 'save' => false]));
 check($intent->payment_method_options->card->setup_future_usage === '' && $intent->payment_method_options->link->setup_future_usage === '' && $intent->metadata->ae_stripe_consent === '0', 'Unchecked clears future usage');
+$intent->amount_received = 2000;
 $gateway->webhook(eventRequest($intent));
 check(ExtensionHelper::$agreements === [], 'Unchecked never creates agreement');
 $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true]));
@@ -211,6 +224,7 @@ $before = count(Http::$calls);
 rejects(fn () => $gateway->setupConsent(new Request(['intent' => $disabledSetupId, 'consent' => true])), 'HTTP 409');
 check(count(Http::$calls) === $before, 'Disabled setup consent makes no HTTP requests');
 Http::$handler = $oldHandler;
+require __DIR__ . '/charge-attempts.php';
 require __DIR__ . '/gateway-lifecycle.php';
 require __DIR__ . '/subscription-listeners.php';
 require __DIR__ . '/adoption.php';

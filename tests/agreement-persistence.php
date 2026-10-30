@@ -100,13 +100,15 @@ if ($scenario === 'all') {
     $agreementSetup->status = 'requires_payment_method';
     $gateway->createBillingAgreement($user);
     $gateway->setupConsent(new Request(['intent' => $agreementSetup->id, 'consent' => true]));
-    $agreementPaid->status = 'requires_payment_method';
+    $agreementPaid->status = 'requires_payment_method'; $agreementPaid->amount_received = 0; $agreementPaid->confirmation_method = 'automatic';
     $user->props->values = [];
-    $gateway->pay($invoice, 20);
+    $checkoutInvoice = clone $invoice; $checkoutInvoice->id = 915; Invoice::$rows[915] = $checkoutInvoice;
+    $gateway->pay($checkoutInvoice, 20);
+    unset(Invoice::$rows[915]);
     $gateway->webhook(eventRequest($agreementMethod, type: 'payment_method.attached'));
     check(ExtensionHelper::$agreements === $unchanged,
         'Creating setup, consenting, rendering pay and ignored payment_method.attached do not persist agreements');
-    $agreementSetup->status = $agreementPaid->status = 'succeeded';
+    $agreementSetup->status = $agreementPaid->status = 'succeeded'; $agreementPaid->amount_received = 2000;
     foreach (['user_id' => 99, 'gateway_id' => 1, 'deleted_at' => '2026-10-23 11:18:14'] as $field => $value) {
         $conflict = array_replace($agreementRow, [$field => $value]);
         ExtensionHelper::$agreements = [$agreementMethod->id => $conflict];

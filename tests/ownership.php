@@ -1,7 +1,7 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 use App\Helpers\ExtensionHelper;
-use App\Models\{Gateway, BillingAgreement};
+use App\Models\{Gateway, BillingAgreement, Invoice};
 use Illuminate\Support\Facades\{Http, Log};
 
 Gateway::$enabled = Gateway::$bundledEnabled = true;
@@ -74,10 +74,12 @@ check(count(Http::$calls) === $before && !isset(ExtensionHelper::$fees['pi_forei
 Gateway::$bundledEnabled = true;
 $gateway->webhook(eventRequest((object) ['payment_intent' => 'pi_ownership', 'balance_transaction' => 'bt_test'], type: 'charge.updated'));
 check(ExtensionHelper::$fees['pi_ownership'] === 0.1, 'Recorded fork ownership permits fee update even without charge metadata');
-Http::$handler = fn () => ['id' => 'cus_owner'];
-$gateway->charge($invoice, 20, new BillingAgreement);
-check(end(Http::$calls)[2]['metadata'] === ['invoice_id' => 12, 'billing_agreement_id' => 4, 'ae_stripe_gateway' => '1'],
+Http::$handler = fn () => ['id' => 'pi_ownercharge', 'status' => 'requires_action', 'confirmation_method' => 'manual', 'currency' => 'usd', 'customer' => 'cus_owner'];
+$ownerInvoice = clone $invoice; $ownerInvoice->id = 917; $ownerInvoice->status = 'pending'; Invoice::$rows[917] = $ownerInvoice;
+paymentStops(fn () => $gateway->charge($ownerInvoice, 20, new BillingAgreement));
+check(end(Http::$calls)[2]['metadata']['invoice_id'] === 917 && end(Http::$calls)[2]['metadata']['ae_stripe_gateway'] === '1',
     'Off-session intent preserves metadata and marks gateway');
+unset(Invoice::$rows[917]);
 Http::$handler = fn () => ['id' => 'seti_created'];
 $gateway->createBillingAgreement($user);
 check(end(Http::$calls)[2]['metadata'] === ['user_id' => 7, 'is_billing_agreement' => '1', 'ae_stripe_gateway' => '1'],

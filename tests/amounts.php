@@ -1,6 +1,6 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-use App\Models\{BillingAgreement, Service, Gateway};
+use App\Models\{BillingAgreement, Service, Gateway, Invoice};
 use Illuminate\Support\Facades\Http;
 
 foreach ([[0.29, 29], ['19.99', 1999], [0.1 + 0.2, 30], ['1.005', 101], ['-1.005', -101], ['0.0049', 0]] as [$value, $expected]) {
@@ -30,7 +30,7 @@ Gateway::$enabled = true;
 Http::$handler = function ($verb, $path, $data) {
     return match (true) {
         $path === '/customers/cus_owner' => ['id' => 'cus_owner'],
-        $path === '/payment_intents' => ['id' => 'pi_amount', 'client_secret' => 'pi_secret'],
+        $path === '/payment_intents' => ['id' => 'pi_amount', 'status' => 'requires_payment_method', 'confirmation_method' => 'automatic', 'currency' => $data['currency'], 'customer' => $data['customer'], 'client_secret' => 'pi_secret'],
         $path === '/customer_sessions' => ['client_secret' => 'cuss_secret'],
         $path === '/subscriptions/sub_test' => ['schedule' => null, 'items' => ['data' => [
             ['id' => 'si_test', 'price' => ['product' => 'prod_test']]]]],
@@ -39,17 +39,19 @@ Http::$handler = function ($verb, $path, $data) {
     };
 };
 $user->props->values = [];
-$gateway->pay($invoice, 0.29);
+$amountInvoice = clone $invoice; $amountInvoice->id = 918; $amountInvoice->total = 0.29; Invoice::$rows[918] = $amountInvoice;
+$gateway->pay($amountInvoice, 0.29);
 check(Http::$calls[count(Http::$calls) - 2][2]['amount'] === 29, 'Checkout sends integer cents');
 $service = new Service;
 $gateway->updateSubscription($service);
 check(end(Http::$calls)[2]['price_data']['unit_amount'] === 5997, 'Subscription update retains quantity > 1');
-$gateway->charge($invoice, '19.99', new BillingAgreement);
-check(end(Http::$calls)[2]['amount'] === 1999, 'Off-session charge sends integer cents');
+$user->props->values = []; $amountInvoice->total = '19.99';
+$gateway->pay($amountInvoice, '19.99');
+check(Http::$calls[count(Http::$calls) - 2][2]['amount'] === 1999, 'Checkout retains decimal invoice cents');
 $user->props->values = [];
-$invoice->currency_code = 'JPY';
-$gateway->pay($invoice, 123);
+$amountInvoice->currency_code = 'JPY'; $amountInvoice->total = 123;
+$gateway->pay($amountInvoice, 123);
 check(Http::$calls[count(Http::$calls) - 2][2]['amount'] === 123, 'JPY checkout sends yen');
-$invoice->currency_code = 'usd';
+unset(Invoice::$rows[918]);
 Http::$handler = $previousHandler;
 Gateway::$enabled = false;

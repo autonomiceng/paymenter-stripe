@@ -240,7 +240,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         check(count(Http::$calls) === $before + ($replace ? 3 : 2), 'Repeated lookup creates at most one customer: ' . $state);
     }
     $user->props->customer = 'cus_owner';
-    $legacy = (object) ['id' => 'pi_legacy_consent', 'status' => 'requires_confirmation', 'customer' => 'cus_owner',
+    $legacy = (object) ['id' => 'pi_legacy_consent', 'confirmation_method' => 'manual', 'status' => 'requires_confirmation', 'customer' => 'cus_owner',
         'setup_future_usage' => 'off_session',
         'metadata' => (object) ['invoice_id' => $invoice->id, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1']];
     Http::$handler = function ($verb, $path, $data) use ($legacy) {

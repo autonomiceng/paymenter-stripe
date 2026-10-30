@@ -32,6 +32,7 @@ use Paymenter\Extensions\Gateways\AeStripe\Concerns\Checkout;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\CardDuplicates;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\PaymentFees;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\CheckoutIntent;
+use Paymenter\Extensions\Gateways\AeStripe\Concerns\ChargeRecovery;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SetupConsent;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\SetupIntent;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\Signature;
@@ -40,7 +41,6 @@ use Paymenter\Extensions\Gateways\AeStripe\Concerns\SubscriptionPayments;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\Webhooks;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\StripeMetadata;
 use Paymenter\Extensions\Gateways\AeStripe\Concerns\TransactionMethod;
-use Str;
 
 require_once __DIR__ . '/GatewayLifecycle.php';
 require_once __DIR__ . '/Concerns/StripeMetadata.php';
@@ -51,6 +51,8 @@ require_once __DIR__ . '/Concerns/Amounts.php';
 require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
 require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
 require_once __DIR__ . '/Concerns/CheckoutIntent.php';
+require_once __DIR__ . '/PaymentPendingException.php';
+require_once __DIR__ . '/Concerns/ChargeRecovery.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
 require_once __DIR__ . '/Concerns/SetupIntent.php';
 require_once __DIR__ . '/Concerns/Webhooks.php';
@@ -66,19 +68,23 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
     public function boot()
     {
         if (app()->runningInConsole()) {
+            app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryChargeAttempts())
+                ->name('ae-stripe:charge-attempts')->everyFiveMinutes()->onOneServer()->withoutOverlapping(60));
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryPaymentFees())
                 ->name('ae-stripe:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
+            require_once __DIR__ . '/ResolveChargeCommand.php';
             require_once __DIR__ . '/DeduplicateCardsCommand.php';
             require_once __DIR__ . '/AdoptBundledCommand.php';
             require_once __DIR__ . '/ConvertFromStripeSavedCommand.php';
             \Illuminate\Console\Application::starting(function ($artisan) {
+                $artisan->resolve(ResolveChargeCommand::class);
                 $artisan->resolve(DeduplicateCardsCommand::class);
                 $artisan->resolve(AdoptBundledCommand::class);
                 $artisan->resolve(ConvertFromStripeSavedCommand::class);
@@ -280,7 +286,7 @@ class AeStripe extends Gateway
             'Stripe-Version' => self::API_VERSION,
         ];
         if ($idempotencyKey !== null) $headers['Idempotency-Key'] = $idempotencyKey;
-        return $this->readStripeObject(Http::withHeaders($headers)->asForm()->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object());
+        return $this->readStripeObject(Http::withHeaders($headers)->asForm()->connectTimeout(2)->timeout(5)->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object());
     }
 
     private function setupSubscription($setupIntent)
@@ -772,38 +778,50 @@ class AeStripe extends Gateway
 
     public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement)
     {
-        $user = $invoice->user;
-        $stripeCustomerId = $user->properties->where('key', 'stripe_id')->first();
-        // Create customer if not exists
-        if (!$stripeCustomerId) {
+        $this->paymentRetryReserved = false;
+        $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
+        if (!$customer) {
             throw new DisplayException('Could not find your saved payment details. Add a new payment method.');
-        } else {
-            $customer = $this->request('get', '/customers/' . $stripeCustomerId->value);
         }
-
-        // Create payment intent
         try {
-            $intent = $this->request('post', '/payment_intents', [
-                'amount' => $this->toMinorUnits($amount, $invoice->currency_code),
-                'currency' => $invoice->currency_code,
-                'customer' => $customer->id,
-                'payment_method' => $billingAgreement->external_reference,
-                'off_session' => 'true',
-                'confirm' => 'true',
-                'metadata' => ['invoice_id' => $invoice->id, 'billing_agreement_id' => $billingAgreement->id, 'ae_stripe_gateway' => '1'],
-            ]);
-        } catch (Exception $e) {
-            if ($e instanceof RequestException && $e->response->status() === 400) {
-                $error = $e->response->object()->error;
-                // If error is invalid_request_error and message contains "The provided currency" we can show the message
-                if ($error->type === 'invalid_request_error' && Str::contains($error->message, 'The currency provided')) {
-                    throw new DisplayException('This card can\'t be charged in ' . $invoice->currency_code . '. Use another payment method.');
-                }
+            $data = $this->checkoutPaymentData($invoice, $this->toMinorUnits($amount, $invoice->currency_code), $customer)
+                + ['agreement_id' => $billingAgreement->id];
+            if (!$this->gatewayEnabled()) {
+                $this->reservePaymentAttempt($invoice, $data);
+                $this->paymentPending('Payments are paused. We will check this payment when payments resume.');
             }
-            throw new DisplayException('Could not process your payment. Try again or use another payment method.');
+            $intent = $this->checkoutIntent($invoice, $data);
+            if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
+                $intent = $this->confirmAttempt($invoice, $intent->id, [
+                    'payment_method' => $billingAgreement->external_reference, 'off_session' => 'true',
+                ], $billingAgreement);
+            }
+            if ($intent->status === 'succeeded') {
+                try { $this->recordIntentPayment($intent, 'succeeded'); }
+                catch (\Throwable $e) {
+                    report($e);
+                    if (!InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) {
+                        $this->paymentPending('Stripe received this payment. We will finish recording it automatically.');
+                    }
+                }
+                if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) return true;
+                $this->paymentReconcileMessage();
+            }
+            if (in_array($intent->status, ['processing', 'requires_capture'], true)) $this->paymentPending();
+            if ($intent->status === 'requires_action') throw new DisplayException('This payment needs authentication. Use the one-time payment option to finish it.');
+            throw new DisplayException('This card was declined. Choose another payment method.');
+        } catch (\PDOException | \Illuminate\Database\QueryException $e) {
+            // Before reservation there is no durable retry: let core surface that failure.
+            // Afterwards even a lost DB connection may follow a landed Stripe confirm.
+            if (!$this->paymentRetryReserved) throw $e;
+            report($e);
+            if (app()->runningInConsole()) return true;
+            $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
+        } catch (PaymentPendingException $e) {
+            // Core cron ignores the bool and emails failure for every thrown exception.
+            if (app()->runningInConsole()) return true;
+            throw $e;
         }
-
-        return true;
     }
 
 }
