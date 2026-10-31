@@ -122,3 +122,24 @@ check($gateway->receiptReversals($i, 'pi_return')[0]['customer'] === 'cus_owner'
     'Replacing the account Stripe customer cannot discard a dispute on its older receipt');
 $s->intent->customer = 'cus_replacement';
 rejects(fn () => $gateway->webhook($oldReceiptEvent), 'HTTP 409');
+
+// Every staff invoice notice must open Paymenter's clustered invoice resource.
+[$i, $s] = $setup(1099, 10.99); $deliver($s);
+foreach (['refund' => 're_notice', 'dispute' => 'du_notice'] as $kind => $id) {
+    $object = (object) ['id' => $id, 'payment_intent' => 'pi_return', 'currency' => 'usd', 'amount' => 100,
+        'status' => $kind === 'refund' ? 'succeeded' : 'needs_response', 'metadata' => (object) []];
+    if ($kind === 'refund') $s->refunds['foreign'] = $object;
+    else $s->dispute = $object;
+    $gateway->webhook(eventRequest($object, type: $kind === 'refund' ? 'refund.created' : 'charge.dispute.created'));
+}
+$links = array_column(Notification::$rows, 'url');
+[$i, $s] = $setup();
+$s->intent->latest_charge->disputed = true; $deliver($s);
+invoke($gateway, 'withPaymentLock', $i, function ($user, $invoice) use ($gateway, $s) {
+    invoke($gateway, 'writePaymentAttempt', $user, $invoice, ['key' => 'notice-review', 'state' => 'reconcile', 'reason' => 'Unknown payment']);
+    invoke($gateway, 'recordPaymentReview', $invoice, $s->intent, 'currency mismatch');
+});
+invoke($gateway, 'sendAttemptReview', $i);
+$links = array_merge($links, array_column(array_filter(Notification::$rows, fn ($notice) => $notice['user_id'] !== $i->user_id), 'url'));
+check($links === array_fill(0, 5, url('/admin/invoice/invoices/' . $i->id . '/edit')),
+    'Refund, dispute, return, checkout and charge recovery notices open the native staff invoice page');

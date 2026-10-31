@@ -359,7 +359,7 @@ trait Checkout
                 foreach (User::whereNotNull('role_id')->get() as $staff) {
                     Notification::create([
                         'user_id' => $staff->id, 'title' => 'Stripe payment needs review',
-                        'url' => url('/admin/invoices/' . $invoice->id . '/edit'),
+                        'url' => $this->adminInvoiceUrl($invoice),
                         'body' => 'Invoice ' . $invoice->id . ', payment ' . $intentId . ': ' . $alert['reason']
                             . '. Check Stripe and choose a refund or account credit; this needs your decision.',
                     ]);
