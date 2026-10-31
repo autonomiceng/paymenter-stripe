@@ -120,7 +120,7 @@ trait RenewalRetry
             . ($willRetry
                 ? ' We may retry in two days, before the renewal due date.' : ' Automatic retries have stopped.');
         $attempt['failure_notified'] = false;
-        DB::afterCommit(fn () => $this->notifyRecoveryRefusal($invoice, $attempt['failure_reason']));
+        DB::afterCommit(fn () => $this->notifyRecoveryRefusal($invoice, $attempt['failure_reason'], storedRefusal: true));
         return $attempt;
     }
 

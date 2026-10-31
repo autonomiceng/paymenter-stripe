@@ -97,7 +97,7 @@ trait ChargeRecovery
                 if (!$collect) continue; // Paused collection still retires old forms.
                 if (!empty($attempt['renewal']) && $attempt['renewal']['state'] !== 'active') {
                     if (!empty($attempt['failure_reason']) && empty($attempt['failure_notified'])) {
-                        $this->notifyRecoveryRefusal($invoice, $attempt['failure_reason']);
+                        $this->notifyRecoveryRefusal($invoice, $attempt['failure_reason'], storedRefusal: true);
                     }
                     $attempt = $this->advanceRenewalRetry($invoice);
                     if (!$attempt) continue;
@@ -106,7 +106,7 @@ trait ChargeRecovery
                 if (($attempt['version'] ?? 1) === 2 && empty($attempt['retry']) && empty($attempt['agreement_id'])) continue;
                 $this->sendAttemptReview($invoice);
                 if (!empty($attempt['failure_reason']) && empty($attempt['failure_notified'])) {
-                    $this->notifyRecoveryRefusal($invoice, $attempt['failure_reason']);
+                    $this->notifyRecoveryRefusal($invoice, $attempt['failure_reason'], storedRefusal: true);
                     continue;
                 }
                 if (!empty($attempt['authentication_check']) && empty($attempt['funds_pending'])
@@ -161,10 +161,11 @@ trait ChargeRecovery
         }
     }
 
-    private function notifyRecoveryRefusal($invoice, string $reason): void
+    private function notifyRecoveryRefusal($invoice, string $reason, bool $storedRefusal = false): void
     {
-        $this->withPaymentLock($invoice, function ($user, $current) use ($reason) {
+        $this->withPaymentLock($invoice, function ($user, $current) use ($reason, $storedRefusal) {
             $attempt = $this->readPaymentAttempt($user, $current);
+            if ($storedRefusal && ($attempt['failure_reason'] ?? null) !== $reason) return;
             if (!$attempt) {
                 DB::afterCommit(fn () => $this->notifyUnpaidInvoice($current, $reason));
                 return;

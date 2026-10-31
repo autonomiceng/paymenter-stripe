@@ -211,7 +211,7 @@ trait CheckoutIntent
                 }
             }
             if ($customerPay) {
-                unset($attempt['renewal'], $attempt['automatic_renewal']);
+                unset($attempt['renewal'], $attempt['automatic_renewal'], $attempt['failure_reason'], $attempt['failure_notified']);
                 $attempt['customer_payment'] = true; // Only an explicit customer takeover removes automatic authority.
             } elseif (!empty($data['renewal_start']) && empty($attempt['customer_payment']) && ($this->nativeRenewalServices($current) || $this->retainedRenewalInvoice($current))) {
                 $attempt['automatic_renewal'] = true;

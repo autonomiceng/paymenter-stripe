@@ -81,6 +81,36 @@ try {
             }
         });
     }
+    $run('renewal-refusal-customer-takeover', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
+        $renewalFixture($invoice, $stripe); $stripe->status = 'requires_action'; $stripe->beforeConfirm = null;
+        $initialRefusal($invoice);
+        $confirmation = null;
+        $takeover = function () use (&$takeover, &$confirmation, $gateway, $invoice, $stripe) {
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            if (DB::$locked || ($attempt['renewal']['state'] ?? null) !== 'waiting') { DB::$afterTransaction = $takeover; return; }
+            $GLOBALS['fakeConsole'] = false;
+            $stripe->failure = function ($verb, $path) {
+                $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                if ($verb === 'get' && $path === '/payment_intents/pi_test1' && !empty($attempt['confirmation'])) {
+                    throw new ConnectionException('Customer confirmation reserved; provider read interrupted');
+                }
+            };
+            // Keep the deferred refusal callback queued until the customer's reservation commits.
+            DB::transaction(function () use ($gateway, $invoice, &$confirmation) {
+                try { $gateway->charge($invoice, 20, new BillingAgreement); }
+                catch (\Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException $e) {}
+                $confirmation = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['confirmation'] ?? null;
+            });
+            $stripe->failure = null;
+        };
+        DB::$afterTransaction = $takeover;
+        $intent = $stripe->intents['pi_test1']; $intent->status = 'requires_payment_method';
+        $intent->last_payment_error = (object) ['code' => 'card_declined'];
+        $gateway->webhook(eventRequest($intent, type: 'payment_intent.payment_failed'));
+        $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+        check($confirmation && ($attempt['confirmation'] ?? null) === $confirmation && $attempt['agreement_id'] === 4 && !Notification::$rows,
+            'A deferred renewal refusal cannot erase customer Pay confirmation or send its old notice after takeover');
+    });
     foreach (['result', 'http-402'] as $path) {
         $run('renewal-refusal-lock-' . $path, function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal, $path) {
             $renewalFixture($invoice, $stripe); $initialRefusal($invoice); $dueRetry();
