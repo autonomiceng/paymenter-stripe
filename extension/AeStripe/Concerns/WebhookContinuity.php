@@ -91,6 +91,12 @@ trait WebhookContinuity
             // Paymenter's edit hook runs after settings writes, with its previously loaded settings
             // still supplied to this instance. Keep that snapshot on the first upgraded save too.
             $old = $state['credentials'] ?? array_combine($names, array_map(fn ($name) => (string) parent::config($name), $names));
+            foreach ($state['previous'] ?? [] as $entry) {
+                if ($entry['until'] !== null && $entry['secret'] === $credentials['stripe_webhook_secret']) {
+                    $credentials['stripe_webhook_secret'] = $old['stripe_webhook_secret'];
+                    break;
+                }
+            }
             try {
                 $key = $credentials['stripe_secret_key'];
                 $mode = $this->stripeKeyMode($key);

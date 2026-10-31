@@ -65,6 +65,8 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         $state = json_decode($extension->settingValues->values[$stateKey], true); $deadline = $state['previous'][0]['until'];
         check($deadline >= time() + 72 * 3600 - 5 && $deadline <= time() + 72 * 3600,
             'The first delivery proving the replacement starts the outgoing secret\'s 72-hour clock');
+        $state['previous'][0]['until'] = $deadline -= 10;
+        $extension->settingValues->values[$stateKey] = json_encode($state);
         $gateway->webhook($newRequest);
         $gateway->updated($extension);
         check(json_decode($extension->settingValues->values[$stateKey], true)['previous'][0]['until'] === $deadline, 'Later deliveries and ordinary edits do not extend the old secret deadline');
@@ -78,6 +80,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
             && $gateway->webhook($newRequest)['status'] === 200, 'A wrong saved secret keeps genuine deliveries accepted without an expiry');
         $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_rotated';
         $gateway->updated($extension); $gateway->webhook($newRequest);
+        check($gateway->config('stripe_webhook_secret') === 'whsec_rotated', 'An outgoing secret without a deadline can be restored to fix a typo');
 
         // Admin A opens the form, admin B rolls and saves C, then A saves its stale B field.
         $staleAdmin = new AeStripe($extension->settingValues->values);
@@ -88,13 +91,17 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_rotated';
         $staleAdmin->updated($extension);
         $stale = json_decode($extension->settingValues->values[$stateKey], true);
-        $working = array_values(array_filter($stale['previous'], fn ($entry) => $entry['secret'] === 'whsec_second_rotation'));
-        check(count($working) === 1 && $working[0]['until'] === null
-            && $gateway->webhook($secondRequest)['status'] === 200, 'A stale second-admin save keeps the secret Stripe really uses accepted without an expiry');
-        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_second_rotation';
-        $gateway->updated($extension); $gateway->webhook($secondRequest);
-        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_rotated';
-        $gateway->updated($extension); $gateway->webhook($newRequest);
+        check($gateway->webhook($newRequest)['status'] === 200, 'The old B delivery still verifies inside its overlap after the stale save');
+        $afterOldDelivery = json_decode($extension->settingValues->values[$stateKey], true);
+        foreach ($afterOldDelivery['previous'] as &$entry) $entry['until'] = time() - 1;
+        unset($entry);
+        $extension->settingValues->values[$stateKey] = json_encode($afterOldDelivery);
+        $at = time();
+        $freshSecondRequest = new Request(body: $body, signature: 't=' . $at . ',v1=' . hash_hmac('sha256', $at . '.' . $body, 'whsec_second_rotation'));
+        check($gateway->webhook($freshSecondRequest)['status'] === 200
+            && $stale['credentials']['stripe_webhook_secret'] === 'whsec_second_rotation'
+            && $extension->settingValues->values['stripe_webhook_secret'] === 'whsec_second_rotation',
+            'B to C proof, stale B save and old B delivery cannot retire C: its fresh paid delivery verifies after overlap expiry');
 
         foreach (['rk_test_otheraccount', 'rk_live_original'] as $invalidKey) {
             $extension->settingValues->values['stripe_secret_key'] = $invalidKey;
@@ -106,7 +113,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         }
         $extension->settingValues->values['stripe_webhook_secret'] = '';
         rejects(fn () => $gateway->updated($extension), "Copy this endpoint's signing secret from Stripe, then save again. Its existing deliveries have been preserved.");
-        check($extension->settingValues->values['stripe_webhook_secret'] === 'whsec_rotated', 'Clearing the signing secret preserves the old accepted secret and endpoint');
+        check($extension->settingValues->values['stripe_webhook_secret'] === 'whsec_second_rotation', 'Clearing the signing secret preserves the old accepted secret and endpoint');
         $endpoint->url = 'https://old.example.invalid/extensions/ae-stripe/webhook';
         $gateway->updated($extension);
         check($endpoint->url === route('extensions.gateways.ae-stripe.webhook'), 'A site URL change updates the same endpoint, keeping pending deliveries and its signing secret');
