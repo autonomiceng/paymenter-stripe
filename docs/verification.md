@@ -312,6 +312,11 @@ for independent allocation rows beyond the old aggregate TEXT limit, due-work
 indexing, native closed-invoice event suppression and cash/credit classification.
 These tests use disposable in-memory SQLite, never the installed application database.
 
+Run `PAYMENTER_TEST_APP=/path/to/pristine-release php tests/native-auto-pay-consent.php`
+to verify that the minimal `{"enabled":false}` request clears the account default
+with the gateway enabled or paused. This exercises the real Laravel request validator
+and native property deletion; the ordinary offline Request fake skips validation.
+
 Optional transaction-method charge retrieval runs before settlement locks. Subscription PaymentIntent reads expand `latest_charge` before acquiring those locks. The locked handler rechecks customer, currency, invoice state and settled-payment replay before storing the label.
 
 Checkout references (read for the deferred integration):

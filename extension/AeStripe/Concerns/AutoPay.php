@@ -33,7 +33,7 @@ trait AutoPay
         $request->validate([
             'enabled' => 'required|boolean',
             'agreement_id' => 'required_if:enabled,true|integer|min:1',
-            'consent' => 'required_if:enabled,true|accepted',
+            'consent' => 'accepted_if:enabled,true',
             'version' => 'required_if:enabled,true|string',
         ]);
         abort_unless(!$request->boolean('enabled') || $this->gatewayEnabled(), 409);

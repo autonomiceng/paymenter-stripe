@@ -425,7 +425,7 @@ namespace Illuminate\Http {
         public function __construct(public array $input = [], public string $body = '', public ?string $signature = null) {}
         public function input($key) { return $this->input[$key] ?? null; }
         public function boolean($key) { return (bool) $this->input($key); }
-        public function validate($rules) {} // Laravel validation is covered by sandbox checks.
+        public function validate($rules) {} // Real rules: tests/native-auto-pay-consent.php; no validation here.
         public function getContent() { return $this->body; }
         public function header($name) { return $this->signature; }
     }
