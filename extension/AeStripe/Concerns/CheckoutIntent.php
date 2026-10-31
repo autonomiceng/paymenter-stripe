@@ -16,13 +16,27 @@ trait CheckoutIntent
     {
         for ($round = 0; $round < 4; ++$round) {
             $attempt = $this->reservePaymentAttempt($invoice, $data, $elements);
+            foreach (['renewal', 'automatic_renewal', 'customer_payment'] as $key) {
+                if (array_key_exists($key, $attempt)) $data[$key] = $attempt[$key];
+            }
             if (!empty($attempt['agreement_id'])) $data['agreement_id'] ??= $attempt['agreement_id'];
             $creating = false;
             try {
                 if (isset($attempt['intent'])) $intent = $this->request('get', '/payment_intents/' . $attempt['intent']);
                 elseif (($attempt['version'] ?? 1) === 2 || $this->legacyUnconfirmedAttempt($invoice, $attempt, array_replace($data, ['amount' => $attempt['due_amount']]))) {
                     // Creation never confirms. After key expiry an orphan cannot have charged.
-                    if (time() - $attempt['created'] >= 23 * 3600) { $this->replacePaymentAttempt($invoice, $attempt); continue; }
+                    if (time() - $attempt['created'] >= 23 * 3600) {
+                        if (!empty($attempt['automatic_renewal'])) {
+                            $this->withPaymentLock($invoice, function ($user, $current) use ($attempt) {
+                                $stored = $this->readPaymentAttempt($user, $current);
+                                if (($stored['key'] ?? null) !== $attempt['key'] || isset($stored['intent'])) return;
+                                // Rotate the proven-unconfirmed creation atomically; a crash cannot discard its authority/count.
+                                $next = $this->newPaymentAttempt($current, $stored['params'], $this->paymentBalance($current), !empty($stored['elements']));
+                                $this->writePaymentAttempt($user, $current, array_replace($stored, $next));
+                            });
+                        } else $this->replacePaymentAttempt($invoice, $attempt);
+                        continue;
+                    }
                     $creating = true;
                     $intent = $this->request('post', '/payment_intents', $attempt['params'], $attempt['key']);
                 } else {
@@ -53,6 +67,24 @@ trait CheckoutIntent
             }
             if (empty($intent->id) || isset($attempt['intent']) && $intent->id !== $attempt['intent']) {
                 $this->holdPaymentAttempt($invoice, $attempt, 'Stripe returned a different payment ID. Link the verified payment before continuing.');
+            }
+            if (!empty($attempt['automatic_renewal']) && ($intent->amount_received ?? 0) === 0
+                && $this->paymentAttemptFailed($attempt, $intent)) {
+                $refused = $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intent) {
+                    $stored = $this->readPaymentAttempt($user, $current);
+                    if (($stored['key'] ?? null) !== $attempt['key'] || empty($stored['automatic_renewal'])) return false;
+                    try { $fresh = $this->request('get', '/payment_intents/' . $intent->id); }
+                    catch (RequestException | ConnectionException $e) {
+                        $this->paymentStripeUnavailable = true;
+                        $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
+                    }
+                    if (($fresh->amount_received ?? 0) !== 0 || !$this->paymentAttemptFailed($stored, $fresh)) return false;
+                    // Keep the claimed confirmation until refusal and renewal policy commit together.
+                    $this->recordIntentPayment($fresh, 'failed');
+                    return $fresh;
+                });
+                if ($refused) return $refused; // The committed policy prevents this automatic caller from confirming.
+                continue; // The attempt or provider result changed; inspect the current reservation again.
             }
             // A concurrent page load may have retired this unconfirmed native intent for Elements.
             if (!$this->rememberPaymentIntent($invoice, $attempt, $intent)) continue;
@@ -140,6 +172,12 @@ trait CheckoutIntent
             $amount = $this->paymentBalance($current);
             if ($current->status !== 'pending' || $amount <= 0) throw new DisplayException('This invoice has no payment due. Refresh the invoice.');
             $attempt = $this->readPaymentAttempt($user, $current);
+            $customerPay = $elements || array_key_exists('renewal_start', $data) && !$data['renewal_start'];
+            $context = array_intersect_key($attempt ?? $data, array_flip(['renewal', 'automatic_renewal', 'customer_payment']));
+            if (!empty($attempt['renewal_only'])) {
+                if (!$customerPay) throw new DisplayException('This renewal is waiting for its next automatic retry. Open the invoice to pay now.');
+                $attempt = null;
+            }
             if (!empty($attempt['notice_only'])) $attempt = null; // A new Pay starts fresh; this marker can only notify.
             if (!$attempt) {
                 // Earlier bank debits have a transaction ID but no attempt property.
@@ -158,10 +196,26 @@ trait CheckoutIntent
                 if (!isset($data['agreement_id']) && !empty($attempt['agreement_id'])) $data['agreement_id'] = $attempt['agreement_id'];
                 $attempt = null;
             }
-            if (!$attempt) $attempt = $this->newPaymentAttempt($current, array_replace($data, [
-                'customer' => $user->properties()->where('key', 'stripe_id')->firstOrFail()->value,
-            ]), $amount, $elements);
-            if (isset($data['agreement_id'])) {
+            if (!$attempt) {
+                $attempt = $this->newPaymentAttempt($current, array_replace($data, [
+                    'customer' => $user->properties()->where('key', 'stripe_id')->firstOrFail()->value,
+                ]), $amount, $elements);
+                $attempt = array_replace($attempt, $context);
+                if (!empty($data['renewal_start']) && empty($attempt['customer_payment'])
+                    && !isset($attempt['automatic_renewal']) && $this->nativeRenewalServices($current)) {
+                    $attempt['automatic_renewal'] = true;
+                    $renewal = $this->nativeRenewal($current, (int) $data['agreement_id']);
+                    if ($renewal) $attempt['renewal'] = $renewal;
+                }
+            }
+            if ($customerPay) {
+                unset($attempt['renewal'], $attempt['automatic_renewal']);
+                $attempt['customer_payment'] = true; // Only an explicit customer takeover removes automatic authority.
+            } elseif (!empty($data['renewal_start']) && empty($attempt['customer_payment']) && $this->nativeRenewalServices($current)) {
+                $attempt['automatic_renewal'] = true;
+            }
+            if (isset($data['agreement_id']) && (empty($attempt['automatic_renewal'])
+                || ($attempt['renewal']['state'] ?? null) === 'active' && empty($attempt['confirmation']))) {
                 $attempt['agreement_id'] = $data['agreement_id'];
                 $attempt['agreement_pending'] = true;
                 $attempt['retry'] = true;
@@ -266,10 +320,18 @@ trait CheckoutIntent
         $user->properties()->updateOrCreate(['key' => 'ae_stripe_checkout_' . $invoice->id], ['value' => json_encode($attempt, JSON_THROW_ON_ERROR)]);
     }
 
-    private function replacePaymentAttempt($invoice, array $attempt): void
+    private function replacePaymentAttempt($invoice, array $attempt, bool $keepWaitingRenewal = false): void
     {
-        $this->withPaymentLock($invoice, function ($user, $current) use ($attempt) {
-            if (($this->readPaymentAttempt($user, $current)['key'] ?? null) === $attempt['key']) {
+        $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $keepWaitingRenewal) {
+            $stored = $this->readPaymentAttempt($user, $current);
+            if (($stored['key'] ?? null) === $attempt['key']) {
+                if ($keepWaitingRenewal && ($stored['renewal']['state'] ?? null) === 'waiting'
+                    && $current->status === 'pending' && $this->paymentBalance($current) > 0) {
+                    $schedule = array_intersect_key($stored, array_flip(['version', 'key', 'created', 'renewal',
+                        'automatic_renewal', 'failure_reason', 'failure_notified']));
+                    $this->writePaymentAttempt($user, $current, $schedule + ['renewal_only' => true, 'retry' => false]);
+                    return;
+                }
                 $user->properties()->where('key', 'ae_stripe_checkout_' . $current->id)->delete();
             }
         });
@@ -309,6 +371,10 @@ trait CheckoutIntent
         $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($intentId, $params, $agreement, $expectedAmount) {
             $attempt = $this->readPaymentAttempt($user, $current);
             if (($attempt['intent'] ?? null) !== $intentId) $this->paymentPending('Payment changed. Refresh the invoice to check its status.');
+            if (!empty($attempt['automatic_renewal'])) {
+                if (($attempt['renewal']['state'] ?? null) !== 'active') throw new DisplayException('Auto Pay stopped for this renewal. Open the invoice to pay the amount due.');
+                if (!empty($attempt['confirmation'])) return $attempt; // Resume the claimed instruction, never replace its identity.
+            }
             $attempt['confirmation'] = ['key' => 'confirm_' . bin2hex(random_bytes(16)), 'params' => $params, 'agreement' => $agreement?->id, 'amount' => $expectedAmount, 'previous_charge' => $attempt['latest_charge'] ?? null];
             unset($attempt['agreement_pending']); // The confirmation now owns this instruction.
             $attempt['retry'] = true;
@@ -319,6 +385,10 @@ trait CheckoutIntent
             $this->writePaymentAttempt($user, $current, $attempt);
             return $attempt;
         });
+        if (!empty($attempt['automatic_renewal'])) {
+            $params = $attempt['confirmation']['params'];
+            $expectedAmount = $attempt['confirmation']['amount'];
+        }
         $writeStarted = false;
         $result = $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intentId, $params, $agreement, $expectedAmount, &$writeStarted) {
             $stored = $this->readPaymentAttempt($user, $current);
@@ -326,6 +396,10 @@ trait CheckoutIntent
             try {
                 $intent = $this->request('get', '/payment_intents/' . $intentId);
                 if (!in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) return $intent;
+                if (!empty($stored['automatic_renewal']) && (empty($stored['renewal'])
+                    || $stored['renewal']['state'] !== 'active' || !$this->renewalStillAuthorized($current, $stored['renewal']))) {
+                    return new DisplayException('Auto Pay stopped for this renewal. Open the invoice to pay the amount due.');
+                }
                 $amount = $this->paymentBalance($current);
                 if ($current->status !== 'pending' || $amount <= 0) return new DisplayException('This invoice has no payment due. Refresh the invoice.');
                 if (strtolower($intent->currency) !== strtolower($current->currency_code) || $expectedAmount !== null && $amount !== $expectedAmount) {
@@ -350,31 +424,29 @@ trait CheckoutIntent
                 }
                 $writeStarted = true;
                 $this->request('post', '/payment_intents/' . $intentId, $updates);
-                return $this->request('post', '/payment_intents/' . $intentId . '/confirm', $params, $attempt['confirmation']['key']);
-            } catch (RequestException | ConnectionException $e) { return $e; }
-        });
-        if ($result instanceof RequestException || $result instanceof ConnectionException || $result === null) {
-            if ($result instanceof RequestException && $writeStarted && $this->definitePaymentRefusal($result)) {
-                $refusal = $result;
-                // Even a 400 can follow a confirmation that already started a debit.
-                try {
-                    $result = $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intentId, $refusal) {
-                        $stored = $this->readPaymentAttempt($user, $current);
-                        if (($stored['confirmation']['key'] ?? null) !== $attempt['confirmation']['key']) return null;
+                $result = $this->request('post', '/payment_intents/' . $intentId . '/confirm', $params, $attempt['confirmation']['key']);
+                if (!empty($stored['automatic_renewal']) && $result->status === 'requires_payment_method'
+                    && ($result->amount_received ?? 0) === 0 && !empty($result->last_payment_error)) $this->recordIntentPayment($result, 'failed');
+                return $result;
+            } catch (RequestException | ConnectionException $e) {
+                if ($e instanceof RequestException && $writeStarted && $this->definitePaymentRefusal($e)) {
+                    // Even a 400 may follow a debit. Prove refusal and commit its transition before releasing these locks.
+                    try {
                         $fresh = $this->request('get', '/payment_intents/' . $intentId);
                         if (($fresh->amount_received ?? 0) === 0 && in_array($fresh->status, ['requires_payment_method', 'requires_confirmation', 'canceled'], true)) {
                             $this->writePaymentAttempt($user, $current, array_replace($stored, ['retry' => false, 'confirmation' => null, 'agreement_id' => null]));
-                            if ($fresh->status === 'requires_payment_method' && ($refusal->response->status() === 402 || !empty($fresh->last_payment_error))) $this->recordIntentPayment($fresh, 'failed');
-                            return new DisplayException($this->paymentRefusalReason($refusal, $current, $fresh->last_payment_error->code ?? null));
+                            if ($fresh->status === 'requires_payment_method' && ($e->response->status() === 402 || !empty($fresh->last_payment_error))) $this->recordIntentPayment($fresh, 'failed');
+                            return new DisplayException($this->paymentRefusalReason($e, $current, $fresh->last_payment_error->code ?? null));
                         }
                         return $fresh;
-                    });
-                } catch (RequestException | ConnectionException $e) { $result = $e; }
+                    } catch (RequestException | ConnectionException $readError) { return $readError; }
+                }
+                return $e;
             }
-            if ($result === null || $result instanceof RequestException || $result instanceof ConnectionException) {
-                $this->paymentStripeUnavailable = true;
-                $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
-            }
+        });
+        if ($result === null || $result instanceof RequestException || $result instanceof ConnectionException) {
+            $this->paymentStripeUnavailable = true;
+            $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
         }
         if (!($result instanceof DisplayException) && ($result->amount_received ?? 0) > 0
             && !in_array($result->status, ['succeeded', 'processing', 'requires_capture'], true)) {

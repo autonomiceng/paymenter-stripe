@@ -95,6 +95,13 @@ trait ChargeRecovery
                     continue;
                 }
                 if (!$collect) continue; // Paused collection still retires old forms.
+                if (!empty($attempt['renewal']) && $attempt['renewal']['state'] !== 'active') {
+                    if (!empty($attempt['failure_reason']) && empty($attempt['failure_notified'])) {
+                        $this->notifyRecoveryRefusal($invoice, $attempt['failure_reason']);
+                    }
+                    $attempt = $this->advanceRenewalRetry($invoice);
+                    if (!$attempt) continue;
+                }
                 // Idle checkout forms need only a local balance check, never a new debit.
                 if (($attempt['version'] ?? 1) === 2 && empty($attempt['retry']) && empty($attempt['agreement_id'])) continue;
                 $this->sendAttemptReview($invoice);
