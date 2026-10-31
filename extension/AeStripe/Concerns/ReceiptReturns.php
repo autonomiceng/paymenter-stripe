@@ -335,11 +335,11 @@ trait ReceiptReturns
         $this->withPaymentLock($invoice, function ($user, $current) use ($id, $key) {
             $receipt = $this->readReceipt($user, $id);
             $a = &$receipt['allocations'][$key];
-            $notice = $this->receiptNotice($a);
+            $notice = ($this->receiptStripeUnavailable ? 'staff:' : '') . $this->receiptNotice($a);
             if (($a['notified'] ?? null) === $notice) return;
             Audit::create(['event' => 'ae_stripe_receipt_return', 'auditable_type' => $current->getMorphClass(), 'auditable_id' => $current->id,
                 'old_values' => [], 'new_values' => ['payment_intent_id' => $id, 'allocation' => $key] + $a]);
-            Notification::create(['user_id' => $user->id, 'title' => 'Payment return', 'url' => route('invoices.show', $current),
+            if (!$this->receiptStripeUnavailable) Notification::create(['user_id' => $user->id, 'title' => 'Payment return', 'url' => route('invoices.show', $current),
                 'body' => match ($a['state']) {
                     'refunded' => 'A payment of ' . number_format($this->fromMinorUnits($a['amount_minor'], $receipt['currency']), $this->currencyDecimals($receipt['currency']), '.', '') . ' ' . strtoupper($receipt['currency']) . ' has been returned to your original payment method.',
                     'credited' => 'Stripe could not refund your original payment method. The returned amount is now account credit. Open the invoice or contact support for help.',
