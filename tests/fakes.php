@@ -32,6 +32,7 @@ namespace Illuminate\Http\Client {
         }
     }
 }
+namespace App\Events\Invoice { class Updated { public function __construct(public $invoice) {} } }
 namespace App\Events\Service { class Updated { public function __construct(public $service) {} } }
 namespace App\Events\ServiceCancellation { class Created { public function __construct(public $cancellation) {} } }
 namespace App\Attributes { #[\Attribute] class ExtensionMeta { public function __construct(...$args) {} } }
@@ -53,7 +54,8 @@ namespace App\Models {
     class Property {
         public static function where(...$args) { return new class($args[2] ?? '') {
             public function __construct(private string $pattern) {}
-            public function where(...$args) { return $this; }
+            private bool $filtered = false;
+            public function where(...$args) { $this->filtered = true; return $this; }
             public function orderBy($key) { return $this; }
             public function limit($n) { return $this; }
             public function get() {
@@ -62,7 +64,7 @@ namespace App\Models {
                     $record = json_decode($value, true);
                     $selected = str_contains($this->pattern, 'payment_alert')
                         ? str_starts_with($key, 'ae_stripe_payment_alert_') && !($record['sent'] ?? true)
-                        : str_starts_with($key, 'ae_stripe_checkout_') && (($record['retry'] ?? false) || ($record['version'] ?? null) !== 2 || !empty($record['agreement_id']));
+                        : str_starts_with($key, 'ae_stripe_checkout_') && (!$this->filtered || ($record['retry'] ?? false) || ($record['version'] ?? null) !== 2 || !empty($record['agreement_id']));
                     if ($selected) $result[] = (object) ['key' => $key, 'value' => $value, 'model_type' => User::class, 'model_id' => User::$row->id];
                 }
                 return $result;
@@ -264,7 +266,14 @@ namespace App\Models {
     class Extension {
         public function getMorphClass() { return Extension::class; }
         public function __construct(array $values = []) { foreach ($values as $k => $v) $this->$k = $v; }
-        public function settings() { return new class { public function where($k, $v) { return new Query((object) ['value' => 'whsec_test']); } }; }
+        public ?Properties $settingValues = null;
+        public function settings() {
+            if (!$this->settingValues) {
+                $this->settingValues = new Properties('');
+                $this->settingValues->values = ['stripe_secret_key' => 'rk_test_fixture', 'stripe_publishable_key' => 'pk_test_fixture', 'stripe_webhook_secret' => 'whsec_test'];
+            }
+            return $this->settingValues;
+        }
         public function wasChanged($key) { return $this->changed ?? false; }
         public function update($values) {
             foreach ($values as $k => $v) $this->$k = $v;
@@ -387,7 +396,7 @@ namespace Illuminate\Support\Facades {
         public function withoutOverlapping($minutes = 1440) { $this->overlapMinutes = $minutes; return $this; }
     }
     class View { public static function addNamespace($name, $path) {} }
-    class Event { public static $listeners = []; public static function listen($type, $callback) { self::$listeners[] = $callback; } }
+    class Event { public static $listeners = []; public static function listen($type, $callback) { self::$listeners[$type] = $callback; } }
     class Auth { public static $id = 7; public static function id() { return self::$id; } public static function user() { return self::$id ? \App\Models\User::$row : null; } }
     class DB {
         public static $tables = [], $locks = [], $updates = [];

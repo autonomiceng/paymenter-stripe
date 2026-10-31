@@ -220,7 +220,7 @@ check(end(Http::$calls)[2]['phases'][0]['items'][0]->price_data['unit_amount'] =
 $service->dirty = ['price'];
 Http::$handler = fn () => throw new RuntimeException('sensitive request payload');
 $service->properties->values['has_stripe_subscription'] = '1';
-Event::$listeners[0](new App\Events\Service\Updated($service));
+Event::$listeners[App\Events\Service\Updated::class](new App\Events\Service\Updated($service));
 check(end(Log::$warnings) === ['AeStripe subscription sync failed', ['service_id' => 41]], 'Listener failure logs service id only');
 Http::$handler = $oldHandler;
 Gateway::$enabled = false;

@@ -87,6 +87,62 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        $run('retire-core-event', function ($invoice, $stripe) use ($gateway) {
+            $gateway->boot(); $gateway->pay($invoice, 20);
+            $invoice->status = 'cancelled'; Gateway::$enabled = false;
+            DB::transaction(fn () => \Illuminate\Support\Facades\Event::$listeners[\App\Events\Invoice\Updated::class](new \App\Events\Invoice\Updated($invoice)));
+            check($stripe->intents['pi_test1']->status === 'canceled', 'The core invoice event retires a form even while the gateway is disabled or bundled Stripe is present');
+            Gateway::$enabled = true; $invoice->status = 'pending';
+            ExtensionHelper::$payments['920:pi_oldbank'] = ['amount' => 20, 'status' => 'processing'];
+            check(!$gateway->cancelInvoicePayments($invoice), 'Credit also waits for a legacy processing transaction without an attempt property');
+        });
+        $run('retire-forms', function ($invoice, $stripe) use ($gateway) {
+            foreach (['requires_payment_method', 'requires_confirmation', 'requires_action', 'processing', 'requires_capture'] as $status) {
+                $gateway->pay($invoice, 20);
+                $intent = $stripe->intents[array_key_last($stripe->intents)]; $intent->status = $status;
+                $invoice->status = 'cancelled';
+                $gateway->retryChargeAttempts();
+                $payable = in_array($status, ['requires_payment_method', 'requires_confirmation', 'requires_action']);
+                check($intent->status === ($payable ? 'canceled' : $status), 'Invoice closure cancels a checkout-only ' . $status . ' form without cancelling in-flight money');
+                if (!$payable) {
+                    check(!$gateway->cancelInvoicePayments($invoice), 'In-flight money prevents applying credit over the same payment');
+                    $intent->status = 'succeeded'; $intent->amount_received = 2000;
+                    $gateway->retryChargeAttempts();
+                    check(count(Audit::$rows) > 0, 'A payment already processing follows the existing late-money review path');
+                }
+                User::$row->props->values = []; $invoice->status = 'pending';
+            }
+            $gateway->pay($invoice, 20); $intent = $stripe->intents[array_key_last($stripe->intents)];
+            DB::transaction(function () use ($gateway, $invoice, $intent) {
+                check($gateway->cancelInvoicePayments($invoice) && $intent->status === 'canceled', 'Credit caller can retire the form before spending credit in its transaction');
+                ExtensionHelper::$payments['920:credit'] = ['amount' => 5, 'status' => 'succeeded'];
+            });
+            $view = $gateway->pay($invoice, 15);
+            check($view['data']['intent']->amount === 1500, 'A fresh form after partial credit uses only the remaining balance');
+            ExtensionHelper::$payments['920:credit']['amount'] = 10;
+            $gateway->retryChargeAttempts();
+            check($stripe->intents[$view['data']['intent']->id]->status === 'canceled', 'Recovery also retires an unchanged pending invoice after partial credit');
+        });
+        $run('retire-outage', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); $invoice->status = 'cancelled';
+            $stripe->failure = fn ($verb, $path) => str_ends_with($path, '/cancel') ? throw new RequestException(503) : null;
+            $gateway->retryChargeAttempts();
+            check(isset(User::$row->props->values['ae_stripe_checkout_920']) && $stripe->intents['pi_test1']->status !== 'canceled', 'A failed cancellation keeps its payment identity');
+            $stripe->failure = null; Gateway::$enabled = false; $gateway->retryChargeAttempts();
+            check($stripe->intents['pi_test1']->status === 'canceled' && !$stripe->charges, 'Recovery cancels the old form when Stripe access returns even with collection paused');
+        });
+        $run('retire-overlap', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); $intent = $stripe->intents['pi_test1'];
+            $stripe->failure = function ($verb, $path) use ($intent) {
+                if (str_ends_with($path, '/cancel')) { $intent->status = 'processing'; throw new RequestException(400); }
+            };
+            check(!$gateway->cancelInvoicePayments($invoice) && $intent->status === 'processing', 'A confirmation completed during cancellation is kept for settlement');
+        });
+        $run('retire-lost-create', function ($invoice, $stripe) use ($gateway) {
+            $stripe->loseCreate = true; paymentStops(fn () => $gateway->pay($invoice, 20));
+            $invoice->status = 'cancelled'; $gateway->retryChargeAttempts();
+            check(count($stripe->intents) === 1 && $stripe->intents['pi_test1']->status === 'canceled', 'Closing an invoice recovers the same lost unconfirmed creation and cancels it');
+        });
         $run('resolve-command-error', function () {
             require_once __DIR__ . '/../extension/AeStripe/ResolveChargeCommand.php';
             $rows = Gateway::$rows; Gateway::$rows = [];

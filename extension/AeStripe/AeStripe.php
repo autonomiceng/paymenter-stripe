@@ -53,6 +53,8 @@ require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
 require_once __DIR__ . '/Concerns/CheckoutIntent.php';
 require_once __DIR__ . '/PaymentPendingException.php';
 require_once __DIR__ . '/Concerns/ChargeRecovery.php';
+require_once __DIR__ . '/Concerns/InvoicePayments.php';
+require_once __DIR__ . '/Concerns/WebhookContinuity.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
 require_once __DIR__ . '/Concerns/SetupIntent.php';
 require_once __DIR__ . '/Concerns/Webhooks.php';
@@ -68,7 +70,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -94,6 +96,13 @@ class AeStripe extends Gateway
         // Register webhook route
         View::addNamespace('gateways.ae-stripe', __DIR__ . '/resources/views');
         FilamentView::registerRenderHook(PanelsRenderHook::CONTENT_START, fn () => $this->gatewayWarning());
+        Event::listen(\App\Events\Invoice\Updated::class, function ($event) {
+            if ($event->invoice->status === 'pending') return;
+            \Illuminate\Support\Facades\DB::afterCommit(function () use ($event) {
+                try { $this->cancelInvoicePayments($event->invoice); }
+                catch (\Throwable $e) { \Illuminate\Support\Facades\Log::warning('AeStripe invoice cancellation will retry', ['invoice_id' => $event->invoice->id]); }
+            });
+        });
         // Core boots disabled gateways too. Let the bundled listener own legacy subscriptions.
         if (!$this->bundledInactive(requireAbsent: true)) {
             return;
@@ -230,51 +239,7 @@ class AeStripe extends Gateway
 
     public function updated(Extension $gateway)
     {
-        if (!empty($gateway->settings()->where('key', 'stripe_webhook_secret')->first()->value)) {
-            if ($gateway->enabled && $gateway->wasChanged('enabled')) $this->disableEmptyBundled();
-            return;
-        }
-
-        // If the extension isn't enabled, try to boot it
-        if (!Route::has('extensions.gateways.ae-stripe.webhook')) {
-            require __DIR__ . '/routes.php';
-        }
-
-        // Check if webhook already exists
-        $webhooks = $this->request('get', '/webhook_endpoints');
-        foreach ($webhooks->data as $webhook) {
-            if ($webhook->url === route('extensions.gateways.ae-stripe.webhook')) {
-                // Delete webhook
-                $this->request('delete', '/webhook_endpoints/' . $webhook->id);
-                break;
-            }
-        }
-
-        // Create webhook on stripe
-        $webhook = $this->request('post', '/webhook_endpoints', [
-            'url' => route('extensions.gateways.ae-stripe.webhook'),
-            'description' => 'Paymenter Stripe Webhook',
-            'enabled_events' => [
-                'payment_intent.succeeded',
-                'payment_intent.payment_failed',
-                'payment_intent.processing',
-                'setup_intent.succeeded',
-                'subscription_schedule.canceled',
-                'invoice.created',
-                'invoice.payment_succeeded',
-                'charge.updated',
-                'charge.succeeded',
-            ],
-            'api_version' => self::API_VERSION,
-        ]);
-
-        $gateway->settings()->updateOrCreate(['key' => 'stripe_webhook_secret'], ['value' => $webhook->secret]);
-
-        Notification::make()
-            ->success()
-            ->title('Webhook created')
-            ->body('We created a webhook on Stripe and saved its signing secret here.')
-            ->send();
+        $this->updateWebhookContinuity($gateway);
 
         if ($gateway->enabled && $gateway->wasChanged('enabled')) $this->disableEmptyBundled();
     }

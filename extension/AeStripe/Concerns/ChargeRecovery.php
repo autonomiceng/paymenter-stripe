@@ -68,12 +68,10 @@ trait ChargeRecovery
 
     public function retryChargeAttempts(): void
     {
-        if (!$this->gatewayEnabled()) return;
-        $this->retryPaymentReviewAlerts();
+        $collect = $this->gatewayEnabled();
+        if ($collect) $this->retryPaymentReviewAlerts();
         $this->paymentStripeUnavailable = false;
-        foreach (Property::where('key', 'like', 'ae_stripe_checkout_%')->where(fn ($query) =>
-            $query->where('value', 'like', '%"retry":true%')->orWhere('value', 'not like', '%"version":2%')
-                ->orWhere(fn ($saved) => $saved->where('value', 'like', '%"agreement_id":%')->where('value', 'not like', '%"agreement_id":null%')))
+        foreach (Property::where('key', 'like', 'ae_stripe_checkout_%')
             ->orderBy('updated_at')->limit(100)->get() as $property) {
             if (!preg_match('/^ae_stripe_checkout_([0-9]+)$/', $property->key, $match)) continue;
             try {
@@ -87,25 +85,14 @@ trait ChargeRecovery
                     return $attempt;
                 });
                 if (!$attempt) continue;
-                if ($invoice->status !== 'pending') {
-                    if (!isset($attempt['intent'])) {
-                        if (($attempt['version'] ?? 1) === 2 || isset($attempt['params']) && empty($attempt['params']['confirm'])) $this->replacePaymentAttempt($invoice, $attempt);
-                        else $this->holdPaymentAttempt($invoice, $attempt, 'This invoice is closed, but Stripe has no payment ID for the older attempt. Check its request log.');
-                        continue;
-                    }
-                    try { $intent = $this->request('get', '/payment_intents/' . $attempt['intent']); }
-                    catch (\Illuminate\Http\Client\RequestException $e) {
-                        if ($e->response->status() !== 404) throw $e;
-                        $this->holdPaymentAttempt($invoice, $attempt, $this->missingPaymentReason($attempt));
-                    }
-                    if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
-                    elseif (in_array($intent->status, ['requires_payment_method', 'requires_confirmation', 'requires_action'], true) && ($intent->amount_received ?? 0) === 0) {
-                        $intent = $this->request('post', '/payment_intents/' . $intent->id . '/cancel');
-                    }
-                    if ($intent->status === 'canceled' && ($intent->amount_received ?? 0) === 0
-                        || $intent->status === 'succeeded' && \App\Models\InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) $this->replacePaymentAttempt($invoice, $attempt);
+                if ($invoice->status !== 'pending' || !empty($attempt['retire'])
+                    || !empty($attempt['elements']) && isset($attempt['params']['amount']) && $this->withPaymentLock($invoice, fn ($user, $current) => $this->paymentBalance($current)) < $attempt['params']['amount']) {
+                    $this->cancelInvoicePayments($invoice);
                     continue;
                 }
+                if (!$collect) continue; // Paused collection still retires old forms.
+                // Idle checkout forms need only a local balance check, never a new debit.
+                if (($attempt['version'] ?? 1) === 2 && empty($attempt['retry']) && empty($attempt['agreement_id'])) continue;
                 $this->sendAttemptReview($invoice);
                 if (!empty($attempt['failure_reason']) && empty($attempt['failure_notified'])) {
                     $this->notifyRecoveryRefusal($invoice, $attempt['failure_reason']);
