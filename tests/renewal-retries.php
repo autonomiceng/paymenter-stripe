@@ -307,14 +307,35 @@ try {
         check($gateway->charge($invoice, 20, new BillingAgreement) && count($stripe->charges) === 1,
             'An explicit customer Pay can pay immediately while the automatic renewal retry is waiting');
     });
+    $run('renewal-domains-revoked', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal, $dueRetry) {
+        require_once __DIR__ . '/fixtures/domains-autopay.php';
+        $service = $renewalFixture($invoice, $stripe);
+        $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
+        TestDomainsAutoPay::$context = ['service_id' => $service->id, 'agreement_id' => 4,
+            'operation_id' => 81, 'operation_key' => 'renewal-fixture', 'generation' => 2,
+            'cutoff' => $invoice->due_at->getTimestamp()];
+        TestDomainsAutoPay::$ownerOn = true; TestDomainsAutoPay::$checks = 0;
+        try {
+            $initialRefusal($invoice);
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(($attempt['renewal']['domains'] ?? null) === TestDomainsAutoPay::$context
+                && $attempt['renewal']['state'] === 'waiting', 'A Domains decline freezes retained authority and schedules the shared retry');
+            $dueRetry();
+            $stripe->beforeCreate = function () { TestDomainsAutoPay::$ownerOn = false; };
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(TestDomainsAutoPay::$checks >= 2 && count($stripe->confirms) === 1 && !$stripe->charges
+                && !empty($attempt['renewal']), 'Owner Auto-renew Off after the frozen context blocks retry confirmation and retains the attempt');
+        } finally { TestDomainsAutoPay::$context = null; TestDomainsAutoPay::$ownerOn = true; }
+    });
     $run('renewal-domains-boundary', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
         $renewalFixture($invoice, $stripe);
         $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
         $initialRefusal($invoice);
         $gateway->retryChargeAttempts();
         $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
-        check(empty($attempt['renewal']) && count($stripe->confirms) === 1,
-            'Retained Domains invoices cannot acquire a guessed native renewal authority');
+        check(empty($attempt['renewal']) && !empty($attempt['automatic_renewal']) && !$stripe->confirms,
+            'Retained automatic renewal invoices cannot debit without Domains authority');
     });
     $run('renewal-processing-uncertain', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
         $renewalFixture($invoice, $stripe); $stripe->status = 'processing'; $stripe->beforeConfirm = null;

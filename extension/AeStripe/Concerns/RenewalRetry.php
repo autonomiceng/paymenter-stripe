@@ -11,6 +11,39 @@ trait RenewalRetry
     private const RENEWAL_RETRIES = 3;
     private const RENEWAL_RETRY_SECONDS = 48 * 3600;
 
+    /** Retained Domains invoices have exactly one line without a native service reference. */
+    private function retainedRenewalInvoice($invoice): bool
+    {
+        $items = $invoice->items()->get();
+        $rows = iterator_to_array($items);
+        return count($rows) === 1 && $rows[0]->reference_type === null && $rows[0]->reference_id === null;
+    }
+
+    private function domainsAutoPay(): ?object
+    {
+        $class = 'Paymenter\\Extensions\\Servers\\Domains\\Services\\RenewalAutoPay';
+        if (!class_exists($class) || !method_exists($class, 'renewalAutoPayContext')
+            || !method_exists($class, 'renewalAutoPayStillAllowed')) return null;
+        return app($class);
+    }
+
+    /** The Domains locking context is only acquired before entering payment transactions. */
+    private function domainsRenewalContext($invoice): ?array
+    {
+        if (DB::transactionLevel() !== 0) return null;
+        try { return $this->domainsAutoPay()?->renewalAutoPayContext((int) $invoice->id); }
+        catch (\Throwable) { return null; }
+    }
+
+    private function renewalEnrollment($invoice, int $agreementId, ?array $domains): ?array
+    {
+        if (!$this->retainedRenewalInvoice($invoice)) return $this->nativeRenewal($invoice, $agreementId);
+        if (!$domains || ($domains['agreement_id'] ?? null) !== $agreementId
+            || !is_int($domains['cutoff'] ?? null) || $domains['cutoff'] <= time()) return null;
+        return ['domains' => $domains, 'agreement_id' => $agreementId, 'cutoff' => date('Y-m-d', $domains['cutoff']),
+            'retries' => 0, 'state' => 'active'];
+    }
+
     /** Only native scheduled renewals. Account defaults never authorize an existing invoice. */
     private function nativeRenewal($invoice, int $agreementId): ?array
     {
@@ -39,8 +72,14 @@ trait RenewalRetry
     /** Current per-service consent, calendar and balance, under the payment locks, including at confirm. */
     private function renewalStillAuthorized($invoice, array $renewal): bool
     {
-        if ($invoice->status !== 'pending' || $this->paymentBalance($invoice) <= 0
-            || (empty($renewal['overdue_once']) && $renewal['cutoff'] <= now()->format('Y-m-d'))
+        if ($invoice->status !== 'pending' || $this->paymentBalance($invoice) <= 0) return false;
+        if (isset($renewal['domains'])) {
+            try {
+                // Revocation after this plain read may lose to an in-flight confirm; normal refunds apply.
+                return $this->domainsAutoPay()?->renewalAutoPayStillAllowed((int) $invoice->id, $renewal['domains']) === true;
+            } catch (\Throwable) { return false; }
+        }
+        if ((empty($renewal['overdue_once']) && $renewal['cutoff'] <= now()->format('Y-m-d'))
             || $invoice->due_at?->format('Y-m-d') !== $renewal['cutoff']) return false;
         if ($this->nativeRenewalServices($invoice) !== $renewal['services']) return false;
         foreach ($renewal['services'] as $id) {
@@ -66,7 +105,9 @@ trait RenewalRetry
             && !in_array($error->advice_code ?? null, ['do_not_try_again', 'confirm_card_data'], true);
         $attempt['renewal']['next_at'] = time() + self::RENEWAL_RETRY_SECONDS;
         $willRetry = $retryable && $attempt['renewal']['retries'] < self::RENEWAL_RETRIES
-            && date('Y-m-d', $attempt['renewal']['next_at']) < $attempt['renewal']['cutoff'];
+            && (isset($attempt['renewal']['domains'])
+                ? $attempt['renewal']['next_at'] < $attempt['renewal']['domains']['cutoff']
+                : date('Y-m-d', $attempt['renewal']['next_at']) < $attempt['renewal']['cutoff']);
         $attempt['renewal']['state'] = $willRetry ? 'waiting' : 'stopped';
         $attempt['failure_reason'] = $this->paymentFailureReason($intent->last_payment_error->code ?? null)
             . ' Open the invoice to pay now or update Auto Pay on your service.'
@@ -80,13 +121,16 @@ trait RenewalRetry
     /** Reserve the next shared attempt atomically. HTTP confirmation belongs to ordinary recovery. */
     private function advanceRenewalRetry($invoice): ?array
     {
-        return $this->withPaymentLock($invoice, function ($user, $current) {
+        $domains = $this->retainedRenewalInvoice($invoice) ? $this->domainsRenewalContext($invoice) : null;
+        return $this->withPaymentLock($invoice, function ($user, $current) use ($domains) {
             $attempt = $this->readPaymentAttempt($user, $current);
             $renewal = $attempt['renewal'] ?? null;
             if (!$renewal || $renewal['state'] === 'active') return $attempt;
             if (!empty($attempt['funds_pending']) || ($attempt['state'] ?? null) === 'reconcile') return $attempt;
             if ($renewal['state'] === 'stopped') return null;
-            if ($renewal['retries'] >= self::RENEWAL_RETRIES || !$this->renewalStillAuthorized($current, $renewal)) {
+            if ($renewal['retries'] >= self::RENEWAL_RETRIES
+                || isset($renewal['domains']) && $domains !== $renewal['domains']
+                || !$this->renewalStillAuthorized($current, $renewal)) {
                 $attempt['renewal']['state'] = 'stopped';
                 $this->writePaymentAttempt($user, $current, $attempt);
                 return null;

@@ -168,7 +168,9 @@ trait CheckoutIntent
     private function reservePaymentAttempt($invoice, array $data, bool $elements = false): array
     {
         $this->paymentRetryReserved = false;
-        $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($data, $elements) {
+        $domains = !empty($data['renewal_start']) && $this->retainedRenewalInvoice($invoice)
+            ? $this->domainsRenewalContext($invoice) : null;
+        $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($data, $elements, $domains) {
             $amount = $this->paymentBalance($current);
             if ($current->status !== 'pending' || $amount <= 0) throw new DisplayException('This invoice has no payment due. Refresh the invoice.');
             $attempt = $this->readPaymentAttempt($user, $current);
@@ -202,16 +204,16 @@ trait CheckoutIntent
                 ]), $amount, $elements);
                 $attempt = array_replace($attempt, $context);
                 if (!empty($data['renewal_start']) && empty($attempt['customer_payment'])
-                    && !isset($attempt['automatic_renewal']) && $this->nativeRenewalServices($current)) {
+                    && !isset($attempt['automatic_renewal']) && ($this->nativeRenewalServices($current) || $this->retainedRenewalInvoice($current))) {
                     $attempt['automatic_renewal'] = true;
-                    $renewal = $this->nativeRenewal($current, (int) $data['agreement_id']);
+                    $renewal = $this->renewalEnrollment($current, (int) $data['agreement_id'], $domains);
                     if ($renewal) $attempt['renewal'] = $renewal;
                 }
             }
             if ($customerPay) {
                 unset($attempt['renewal'], $attempt['automatic_renewal']);
                 $attempt['customer_payment'] = true; // Only an explicit customer takeover removes automatic authority.
-            } elseif (!empty($data['renewal_start']) && empty($attempt['customer_payment']) && $this->nativeRenewalServices($current)) {
+            } elseif (!empty($data['renewal_start']) && empty($attempt['customer_payment']) && ($this->nativeRenewalServices($current) || $this->retainedRenewalInvoice($current))) {
                 $attempt['automatic_renewal'] = true;
             }
             if (isset($data['agreement_id']) && (empty($attempt['automatic_renewal'])
