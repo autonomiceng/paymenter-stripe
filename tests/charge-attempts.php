@@ -108,7 +108,9 @@ use Illuminate\Support\Facades\{DB, Http};
                     check(!$gateway->cancelInvoicePayments($invoice), 'In-flight money prevents applying credit over the same payment');
                     $intent->status = 'succeeded'; $intent->amount_received = 2000;
                     $gateway->retryChargeAttempts();
-                    check(count(Audit::$rows) > 0, 'A payment already processing follows the existing late-money review path');
+                    $reviews = array_filter(Audit::$rows, fn ($row) => $row['event'] === 'ae_stripe_payment_review'
+                        && $row['new_values']['payment_intent_id'] === $intent->id);
+                    check(count($reviews) === 1, 'A payment already ' . $status . ' follows the existing late-money review path');
                 }
                 User::$row->props->values = []; $invoice->status = 'pending';
             }
@@ -145,12 +147,16 @@ use Illuminate\Support\Facades\{DB, Http};
             $applications = ExtensionHelper::$applications;
             $gateway->webhook(eventRequest($intent)); $gateway->webhook(eventRequest($intent));
             $gateway->retryChargeAttempts();
+            $calls = count(Http::$calls);
+            $gateway->retryChargeAttempts();
             $reviews = array_values(array_filter(Audit::$rows, fn ($row) => $row['event'] === 'ae_stripe_payment_review'
                 && $row['new_values']['payment_intent_id'] === $intent->id));
             check($invoice->status === 'cancelled' && !ExtensionHelper::$payments && ExtensionHelper::$applications === $applications,
                 'Late 3DS success does not fund or reopen the closed invoice, so the native paid/activation path is not called');
             check(count($reviews) === 1 && $reviews[0]['new_values']['reason'] === 'invoice not pending',
                 'Repeated late success and recovery enter the existing late-money review path once; automatic return needs the integrated ledger');
+            check(!isset(User::$row->props->values['ae_stripe_checkout_920']) && count(Http::$calls) === $calls,
+                'A handled late success retires the checkout attempt, so another recovery makes no Stripe request');
         });
         $run('retire-overlap', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20); $intent = $stripe->intents['pi_test1'];

@@ -55,9 +55,10 @@ trait InvoicePayments
             }
             if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
             if ($intent->status === 'canceled' && ($intent->amount_received ?? 0) === 0
-                || $intent->status === 'succeeded' && InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) {
+                || $intent->status === 'succeeded' && (!in_array($current->status, ['pending', 'paid'], true)
+                    || InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists())) {
                 $this->replacePaymentAttempt($current, $attempt);
-                // A just-settled payment changes the balance. Credit callers must re-read before applying.
+                // Settlement/review owns received money now. Credit callers must re-read the balance.
                 return $intent->status === 'canceled';
             }
             if (($intent->amount_received ?? 0) > 0 && !in_array($intent->status, ['processing', 'requires_capture', 'succeeded'], true)) {
