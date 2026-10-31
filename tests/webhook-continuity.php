@@ -8,6 +8,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
 (function () {
     if (!\Illuminate\Support\Facades\Route::has('extensions.gateways.ae-stripe.webhook')) require __DIR__ . '/../extension/AeStripe/routes.php';
     $handler = Http::$handler; $rows = Gateway::$rows; $tables = DB::$tables; $bundled = Gateway::$bundledEnabled;
+    $component = \Livewire\Livewire::$component;
     $config = ['stripe_secret_key' => 'rk_test_original', 'stripe_publishable_key' => 'pk_test_original', 'stripe_webhook_secret' => 'whsec_test'];
     $extension = new Extension(['id' => 3, 'enabled' => true, 'changed' => true]);
     $extension->settingValues = new Properties(''); $extension->settingValues->values = $config;
@@ -133,9 +134,38 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         check(json_decode($extension->settingValues->values[$stateKey], true)['previous'] === []
             && !$extension->settingValues->values['stripe_revoke_previous_secrets'] && !$gateway->config('stripe_revoke_previous_secrets'),
             'Revocation clears all previous secrets and resets its one-shot setting');
+        foreach ([false, true] as $failedFirstSave) {
+            $page = \Livewire\Livewire::$component = new \App\Admin\Resources\GatewayResource\Pages\EditGateway($extension);
+            $page->data = ['settings' => array_intersect_key($extension->settingValues->values, array_column($gateway->getConfig(), null, 'name'))];
+            $workingSecret = $page->data['settings']['stripe_webhook_secret'];
+            $page->data['settings']['stripe_webhook_secret'] = 'whsec_form_replacement_' . (int) $failedFirstSave;
+            $page->data['settings']['stripe_revoke_previous_secrets'] = true;
+            // Native EditGateway persists submitted fields, invokes the hook, and does not refill the form.
+            $saveForm = function () use ($page, $extension, $gateway) {
+                $extension->settingValues->values = array_replace($extension->settingValues->values, $page->data['settings']);
+                $gateway->updated($extension);
+            };
+            $failure = $failedFirstSave ? 'get' : null;
+            if ($failedFirstSave) {
+                rejects($saveForm, 'Stripe setup could not be verified. The previous credentials were kept. Check the API key permissions and save again.');
+                check($extension->settingValues->values['stripe_webhook_secret'] === $workingSecret, 'A failed same-form save restores the working secret');
+            } else {
+                $saveForm(); $workingSecret = $page->data['settings']['stripe_webhook_secret'];
+            }
+            check($page->data['settings']['stripe_revoke_previous_secrets'] === false,
+                'Every attempted save disarms the open form, including credential restoration after failure');
+            $page->data['settings']['stripe_webhook_secret'] = 'whsec_form_typo';
+            $failure = null; $saveForm(); // Same page, no refill/reload or fresh revocation selection.
+            $at = time();
+            $formWorkingRequest = new Request(body: $body, signature: 't=' . $at . ',v1=' . hash_hmac('sha256', $at . '.' . $body, $workingSecret));
+            check($gateway->webhook($formWorkingRequest)['status'] === 200,
+                'A later mistyped save in the same open form preserves genuine paid deliveries after success or failure');
+            $page->data['settings']['stripe_webhook_secret'] = $workingSecret; $saveForm();
+        }
+        \Livewire\Livewire::$component = $component;
         $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_after_emergency';
         $gateway->updated($extension);
-        check($gateway->webhook($emergencyRequest)['status'] === 200, 'A later ordinary rotation retains overlap because revocation does not stay enabled');
+        check($gateway->webhook($formWorkingRequest)['status'] === 200, 'A later ordinary rotation retains overlap because revocation does not stay enabled');
         $failure = 'get'; Gateway::$bundledEnabled = true;
         $extension->settingValues->values['stripe_secret_key'] = 'rk_test_failed';
         rejects(fn () => $gateway->enabled($extension), 'Stripe setup could not be verified. The previous credentials were kept. Check the API key permissions and save again.');
@@ -168,6 +198,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
             }
         }
     } finally {
+        \Livewire\Livewire::$component = $component;
         Http::$handler = $handler; Gateway::$rows = $rows; DB::$tables = $tables; Gateway::$bundledEnabled = $bundled;
     }
 })();

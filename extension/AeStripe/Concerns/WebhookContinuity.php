@@ -81,6 +81,11 @@ trait WebhookContinuity
 
     private function updateWebhookContinuity(Extension $gateway): void
     {
+        // The native edit page retains submitted form data, including after credential restoration.
+        $page = \Livewire\Livewire::current();
+        if ($page instanceof \App\Admin\Resources\GatewayResource\Pages\EditGateway && $page->getRecord()->id === $gateway->id) {
+            $page->data['settings']['stripe_revoke_previous_secrets'] = false;
+        }
         $failure = DB::transaction(function () use ($gateway) {
             \App\Models\Gateway::where('extension', 'AeStripe')->where('id', $gateway->id)->lockForUpdate()->firstOrFail();
             $stored = $gateway->settings()->where('key', self::WEBHOOK_STATE)->first()?->value;

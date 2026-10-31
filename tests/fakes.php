@@ -13,6 +13,19 @@ namespace Illuminate\Console {
 }
 namespace { if (!class_exists('PDOException')) { class PDOException extends \RuntimeException {} } }
 namespace App\Exceptions { class DisplayException extends \Exception {} }
+namespace Livewire {
+    class Livewire {
+        public static $component;
+        public static function current() { return self::$component; }
+    }
+}
+namespace App\Admin\Resources\GatewayResource\Pages {
+    class EditGateway {
+        public array $data = [];
+        public function __construct(private $record) {}
+        public function getRecord() { return $this->record; }
+    }
+}
 namespace Illuminate\Database { class UniqueConstraintViolationException extends \RuntimeException {} class QueryException extends \RuntimeException {} }
 namespace Illuminate\Http\Client {
     class ConnectionException extends \RuntimeException {}
