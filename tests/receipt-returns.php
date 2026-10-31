@@ -22,7 +22,7 @@ use Illuminate\Support\Facades\{DB, Http};
             public function request($verb, $path, $data) {
                 if ($path === '/payment_intents/pi_return') return $this->intent;
                 if ($path === '/charges/ch_return') return (object) ['id' => 'ch_return', 'payment_intent' => 'pi_return', 'customer' => 'cus_owner', 'currency' => $this->intent->currency];
-                if ($path === '/disputes/dp_return') return $this->dispute;
+                if ($this->dispute && $path === '/disputes/' . $this->dispute->id) return $this->dispute;
                 if (str_starts_with($path, '/refunds/')) {
                     foreach ($this->refunds as $refund) if ($path === '/refunds/' . $refund->id) return $refund;
                 }

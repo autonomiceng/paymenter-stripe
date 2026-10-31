@@ -95,8 +95,8 @@ Never clear a reservation to retry.
 
 Dashboard refunds (`refund.created`, `refund.updated`, `refund.failed`) and disputes
 (`charge.dispute.created`, `charge.dispute.updated`, `charge.dispute.closed`) are
-recorded in the same receipt ledger under `stripe:refund:re_…` or
-`stripe:dispute:dp_…`. These rows do not consume allocation budget and never enter
+recorded in the same receipt ledger under `stripe:refund:<id>` or
+`stripe:dispute:<id>`. These rows do not consume allocation budget and never enter
 the money-return worker. Owned return refunds keep their existing reconciliation.
 Foreign refund history still prevents another return, even if that refund failed.
 
@@ -105,8 +105,9 @@ invoice locks. It must match the succeeded native AE Stripe receipt or an existi
 closed-invoice receipt, its owner, Stripe customer, currency and received amount.
 Charge-only disputes resolve through their charge's PaymentIntent. Events arriving
 before an expected local settlement return a retryable error. Unrelated gateway
-payments are ignored. A failed read or staff notification rolls back, so Stripe
-can retry. Duplicate state creates no repeated audit or alert; stale open events
+payments are ignored. A failed read, ledger write or staff notification rolls back
+and propagates a non-2xx response so Stripe can retry; the original payment stays
+recorded. Duplicate state creates no repeated audit or alert; stale open events
 cannot reopen a won or lost dispute. No invoice status, service, transaction or
 credit changes are made by observation.
 

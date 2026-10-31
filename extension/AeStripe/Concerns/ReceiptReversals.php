@@ -53,7 +53,8 @@ trait ReceiptReversals
     {
         $this->ensureReceiptReturnSchema();
         $id = $object->id ?? '';
-        abort_unless(is_string($id) && preg_match($kind === 'refund' ? '/^re_[a-zA-Z0-9]+$/D' : '/^dp_[a-zA-Z0-9]+$/D', $id), 409);
+        // The event type selects the resource; its opaque ID must be a safe path segment.
+        abort_unless(is_string($id) && preg_match('/^[a-zA-Z0-9_]+$/D', $id), 409);
         // The signed event locates the receipt; only canonical state is recorded below.
         $paymentId = $object->payment_intent ?? null;
         if (!$paymentId && is_string($object->charge ?? null)) {
@@ -110,7 +111,7 @@ trait ReceiptReversals
             $values = ['user_id' => $user->id, 'invoice_id' => $current->id, 'customer' => $receipt['customer'],
                 'currency' => $receipt['currency'], 'received_minor' => $receipt['received_minor'], 'closed_invoice' => $receipt['closed_invoice'],
                 'subscription_invoice_id' => $receipt['subscription_invoice_id'] ?? null,
-                'amount_minor' => $latest->amount, 'return_key' => 'ae-observe-' . hash('sha256', $paymentId . ':' . $key),
+                'amount_minor' => $latest->amount, 'return_key' => 'ae-obsv-' . hash('sha256', $paymentId . ':' . $key),
                 'state' => $state, 'retry' => false, 'recheck' => false, 'updated_at' => time(),
                 'refund_id' => $kind === 'refund' ? $id : null, 'credit_id' => null, 'sent_at' => null, 'reason' => null, 'notified' => $state];
             $details = $this->receiptReversalDetails($user, $current, $receipt, (object) ($values + ['allocation_key' => $key]));

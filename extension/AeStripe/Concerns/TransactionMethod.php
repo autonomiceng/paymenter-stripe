@@ -20,7 +20,7 @@ trait TransactionMethod
         $existing = InvoiceTransaction::where('transaction_id', $intent->id)->first();
         // A failed attempt may clear this label before success acquires its locks.
         if ($status === 'processing' && $existing && DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $existing->id)->exists()) return $intent;
-        if (is_string($charge) && preg_match('/^ch_[a-zA-Z0-9]+$/D', $charge)) {
+        if (is_string($charge) && preg_match('/^(?:ch|py)_[a-zA-Z0-9]+$/D', $charge)) {
             try {
                 $charge = $this->request('get', '/charges/' . $charge);
             } catch (ConnectionException | RequestException $e) {
