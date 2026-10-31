@@ -45,6 +45,9 @@ check($work['status'] === 'open' && $work['needs_review'] && $work['credited_min
     && $work['amount_minor'] === 1200 && count(Audit::$rows) === $before[0] + 1
     && count(Notification::$rows) === $before[1] + 1,
     'A duplicate dispute after spent credit identifies the customer, reversal, credited amount and current balance once');
+$audit = end(Audit::$rows)['new_values'];
+check(($audit['stripe_id'] ?? null) === $s->dispute->id && !array_key_exists('id', $audit) && $work['id'] === $s->dispute->id,
+    'Invoice reversal audits retain the full Stripe ID without the native integer ID cast, while receipt readers keep id');
 check(str_contains(end(Notification::$rows)['body'], 'cus_owner') && str_contains(end(Notification::$rows)['body'], '10 USD'),
     'Staff receive the customer and credited amount in their next-step line');
 $s->dispute->status = 'lost';
