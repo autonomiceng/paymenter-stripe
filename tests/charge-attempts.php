@@ -19,7 +19,7 @@ use Illuminate\Support\Facades\{DB, Http};
         ExtensionHelper::$agreements = ['pm_test' => ['id' => 4, 'user_id' => 7, 'gateway_id' => 3],
             'pm_other' => ['id' => 5, 'user_id' => 7, 'gateway_id' => 3]];
         $stripe = new class {
-            public array $intents = [], $cache = [], $charges = [], $confirms = [];
+            public array $intents = [], $cache = [], $charges = [], $confirms = [], $refunds = [];
             public $beforeCreate, $beforeConfirm, $failure;
             public string $status = 'succeeded';
             public bool $loseCreate = false, $loseConfirm = false, $dropCreate = false;
@@ -32,6 +32,11 @@ use Illuminate\Support\Facades\{DB, Http};
                 if (str_starts_with($path, '/charges/ch_')) return (object) ['id' => substr($path, 9)];
                 $key = end(Http::$calls)[3]['Idempotency-Key'] ?? null;
                 if ($verb === 'post' && $key && isset($this->cache[$key])) return clone $this->cache[$key];
+                if ($path === '/refunds') {
+                    if ($verb === 'get') return (object) ['data' => array_values($this->refunds), 'has_more' => false];
+                    return $this->refunds[$key] ??= (object) ['id' => 're_attempt', 'payment_intent' => $data['payment_intent'],
+                        'amount' => $data['amount'], 'currency' => 'usd', 'metadata' => (object) $data['metadata'], 'status' => 'succeeded'];
+                }
                 if ($path === '/payment_intents') {
                     if (isset($data['automatic_payment_methods'], $data['confirmation_method'])) throw new RequestException(400, ['error' => ['message' => 'You may only specify one of these parameters: automatic_payment_methods, confirmation_method.']]);
                     if ($this->dropCreate) { $this->dropCreate = false; throw new ConnectionException('Never reached Stripe'); }
@@ -50,7 +55,11 @@ use Illuminate\Support\Facades\{DB, Http};
                 }
                 if (!preg_match('~^/payment_intents/(pi_[a-zA-Z0-9]+)(/confirm|/cancel)?$~', $path, $match)) throw new RuntimeException('Unexpected payment request ' . $path);
                 $intent = $this->intents[$match[1]] ?? throw new RequestException(404);
-                if ($verb === 'get') return clone $intent;
+                if ($verb === 'get') {
+                    $copy = clone $intent;
+                    if (isset($data['expand'])) $copy->latest_charge = (object) ['id' => $intent->latest_charge ?? 'ch_attempt', 'disputed' => false];
+                    return $copy;
+                }
                 if (($match[2] ?? '') === '/confirm') {
                     // Observed on Stripe TEST / 2025-07-30.basil in the live pass; this is only a regression fixture.
                     if (isset($data['confirmation_token']) && $intent->confirmation_method === 'manual') throw new RequestException(400, ['error' => ['param' => 'confirmation_method', 'message' => 'Payment details were collected through Stripe Elements and cannot be confirmed with a Payment Intent configured with manual confirmation_method.']]);
@@ -309,8 +318,8 @@ use Illuminate\Support\Facades\{DB, Http};
             check(isset(ExtensionHelper::$payments['920:' . $id]), 'Status recovery settles completed authentication without a webhook or customer return');
             $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'amount' => 2000]));
             check(count($stripe->confirms) === 1 && ExtensionHelper::$payments['920:' . $id]['amount'] === 20.0
-                && count(array_filter(Audit::$rows, fn ($row) => $row['event'] === 'ae_stripe_payment_review')) === 1,
-                'Automatic authentication is not reconfirmed; a later balance change records the funds and opens payment review');
+                && count(array_filter(Audit::$rows, fn ($row) => $row['event'] === 'ae_stripe_receipt_return')) === 1,
+                'Automatic authentication is not reconfirmed; a later balance change reserves and attempts the excess return');
         });
         $run('elements-failed-authentication', function ($invoice, $stripe) use ($gateway) {
             foreach (['page', 'return', 'webhook'] as $contact) {
@@ -1003,15 +1012,16 @@ use Illuminate\Support\Facades\{DB, Http};
             check($gateway->charge($invoice, 20, new BillingAgreement) === true && isset(ExtensionHelper::$payments['920:pi_test1']),
                 'Inbox failure after committed settlement cannot send cron payment-failed email');
             Notification::$fail = false;
-            $gateway->retryChargeAttempts();
-            check(count(Notification::$rows) === 1, 'Scheduled recovery retries the failed alert once without another webhook');
+            $gateway->retryReceiptReturns();
+            check(count(Notification::$rows) === 1 && count($stripe->refunds) === 1, 'Scheduled recovery retries the failed return notice without repeating its refund');
         });
         $run('overpay-alert', function ($invoice, $stripe) use ($gateway) {
             $invoice->total = 15;
             $intent = (object) ['id' => 'pi_extra', 'status' => 'succeeded', 'customer' => 'cus_owner', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 2000, 'metadata' => (object) ['invoice_id' => 920, 'ae_stripe_gateway' => '1']];
-            DB::transaction(function () use ($gateway, $intent) { $gateway->webhook(eventRequest($intent)); check(!Notification::$rows, 'Overpay alert waits for commit'); });
+            $stripe->intents[$intent->id] = $intent;
+            DB::transaction(function () use ($gateway, $intent, $stripe) { $gateway->webhook(eventRequest($intent)); check(!Notification::$rows && !$stripe->refunds, 'Overpay return waits for commit'); });
             $gateway->webhook(eventRequest($intent));
-            check(count(Notification::$rows) === 1 && count(Audit::$rows) === 1, 'Overpayment on a pending invoice sends one staff alert');
+            check(count(Notification::$rows) === 1 && count(Audit::$rows) === 1, 'Overpayment on a pending invoice returns excess automatically with one customer notice');
         });
     } finally {
         Http::$handler = $handler; Invoice::$rows = $rows; User::$row = $user; Gateway::$enabled = $enabled;

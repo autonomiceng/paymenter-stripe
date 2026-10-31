@@ -17,8 +17,12 @@ use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 
+require_once __DIR__ . '/ReceiptReturns.php';
+
 trait Checkout
 {
+    use ReceiptReturns;
+
     public function pay($invoice, $total)
     {
         abort_unless($this->gatewayEnabled(), 409);
@@ -249,6 +253,7 @@ trait Checkout
             $this->bindWebhookAttempt($user, $invoice, $intent);
             if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->lockForUpdate()->first()) {
                 $this->schedulePaymentReviewAlert($invoice, $intent->id);
+                DB::afterCommit(fn () => $this->processReceiptReturns($invoice, $intent->id));
                 return;
             }
             if ($this->paymentManuallyAccounted($invoice, $intent->id)) return;
@@ -269,8 +274,9 @@ trait Checkout
             }
             if ($status === 'succeeded' && ($invoice->status === 'paid' || $intent->amount_received > $this->paymentBalance($invoice))) {
                 \Illuminate\Support\Facades\Log::warning('AeStripe payment received for paid invoice', ['invoice_id' => $invoice->id]);
-                $this->recordPaymentReview($invoice, $intent, 'payment exceeds the amount due');
             }
+            if ($status === 'succeeded') $this->recordReceipt($invoice, $intent,
+                max(0, $intent->amount_received - ($invoice->status === 'paid' ? 0 : max(0, $this->paymentBalance($invoice)))));
             $helper = match ($status) {
                 'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',
             };

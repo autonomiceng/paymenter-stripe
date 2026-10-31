@@ -137,7 +137,8 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     check(count(Log::$warnings) === $warnings + 1 && end(Log::$warnings) === [
         'AeStripe payment received for paid invoice', ['invoice_id' => $invoice->id],
     ], 'Late charge warns once without customer data');
-    check(count(Http::$calls) === $calls, 'Late success never refunds or changes Stripe');
+    check(count(Http::$calls) > $calls && !array_filter(array_slice(Http::$calls, $calls), fn ($c) => $c[0] !== 'get'),
+        'Late success tries to verify the excess return before any remote write');
 
     $invoice->status = 'pending';
     foreach (['customer mismatch', 'currency mismatch'] as $reason) {

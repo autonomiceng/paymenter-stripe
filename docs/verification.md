@@ -89,7 +89,7 @@ A Stripe timeout stays pending. After a saved instruction commits, statement err
 amount requires a refresh because the customer has not agreed to the new total.
 Elements 3DS uses `handleNextAction` and completes without another server confirmation.
 The first confirm rechecks the balance; if the invoice changes after authentication starts,
-the original amount can complete and any excess enters the existing payment review.
+the original amount can complete and any excess is automatically returned through the receipt ledger.
 Failed Elements authentication is canceled on the next page load, return or failure webhook,
 after retrieving the current status; a fresh attempt then permits another payment.
 Native manual authentication and bank verification still reconfirm under the server checks. Card/Link saving consent remains explicit and method-specific.
@@ -151,8 +151,8 @@ A 404 or an empty search cannot establish that a confirm never arrived. The exte
 requires a known succeeded or canceled intent and records staff evidence that its funds
 were refunded or credited; late deliveries then cannot apply those funds again. Processing
 intents cannot be released this way. Stripe cannot choose how to account for these funds,
-so staff must verify that step. No refund or credit moves automatically. Known IDs keep retrying after access to the original
-Stripe account is restored. Received funds still need the staff refund or credit choice.
+so staff must verify that legacy reconciliation step. Known IDs keep retrying after access to the original
+Stripe account is restored. New, validated excess receipts use the automatic return flow below.
 Reconcile `ae_stripe_subscription_<service-id>` separately before removing an unresolved
 schedule attempt; subscription behavior is unchanged by charge-attempt recovery.
 Fakes do not
@@ -191,14 +191,36 @@ consent metadata and `off_session` for the actual method type. Bank debits are n
 Verify both method-specific options against pinned Basil before release.
 
 A successful checkout or bound subscription charge on an already paid invoice is
-recorded as another successful transaction. The invoice stays paid; Paymenter does
-not automatically create account credit. Refused successes and extra paid-invoice
-charges retain one `ae_stripe_payment_review` invoice Audit Log entry and one staff
-inbox alert per payment. Alerts run after the settlement commits; a durable pending
-marker retries a failed alert on the next delivery without duplicating it. Check
-Stripe and choose a refund or account credit; this needs a staff decision. No money
-moves automatically. The audit identifies the intent, received amount, currency
-and reason without customer details or client secrets.
+recorded in full. The invoice stays paid. Each validated receipt reserves its excess
+in `ae_stripe_receipt_<PaymentIntent>` on the native user, in the same transaction
+as settlement. After commit, AE Stripe returns that amount to the original payment
+method. The five-minute `ae-stripe:receipt-returns` task recovers interrupted returns,
+including after the charge-attempt property has been removed. Refund read/write
+permissions are required; missing access surfaces an invoice-linked problem and keeps
+checking automatically.
+
+Each allocation has an immutable amount and idempotency key bound to the payment,
+allocation and amount. Before sending, recovery checks the current receipt, customer,
+currency, dispute status and complete refund history. The first-send marker commits
+before HTTP. A lost response is recovered by `ae_stripe_return` refund metadata;
+unknown sends are never replayed after 23 hours because Stripe can expire keys after
+24 hours. Pending refunds remain reserved. Only a verified failed or canceled refund
+on an undisputed receipt becomes account credit, atomically with the return adjustment.
+An external refund, disputed payment, missing history or unknown expired send needs
+finance reconciliation: staff get the invoice link, reason and Audit Log key, and the
+customer gets a support path. No automatic credit guesses that a refund did not happen.
+Reads keep retrying, so a later matching refund completes automatically.
+
+The full positive receipt remains in native transactions. Completion adds one negative
+transaction keyed by the allocation, preserving the correct net invoice payment.
+`ae_stripe_receipt_return` Audit Log entries and customer notices identify progress,
+completion or a problem. Notification failures retry independently of money movement.
+The shared allocation API for failed-order refunds is documented in
+[receipt returns](receipt-returns.md). Historical receipts can be adopted only with a
+verified native payment and explicit allocation; old staff-choice overpayments are not
+reclassified by guessing their original excess. Identity/currency conflicts and
+nonpending invoices retain their existing `ae_stripe_payment_review` path because the
+invoice's entitlement cannot be proved safely.
 
 Successful transactions and review records use the PaymentIntent's `amount_received`,
 in its original currency. Subscription settlement retrieves the PaymentIntent before

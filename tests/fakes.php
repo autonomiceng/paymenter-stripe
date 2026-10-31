@@ -62,7 +62,7 @@ namespace App\Models {
         public function exists() { return (bool) $this->value; }
         public function firstOrFail() { return $this->value ?? throw new \RuntimeException('Missing row'); }
         public function where($key, $value) { return $this; }
-        public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $hook(); } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
+        public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $before = \App\Helpers\ExtensionHelper::$payments; $hook(); foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) if (($before[$key] ?? null) !== $row) \Illuminate\Support\Facades\DB::$concurrentPayments[$key] = $row; } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
     }
     class Property {
         public static ?array $lastRawOrder = null;
@@ -79,9 +79,9 @@ namespace App\Models {
                 $result = [];
                 foreach (User::$row->props->values as $key => $value) {
                     $record = json_decode($value, true);
-                    $selected = str_contains($this->pattern, 'payment_alert')
+                    $selected = str_contains($this->pattern, 'receipt') ? str_starts_with($key, 'ae_stripe_receipt_') && !empty($record['retry']) : (str_contains($this->pattern, 'payment_alert')
                         ? str_starts_with($key, 'ae_stripe_payment_alert_') && !($record['sent'] ?? true)
-                        : str_starts_with($key, 'ae_stripe_checkout_') && (!$this->filtered || ($record['retry'] ?? false) || ($record['version'] ?? null) !== 2 || !empty($record['agreement_id']));
+                        : str_starts_with($key, 'ae_stripe_checkout_') && (!$this->filtered || ($record['retry'] ?? false) || ($record['version'] ?? null) !== 2 || !empty($record['agreement_id'])));
                     if ($selected) $result[] = (object) ['key' => $key, 'value' => $value, 'model_type' => User::class, 'model_id' => User::$row->id];
                 }
                 if ($this->rawOrder) {
@@ -97,6 +97,7 @@ namespace App\Models {
         }; }
     }
     class Properties {
+        public static $beforeWrite = null;
         public array $values = [];
         public function __construct(public string $customer) {}
         public function where($key, $value) {
@@ -107,6 +108,7 @@ namespace App\Models {
             };
         }
         public function updateOrCreate($key, $data) {
+            if (self::$beforeWrite) (self::$beforeWrite)($key, $data);
             if ($key['key'] === 'stripe_id') $this->customer = $data['value'];
             else $this->values[$key['key']] = $data['value'];
         }
@@ -335,6 +337,20 @@ namespace App\Models {
         public static $rows = [], $fail = false;
         public static function create($row) { if (self::$fail) throw new \RuntimeException('Inbox unavailable'); self::$rows[] = $row; }
     }
+    class Credit {
+        public $id = 1;
+        public static $rows = [];
+        public function __construct(public $user_id, public $currency_code, public $amount) {}
+        public static function where($key, $value) { return new class($value) {
+            private $currency;
+            public function __construct(private $user) {}
+            public function where($key, $value) { $this->currency = $value; return $this; }
+            public function lockForUpdate() { return $this; }
+            public function first() { return Credit::$rows[$this->user . ':' . $this->currency] ?? null; }
+        }; }
+        public static function create($row) { return self::$rows[$row['user_id'] . ':' . $row['currency_code']] = new self(...$row); }
+        public function update($row) { $this->amount = $row['amount']; }
+    }
     class InvoiceTransaction {
         public static function where($key, $value) { return new class($value) {
             private $status, $currentRead = false;
@@ -426,7 +442,7 @@ namespace Illuminate\Support\Facades {
     class DB {
         public static $tables = [], $locks = [], $updates = [];
         public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } }; }
-        public static $concurrentAgreements = [];
+        public static $concurrentAgreements = [], $concurrentPayments = [];
         public static function table($name) { return match ($name) { 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
         public static $beforeUserLock = null, $afterTransaction = null;
         private static $afterCommit = [];
@@ -436,15 +452,18 @@ namespace Illuminate\Support\Facades {
         public static function transaction($callback) {
             $priorUserLock = self::$userLocked;
             $outerLocked = self::$locked;
+            if (!$outerLocked) self::$concurrentPayments = [];
             $callbacks = count(self::$afterCommit);
             $properties = \App\Models\User::$row?->props->values;
             $before = self::$tables;
             $agreements = \App\Helpers\ExtensionHelper::$agreements;
+            $payments = \App\Helpers\ExtensionHelper::$payments;
+            $credits = unserialize(serialize(\App\Models\Credit::$rows));
             $fees = \App\Helpers\ExtensionHelper::$fees;
             $audit = \App\Models\Audit::$rows;
             $notifications = \App\Models\Notification::$rows;
             self::$locked = true;
-            try { $result = $callback(); } catch (\Throwable $e) { self::$afterCommit = array_slice(self::$afterCommit, 0, $callbacks); if (\App\Models\User::$row && $properties !== null) \App\Models\User::$row->props->values = $properties; self::$tables = $before; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
+            try { $result = $callback(); } catch (\Throwable $e) { self::$afterCommit = array_slice(self::$afterCommit, 0, $callbacks); if (\App\Models\User::$row && $properties !== null) \App\Models\User::$row->props->values = $properties; self::$tables = $before; \App\Helpers\ExtensionHelper::$payments = array_replace($payments, self::$concurrentPayments); \App\Models\Credit::$rows = $credits; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
             finally { self::$locked = $outerLocked; self::$userLocked = $priorUserLock; }
             if ($hook = self::$afterTransaction) { self::$afterTransaction = null; $hook(); }
             if (!$outerLocked) { $pending = self::$afterCommit; self::$afterCommit = []; foreach ($pending as $callback) $callback(); }

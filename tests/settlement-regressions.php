@@ -32,7 +32,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
             ['status' => 'paid', 'amount_paid' => 1250,
                 'payment' => ['type' => 'payment_intent', 'payment_intent' => $intent->id]]]];
         if ($verb === 'get' && $path === '/payment_intents/' . $intent->id) {
-            check(!DB::$locked, 'Subscription PaymentIntent lookup runs before the settlement transaction');
+            check(!DB::$locked || DB::$userLocked, 'Return verification also serializes on the receipt owner');
             return $intent;
         }
         throw new RuntimeException('Unexpected settlement request: ' . $path);
@@ -71,8 +71,8 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $deliver();
     $deliver();
     check(count(array_filter(array_slice(Http::$calls, $calls), fn ($call) => $call[0] === 'get'
-        && $call[1] === '/payment_intents/pi_subscription_paid')) === 2,
-        'Each subscription delivery fetches the settled PaymentIntent before checking local rows');
+        && $call[1] === '/payment_intents/pi_subscription_paid')) === 3,
+        'Subscription deliveries fetch the settled intent, and the first delivery also attempts return verification');
     check(ExtensionHelper::$applications === $before + 1 && $invoice->status === 'paid'
         && ExtensionHelper::$payments['112:pi_subscription_paid']['amount'] === 12.5,
         'Paid bound subscription invoice retains one successful charge with received units');

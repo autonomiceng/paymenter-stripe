@@ -26,6 +26,7 @@ All paths start with `/v1`. Read uses `GET`; write uses `POST` unless marked `DE
 | Invoices | `/invoices/{id}` | `/invoices/{id}`, `/invoices/{id}/finalize`, `/invoices/{id}/pay` |
 | PaymentIntents | `/payment_intents/{id}` | `/payment_intents`, `/payment_intents/{id}` |
 | Payment methods | `/payment_methods/{id}` | `/payment_methods/{id}`, `/payment_methods/{id}/detach` |
+| Refunds | `/refunds` | `/refunds` |
 | Products | `/products/search` | `/products` |
 | SetupIntents | `/setup_intents/{id}` | `/setup_intents`, `/setup_intents/{id}` |
 | Subscription items | None | `/subscription_items/{id}` |

@@ -30,7 +30,7 @@ if (in_array($scenario, ['all', 'boot'], true)) {
         (new AeStripe)->boot();
         check(Schema::$checks === $schemaChecks, 'Boot never checks or migrates the fee schema');
         check(count($GLOBALS['reportedErrors'] ?? []) === $reports, 'Boot never reports fee schema failures');
-        check(count(Schedule::$callbacks) === $beforeSchedules + 4, 'Boot registers fee and charge recovery without schema access');
+        check(count(Schedule::$callbacks) === $beforeSchedules + 6, 'Boot registers fee and charge recovery without schema access');
         check(count(Application::$callbacks) === $beforeCommands + 2, 'Boot registers adoption command without schema access');
     } finally {
         Schema::$beforeCheck = null;
