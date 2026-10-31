@@ -240,8 +240,9 @@ neither unknown refunds nor a 409 allows another refund or independent credit.
 Customer/currency conflicts still use payment review because ownership cannot be
 proved. Historical excess is not inferred from today's balance. The
 [shared receipt-return API](receipt-returns.md) can adopt a verified historical
-native receipt for a caller's proved entitlement. Dashboard refund coordination
-belongs to P05; this change does not serialize Dashboard actions with API reads.
+native receipt for a caller's proved entitlement. Refunds created in the Stripe
+Dashboard are not coordinated with this flow; Dashboard actions are not serialized
+with API reads.
 
 Successful transactions and review records use the PaymentIntent's `amount_received`,
 in its original currency. Subscription settlement retrieves the PaymentIntent before

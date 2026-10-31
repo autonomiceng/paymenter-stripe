@@ -268,6 +268,11 @@ trait Checkout
                 if ($status === 'succeeded') $this->recordPaymentReview($invoice, $intent, 'currency mismatch');
                 return;
             }
+            if ($this->readReceipt($user, $intent->id)['closed_invoice'] ?? false) {
+                // A closed receipt remains wholly reserved even if the invoice is reopened.
+                DB::afterCommit(fn () => $this->processReceiptReturns($invoice, $intent->id));
+                return;
+            }
             if ($status === 'succeeded' && !in_array($invoice->status, ['pending', 'paid'], true)) {
                 \Illuminate\Support\Facades\Log::warning('AeStripe payment received for nonpending invoice', ['invoice_id' => $invoice->id]);
                 $this->recordReceipt($invoice, $intent, $intent->amount_received, closed: true, subscriptionInvoiceId: $subscriptionInvoiceId);

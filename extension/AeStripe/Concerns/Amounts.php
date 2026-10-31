@@ -16,7 +16,7 @@ trait Amounts
             throw new \InvalidArgumentException('Invalid payment amount');
         }
         $compatibility = in_array(strtolower($currency), ['isk', 'ugx'], true);
-        $places = $compatibility || in_array(strtolower($currency), self::ZERO_DECIMAL, true) ? 0 : 2;
+        $places = $this->currencyDecimals($currency);
         $fraction = str_pad($parts[3] ?? '', $places + 1, '0');
         $digits = ltrim($parts[2] . substr($fraction, 0, $places), '0') ?: '0';
         // Reserve one integer unit for half-up rounding, including negative amounts.
@@ -27,6 +27,11 @@ trait Amounts
         $minor = (int) $digits + ((int) $fraction[$places] >= 5 ? 1 : 0);
         $minor *= $compatibility ? 100 : 1;
         return $parts[1] === '-' ? -$minor : $minor;
+    }
+
+    private function currencyDecimals(string $currency): int
+    {
+        return in_array(strtolower($currency), ['isk', ...self::ZERO_DECIMAL], true) ? 0 : 2;
     }
 
     private function fromMinorUnits(int $amount, string $currency): float

@@ -132,6 +132,14 @@ use Illuminate\Support\Facades\{DB, Http};
         check($status($i)['state'] === 'refunded' && count($s->posts) === 1 && count(Notification::$rows) === 1,
             'Notification failure retries the notice without repeating the completed return');
 
+        [$i, $s] = $setup(); $s->status = 'failed'; Notification::$fail = true; $deliver($s); Notification::$fail = false;
+        unset(Invoice::$rows[$i->id]); $gateway->retryReceiptReturns();
+        $held = DB::$tables['ae_stripe_receipt_returns']['pi_return:excess'];
+        Invoice::$rows[$i->id] = $i; $deliver($s); $gateway->retryReceiptReturns();
+        check(Credit::$rows['7:usd']->amount === 10.0 && $held['state'] === 'credited' && !$held['retry']
+            && $status($i)['state'] === 'credited' && count($s->posts) === 1 && count(Notification::$rows) === 1,
+            'An unavailable invoice cannot erase completed credit or add it twice when its binding is restored');
+
         foreach (['succeeded', 'failed'] as $later) {
             [$i, $s] = $setup(); $s->status = 'pending'; $deliver($s);
             current($s->refunds)->status = $later; Notification::$fail = true;
@@ -173,6 +181,17 @@ use Illuminate\Support\Facades\{DB, Http};
         check($status($i)['state'] === 'review' && !Credit::$rows && count(ExtensionHelper::$payments) === 2,
             'A later disputed refund is held and surfaced without credit or a second adjustment');
 
+        [$i, $s] = $setup(); $i->status = 'cancelled'; $s->status = 'pending';
+        ExtensionHelper::$simulateNativeListeners = true; $activations = ExtensionHelper::$activations;
+        $deliver($s); $i->status = 'pending'; $deliver($s);
+        check(!ExtensionHelper::$payments && $i->status === 'pending' && ExtensionHelper::$activations === $activations,
+            'Reopening an invoice cannot spend a closed receipt already reserved for a whole return');
+        current($s->refunds)->status = 'succeeded'; $gateway->retryReceiptReturns(); $deliver($s);
+        check($status($i)['state'] === 'refunded' && count($s->posts) === 1 && count(ExtensionHelper::$payments) === 2
+            && array_sum(array_column(ExtensionHelper::$payments, 'amount')) === 0.0 && $i->status === 'pending'
+            && ExtensionHelper::$activations === $activations, 'A reopened invoice retains one whole return without paid processing');
+        ExtensionHelper::$simulateNativeListeners = false;
+
         foreach (['succeeded', 'failed'] as $outcome) {
             [$i, $s] = $setup(); $i->status = 'cancelled'; $s->status = 'pending';
             ExtensionHelper::$simulateNativeListeners = true; $activations = ExtensionHelper::$activations;
@@ -202,6 +221,13 @@ use Illuminate\Support\Facades\{DB, Http};
         foreach ([['jpy', 20, 10, 10], ['ugx', 2000, 10, 1000]] as [$currency, $received, $total, $excess]) {
             [$i, $s] = $setup($received, $total, $currency); $deliver($s);
             check($status($i)['state'] === 'refunded' && $s->posts[0][1]['amount'] === $excess, 'Return amount uses Stripe minor units for ' . $currency);
+        }
+
+        foreach ([['usd', 1050, 10, '0.50 USD'], ['usd', 2000, 10, '10.00 USD'], ['jpy', 20, 10, '10 JPY'],
+            ['isk', 2000, 10, '10 ISK'], ['ugx', 2000, 10, '10 UGX']] as [$currency, $received, $total, $display]) {
+            [$i, $s] = $setup($received, $total, $currency); $deliver($s);
+            check(str_contains(Notification::$rows[0]['body'], 'A payment of ' . $display . ' has been returned'),
+                'Refund notice uses currency display precision for ' . $display);
         }
 
         [$i, $s] = $setup(2000, 20); $deliver($s);

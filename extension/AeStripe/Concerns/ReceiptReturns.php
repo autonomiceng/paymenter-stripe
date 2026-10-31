@@ -146,8 +146,10 @@ trait ReceiptReturns
             } catch (\Throwable $e) {
                 report($e);
                 // Unusable native bindings cannot send money; keep them off the due queue.
-                $this->receiptRows()->where('return_key', $row->return_key)->update(['state' => 'review', 'retry' => false,
-                    'reason' => 'Original invoice or owner unavailable. Restore the invoice binding before returning money.']);
+                $update = ['retry' => false];
+                if (!in_array($row->state, ['refunded', 'credited'], true)) $update += ['state' => 'review',
+                    'reason' => 'Original invoice or owner unavailable. Restore the invoice binding before returning money.'];
+                $this->receiptRows()->where('return_key', $row->return_key)->where('state', $row->state)->update($update);
             }
             if ($this->receiptStripeUnavailable) break;
         }
@@ -336,7 +338,7 @@ trait ReceiptReturns
                 'old_values' => [], 'new_values' => ['payment_intent_id' => $id, 'allocation' => $key] + $a]);
             Notification::create(['user_id' => $user->id, 'title' => 'Payment return', 'url' => route('invoices.show', $current),
                 'body' => match ($a['state']) {
-                    'refunded' => 'A payment of ' . $this->fromMinorUnits($a['amount_minor'], $receipt['currency']) . ' ' . strtoupper($receipt['currency']) . ' has been returned to your original payment method.',
+                    'refunded' => 'A payment of ' . number_format($this->fromMinorUnits($a['amount_minor'], $receipt['currency']), $this->currencyDecimals($receipt['currency']), '.', '') . ' ' . strtoupper($receipt['currency']) . ' has been returned to your original payment method.',
                     'credited' => 'Stripe could not refund your original payment method. The returned amount is now account credit. Open the invoice or contact support for help.',
                     'pending' => 'Your payment return is processing. We are checking it automatically. Open the invoice or contact support for help.',
                     default => 'Your payment return needs attention. We are checking it automatically. Contact support with invoice ' . $current->id . ' for help.',
