@@ -269,3 +269,72 @@ Checkout references (read for the deferred integration):
 - https://docs.stripe.com/api/payment_intents/cancel
 
 Offline Elements checks use local Stripe.js and HTTP fixtures. They do not prove Stripe accepts the new automatic token flow, CustomerSession tokens, saving options, 3DS completion or redirects. A fixture rejects the manual/Elements pairing using the observed live error; it is not provider acceptance evidence. Validate those combinations in test mode on the pinned API version before release.
+
+## Retire open payment forms before credit
+
+`AeStripe::cancelInvoicePayments($invoice): bool` cancels the invoice's still-payable
+PaymentIntent. It returns `false` when money is processing, needs capture, or just
+settled; leave credit unapplied and refresh the invoice after settlement. Exceptions
+also mean do not apply credit. No processing payment is cancelled. Successes use the
+existing settlement/late-money handler.
+
+For an explicit credit action, lock the user then invoice in the same database
+transaction as spending credit, call the gateway, and apply credit only on `true`:
+
+```php
+$applied = DB::transaction(function () use ($invoice, $gateway) {
+    User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
+    $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
+    if (ExtensionHelper::call($gateway, 'cancelInvoicePayments', [$current]) !== true) return false;
+    // Re-read the remaining balance and apply the requested credit here.
+    return true;
+});
+// On false, tell the customer payment is being checked and refresh; do not spend credit.
+```
+
+`$gateway` is the native `App\Models\Gateway` row for `AeStripe`. This is a server
+integration call, not a customer route. Landing owns integrating it into Apply credit.
+Domains needs no Stripe dependency: normal Eloquent invoice status updates dispatch
+Paymenter 1.5.9's `App\Events\Invoice\Updated`, and the gateway retires forms after
+commit. Invoice closure is not gated on Stripe access: an outage can leave an old
+3DS tab able to complete before cancellation recovery. A late success must leave the
+invoice closed and reach the late-money handler. The integrated receipt-return
+ledger must return those funds automatically once, without activating the order.
+Bulk SQL updates do not dispatch that event. The five-minute recovery job
+also scans checkout-only attempts, including `retry=false`, and retries cancellation
+when Stripe returns. Partial-credit changes retire checkout forms too. Call before
+credit rather than relying on that later sweep to protect an already open tab.
+
+## Webhook continuity
+
+Before the first credential rotation after upgrade, save the existing working keys
+and signing secret once. Each save verifies `GET /v1/account` and the paginated
+webhook list. Keep the same Stripe account and test/live mode; API-key replacement
+is allowed on that account. The restricted key needs account-read and endpoint-read
+permissions plus endpoint-write when creating or updating setup. Use the account's
+matching publishable key; Stripe's account read does not prove a publishable key's
+account identity.
+
+The gateway stores its checked account, endpoint, API credentials and saved signing
+secrets in one native encrypted setting, omitted from the configuration form. A
+failed account/endpoint check restores the previous accepted credentials. Runtime requests refresh
+that setting so an in-flight handler can use a replacement API key. Keep API keys
+valid until their in-flight HTTP requests finish.
+
+Roll a signing secret in Stripe, then save the replacement on the gateway. The old
+secret stays accepted **without expiry until a delivery validates with the saved
+replacement**. That delivery starts its **72-hour overlap**; later saves and deliveries
+do not extend the deadline. A typo or stale admin form therefore cannot time out the
+secret Stripe is still using. Signature timestamps retain the five-minute replay check. This covers
+Stripe's [three-day automatic delivery retry window](https://docs.stripe.com/webhooks#automatic-retries).
+Do not log, copy into reports, or screenshot signing secrets or API keys.
+
+Existing endpoints are reused, including the legacy StripeSaved route. URL changes
+update the same endpoint; pending deliveries, API version, enabled/disabled status
+and existing event subscriptions remain. The [endpoint update API](https://docs.stripe.com/api/webhook_endpoints/update)
+supports URL and event edits; API version is only set when creating a new endpoint.
+An existing endpoint with a missing local secret is preserved and asks for its secret
+from Stripe, since Stripe's list API cannot recover it. No endpoint is deleted.
+Cutover still follows the paused-writer and missed-event reconciliation steps in
+[migration](migrating-from-bundled.md); this does not redirect the bundled core route
+or enable a disabled endpoint.

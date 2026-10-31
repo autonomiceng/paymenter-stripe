@@ -67,6 +67,12 @@ if (in_array('--charge-attempts', $argv, true)) {
     return;
 }
 
+if (in_array('--webhook-continuity', $argv, true)) {
+    require __DIR__ . '/webhook-continuity.php';
+    echo "PASS: $count webhook continuity assertions\n";
+    return;
+}
+
 if (in_array('--gateway-lifecycle', $argv, true)) {
     require __DIR__ . '/gateway-lifecycle.php';
     echo "PASS: $count gateway lifecycle assertions\n";
@@ -80,7 +86,7 @@ if (in_array('--setup-intents', $argv, true)) {
 
 \Illuminate\Console\Application::$callbacks = [];
 $gateway->boot();
-check(Event::$listeners === [], 'Bundled row retains subscription callbacks even when disabled');
+check(count(Event::$listeners) === 1, 'Invoice cancellation listens even while bundled Stripe owns subscriptions');
 check(Route::$routes === ['/extensions/ae-stripe/webhook', '/extensions/stripe-saved/webhook',
     '/extensions/ae-stripe/setup-agreement', '/extensions/stripe-saved/setup-agreement',
     '/extensions/ae-stripe/consent', '/extensions/ae-stripe/setup-consent', '/extensions/ae-stripe/disable-core', '/extensions/ae-stripe/confirm', '/extensions/ae-stripe/payment-return'], 'Distinct routes are still registered');
@@ -95,7 +101,7 @@ check(Route::$definitions['/extensions/stripe-saved/setup-agreement'] === Route:
 Gateway::$bundled = false;
 $gateway->boot();
 check(count(\Illuminate\Console\Application::$callbacks) === 2, 'Commands registered once per extension boot including bundled-present path');
-check(count(Event::$listeners) === 2, 'Standalone fork registers legacy subscription callbacks');
+check(count(Event::$listeners) === 3, 'Standalone fork registers legacy subscription callbacks');
 Gateway::$bundled = true;
 
 $view = $gateway->pay($invoice, 20);
@@ -226,6 +232,7 @@ check(count(Http::$calls) === $before, 'Disabled setup consent makes no HTTP req
 Http::$handler = $oldHandler;
 require __DIR__ . '/charge-attempts.php';
 require __DIR__ . '/gateway-lifecycle.php';
+require __DIR__ . '/webhook-continuity.php';
 require __DIR__ . '/subscription-listeners.php';
 require __DIR__ . '/adoption.php';
 require __DIR__ . '/adoption-store.php';

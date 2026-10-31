@@ -1,7 +1,7 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 use App\Helpers\ExtensionHelper;
-use App\Models\{Audit, BillingAgreement, Gateway, Invoice, Notification, Properties, User};
+use App\Models\{Audit, BillingAgreement, Gateway, Invoice, Notification, Properties, Property, User};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\{DB, Http};
@@ -87,6 +87,89 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        $run('retire-core-event', function ($invoice, $stripe) use ($gateway) {
+            $gateway->boot(); $gateway->pay($invoice, 20);
+            $invoice->status = 'cancelled'; Gateway::$enabled = false;
+            DB::transaction(fn () => \Illuminate\Support\Facades\Event::$listeners[\App\Events\Invoice\Updated::class](new \App\Events\Invoice\Updated($invoice)));
+            check($stripe->intents['pi_test1']->status === 'canceled', 'The core invoice event retires a form even while the gateway is disabled or bundled Stripe is present');
+            Gateway::$enabled = true; $invoice->status = 'pending';
+            ExtensionHelper::$payments['920:pi_oldbank'] = ['amount' => 20, 'status' => 'processing'];
+            check(!$gateway->cancelInvoicePayments($invoice), 'Credit also waits for a legacy processing transaction without an attempt property');
+        });
+        $run('retire-forms', function ($invoice, $stripe) use ($gateway) {
+            foreach (['requires_payment_method', 'requires_confirmation', 'requires_action', 'processing', 'requires_capture'] as $status) {
+                $gateway->pay($invoice, 20);
+                $intent = $stripe->intents[array_key_last($stripe->intents)]; $intent->status = $status;
+                $invoice->status = 'cancelled';
+                $gateway->retryChargeAttempts();
+                $payable = in_array($status, ['requires_payment_method', 'requires_confirmation', 'requires_action']);
+                check($intent->status === ($payable ? 'canceled' : $status), 'Invoice closure cancels a checkout-only ' . $status . ' form without cancelling in-flight money');
+                if (!$payable) {
+                    check(!$gateway->cancelInvoicePayments($invoice), 'In-flight money prevents applying credit over the same payment');
+                    $intent->status = 'succeeded'; $intent->amount_received = 2000;
+                    $gateway->retryChargeAttempts();
+                    $reviews = array_filter(Audit::$rows, fn ($row) => $row['event'] === 'ae_stripe_payment_review'
+                        && $row['new_values']['payment_intent_id'] === $intent->id);
+                    check(count($reviews) === 1, 'A payment already ' . $status . ' follows the existing late-money review path');
+                }
+                User::$row->props->values = []; $invoice->status = 'pending';
+            }
+            $gateway->pay($invoice, 20); $intent = $stripe->intents[array_key_last($stripe->intents)];
+            DB::transaction(function () use ($gateway, $invoice, $intent) {
+                check($gateway->cancelInvoicePayments($invoice) && $intent->status === 'canceled', 'Credit caller can retire the form before spending credit in its transaction');
+                ExtensionHelper::$payments['920:credit'] = ['amount' => 5, 'status' => 'succeeded'];
+            });
+            $view = $gateway->pay($invoice, 15);
+            check($view['data']['intent']->amount === 1500, 'A fresh form after partial credit uses only the remaining balance');
+            ExtensionHelper::$payments['920:credit']['amount'] = 10;
+            $gateway->retryChargeAttempts();
+            check($stripe->intents[$view['data']['intent']->id]->status === 'canceled', 'Recovery also retires an unchanged pending invoice after partial credit');
+        });
+        $run('retire-outage', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); $invoice->status = 'cancelled';
+            $stripe->failure = fn ($verb, $path) => str_ends_with($path, '/cancel') ? throw new RequestException(503) : null;
+            $gateway->retryChargeAttempts();
+            check(isset(User::$row->props->values['ae_stripe_checkout_920']) && $stripe->intents['pi_test1']->status !== 'canceled', 'A failed cancellation keeps its payment identity');
+            $stripe->failure = null; Gateway::$enabled = false; $gateway->retryChargeAttempts();
+            check($stripe->intents['pi_test1']->status === 'canceled' && !$stripe->charges, 'Recovery cancels the old form when Stripe access returns even with collection paused');
+        });
+        $run('retire-3ds-outage-late-money', function ($invoice, $stripe) use ($gateway) {
+            $gateway->boot(); $gateway->pay($invoice, 20);
+            $intent = $stripe->intents['pi_test1']; $intent->status = 'requires_action';
+            $stripe->failure = fn ($verb, $path) => str_ends_with($path, '/cancel') ? throw new ConnectionException('Cancellation transport unavailable') : null;
+            DB::transaction(function () use ($invoice) {
+                $invoice->status = 'cancelled';
+                \Illuminate\Support\Facades\Event::$listeners[\App\Events\Invoice\Updated::class](new \App\Events\Invoice\Updated($invoice));
+            });
+            check($invoice->status === 'cancelled' && $intent->status === 'requires_action', 'Closure commits during a cancellation outage while an old 3DS tab remains open');
+            // Stripe.js can finish authentication directly, without another local confirmation call.
+            $intent->status = 'succeeded'; $intent->amount_received = $intent->amount;
+            $applications = ExtensionHelper::$applications;
+            $gateway->webhook(eventRequest($intent)); $gateway->webhook(eventRequest($intent));
+            $gateway->retryChargeAttempts();
+            $calls = count(Http::$calls);
+            $gateway->retryChargeAttempts();
+            $reviews = array_values(array_filter(Audit::$rows, fn ($row) => $row['event'] === 'ae_stripe_payment_review'
+                && $row['new_values']['payment_intent_id'] === $intent->id));
+            check($invoice->status === 'cancelled' && !ExtensionHelper::$payments && ExtensionHelper::$applications === $applications,
+                'Late 3DS success does not fund or reopen the closed invoice, so the native paid/activation path is not called');
+            check(count($reviews) === 1 && $reviews[0]['new_values']['reason'] === 'invoice not pending',
+                'Repeated late success and recovery enter the existing late-money review path once; automatic return needs the integrated ledger');
+            check(!isset(User::$row->props->values['ae_stripe_checkout_920']) && count(Http::$calls) === $calls,
+                'A handled late success retires the checkout attempt, so another recovery makes no Stripe request');
+        });
+        $run('retire-overlap', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); $intent = $stripe->intents['pi_test1'];
+            $stripe->failure = function ($verb, $path) use ($intent) {
+                if (str_ends_with($path, '/cancel')) { $intent->status = 'processing'; throw new RequestException(400); }
+            };
+            check(!$gateway->cancelInvoicePayments($invoice) && $intent->status === 'processing', 'A confirmation completed during cancellation is kept for settlement');
+        });
+        $run('retire-lost-create', function ($invoice, $stripe) use ($gateway) {
+            $stripe->loseCreate = true; paymentStops(fn () => $gateway->pay($invoice, 20));
+            $invoice->status = 'cancelled'; $gateway->retryChargeAttempts();
+            check(count($stripe->intents) === 1 && $stripe->intents['pi_test1']->status === 'canceled', 'Closing an invoice recovers the same lost unconfirmed creation and cancels it');
+        });
         $run('resolve-command-error', function () {
             require_once __DIR__ . '/../extension/AeStripe/ResolveChargeCommand.php';
             $rows = Gateway::$rows; Gateway::$rows = [];
@@ -620,6 +703,67 @@ use Illuminate\Support\Facades\{DB, Http};
             $stripe->loseConfirm = true; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
             $gateway->retryChargeAttempts();
             check(isset(ExtensionHelper::$payments['920:pi_test1']) && count($stripe->charges) === 1, 'Scheduled recovery settles a lost confirmation without customer input');
+        });
+        $run('recovery-priority-query', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); Property::$lastRawOrder = null;
+            $gateway->retryChargeAttempts();
+            check(Property::$lastRawOrder === [
+                'CASE WHEN value LIKE ? OR value NOT LIKE ? OR (value LIKE ? AND value NOT LIKE ?) THEN 0 ELSE 1 END',
+                ['%"retry":true%', '%"version":2%', '%"agreement_id":%', '%"agreement_id":null%'],
+            ], 'The production recovery priority SQL and four bindings match the dependency-free fake');
+        });
+        $run('idle-scan-progress', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $before = User::$row->props->values['ae_stripe_checkout_920'];
+            $gateway->retryChargeAttempts();
+            $after = User::$row->props->values['ae_stripe_checkout_920']; $attempt = json_decode($after, true);
+            check($after !== $before && ($attempt['checks'] ?? 0) === 0 && isset($attempt['scanned_at']),
+                'An idle scan changes the stored value so updated_at advances without counting an active check');
+            $gateway->retryChargeAttempts();
+            check(User::$row->props->values['ae_stripe_checkout_920'] !== $after,
+                'Another idle scan changes the stored value even within the same second');
+        });
+        $run('paused-active-scan', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); $attempt['retry'] = true;
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            Gateway::$enabled = false;
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(($attempt['checks'] ?? 0) === 0 && isset($attempt['scanned_at']), 'Paused active scans leave the recovery check count unchanged');
+            Gateway::$enabled = true;
+            $stripe->failure = fn ($verb, $path) => str_starts_with($path, '/payment_intents/') ? throw new RequestException(403) : null;
+            $gateway->retryChargeAttempts(); DB::transaction(fn () => null);
+            check(!Notification::$rows, 'The first refusal after paused scans does not send a repeated-refusal staff alert');
+        });
+        $run('idle-access-refusal', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            $stripe->failure = fn ($verb, $path) => str_starts_with($path, '/payment_intents/') ? throw new RequestException(403) : null;
+            paymentStops(fn () => $gateway->pay($invoice, 20));
+            DB::transaction(fn () => null); // Flush the fake's queued after-commit staff alert.
+            check(!Notification::$rows, 'Two idle retirement checks cannot turn the first real access refusal into a staff alert');
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(($attempt['checks'] ?? 0) === 0, 'Idle forms do not accumulate active recovery checks');
+        });
+        $run('active-before-idle', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $idle = User::$row->props->values['ae_stripe_checkout_920'];
+            for ($id = 921; $id <= 1020; ++$id) {
+                $other = clone $invoice; $other->id = $id; Invoice::$rows[$id] = $other;
+                $attempt = json_decode($idle, true); $attempt['agreement_id'] = null;
+                User::$row->props->values['ae_stripe_checkout_' . $id] = json_encode($attempt);
+            }
+            $active = clone $invoice; $active->id = 1021; Invoice::$rows[1021] = $active;
+            $gateway->pay($active, 20);
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_1021'], true); $attempt['agreement_id'] = 4;
+            User::$row->props->values['ae_stripe_checkout_1021'] = json_encode($attempt);
+            $gateway->retryChargeAttempts();
+            $paid = array_filter(array_keys(ExtensionHelper::$payments), fn ($key) => str_starts_with($key, '1021:'));
+            check(count($stripe->charges) === 1 && count($paid) === 1,
+                'An active saved-method attempt behind 101 idle forms is recovered in the first 100-row batch');
+            $untouched = json_decode(User::$row->props->values['ae_stripe_checkout_1020'], true);
+            check(!isset($untouched['checks']), 'An explicit null agreement stays idle and cannot outrank an active attempt');
         });
         $run('outage-batch', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20); $other = clone $invoice; $other->id = 921; Invoice::$rows[921] = $other;

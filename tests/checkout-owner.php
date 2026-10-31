@@ -20,7 +20,7 @@ foreach (['enabled', 'disabled', 'absent', 'deleted'] as $forkState) {
             'Unmarked webhook ownership requires bundled retirement: ' . $bundledState);
         Event::$listeners = [];
         $gateway->boot();
-        check(count(Event::$listeners) === (in_array($bundledState, ['absent', 'deleted']) ? 2 : 0),
+        check(count(Event::$listeners) === (in_array($bundledState, ['absent', 'deleted']) ? 3 : 1),
             'Disabled bundled still owns listeners; retired/absent transfers them: ' . $bundledState);
     }
 }

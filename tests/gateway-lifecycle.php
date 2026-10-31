@@ -8,56 +8,35 @@ use Illuminate\Support\Facades\{DB, Http};
     DB::$tables = ['billing_agreements' => [], 'services' => [], 'properties' => []];
     Gateway::$enabled = Gateway::$bundledEnabled = true;
     $handler = Http::$handler;
-    foreach (['enabled', 'updated'] as $hook) {
-        foreach (['get', 'post', null] as $failure) {
-            Gateway::$bundledEnabled = true;
-            \Filament\Notifications\Notification::$sent = [];
-            $extension = new class(['enabled' => true, 'changed' => true]) extends Extension {
-                public \App\Models\Properties $values;
-                public function __construct($attributes) { parent::__construct($attributes); $this->values = new \App\Models\Properties(''); }
-                public function settings() { return $this->values; }
-            };
-            $duringRequests = [];
-            Http::$handler = function ($verb, $path) use ($failure, &$duringRequests) {
-                $duringRequests[] = [Gateway::$bundledEnabled, \Filament\Notifications\Notification::$sent];
-                if ($path !== '/webhook_endpoints') throw new RuntimeException('Unexpected webhook request');
-                if ($verb === $failure) throw new RuntimeException('Synthetic webhook failure');
-                return $verb === 'get' ? ['data' => []] : ['secret' => 'whsec_created'];
-            };
-            if ($failure !== null) {
-                rejects(fn () => $gateway->$hook($extension), 'Synthetic webhook failure');
-                check(Gateway::$bundledEnabled, "$hook $failure failure preserves enabled core Stripe");
-                check(!in_array('Core Stripe was turned off.', \Filament\Notifications\Notification::$sent), "$hook $failure failure sends no core disable notice");
-                check($extension->values->values === [], "$hook $failure failure stores no webhook secret");
-            } else {
-                $gateway->$hook($extension);
-                check(!Gateway::$bundledEnabled && $extension->values->values['stripe_webhook_secret'] === 'whsec_created', "$hook disables core after saving successful webhook setup");
-                check(in_array('Core Stripe was turned off.', \Filament\Notifications\Notification::$sent), "$hook successful setup sends the core disable notice");
-            }
-            check(!array_filter($duringRequests, fn ($state) => !$state[0] || in_array('Core Stripe was turned off.', $state[1])), "$hook keeps core enabled without a disable notice throughout webhook requests");
-        }
-    }
-    Http::$handler = $handler;
-    Gateway::$bundledEnabled = true;
+    $gateway = new \Paymenter\Extensions\Gateways\AeStripe\AeStripe([
+        'stripe_secret_key' => 'rk_test_fixture', 'stripe_publishable_key' => 'pk_test_fixture', 'stripe_webhook_secret' => 'whsec_test',
+    ]);
+    Http::$handler = function ($verb, $path) {
+        return match ($path) {
+            '/account' => (object) ['id' => 'acct_fixture'],
+            '/webhook_endpoints' => (object) ['data' => [(object) ['id' => 'we_fixture', 'url' => route('extensions.gateways.ae-stripe.webhook'),
+                'api_version' => '2025-07-30.basil', 'enabled_events' => ['payment_intent.succeeded', 'payment_intent.payment_failed', 'payment_intent.processing',
+                    'setup_intent.succeeded', 'subscription_schedule.canceled', 'invoice.created', 'invoice.payment_succeeded', 'charge.updated', 'charge.succeeded']]]],
+            default => throw new RuntimeException('Unexpected lifecycle request'),
+        };
+    };
     $calls = count(Http::$calls);
-    \Filament\Notifications\Notification::$sent = [];
-    $gateway->enabled(new Extension(['enabled' => true]));
-    check(!Gateway::$bundledEnabled, 'Enabling AeStripe turns off empty core Stripe');
-    check(count(Http::$calls) === $calls, 'Existing webhook setup needs no Stripe request');
+    $gateway->enabled(new Extension(['id' => 2, 'enabled' => true]));
+    check(!Gateway::$bundledEnabled, 'Enabling AeStripe turns off empty core Stripe after verifying webhook continuity');
     Gateway::$bundledEnabled = true;
     DB::$tables['billing_agreements'] = [['id' => 10, 'gateway_id' => 1, 'deleted_at' => null]];
     \Filament\Notifications\Notification::$sent = [];
-    $gateway->enabled(new Extension(['enabled' => true]));
+    $gateway->enabled(new Extension(['id' => 2, 'enabled' => true]));
     check(Gateway::$bundledEnabled, 'Enabling with a saved card preserves core Stripe');
     DB::$tables['billing_agreements'][0]['deleted_at'] = '2026-01-01';
     DB::$tables['services'] = [['id' => 20, 'billing_agreement_id' => 10, 'subscription_id' => null]];
     \Filament\Notifications\Notification::$sent = [];
-    $gateway->enabled(new Extension(['enabled' => true]));
+    $gateway->enabled(new Extension(['id' => 2, 'enabled' => true]));
     check(Gateway::$bundledEnabled, 'A service referencing a deleted core agreement prevents automatic disable');
     DB::$tables['services'][0] = ['id' => 20, 'billing_agreement_id' => null, 'subscription_id' => 'sub_legacy'];
     DB::$tables['properties'] = [['model_id' => 20, 'model_type' => \App\Models\Service::class, 'key' => 'has_stripe_subscription', 'value' => '1']];
     \Filament\Notifications\Notification::$sent = [];
-    $gateway->enabled(new Extension(['enabled' => true]));
+    $gateway->enabled(new Extension(['id' => 2, 'enabled' => true]));
     check(Gateway::$bundledEnabled, 'Legacy Stripe subscription without an agreement prevents automatic disable');
     \App\Models\User::$staff = true;
     \Filament\Notifications\Notification::$sent = [];
@@ -76,7 +55,7 @@ use Illuminate\Support\Facades\{DB, Http};
     DB::$tables['billing_agreements'] = DB::$tables['services'] = DB::$tables['properties'] = [];
     Gateway::$bundledEnabled = true;
     \Filament\Notifications\Notification::$sent = [];
-    $gateway->updated(new Extension(['enabled' => true, 'changed' => true]));
+    $gateway->updated(new Extension(['id' => 2, 'enabled' => true, 'changed' => true]));
     check(!Gateway::$bundledEnabled, 'Gateway admin updated hook handles an enabled transition');
     \App\Models\User::$gatewayUpdate = true;
     Gateway::$bundledEnabled = true;
@@ -122,10 +101,11 @@ use Illuminate\Support\Facades\{DB, Http};
     check($warning() !== '', 'Reenabled core Stripe restores the warning without enabling AeStripe again');
     DB::$tables['billing_agreements'] = [];
     \Filament\Notifications\Notification::$sent = [];
-    $gateway->updated(new Extension(['enabled' => true, 'changed' => false]));
+    $gateway->updated(new Extension(['id' => 2, 'enabled' => true, 'changed' => false]));
     check(Gateway::$bundledEnabled, 'An ordinary settings save does not silently disable reenabled core');
     check(\Filament\Notifications\Notification::$sent === [], 'An ordinary settings save sends no core disable notice');
-    check(count(Http::$calls) === $calls, 'All lifecycle guards and admin notices make no Stripe requests');
+    check(!array_filter(array_slice(Http::$calls, $calls), fn ($call) => $call[0] !== 'get'), 'Lifecycle checks reuse the existing endpoint without Stripe writes');
+    Http::$handler = $handler;
     \App\Models\User::$gatewayUpdate = \App\Models\User::$staff = false;
     DB::$tables = $tables; Gateway::$enabled = $enabled; Gateway::$bundledEnabled = $bundled;
 })();

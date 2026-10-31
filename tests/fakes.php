@@ -13,6 +13,19 @@ namespace Illuminate\Console {
 }
 namespace { if (!class_exists('PDOException')) { class PDOException extends \RuntimeException {} } }
 namespace App\Exceptions { class DisplayException extends \Exception {} }
+namespace Livewire {
+    class Livewire {
+        public static $component;
+        public static function current() { return self::$component; }
+    }
+}
+namespace App\Admin\Resources\GatewayResource\Pages {
+    class EditGateway {
+        public array $data = [];
+        public function __construct(private $record) {}
+        public function getRecord() { return $this->record; }
+    }
+}
 namespace Illuminate\Database { class UniqueConstraintViolationException extends \RuntimeException {} class QueryException extends \RuntimeException {} }
 namespace Illuminate\Http\Client {
     class ConnectionException extends \RuntimeException {}
@@ -32,6 +45,7 @@ namespace Illuminate\Http\Client {
         }
     }
 }
+namespace App\Events\Invoice { class Updated { public function __construct(public $invoice) {} } }
 namespace App\Events\Service { class Updated { public function __construct(public $service) {} } }
 namespace App\Events\ServiceCancellation { class Created { public function __construct(public $cancellation) {} } }
 namespace App\Attributes { #[\Attribute] class ExtensionMeta { public function __construct(...$args) {} } }
@@ -51,21 +65,34 @@ namespace App\Models {
         public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $hook(); } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
     }
     class Property {
+        public static ?array $lastRawOrder = null;
         public static function where(...$args) { return new class($args[2] ?? '') {
             public function __construct(private string $pattern) {}
-            public function where(...$args) { return $this; }
+            private bool $filtered = false;
+            private ?array $rawOrder = null;
+            private int $rowLimit = PHP_INT_MAX;
+            public function where(...$args) { $this->filtered = true; return $this; }
             public function orderBy($key) { return $this; }
-            public function limit($n) { return $this; }
+            public function orderByRaw($sql, $bindings = []) { $this->rawOrder = Property::$lastRawOrder = [$sql, $bindings]; return $this; }
+            public function limit($n) { $this->rowLimit = $n; return $this; }
             public function get() {
                 $result = [];
                 foreach (User::$row->props->values as $key => $value) {
                     $record = json_decode($value, true);
                     $selected = str_contains($this->pattern, 'payment_alert')
                         ? str_starts_with($key, 'ae_stripe_payment_alert_') && !($record['sent'] ?? true)
-                        : str_starts_with($key, 'ae_stripe_checkout_') && (($record['retry'] ?? false) || ($record['version'] ?? null) !== 2 || !empty($record['agreement_id']));
+                        : str_starts_with($key, 'ae_stripe_checkout_') && (!$this->filtered || ($record['retry'] ?? false) || ($record['version'] ?? null) !== 2 || !empty($record['agreement_id']));
                     if ($selected) $result[] = (object) ['key' => $key, 'value' => $value, 'model_type' => User::class, 'model_id' => User::$row->id];
                 }
-                return $result;
+                if ($this->rawOrder) {
+                    // The query regression pins this expression and its bindings to the production SQL.
+                    $bindings = $this->rawOrder[1];
+                    $matches = fn ($row, $binding) => str_contains($row->value, trim($binding, '%'));
+                    $priority = fn ($row) => $matches($row, $bindings[0]) || !$matches($row, $bindings[1])
+                        || $matches($row, $bindings[2]) && !$matches($row, $bindings[3]) ? 0 : 1;
+                    usort($result, fn ($a, $b) => $priority($a) <=> $priority($b));
+                }
+                return array_slice($result, 0, $this->rowLimit);
             }
         }; }
     }
@@ -264,7 +291,14 @@ namespace App\Models {
     class Extension {
         public function getMorphClass() { return Extension::class; }
         public function __construct(array $values = []) { foreach ($values as $k => $v) $this->$k = $v; }
-        public function settings() { return new class { public function where($k, $v) { return new Query((object) ['value' => 'whsec_test']); } }; }
+        public ?Properties $settingValues = null;
+        public function settings() {
+            if (!$this->settingValues) {
+                $this->settingValues = new Properties('');
+                $this->settingValues->values = ['stripe_secret_key' => 'rk_test_fixture', 'stripe_publishable_key' => 'pk_test_fixture', 'stripe_webhook_secret' => 'whsec_test'];
+            }
+            return $this->settingValues;
+        }
         public function wasChanged($key) { return $this->changed ?? false; }
         public function update($values) {
             foreach ($values as $k => $v) $this->$k = $v;
@@ -387,7 +421,7 @@ namespace Illuminate\Support\Facades {
         public function withoutOverlapping($minutes = 1440) { $this->overlapMinutes = $minutes; return $this; }
     }
     class View { public static function addNamespace($name, $path) {} }
-    class Event { public static $listeners = []; public static function listen($type, $callback) { self::$listeners[] = $callback; } }
+    class Event { public static $listeners = []; public static function listen($type, $callback) { self::$listeners[$type] = $callback; } }
     class Auth { public static $id = 7; public static function id() { return self::$id; } public static function user() { return self::$id ? \App\Models\User::$row : null; } }
     class DB {
         public static $tables = [], $locks = [], $updates = [];

@@ -21,8 +21,8 @@ $subscriptionService = function () {
     return $service;
 };
 $dispatchers = [
-    'Updated' => fn ($service) => Event::$listeners[0](new Updated($service)),
-    'Created' => fn ($service) => Event::$listeners[1](new Created((object) ['service' => $service])),
+    'Updated' => fn ($service) => Event::$listeners[Updated::class](new Updated($service)),
+    'Created' => fn ($service) => Event::$listeners[Created::class](new Created((object) ['service' => $service])),
 ];
 
 Gateway::$enabled = false;

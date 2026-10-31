@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+# Made-up key names in the webhook tests, not real credentials.
+[[allowlists]]
+description = "Named test fixtures"
+condition = "AND"
+paths = ['''^tests/[a-z-]+\.php$''']
+regexes = ['''^rk_test_(otheraccount|replacement)$''']
