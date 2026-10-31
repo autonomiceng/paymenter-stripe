@@ -348,7 +348,7 @@ trait ReceiptReturns
                 }]);
             if ($a['state'] === 'review' || str_contains($a['reason'] ?? '', 'instructions')) {
                 foreach (\App\Models\User::whereNotNull('role_id')->get() as $staff) Notification::create(['user_id' => $staff->id,
-                    'title' => 'Stripe payment return needs attention', 'url' => url('/admin/invoices/' . $current->id . '/edit'),
+                    'title' => 'Stripe payment return needs attention', 'url' => $this->adminInvoiceUrl($current),
                     'body' => 'Invoice ' . $current->id . ', payment ' . $id . ': ' . $a['reason']]);
             }
             $a['notified'] = $notice;

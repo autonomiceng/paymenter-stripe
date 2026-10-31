@@ -56,7 +56,7 @@ trait ChargeRecovery
                         foreach (User::whereNotNull('role_id')->get() as $staff) Notification::create([
                             'user_id' => $staff->id, 'title' => 'Stripe payment needs review',
                             'body' => 'Invoice ' . $invoice->id . ': ' . $attempt['reason'] . ' Use ae-stripe:resolve-charge.',
-                            'url' => url('/admin/invoices/' . $invoice->id . '/edit'),
+                            'url' => $this->adminInvoiceUrl($invoice),
                         ]);
                         $attempt['alert_sent'] = true;
                         $this->writePaymentAttempt($user, $invoice, $attempt);
