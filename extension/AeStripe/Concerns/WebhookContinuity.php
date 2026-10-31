@@ -88,6 +88,8 @@ trait WebhookContinuity
             $names = ['stripe_secret_key', 'stripe_publishable_key', 'stripe_webhook_secret'];
             $credentials = [];
             foreach ($names as $name) $credentials[$name] = (string) ($gateway->settings()->where('key', $name)->first()?->value ?? '');
+            $revokePrevious = (bool) $gateway->settings()->where('key', 'stripe_revoke_previous_secrets')->first()?->value;
+            $gateway->settings()->updateOrCreate(['key' => 'stripe_revoke_previous_secrets'], ['value' => false]);
             // Paymenter's edit hook runs after settings writes, with its previously loaded settings
             // still supplied to this instance. Keep that snapshot on the first upgraded save too.
             $old = $state['credentials'] ?? array_combine($names, array_map(fn ($name) => (string) parent::config($name), $names));
@@ -106,8 +108,12 @@ trait WebhookContinuity
                 if (!$account) throw new DisplayException('Stripe did not identify the account. Check the API key permissions and save again.');
                 $oldAccount = $state['account'] ?? null;
                 if (!$oldAccount && $old['stripe_secret_key'] !== '' && $old['stripe_secret_key'] !== $key) {
-                    $oldAccount = $this->continuityRequest($old['stripe_secret_key'], 'get', '/account')->id ?? null;
-                    if (!$oldAccount) throw new DisplayException('Verify the existing Stripe account before replacing its API key.');
+                    try {
+                        $oldAccount = $this->continuityRequest($old['stripe_secret_key'], 'get', '/account')->id ?? null;
+                        if (!$oldAccount) throw new DisplayException('Verify the existing Stripe account before replacing its API key.');
+                    } catch (\Illuminate\Http\Client\RequestException $e) {
+                        if ($e->response->status() !== 401) throw $e;
+                    }
                 }
                 $oldMode = $state['mode'] ?? ($old['stripe_secret_key'] !== '' ? $this->stripeKeyMode($old['stripe_secret_key']) : $mode);
                 if ($oldAccount && ($oldAccount !== $account || $oldMode !== $mode)) throw new DisplayException('Keep this gateway on its original Stripe account and mode. Use a separate gateway for another account.');
@@ -159,13 +165,14 @@ trait WebhookContinuity
                 if ($old['stripe_webhook_secret'] !== '' && $old['stripe_webhook_secret'] !== $credentials['stripe_webhook_secret']) {
                     $previous[] = ['secret' => $old['stripe_webhook_secret'], 'until' => null];
                 }
+                if ($revokePrevious) $previous = [];
                 $state = ['account' => $account, 'mode' => $mode, 'endpoint' => $endpoint->id,
                     'credentials' => $credentials, 'previous' => $previous];
                 foreach ($credentials as $name => $value) $gateway->settings()->updateOrCreate(['key' => $name], [
                     'value' => $value, 'encrypted' => $name !== 'stripe_publishable_key',
                 ]);
                 $gateway->settings()->updateOrCreate(['key' => self::WEBHOOK_STATE], ['value' => json_encode($state, JSON_THROW_ON_ERROR), 'encrypted' => true]);
-                $this->config = array_replace($this->config, $credentials, [self::WEBHOOK_STATE => json_encode($state, JSON_THROW_ON_ERROR)]);
+                $this->config = array_replace($this->config, $credentials, [self::WEBHOOK_STATE => json_encode($state, JSON_THROW_ON_ERROR), 'stripe_revoke_previous_secrets' => false]);
             } catch (\Throwable $e) {
                 // The core edit has already persisted the submitted fields. Restore verified values.
                 // Do not include Stripe exception messages: they can contain request details.

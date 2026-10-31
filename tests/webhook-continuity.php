@@ -18,11 +18,15 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         'setup_intent.succeeded', 'subscription_schedule.canceled', 'invoice.created', 'invoice.payment_succeeded', 'charge.updated', 'charge.succeeded'];
     $endpoint = (object) ['id' => 'we_existing', 'url' => route('extensions.gateways.ae-stripe.webhook'),
         'enabled_events' => $events, 'api_version' => '2025-07-30.basil'];
-    $endpoints = [$endpoint]; $failure = null; $secondPage = false; $creationCache = []; $loseCreation = false;
-    Http::$handler = function ($verb, $path, $data) use (&$endpoints, &$failure, &$secondPage, &$creationCache, &$loseCreation) {
+    $endpoints = [$endpoint]; $failure = null; $oldKeyFailure = null; $secondPage = false; $creationCache = []; $loseCreation = false;
+    Http::$handler = function ($verb, $path, $data) use (&$endpoints, &$failure, &$oldKeyFailure, &$secondPage, &$creationCache, &$loseCreation) {
         if ($failure === $verb) throw new RuntimeException('Synthetic provider detail must not be shown');
         if ($path === '/account') {
             $key = end(Http::$calls)[3]['Authorization'];
+            if ($key === 'Bearer rk_test_revoked') {
+                if ($oldKeyFailure === 'timeout') throw new \Illuminate\Http\Client\ConnectionException('Old account lookup timed out');
+                throw new \Illuminate\Http\Client\RequestException($oldKeyFailure);
+            }
             return (object) ['id' => str_contains($key, 'otheraccount') ? 'acct_other' : 'acct_original'];
         }
         if ($path === '/webhook_endpoints' && $verb === 'get') {
@@ -117,6 +121,21 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         $endpoint->url = 'https://old.example.invalid/extensions/ae-stripe/webhook';
         $gateway->updated($extension);
         check($endpoint->url === route('extensions.gateways.ae-stripe.webhook'), 'A site URL change updates the same endpoint, keeping pending deliveries and its signing secret');
+        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_emergency';
+        $gateway->updated($extension);
+        check($gateway->webhook($freshSecondRequest)['status'] === 200, 'The outgoing secret still verifies before explicit revocation');
+        $extension->settingValues->values['stripe_revoke_previous_secrets'] = true;
+        $gateway->updated($extension);
+        $at = time();
+        $emergencyRequest = new Request(body: $body, signature: 't=' . $at . ',v1=' . hash_hmac('sha256', $at . '.' . $body, 'whsec_emergency'));
+        check($gateway->webhook($freshSecondRequest)['status'] === 400 && $gateway->webhook($emergencyRequest)['status'] === 200,
+            'Explicit revocation immediately refuses the leaked outgoing secret while accepting its replacement');
+        check(json_decode($extension->settingValues->values[$stateKey], true)['previous'] === []
+            && !$extension->settingValues->values['stripe_revoke_previous_secrets'] && !$gateway->config('stripe_revoke_previous_secrets'),
+            'Revocation clears all previous secrets and resets its one-shot setting');
+        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_after_emergency';
+        $gateway->updated($extension);
+        check($gateway->webhook($emergencyRequest)['status'] === 200, 'A later ordinary rotation retains overlap because revocation does not stay enabled');
         $failure = 'get'; Gateway::$bundledEnabled = true;
         $extension->settingValues->values['stripe_secret_key'] = 'rk_test_failed';
         rejects(fn () => $gateway->enabled($extension), 'Stripe setup could not be verified. The previous credentials were kept. Check the API key permissions and save again.');
@@ -133,6 +152,21 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         $creates = array_values(array_filter(array_slice(Http::$calls, $before), fn ($call) => $call[0] === 'post'));
         check(count($creates) === 2 && !empty($creates[0][3]['Idempotency-Key']) && $creates[0][3]['Idempotency-Key'] === $creates[1][3]['Idempotency-Key'], 'Webhook creation uses a stable retry identity');
         check(!array_filter(Http::$calls, fn ($call) => $call[0] === 'delete'), 'No credential edit deletes a Stripe endpoint');
+
+        foreach ([401, 403, 'timeout'] as $oldKeyFailure) {
+            $extension->settingValues->values = array_replace($config, ['stripe_secret_key' => 'rk_test_otheraccount']);
+            $gateway = new AeStripe(array_replace($config, ['stripe_secret_key' => 'rk_test_revoked']));
+            if ($oldKeyFailure === 401) {
+                $gateway->updated($extension);
+                $state = json_decode($extension->settingValues->values[$stateKey], true);
+                check($state['account'] === 'acct_other' && $gateway->config('stripe_secret_key') === 'rk_test_otheraccount',
+                    'Without a pin, a proved old-key 401 permits recovery by pinning the checked replacement account');
+            } else {
+                rejects(fn () => $gateway->updated($extension), 'Stripe setup could not be verified. The previous credentials were kept. Check the API key permissions and save again.');
+                check($extension->settingValues->values['stripe_secret_key'] === 'rk_test_revoked' && !isset($extension->settingValues->values[$stateKey]),
+                    'An old-key failure other than 401 refuses replacement without establishing a new account pin');
+            }
+        }
     } finally {
         Http::$handler = $handler; Gateway::$rows = $rows; DB::$tables = $tables; Gateway::$bundledEnabled = $bundled;
     }

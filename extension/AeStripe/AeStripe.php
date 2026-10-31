@@ -216,6 +216,13 @@ class AeStripe extends Gateway
                 'description' => 'Created automatically when you enable the gateway.',
                 'required' => false,
             ],
+            [
+                'name' => 'stripe_revoke_previous_secrets',
+                'label' => 'Revoke previous signing secrets',
+                'type' => 'checkbox',
+                'description' => 'If a secret leaked, save its replacement and select this to stop accepting old secrets immediately. Clears after saving.',
+                'required' => false,
+            ],
         ];
     }
 
