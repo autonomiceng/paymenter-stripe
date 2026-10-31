@@ -75,7 +75,13 @@ trait RenewalRetry
         if ($invoice->status !== 'pending' || $this->paymentBalance($invoice) <= 0) return false;
         if (isset($renewal['domains'])) {
             try {
-                // Revocation after this plain read may lose to an in-flight confirm; normal refunds apply.
+                $service = Service::where('id', $renewal['domains']['service_id'])->lockForUpdate()->first();
+                if (!$service || $service->user_id != $invoice->user_id
+                    || $service->billing_agreement_id != $renewal['agreement_id']) return false;
+                $agreement = BillingAgreement::where('id', $renewal['agreement_id'])->lockForUpdate()->first();
+                if (!$agreement || $agreement->user_id != $invoice->user_id
+                    || ($agreement->gateway->extension ?? null) !== 'AeStripe') return false;
+                // Revocation during an in-flight confirm may lose that race; normal refunds apply.
                 return $this->domainsAutoPay()?->renewalAutoPayStillAllowed((int) $invoice->id, $renewal['domains']) === true;
             } catch (\Throwable) { return false; }
         }
@@ -129,12 +135,15 @@ trait RenewalRetry
             if (!empty($attempt['funds_pending']) || ($attempt['state'] ?? null) === 'reconcile') return $attempt;
             if ($renewal['state'] === 'stopped') return null;
             if ($renewal['retries'] >= self::RENEWAL_RETRIES
-                || isset($renewal['domains']) && $domains !== $renewal['domains']
-                || !$this->renewalStillAuthorized($current, $renewal)) {
+                || (isset($renewal['domains']) ? $renewal['domains']['cutoff'] <= time()
+                    : !$this->renewalStillAuthorized($current, $renewal))) {
                 $attempt['renewal']['state'] = 'stopped';
                 $this->writePaymentAttempt($user, $current, $attempt);
                 return null;
             }
+            // Missing or revoked Domains authority defers this scan without consuming the schedule.
+            if (isset($renewal['domains']) && ($domains !== $renewal['domains']
+                || !$this->renewalStillAuthorized($current, $renewal))) return null;
             if ($renewal['next_at'] > time()) return null;
             // Never replace uncertainty, money in flight, or a newer customer's payment form.
             if (!empty($attempt['confirmation']) || !empty($attempt['agreement_id'])) return $attempt;

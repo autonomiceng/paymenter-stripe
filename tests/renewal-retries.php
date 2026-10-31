@@ -328,6 +328,46 @@ try {
                 && !empty($attempt['renewal']), 'Owner Auto-renew Off after the frozen context blocks retry confirmation and retains the attempt');
         } finally { TestDomainsAutoPay::$context = null; TestDomainsAutoPay::$ownerOn = true; }
     });
+    $run('renewal-domains-agreement-cleared', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal, $dueRetry) {
+        require_once __DIR__ . '/fixtures/domains-autopay.php';
+        $service = $renewalFixture($invoice, $stripe);
+        $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
+        TestDomainsAutoPay::$context = ['service_id' => $service->id, 'agreement_id' => 4,
+            'operation_id' => 81, 'operation_key' => 'renewal-fixture', 'generation' => 2,
+            'cutoff' => $invoice->due_at->getTimestamp()];
+        try {
+            $initialRefusal($invoice); $dueRetry();
+            $stripe->beforeCreate = function () use ($service) {
+                $service->billing_agreement_id = null; // Customer clears Auto Pay after the context was frozen.
+                DB::$modelLocks = [];
+            };
+            $gateway->retryChargeAttempts();
+            check(in_array(Service::class, DB::$modelLocks, true) && count($stripe->confirms) === 1 && !$stripe->charges,
+                'A locking current service read refuses a cleared Domains agreement before retry confirm');
+        } finally { TestDomainsAutoPay::$context = null; }
+    });
+    $run('renewal-domains-context-unavailable', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal, $dueRetry) {
+        require_once __DIR__ . '/fixtures/domains-autopay.php';
+        $service = $renewalFixture($invoice, $stripe);
+        $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
+        TestDomainsAutoPay::$context = ['service_id' => $service->id, 'agreement_id' => 4,
+            'operation_id' => 81, 'operation_key' => 'renewal-fixture', 'generation' => 2,
+            'cutoff' => $invoice->due_at->getTimestamp()];
+        try {
+            $initialRefusal($invoice); $dueRetry();
+            $waiting = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['renewal'];
+            $context = TestDomainsAutoPay::$context; TestDomainsAutoPay::$context = null;
+            $gateway->retryChargeAttempts();
+            $after = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['renewal'];
+            check($after === $waiting && $after['state'] === 'waiting' && $after['retries'] === 0 && count($stripe->confirms) === 1,
+                'A null Domains context preserves the waiting schedule and retry budget without a debit');
+            TestDomainsAutoPay::$context = $context;
+            $gateway->retryChargeAttempts();
+            $after = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['renewal'];
+            check(count($stripe->confirms) === 2 && $after['retries'] === 1,
+                'A deferred Domains retry resumes when current consent becomes readable');
+        } finally { TestDomainsAutoPay::$context = null; }
+    });
     $run('renewal-domains-boundary', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
         $renewalFixture($invoice, $stripe);
         $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
