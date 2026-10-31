@@ -219,7 +219,8 @@ class AeStripe extends Gateway
                 'label' => 'Stripe webhook signing secret',
                 'type' => 'text',
                 'encrypted' => true,
-                'description' => 'Created automatically when you enable the gateway.',
+                'description' => \App\Models\Gateway::where('extension', 'AeStripe')->first()?->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'retry'
+                    ? 'Webhook events could not be verified. Check the Stripe endpoint and API permissions, then save AE Stripe; automatic checks will retry.' : 'Created automatically when you enable the gateway.',
                 'required' => false,
             ],
             [

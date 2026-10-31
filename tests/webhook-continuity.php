@@ -16,12 +16,13 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
     Gateway::$rows = ['AeStripe' => [$extension]];
     $gateway = new AeStripe($config);
     $events = ['payment_intent.succeeded', 'payment_intent.payment_failed', 'payment_intent.processing',
-        'setup_intent.succeeded', 'subscription_schedule.canceled', 'invoice.created', 'invoice.payment_succeeded', 'charge.updated', 'charge.succeeded'];
+        'setup_intent.succeeded', 'subscription_schedule.canceled', 'invoice.created', 'invoice.payment_succeeded', 'charge.updated', 'charge.succeeded', 'customer.created'];
     $reversalEvents = ['refund.created', 'refund.updated', 'refund.failed', 'charge.dispute.created', 'charge.dispute.updated', 'charge.dispute.closed'];
     $endpoint = (object) ['id' => 'we_existing', 'url' => route('extensions.gateways.ae-stripe.webhook'),
         'enabled_events' => $events, 'api_version' => '2025-07-30.basil'];
+    $forceIncomplete = false;
     $endpoints = [$endpoint]; $failure = null; $oldKeyFailure = null; $secondPage = false; $creationCache = []; $loseCreation = false;
-    Http::$handler = function ($verb, $path, $data) use (&$endpoints, &$failure, &$oldKeyFailure, &$secondPage, &$creationCache, &$loseCreation) {
+    Http::$handler = function ($verb, $path, $data) use (&$endpoints, &$failure, &$oldKeyFailure, &$secondPage, &$creationCache, &$loseCreation, &$forceIncomplete) {
         if ($failure === $verb) throw new RuntimeException('Synthetic provider detail must not be shown');
         if ($path === '/account') {
             $key = end(Http::$calls)[3]['Authorization'];
@@ -33,7 +34,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         }
         if ($path === '/webhook_endpoints' && $verb === 'get') {
             if ($secondPage && !isset($data['starting_after'])) return (object) ['data' => [(object) ['id' => 'we_unrelated', 'url' => 'https://example.invalid/other']], 'has_more' => true];
-            return (object) ['data' => $endpoints, 'has_more' => false];
+            return (object) ['data' => $endpoints, 'has_more' => $forceIncomplete];
         }
         if ($path === '/webhook_endpoints' && $verb === 'post') {
             $key = end(Http::$calls)[3]['Idempotency-Key'];
@@ -50,6 +51,62 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         throw new RuntimeException('Unexpected continuity request');
     };
     try {
+        $gateway->upgraded();
+        $beforeSettings = $extension->settingValues->values;
+        $gateway->retryReceiptReturns();
+        $subscriptionPosts = array_values(array_filter(Http::$calls, fn ($c) => $c[0] === 'post' && $c[1] === '/webhook_endpoints/we_existing'));
+        check(count($subscriptionPosts) === 1 && array_keys($subscriptionPosts[0][2]) === ['enabled_events']
+            && !array_diff(array_merge($events, $reversalEvents), $endpoints[0]->enabled_events),
+            'An upgraded install adds missing subscriptions automatically on the five-minute sweep, with only enabled_events');
+        check(array_intersect_key($extension->settingValues->values, $beforeSettings) === $beforeSettings
+            && !isset($extension->settingValues->values['ae_stripe_webhook_continuity'])
+            && $endpoint->url === route('extensions.gateways.ae-stripe.webhook') && $endpoint->api_version === '2025-07-30.basil',
+            'Automatic subscription repair preserves credentials, URL, version and uninitialized continuity state');
+        $calls = count(Http::$calls); $gateway->retryReceiptReturns();
+        check(count(Http::$calls) === $calls, 'Successful subscription repair stops automatic provider checks');
+        $subscriptionMarker = 'ae_stripe_webhook_events_p05';
+        foreach (['missing', 'ambiguous', 'get', 'post', 'incomplete', 'account', 'mode', 'wrong-url'] as $problem) {
+            unset($extension->settingValues->values[$subscriptionMarker]);
+            $endpoint->enabled_events = $events;
+            $endpoint->url = $problem === 'wrong-url' ? 'https://example.invalid/changed' : route('extensions.gateways.ae-stripe.webhook');
+            $endpoints = $problem === 'missing' ? [] : [$endpoint];
+            if ($problem === 'ambiguous') { $other = clone $endpoint; $other->id = 'we_duplicate'; $endpoints[] = $other; }
+            $extension->settingValues->values['ae_stripe_webhook_continuity'] = json_encode([
+                'endpoint' => 'we_existing', 'account' => $problem === 'account' ? 'acct_other' : 'acct_original',
+                'mode' => $problem === 'mode' ? 'live' : 'test', 'previous' => [['secret' => 'whsec_retained', 'until' => null]],
+                'credentials' => $config,
+            ]);
+            $savedState = $extension->settingValues->values['ae_stripe_webhook_continuity'];
+            $failure = in_array($problem, ['get', 'post'], true) ? $problem : null;
+            $forceIncomplete = $problem === 'incomplete'; $calls = count(Http::$calls);
+            $gateway->retryReceiptReturns();
+            $configFields = array_column((new AeStripe)->getConfig(), null, 'name');
+            check($endpoint->enabled_events === $events
+                && $extension->settingValues->values['ae_stripe_webhook_continuity'] === $savedState
+                && str_contains($configFields['stripe_webhook_secret']['description'], 'save AE Stripe'),
+                'Unsafe subscription repair leaves the endpoint and P13 state untouched and shows a gateway action: ' . $problem);
+            check(!array_filter(array_slice(Http::$calls, $calls), fn ($c) => $c[0] !== 'get'
+                && !($problem === 'post' && $c[0] === 'post' && $c[1] === '/webhook_endpoints/we_existing' && array_keys($c[2]) === ['enabled_events'])),
+                'Automatic repair never creates, deletes or edits endpoint continuity: ' . $problem);
+        }
+        $failure = null; $forceIncomplete = false; $endpoint->url = route('extensions.gateways.ae-stripe.webhook'); $endpoints = [$endpoint];
+        $gateway->retryReceiptReturns();
+        check(!array_diff($reversalEvents, $endpoint->enabled_events)
+            && $extension->settingValues->values['ae_stripe_webhook_continuity'] === $savedState,
+            'An automatic retry succeeds without changing existing secret overlap');
+        $configFields = array_column((new AeStripe)->getConfig(), null, 'name');
+        check(!str_contains($configFields['stripe_webhook_secret']['description'], 'save AE Stripe'), 'Successful repair clears the gateway action');
+        unset($extension->settingValues->values[$subscriptionMarker]);
+        $endpoint->enabled_events = ['*']; $endpoint->url = str_replace('/extensions/ae-stripe/webhook', '/extensions/stripe-saved/webhook', $endpoint->url);
+        $calls = count(Http::$calls); $gateway->retryReceiptReturns();
+        check($extension->settingValues->values[$subscriptionMarker] === 'ready'
+            && !array_filter(array_slice(Http::$calls, $calls), fn ($c) => $c[0] !== 'get') && $endpoint->enabled_events === ['*'],
+            'Legacy endpoints with wildcard subscriptions need no provider write');
+        $endpoint->url = route('extensions.gateways.ae-stripe.webhook');
+        // Restore old subscriptions so the existing manual-save checks remain independent.
+        unset($extension->settingValues->values[$subscriptionMarker], $extension->settingValues->values['ae_stripe_webhook_continuity']);
+        $endpoint->enabled_events = $events;
+        Http::$calls = array_values(array_filter(Http::$calls, fn ($c) => $c[1] !== '/webhook_endpoints/we_existing'));
         $gateway->updated($extension);
         $subscriptionUpdates = array_values(array_filter(Http::$calls, fn ($c) => $c[0] === 'post' && $c[1] === '/webhook_endpoints/we_existing'));
         check(count($subscriptionUpdates) === 1 && !array_diff($reversalEvents, $endpoints[0]->enabled_events)

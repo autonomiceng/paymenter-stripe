@@ -142,12 +142,17 @@ these observations with its recorded credits/obligations, and route proven repai
 to staff; it must not issue another credit or guess a debit. No automatic debit,
 service deletion, or refund on a dispute is provided here.
 
-The schema upgrade cannot verify endpoint settings on its own. For existing
-installs, save the gateway once with its working credentials after upgrade. Setup adds the new event subscriptions to the existing endpoint without
-deleting it or changing its signing secret. Fresh installs subscribe at creation.
-Keep the old signing secret under the overlap rules in
-[verification](verification.md#webhook-continuity); do not recreate the endpoint
-to add events. Reconcile/resend missed refund/dispute events from before the save.
+The existing five-minute receipt-return sweep reconciles event subscriptions after
+upgrade, retrying until successful; no gateway save is needed. It merges required
+events onto one existing endpoint after checking account/mode and a complete list
+within our 100-endpoint inspection cap. It never creates/deletes endpoints or changes their URL,
+version, signing secret, credentials or retained-secret overlap. Missing, ambiguous,
+changed or unverified endpoints and refused requests remain untouched; the gateway
+page shows one line to check the endpoint/API permissions and save AE Stripe.
+Saving remains the manual setup path, including complete paginated inspection.
+Fresh installs subscribe at creation. No missed-event backfill is performed.
+Keep signing secrets under the overlap rules in
+[verification](verification.md#webhook-continuity).
 
 API references: [partial refunds](https://docs.stripe.com/api/refunds/create),
 [refund listing](https://docs.stripe.com/api/refunds/list),
