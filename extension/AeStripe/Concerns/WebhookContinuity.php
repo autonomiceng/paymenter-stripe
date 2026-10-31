@@ -28,19 +28,48 @@ trait WebhookContinuity
 
     public function config($key)
     {
-        // Runtime uses the last verified credentials, including while an admin save is being checked.
+        // Runtime uses account-checked API credentials, including while an admin save is being checked.
         if (!in_array($key, ['stripe_secret_key', 'stripe_publishable_key', 'stripe_webhook_secret'], true)) return parent::config($key);
         return $this->savedContinuityState()['credentials'][$key] ?? parent::config($key);
     }
 
     private function validWebhookSignature($payload, $header): bool
     {
-        // Refresh for long-running workers and requests that started before a rotation committed.
         $state = $this->savedContinuityState();
-        $secrets = [$state['credentials']['stripe_webhook_secret'] ?? $this->config('stripe_webhook_secret')];
-        foreach ($state['previous'] ?? [] as $entry) if ($entry['until'] > time()) $secrets[] = $entry['secret'];
-        foreach ($secrets as $secret) if ($this->isValidSignature($payload, $header, $secret)) return true;
-        return false;
+        $current = $state['credentials']['stripe_webhook_secret'] ?? parent::config('stripe_webhook_secret');
+        if (!$this->isValidSignature($payload, $header, $current)) {
+            foreach ($state['previous'] ?? [] as $entry) {
+                if (($entry['until'] === null || $entry['until'] > time()) && $this->isValidSignature($payload, $header, $entry['secret'])) return true;
+            }
+            return false;
+        }
+        if (!array_filter($state['previous'] ?? [], fn ($entry) => $entry['until'] === null)) return true;
+
+        // Serialize proof with settings saves so an in-flight old request cannot retire a newer secret.
+        return DB::transaction(function () use ($payload, $header) {
+            $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->lockForUpdate()->first();
+            $stored = $gateway?->settings()->where('key', self::WEBHOOK_STATE)->first()?->value;
+            $state = $stored ? json_decode($stored, true, flags: JSON_THROW_ON_ERROR) : $this->continuityState();
+            $current = $state['credentials']['stripe_webhook_secret'] ?? parent::config('stripe_webhook_secret');
+            if ($this->isValidSignature($payload, $header, $current)) {
+                $changed = false;
+                foreach ($state['previous'] ?? [] as $index => $entry) {
+                    if ($entry['until'] === null) {
+                        $state['previous'][$index]['until'] = time() + self::WEBHOOK_OVERLAP;
+                        $changed = true;
+                    }
+                }
+                // Saving a secret cannot prove it works. Only its first signed delivery starts overlap.
+                if ($changed && $gateway) $gateway->settings()->updateOrCreate(['key' => self::WEBHOOK_STATE], [
+                    'value' => json_encode($state, JSON_THROW_ON_ERROR), 'encrypted' => true,
+                ]);
+                return true;
+            }
+            foreach ($state['previous'] ?? [] as $entry) {
+                if (($entry['until'] === null || $entry['until'] > time()) && $this->isValidSignature($payload, $header, $entry['secret'])) return true;
+            }
+            return false;
+        });
     }
 
     private function continuityRequest(string $key, string $method, string $path, array $data = [], ?string $idempotencyKey = null)
@@ -117,9 +146,12 @@ trait WebhookContinuity
                     if (empty($endpoint->id) || empty($endpoint->secret)) throw new DisplayException('Stripe did not return the new webhook details. Save again to recover the same endpoint.');
                     $credentials['stripe_webhook_secret'] = $endpoint->secret;
                 }
-                $previous = array_values(array_filter($state['previous'] ?? [], fn ($entry) => $entry['until'] > time()));
+                $previous = array_values(array_filter($state['previous'] ?? [], fn ($entry) =>
+                    ($entry['until'] === null || $entry['until'] > time())
+                    && $entry['secret'] !== $credentials['stripe_webhook_secret']
+                    && $entry['secret'] !== $old['stripe_webhook_secret']));
                 if ($old['stripe_webhook_secret'] !== '' && $old['stripe_webhook_secret'] !== $credentials['stripe_webhook_secret']) {
-                    $previous[] = ['secret' => $old['stripe_webhook_secret'], 'until' => time() + self::WEBHOOK_OVERLAP];
+                    $previous[] = ['secret' => $old['stripe_webhook_secret'], 'until' => null];
                 }
                 $state = ['account' => $account, 'mode' => $mode, 'endpoint' => $endpoint->id,
                     'credentials' => $credentials, 'previous' => $previous];

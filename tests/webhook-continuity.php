@@ -47,24 +47,55 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         $gateway->updated($extension);
         $stateKey = 'ae_stripe_webhook_continuity';
         $state = json_decode($extension->settingValues->values[$stateKey], true);
-        check($state['account'] === 'acct_original' && $state['endpoint'] === 'we_existing', 'Existing signing secret is checked against the current Stripe account and endpoint');
+        check($state['account'] === 'acct_original' && $state['endpoint'] === 'we_existing', 'Saving pins the Stripe account and endpoint without proving the signing secret');
         $before = count(Http::$calls); $secondPage = true;
         $extension->settingValues->values['stripe_secret_key'] = 'rk_test_replacement';
         $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_rotated';
         $gateway->updated($extension);
         check($gateway->config('stripe_secret_key') === 'rk_test_replacement', 'A replacement key on the same account takes effect after verification');
         check(!array_filter(array_slice(Http::$calls, $before), fn ($call) => $call[0] !== 'get'), 'A settings edit reuses a matching endpoint found on a later page without deleting it');
-        $oldRequest = eventRequest((object) ['id' => 'evt_paid_inflight'], type: 'unhandled.event');
+        $oldRequest = eventRequest((object) ['id' => 'pi_paid_inflight', 'metadata' => (object) ['ae_stripe_gateway' => '1']], type: 'payment_intent.succeeded');
         check($gateway->webhook($oldRequest)['status'] === 200, 'A delivery signed before rotation remains verifiable');
+        $pending = json_decode($extension->settingValues->values[$stateKey], true);
+        check($pending['previous'][0]['until'] === null, 'The outgoing secret has no expiry until a delivery proves the replacement');
         $freshGateway = new AeStripe($config); // A request that started before the edit.
         $body = $oldRequest->body; $at = time();
         $newRequest = new Request(body: $body, signature: 't=' . $at . ',v1=' . hash_hmac('sha256', $at . '.' . $body, 'whsec_rotated'));
         check($freshGateway->webhook($newRequest)['status'] === 200 && $freshGateway->config('stripe_secret_key') === 'rk_test_replacement', 'A request started before rotation refreshes the saved signing secrets');
         $state = json_decode($extension->settingValues->values[$stateKey], true); $deadline = $state['previous'][0]['until'];
+        check($deadline >= time() + 72 * 3600 - 5 && $deadline <= time() + 72 * 3600,
+            'The first delivery proving the replacement starts the outgoing secret\'s 72-hour clock');
+        $gateway->webhook($newRequest);
         $gateway->updated($extension);
-        check(json_decode($extension->settingValues->values[$stateKey], true)['previous'][0]['until'] === $deadline, 'An ordinary edit does not extend the old secret deadline');
+        check(json_decode($extension->settingValues->values[$stateKey], true)['previous'][0]['until'] === $deadline, 'Later deliveries and ordinary edits do not extend the old secret deadline');
         $state['previous'][0]['until'] = time() - 1; $extension->settingValues->values[$stateKey] = json_encode($state);
         check($gateway->webhook($oldRequest)['status'] === 400 && $gateway->webhook($newRequest)['status'] === 200, 'Expired old secrets stop authenticating while the current secret keeps working');
+        // A mistyped nonempty secret must never time out the secret Stripe actually uses.
+        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_typo';
+        $gateway->updated($extension);
+        $pending = json_decode($extension->settingValues->values[$stateKey], true);
+        check($pending['previous'][0]['secret'] === 'whsec_rotated' && $pending['previous'][0]['until'] === null
+            && $gateway->webhook($newRequest)['status'] === 200, 'A wrong saved secret keeps genuine deliveries accepted without an expiry');
+        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_rotated';
+        $gateway->updated($extension); $gateway->webhook($newRequest);
+
+        // Admin A opens the form, admin B rolls and saves C, then A saves its stale B field.
+        $staleAdmin = new AeStripe($extension->settingValues->values);
+        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_second_rotation';
+        $gateway->updated($extension);
+        $secondRequest = new Request(body: $body, signature: 't=' . $at . ',v1=' . hash_hmac('sha256', $at . '.' . $body, 'whsec_second_rotation'));
+        check($gateway->webhook($secondRequest)['status'] === 200, 'The first admin save accepts a delivery proving the real rotation');
+        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_rotated';
+        $staleAdmin->updated($extension);
+        $stale = json_decode($extension->settingValues->values[$stateKey], true);
+        $working = array_values(array_filter($stale['previous'], fn ($entry) => $entry['secret'] === 'whsec_second_rotation'));
+        check(count($working) === 1 && $working[0]['until'] === null
+            && $gateway->webhook($secondRequest)['status'] === 200, 'A stale second-admin save keeps the secret Stripe really uses accepted without an expiry');
+        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_second_rotation';
+        $gateway->updated($extension); $gateway->webhook($secondRequest);
+        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_rotated';
+        $gateway->updated($extension); $gateway->webhook($newRequest);
+
         foreach (['rk_test_otheraccount', 'rk_live_original'] as $invalidKey) {
             $extension->settingValues->values['stripe_secret_key'] = $invalidKey;
             try { $gateway->updated($extension); throw new RuntimeException('Expected refusal'); }

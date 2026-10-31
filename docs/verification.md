@@ -296,7 +296,11 @@ $applied = DB::transaction(function () use ($invoice, $gateway) {
 integration call, not a customer route. Landing owns integrating it into Apply credit.
 Domains needs no Stripe dependency: normal Eloquent invoice status updates dispatch
 Paymenter 1.5.9's `App\Events\Invoice\Updated`, and the gateway retires forms after
-commit. Bulk SQL updates do not dispatch that event. The five-minute recovery job
+commit. Invoice closure is not gated on Stripe access: an outage can leave an old
+3DS tab able to complete before cancellation recovery. A late success must leave the
+invoice closed and reach the late-money handler. The integrated receipt-return
+ledger must return those funds automatically once, without activating the order.
+Bulk SQL updates do not dispatch that event. The five-minute recovery job
 also scans checkout-only attempts, including `retry=false`, and retries cancellation
 when Stripe returns. Partial-credit changes retire checkout forms too. Call before
 credit rather than relying on that later sweep to protect an already open tab.
@@ -311,15 +315,17 @@ permissions plus endpoint-write when creating or updating setup. Use the account
 matching publishable key; Stripe's account read does not prove a publishable key's
 account identity.
 
-The gateway stores its verified account, endpoint, credentials and previous signing
+The gateway stores its checked account, endpoint, API credentials and saved signing
 secrets in one native encrypted setting, omitted from the configuration form. A
-failed edit restores the previous verified credentials. Runtime requests refresh
+failed account/endpoint check restores the previous accepted credentials. Runtime requests refresh
 that setting so an in-flight handler can use a replacement API key. Keep API keys
 valid until their in-flight HTTP requests finish.
 
 Roll a signing secret in Stripe, then save the replacement on the gateway. The old
-secret remains accepted for **72 hours from that save**; ordinary saves do not extend
-its deadline. Signature timestamps retain the five-minute replay check. This covers
+secret stays accepted **without expiry until a delivery validates with the saved
+replacement**. That delivery starts its **72-hour overlap**; later saves and deliveries
+do not extend the deadline. A typo or stale admin form therefore cannot time out the
+secret Stripe is still using. Signature timestamps retain the five-minute replay check. This covers
 Stripe's [three-day automatic delivery retry window](https://docs.stripe.com/webhooks#automatic-retries).
 Do not log, copy into reports, or screenshot signing secrets or API keys.
 

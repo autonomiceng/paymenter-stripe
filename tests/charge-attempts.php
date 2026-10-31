@@ -131,6 +131,27 @@ use Illuminate\Support\Facades\{DB, Http};
             $stripe->failure = null; Gateway::$enabled = false; $gateway->retryChargeAttempts();
             check($stripe->intents['pi_test1']->status === 'canceled' && !$stripe->charges, 'Recovery cancels the old form when Stripe access returns even with collection paused');
         });
+        $run('retire-3ds-outage-late-money', function ($invoice, $stripe) use ($gateway) {
+            $gateway->boot(); $gateway->pay($invoice, 20);
+            $intent = $stripe->intents['pi_test1']; $intent->status = 'requires_action';
+            $stripe->failure = fn ($verb, $path) => str_ends_with($path, '/cancel') ? throw new ConnectionException('Cancellation transport unavailable') : null;
+            DB::transaction(function () use ($invoice) {
+                $invoice->status = 'cancelled';
+                \Illuminate\Support\Facades\Event::$listeners[\App\Events\Invoice\Updated::class](new \App\Events\Invoice\Updated($invoice));
+            });
+            check($invoice->status === 'cancelled' && $intent->status === 'requires_action', 'Closure commits during a cancellation outage while an old 3DS tab remains open');
+            // Stripe.js can finish authentication directly, without another local confirmation call.
+            $intent->status = 'succeeded'; $intent->amount_received = $intent->amount;
+            $applications = ExtensionHelper::$applications;
+            $gateway->webhook(eventRequest($intent)); $gateway->webhook(eventRequest($intent));
+            $gateway->retryChargeAttempts();
+            $reviews = array_values(array_filter(Audit::$rows, fn ($row) => $row['event'] === 'ae_stripe_payment_review'
+                && $row['new_values']['payment_intent_id'] === $intent->id));
+            check($invoice->status === 'cancelled' && !ExtensionHelper::$payments && ExtensionHelper::$applications === $applications,
+                'Late 3DS success does not fund or reopen the closed invoice, so the native paid/activation path is not called');
+            check(count($reviews) === 1 && $reviews[0]['new_values']['reason'] === 'invoice not pending',
+                'Repeated late success and recovery enter the existing late-money review path once; automatic return needs the integrated ledger');
+        });
         $run('retire-overlap', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20); $intent = $stripe->intents['pi_test1'];
             $stripe->failure = function ($verb, $path) use ($intent) {
