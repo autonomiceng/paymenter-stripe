@@ -11,7 +11,7 @@ use Illuminate\Support\Facades\Route;
 trait WebhookContinuity
 {
     private const WEBHOOK_STATE = 'ae_stripe_webhook_continuity';
-    private const WEBHOOK_EVENTS = 'ae_stripe_webhook_events_p05';
+    private const WEBHOOK_EVENTS = 'ae_stripe_webhook_events';
     private const WEBHOOK_OVERLAP = 72 * 3600;
 
     private function webhookEvents(array $existing = []): array

@@ -98,3 +98,14 @@ $s->refunds['foreign'] = clone $foreign; $s->refunds['foreign']->status = 'succe
 rejects(fn () => $gateway->webhook($request), 'HTTP 409');
 $deliver($s); $gateway->webhook($request);
 check(count($gateway->receiptReversals($i, 'pi_return')) === 1, 'An event delivered before local settlement retries against the eventual native receipt');
+
+[$i, $s] = $setup(); $deliver($s); // Existing receipt retains cus_owner.
+$i->user->properties()->updateOrCreate(['key' => 'stripe_id'], ['value' => 'cus_replacement']);
+$s->dispute = (object) ['id' => 'dp_return', 'charge' => 'ch_return', 'payment_intent' => 'pi_return',
+    'currency' => 'usd', 'amount' => 2000, 'status' => 'needs_response'];
+$oldReceiptEvent = eventRequest($s->dispute, type: 'charge.dispute.created');
+$gateway->webhook($oldReceiptEvent);
+check($gateway->receiptReversals($i, 'pi_return')[0]['customer'] === 'cus_owner',
+    'Replacing the account Stripe customer cannot discard a dispute on its older receipt');
+$s->intent->customer = 'cus_replacement';
+rejects(fn () => $gateway->webhook($oldReceiptEvent), 'HTTP 409');

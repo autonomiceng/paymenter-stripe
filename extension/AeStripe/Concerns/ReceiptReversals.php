@@ -80,7 +80,7 @@ trait ReceiptReversals
             if ($payment) abort_unless($payment->invoice->id === $current->id && ($payment->gateway->extension ?? null) === 'AeStripe', 409);
             $intent = $this->request('get', '/payment_intents/' . $paymentId);
             abort_unless(($intent->id ?? null) === $paymentId && ($intent->status ?? null) === 'succeeded'
-                && !empty($intent->customer) && ($intent->customer ?? null) === $user->properties()->where('key', 'stripe_id')->first()?->value
+                && !empty($intent->customer) && ($intent->customer ?? null) === ($receipt ? $receipt['customer'] : $user->properties()->where('key', 'stripe_id')->first()?->value)
                 && strtolower($intent->currency ?? '') === strtolower($current->currency_code)
                 && is_int($intent->amount_received ?? null) && $intent->amount_received > 0, 409);
             if (!$receipt) $receipt = $this->recordReceipt($current, $intent, 0);

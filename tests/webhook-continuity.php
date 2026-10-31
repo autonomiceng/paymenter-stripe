@@ -64,7 +64,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
             'Automatic subscription repair preserves credentials, URL, version and uninitialized continuity state');
         $calls = count(Http::$calls); $gateway->retryReceiptReturns();
         check(count(Http::$calls) === $calls, 'Successful subscription repair stops automatic provider checks');
-        $subscriptionMarker = 'ae_stripe_webhook_events_p05';
+        $subscriptionMarker = 'ae_stripe_webhook_events';
         foreach (['missing', 'ambiguous', 'get', 'post', 'incomplete', 'account', 'mode', 'wrong-url'] as $problem) {
             unset($extension->settingValues->values[$subscriptionMarker]);
             $endpoint->enabled_events = $events;

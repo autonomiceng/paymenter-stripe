@@ -136,7 +136,7 @@ trait ReceiptReturns
     public function retryReceiptReturns(): void
     {
         if (!$this->gatewayEnabled()) return;
-        $this->reconcileWebhookSubscriptions();
+        try { $this->reconcileWebhookSubscriptions(); } catch (\Throwable $e) { report($e); }
         $this->ensureReceiptReturnSchema();
         $this->receiptStripeUnavailable = false;
         foreach ($this->receiptRows()->whereIn('state', ['reserved', 'pending', 'review', 'refunded', 'credited'])
