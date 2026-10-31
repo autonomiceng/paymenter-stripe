@@ -31,6 +31,27 @@ $initialRefusal = function ($invoice) use ($gateway) {
 };
 $savedService = Service::$row;
 try {
+    foreach (['2026-10-31', '2026-10-30'] as $date) {
+        foreach (['succeeded', 'requires_payment_method'] as $status) {
+            $run('renewal-overdue-once-' . $date . '-' . $status, function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $date, $status) {
+                $service = $renewalFixture($invoice, $stripe);
+                $service->expires_at = $invoice->due_at = new DateTimeImmutable($date);
+                $stripe->status = $status;
+                if ($status === 'succeeded') $stripe->beforeConfirm = null;
+                $cron = require __DIR__ . '/fixtures/native-cron-charge.php';
+                \App\Helpers\NotificationHelper::$failures = 0;
+                DB::transaction(fn () => $cron->run($invoice, (object) ['billingAgreement' => new BillingAgreement]));
+                check(count($stripe->confirms) === 1 && count($stripe->charges) === ($status === 'succeeded' ? 1 : 0),
+                    'A renewal due today or earlier gets its one native debit attempt: ' . $date . '/' . $status);
+                if ($status === 'requires_payment_method') $dueRetry();
+                $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+                check(count($stripe->confirms) === 1, 'An overdue renewal never starts an automatic retry');
+                check(count(Notification::$rows) === ($status === 'succeeded' ? 0 : 1)
+                    && \App\Helpers\NotificationHelper::$failures === 0,
+                    'An overdue refusal gets exactly one linked notice through the native cron catch');
+            });
+        }
+    }
     foreach (['opted-out', 'authorized', 'missing-context'] as $mode) {
         $run('renewal-expired-create-' . $mode, function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal, $mode) {
             $service = $renewalFixture($invoice, $stripe); $initialRefusal($invoice); $dueRetry();

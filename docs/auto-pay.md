@@ -80,7 +80,10 @@ problems clear within a seven-day renewal window; it is fixed, with no staff set
 Only temporary card refusals are retried; hard declines, expired cards and explicit
 no-retry advice stop collection. The customer gets a refusal notice with an invoice
 payment link and retry guidance.
-No old failed invoice is enrolled retrospectively.
+No old failed invoice is enrolled retrospectively. A newly issued renewal already due
+today or earlier gets one debit at that billing run and no retries. All other authorization
+checks still apply; a missing due date fails closed. Renewals first charged before their
+due date retain their original cutoff, including after an interrupted attempt.
 
 Before reserving and confirming each retry, current locked reads check the unpaid
 balance, invoice items, service ownership, active recurring service, unchanged

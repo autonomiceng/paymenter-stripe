@@ -15,11 +15,13 @@ trait RenewalRetry
     private function nativeRenewal($invoice, int $agreementId): ?array
     {
         $cutoff = $invoice->due_at?->format('Y-m-d');
-        if (!$cutoff || $cutoff <= now()->format('Y-m-d')) return null;
+        if (!$cutoff) return null;
+        $overdue = $cutoff <= now()->format('Y-m-d');
         $ids = $this->nativeRenewalServices($invoice);
         if (!$ids) return null;
         $renewal = ['services' => $ids, 'agreement_id' => $agreementId,
-            'cutoff' => $cutoff, 'retries' => 0, 'state' => 'active'];
+            'cutoff' => $cutoff, 'retries' => $overdue ? self::RENEWAL_RETRIES : 0, 'state' => 'active'];
+        if ($overdue) $renewal['overdue_once'] = true; // Native cron still owns one first debit after a missed billing run.
         return $this->renewalStillAuthorized($invoice, $renewal) ? $renewal : null;
     }
 
@@ -38,7 +40,7 @@ trait RenewalRetry
     private function renewalStillAuthorized($invoice, array $renewal): bool
     {
         if ($invoice->status !== 'pending' || $this->paymentBalance($invoice) <= 0
-            || $renewal['cutoff'] <= now()->format('Y-m-d')
+            || (empty($renewal['overdue_once']) && $renewal['cutoff'] <= now()->format('Y-m-d'))
             || $invoice->due_at?->format('Y-m-d') !== $renewal['cutoff']) return false;
         if ($this->nativeRenewalServices($invoice) !== $renewal['services']) return false;
         foreach ($renewal['services'] as $id) {
