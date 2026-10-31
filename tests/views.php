@@ -62,8 +62,8 @@ foreach (['pay', 'billing-agreement'] as $name) {
     check($handlerPosition !== false && $mountPosition !== false && $handlerPosition < $mountPosition, "$name: submit handler is installed before mounting");
 }
 $setupView = file_get_contents($views . 'billing-agreement.blade.php');
-check(str_contains($setupView, 'id="setup-consent" required disabled') && str_contains($setupView, 'I agree to save this payment method and allow charges to it for my future invoices, including renewals, when I am not present.')
-    && str_contains($setupView, 'Saving does not turn on Auto Pay; you can choose it for a service later.'), 'Setup has an explicit future off-session opt-in');
+check(str_contains($setupView, 'id="setup-consent" required disabled') && str_contains($setupView, 'I agree to save this payment method for future charges, including renewals.')
+    && str_contains($setupView, 'Auto Pay can charge when you are away. Saving does not turn on Auto Pay.'), 'Setup has an explicit future off-session opt-in');
 check(str_contains($setupView, "document.querySelector('script[src^=\"https://js.stripe.com/v3\"]')"), 'Setup reuses an existing Stripe.js script');
 check(str_contains($setupView, 'if (window.Stripe) {')
     && str_contains($setupView, 'stripeScript = null;')

@@ -12,14 +12,16 @@ python3 tools/build_release.py --output dist/AeStripe.zip
 Upgrade through the native admin upload over an installed copy; root PHP files must declare only classes for Paymenter 1.5.9 `getExtensionType()`.
 
 Account setup displays an unchecked opt-in: “I agree to save this payment method
-and allow charges to it for my future invoices, including renewals, when I am not
-present.” It also states: “Saving does not turn on Auto Pay; you can choose it for
-a service later.” Before confirmation, the
-authenticated CSRF-protected setup-consent endpoint checks the SetupIntent's user,
-customer, purpose and unfinished status, then records `off_session_v1`, authenticated
-user ID and server acceptance time in Stripe metadata. Webhook and redirect both
-require that record and matching customer before persisting an agreement. Existing
-agreements are unchanged; unconsented in-flight setups must restart with the opt-in.
+for future charges, including renewals.” The configured Terms link stays beside it.
+It explains that Auto Pay can charge when the customer is away and saving does
+not enable it. The authenticated CSRF-protected setup-consent endpoint checks the
+SetupIntent's user, customer, purpose and unfinished status, then records
+`off_session_v2`, authenticated user ID and server acceptance time in Stripe metadata.
+Legacy forms without a version retain `off_session_v1`; a v1 authentication resume
+keeps its original metadata. Both versions save only a payment method. Neither can
+enroll services through a webhook or redirect. Existing agreements stay unchanged.
+The separate account default requires fresh `auto_pay_new_services_v2` consent;
+see [Auto Pay integration](auto-pay.md) for the theme calls and dates.
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.
 Browser-check both pay and setup views inside the theme's teleported modal (default theme `x-teleport="body"`).
@@ -79,7 +81,9 @@ plus manual payment-method creation. BLIK and ACSS are excluded because this int
 Ilya checked creation in Stripe test mode on 2026-10-30 at 12:00 PM PT (2025-07-30.basil): manual confirmation alone returned 200; adding automatic_payment_methods returned 400.
 The live pass on 2026-10-30 then proved Elements tokens are rejected on manual intents.
 Elements now uses the documented automatic flow; its real Stripe acceptance must be checked again.
-Klarna, Cash App, Link and bank methods remain available under the same exclusions.
+Klarna, Cash App and bank methods remain available under the same exclusions.
+New Payment Elements also set `wallets.link: never`, removing the separate Link
+sign-up/save prompt. Existing agreements are not removed.
 Submission sends a ConfirmationToken to the authenticated,
 CSRF-protected confirm endpoint. Under user then invoice locks, the server retrieves
 the intent, rechecks the balance, customer and active saved agreement, updates the amount,
@@ -174,7 +178,9 @@ compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
   Check the bank/3DS error page and its invoice link. Check clearing method-specific future usage with `''` and preserving consent after authentication.
 - Run concurrent success deliveries/setup redirects against the real database;
   assert one agreement/transaction, preserved success after late failed/processing
-  events, no automatic service assignment, and unchanged Auto Pay.
+  events, no automatic service assignment from saving a method, and unchanged existing Auto Pay.
+- With fresh account-default consent, create a recurring service and verify it inherits
+  the chosen card. Turning the default off must leave existing services unchanged.
 - Reject bad/stale signatures; disable the fork and confirm 503/no effects.
   Rehearse migration and legacy subscription billing/cancellation end to end.
 
@@ -305,6 +311,11 @@ to verify migration, upgrade, unique key, foreign key and rollback on SQLite. Ru
 for independent allocation rows beyond the old aggregate TEXT limit, due-work
 indexing, native closed-invoice event suppression and cash/credit classification.
 These tests use disposable in-memory SQLite, never the installed application database.
+
+Run `PAYMENTER_TEST_APP=/path/to/pristine-release php tests/native-auto-pay-consent.php`
+to verify that the minimal `{"enabled":false}` request clears the account default
+with the gateway enabled or paused. This exercises the real Laravel request validator
+and native property deletion; the ordinary offline Request fake skips validation.
 
 Optional transaction-method charge retrieval runs before settlement locks. Subscription PaymentIntent reads expand `latest_charge` before acquiring those locks. The locked handler rechecks customer, currency, invoice state and settled-payment replay before storing the label.
 

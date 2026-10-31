@@ -32,3 +32,7 @@ Route::post('/extensions/ae-stripe/confirm', [AeStripe::class, 'confirmPayment']
 Route::get('/extensions/ae-stripe/payment-return', [AeStripe::class, 'finishPayment'])
     ->middleware(['web', 'auth'])
     ->name('extensions.gateways.ae-stripe.payment-return');
+
+Route::post('/extensions/ae-stripe/auto-pay-default', [AeStripe::class, 'saveAutoPayDefault'])
+    ->middleware(['web', 'auth'])
+    ->name('extensions.gateways.ae-stripe.auto-pay-default');

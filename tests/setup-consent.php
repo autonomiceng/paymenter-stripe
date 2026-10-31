@@ -50,6 +50,13 @@ foreach (['ae_stripe_setup_consent' => 'unknown', 'ae_stripe_setup_consent_at' =
     rejects(fn () => $gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true])), 'HTTP 409');
     $agreementIntent->metadata->$key = $saved;
 }
+// A new form accepts v2; a v1 authentication resume never rewrites the old terms.
+check($gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true, 'version' => 'off_session_v2']))['data']['ok'] === true
+    && $agreementIntent->metadata == $recordedMetadata, 'Legacy authentication resumes without acquiring new consent scope');
+$agreementIntent->status = 'requires_payment_method';
+rejects(fn () => $gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true, 'version' => 'unknown'])), 'HTTP 422');
+$gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true, 'version' => 'off_session_v2']));
+check($agreementIntent->metadata->ae_stripe_setup_consent === 'off_session_v2', 'New setup forms record v2 authenticated saved-method consent');
 $agreementIntent->status = 'succeeded';
 $gateway->webhook(eventRequest($agreementIntent, type: 'setup_intent.succeeded'));
 $gateway->setupAgreement(new Request(['setup_intent' => 'seti_consent']));

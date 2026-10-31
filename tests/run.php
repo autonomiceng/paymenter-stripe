@@ -84,6 +84,12 @@ if (in_array('--gateway-lifecycle', $argv, true)) {
     echo "PASS: $count gateway lifecycle assertions\n";
     return;
 }
+if (in_array('--auto-pay-consent', $argv, true)) {
+    require __DIR__ . '/auto-pay-consent.php';
+    echo "PASS: $count Auto Pay consent assertions\n";
+    return;
+}
+
 if (in_array('--setup-intents', $argv, true)) {
     require __DIR__ . '/setup-intents.php';
     echo "PASS: $count setup intent assertions\n";
@@ -92,10 +98,10 @@ if (in_array('--setup-intents', $argv, true)) {
 
 \Illuminate\Console\Application::$callbacks = [];
 $gateway->boot();
-check(count(Event::$listeners) === 1, 'Invoice cancellation listens even while bundled Stripe owns subscriptions');
+check(count(Event::$listeners) === 2, 'Invoice cancellation and new-service defaults listen even while bundled Stripe owns subscriptions');
 check(Route::$routes === ['/extensions/ae-stripe/webhook', '/extensions/stripe-saved/webhook',
     '/extensions/ae-stripe/setup-agreement', '/extensions/stripe-saved/setup-agreement',
-    '/extensions/ae-stripe/consent', '/extensions/ae-stripe/setup-consent', '/extensions/ae-stripe/disable-core', '/extensions/ae-stripe/confirm', '/extensions/ae-stripe/payment-return'], 'Distinct routes are still registered');
+    '/extensions/ae-stripe/consent', '/extensions/ae-stripe/setup-consent', '/extensions/ae-stripe/disable-core', '/extensions/ae-stripe/confirm', '/extensions/ae-stripe/payment-return', '/extensions/ae-stripe/auto-pay-default'], 'Distinct routes are still registered');
 $legacyWebhook = Route::$definitions['/extensions/stripe-saved/webhook'];
 check($legacyWebhook === Route::$definitions['/extensions/ae-stripe/webhook'], 'Legacy webhook shares the POST handler and CSRF exemption');
 [$handlerClass, $handlerMethod] = $legacyWebhook['action'];
@@ -107,7 +113,7 @@ check(Route::$definitions['/extensions/stripe-saved/setup-agreement'] === Route:
 Gateway::$bundled = false;
 $gateway->boot();
 check(count(\Illuminate\Console\Application::$callbacks) === 2, 'Commands registered once per extension boot including bundled-present path');
-check(count(Event::$listeners) === 3, 'Standalone fork registers legacy subscription callbacks');
+check(count(Event::$listeners) === 4, 'Standalone fork registers legacy subscription callbacks');
 Gateway::$bundled = true;
 
 $view = $gateway->pay($invoice, 20);
@@ -253,6 +259,7 @@ require __DIR__ . '/handlers.php';
 require __DIR__ . '/retries.php';
 require __DIR__ . '/subscription-attempts.php';
 require __DIR__ . '/setup-consent.php';
+require __DIR__ . '/auto-pay-consent.php';
 require __DIR__ . '/setup-intents.php';
 require __DIR__ . '/ownership.php';
 require __DIR__ . '/checkout-owner.php';

@@ -56,6 +56,7 @@ require_once __DIR__ . '/Concerns/ChargeRecovery.php';
 require_once __DIR__ . '/Concerns/InvoicePayments.php';
 require_once __DIR__ . '/Concerns/WebhookContinuity.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
+require_once __DIR__ . '/Concerns/AutoPay.php';
 require_once __DIR__ . '/Concerns/SetupIntent.php';
 require_once __DIR__ . '/Concerns/Webhooks.php';
 require_once __DIR__ . '/Concerns/PaymentFees.php';
@@ -70,7 +71,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -105,6 +106,7 @@ class AeStripe extends Gateway
                 catch (\Throwable $e) { \Illuminate\Support\Facades\Log::warning('AeStripe invoice cancellation will retry', ['invoice_id' => $event->invoice->id]); }
             });
         });
+        Event::listen(\App\Events\Service\Created::class, fn ($event) => $this->applyNewServiceAutoPay($event->service));
         // Core boots disabled gateways too. Let the bundled listener own legacy subscriptions.
         if (!$this->bundledInactive(requireAbsent: true)) {
             return;
@@ -592,7 +594,8 @@ class AeStripe extends Gateway
         ]);
 
         // Return the client secret to the frontend to complete the setup
-        return view('gateways.ae-stripe::billing-agreement', ['intent' => $setupIntent, 'type' => 'setup', 'stripePublishableKey' => $this->config('stripe_publishable_key')]);
+        return view('gateways.ae-stripe::billing-agreement', ['intent' => $setupIntent, 'type' => 'setup', 'stripePublishableKey' => $this->config('stripe_publishable_key'),
+            'autoPayConsentVersion' => self::AUTO_PAY_CONSENT, 'autoPayDefault' => $this->autoPayDefault($user)]);
     }
 
     public function cancelBillingAgreement(BillingAgreement $billingAgreement): bool
@@ -664,7 +667,7 @@ class AeStripe extends Gateway
         ]);
 
         if (($setupIntent->metadata->is_billing_agreement ?? null) !== '1'
-            || ($setupIntent->metadata->ae_stripe_setup_consent ?? null) !== 'off_session_v1'
+            || !in_array($setupIntent->metadata->ae_stripe_setup_consent ?? null, ['off_session_v1', 'off_session_v2'], true)
             || empty($setupIntent->metadata->ae_stripe_setup_consent_at)
             || ($setupIntent->metadata->ae_stripe_setup_consent_user ?? null) != ($setupIntent->metadata->user_id ?? null)
             || $setupIntent->status !== 'succeeded') return false;

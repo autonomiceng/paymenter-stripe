@@ -47,6 +47,7 @@ namespace Illuminate\Http\Client {
 }
 namespace App\Events\Invoice { class Updated { public function __construct(public $invoice) {} } }
 namespace App\Events\Service { class Updated { public function __construct(public $service) {} } }
+namespace App\Events\Service { class Created { public function __construct(public $service) {} } }
 namespace App\Events\ServiceCancellation { class Created { public function __construct(public $cancellation) {} } }
 namespace App\Attributes { #[\Attribute] class ExtensionMeta { public function __construct(...$args) {} } }
 namespace App\Classes\Extension {
@@ -125,7 +126,7 @@ namespace App\Models {
         public function properties() { return $this->props; }
         public function getMorphClass() { return self::class; }
         public function __get($key) { return $this->props; }
-        public static function where($key, $id) { return new Query(self::$row, User::class); }
+        public static function where($key, $id) { return new Query(self::$row && self::$row->$key == $id ? self::$row : null, User::class); }
         public static function findOrFail($id) { return self::$row; }
         public static function whereNotNull($key) { return new class { public function get() { return [(object) ['id' => 99]]; } }; }
     }
@@ -220,6 +221,10 @@ namespace App\Models {
         public $id = 41, $subscription_id = 'sub_test', $price = '19.99', $quantity = 3;
         public static $row;
         public $currency, $plan, $product, $properties;
+        public $expires_at = null, $cancellation = null, $user;
+        public array $pendingInvoices = [];
+        public function getMorphClass() { return self::class; }
+        public function invoices() { return new Query($this->pendingInvoices[0] ?? null); }
         public array $invoiceRows = [];
         public static function where($key, $value) { return new Query(self::$row && self::$row->$key === $value ? self::$row : null, Service::class); }
         public function update($values) { foreach ($values as $key => $value) $this->$key = $value; }
@@ -420,7 +425,7 @@ namespace Illuminate\Http {
         public function __construct(public array $input = [], public string $body = '', public ?string $signature = null) {}
         public function input($key) { return $this->input[$key] ?? null; }
         public function boolean($key) { return (bool) $this->input($key); }
-        public function validate($rules) {} // Laravel validation is covered by sandbox checks.
+        public function validate($rules) {} // Real rules: tests/native-auto-pay-consent.php; no validation here.
         public function getContent() { return $this->body; }
         public function header($name) { return $this->signature; }
     }
@@ -541,10 +546,11 @@ namespace {
         }
     }
     function report($error) { $GLOBALS['reportedErrors'][] = $error; }
-    function now() { return new class { public $timestamp = 1700000000; public function startOfDay() { return $this; } }; }
+    function config($key, $default = null) { return $GLOBALS['fakeConfig'][$key] ?? $default; }
+    function now() { return new class { public function format($format) { return (new \DateTimeImmutable('2026-10-31'))->format($format); } public $timestamp = 1700000000; public function startOfDay() { return $this; } }; }
     function base_path($path) { return ($GLOBALS['paymenterBase'] ?? dirname(__DIR__)) . '/' . (isset($GLOBALS['paymenterBase']) ? $path : str_replace('extensions/Gateways/', 'extension/', $path)); }
     function storage_path($path) { return $GLOBALS['adoptionStorage'] . '/' . $path; }
-    function app($class = null) { if ($class) return new $class; return new class { public function runningInConsole() { return $GLOBALS['fakeConsole'] ?? true; } public function booted($callback) { $callback(); } }; }
+    function app($class = null) { if ($class) return new $class; return new class { public function bound($class) { return class_exists($class); } public function runningInConsole() { return $GLOBALS['fakeConsole'] ?? true; } public function booted($callback) { $callback(); } }; }
     function abort($status, $message = '') { throw new \RuntimeException('HTTP ' . $status); }
     function abort_unless($condition, $status) { if (!$condition) throw new \RuntimeException('HTTP ' . $status); }
     function __($key, $values = []) { return $key; }
