@@ -17,8 +17,12 @@ use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 
+require_once __DIR__ . '/ReceiptReturns.php';
+
 trait Checkout
 {
+    use ReceiptReturns;
+
     public function pay($invoice, $total)
     {
         abort_unless($this->gatewayEnabled(), 409);
@@ -238,17 +242,19 @@ trait Checkout
         return $agreement;
     }
 
-    private function recordIntentPayment($intent, $status, bool $prepareMethod = true)
+    private function recordIntentPayment($intent, $status, bool $prepareMethod = true, ?string $subscriptionInvoiceId = null)
     {
+        $this->ensureReceiptReturnSchema();
         $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
         $userId = $invoice->user_id;
         if ($prepareMethod) $intent = $this->prepareTransactionMethod($invoice, $intent, $status);
-        DB::transaction(function () use ($intent, $status, $userId) {
+        DB::transaction(function () use ($intent, $status, $userId, $subscriptionInvoiceId) {
             $user = User::where('id', $userId)->lockForUpdate()->firstOrFail();
             $invoice = Invoice::where('id', $intent->metadata->invoice_id)->lockForUpdate()->firstOrFail();
             $this->bindWebhookAttempt($user, $invoice, $intent);
             if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->lockForUpdate()->first()) {
                 $this->schedulePaymentReviewAlert($invoice, $intent->id);
+                DB::afterCommit(fn () => $this->processReceiptReturns($invoice, $intent->id));
                 return;
             }
             if ($this->paymentManuallyAccounted($invoice, $intent->id)) return;
@@ -262,15 +268,21 @@ trait Checkout
                 if ($status === 'succeeded') $this->recordPaymentReview($invoice, $intent, 'currency mismatch');
                 return;
             }
+            if ($this->readReceipt($user, $intent->id)['closed_invoice'] ?? false) {
+                // A closed receipt remains wholly reserved even if the invoice is reopened.
+                DB::afterCommit(fn () => $this->processReceiptReturns($invoice, $intent->id));
+                return;
+            }
             if ($status === 'succeeded' && !in_array($invoice->status, ['pending', 'paid'], true)) {
                 \Illuminate\Support\Facades\Log::warning('AeStripe payment received for nonpending invoice', ['invoice_id' => $invoice->id]);
-                $this->recordPaymentReview($invoice, $intent, 'invoice not pending');
+                $this->recordReceipt($invoice, $intent, $intent->amount_received, closed: true, subscriptionInvoiceId: $subscriptionInvoiceId);
                 return;
             }
             if ($status === 'succeeded' && ($invoice->status === 'paid' || $intent->amount_received > $this->paymentBalance($invoice))) {
                 \Illuminate\Support\Facades\Log::warning('AeStripe payment received for paid invoice', ['invoice_id' => $invoice->id]);
-                $this->recordPaymentReview($invoice, $intent, 'payment exceeds the amount due');
             }
+            if ($status === 'succeeded') $this->recordReceipt($invoice, $intent,
+                max(0, $intent->amount_received - ($invoice->status === 'paid' ? 0 : max(0, $this->paymentBalance($invoice)))));
             $helper = match ($status) {
                 'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',
             };

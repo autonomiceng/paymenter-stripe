@@ -30,7 +30,7 @@ if (in_array($scenario, ['all', 'boot'], true)) {
         (new AeStripe)->boot();
         check(Schema::$checks === $schemaChecks, 'Boot never checks or migrates the fee schema');
         check(count($GLOBALS['reportedErrors'] ?? []) === $reports, 'Boot never reports fee schema failures');
-        check(count(Schedule::$callbacks) === $beforeSchedules + 4, 'Boot registers fee and charge recovery without schema access');
+        check(count(Schedule::$callbacks) === $beforeSchedules + 6, 'Boot registers fee and charge recovery without schema access');
         check(count(Application::$callbacks) === $beforeCommands + 2, 'Boot registers adoption command without schema access');
     } finally {
         Schema::$beforeCheck = null;
@@ -71,7 +71,7 @@ if (in_array($scenario, ['all', 'fee'], true)) {
                 $time = time();
                 $firstGateway->webhook(new \Illuminate\Http\Request(body: $body,
                     signature: 't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.' . $body, 'whsec_test')));
-                check(count(\Illuminate\Database\Migrations\Migrator::$ran) === 2
+                check(count(\Illuminate\Database\Migrations\Migrator::$ran) === 3
                     && (DB::$tables['ae_stripe_payment_fees']['pi_schema']['state'] ?? null) === 'completed',
                     'First charge fee path creates the table and records the fee');
             } else {

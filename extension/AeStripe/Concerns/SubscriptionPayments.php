@@ -77,6 +77,7 @@ trait SubscriptionPayments
         // Expand before settlement locks; no optional charge request belongs inside them.
         $intent = $this->request('get', '/payment_intents/' . $paymentId, ['expand' => ['latest_charge']]);
         abort_unless($intent->id === $paymentId && $intent->status === 'succeeded', 409);
+        $this->ensureReceiptReturnSchema();
         DB::transaction(function () use ($stripeInvoice, $subscriptionId, $paymentId, $intent) {
             $ownerId = Service::where('subscription_id', $subscriptionId)->first()?->user_id;
             if (!$ownerId) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
@@ -100,18 +101,13 @@ trait SubscriptionPayments
             abort_unless($invoice->user_id === $ownerId, 409);
             // Subscription metadata owns the local binding, not PaymentIntent metadata.
             $intent->metadata = (object) ['invoice_id' => $invoice->id];
-            if (!in_array($invoice->status, ['pending', 'paid'], true)) {
-                Log::warning('AeStripe subscription invoice needs reconciliation', ['service_id' => $service->id]);
-                $this->recordPaymentReview($invoice, $intent, 'invoice not pending');
-                return;
-            }
             if (strtolower($invoice->currency_code) !== strtolower($stripeInvoice->currency ?? '')) {
                 Log::warning('AeStripe subscription payment currency mismatch', ['service_id' => $service->id]);
                 $this->recordPaymentReview($invoice, $intent, 'currency mismatch');
                 return;
             }
             // Use the same locked transaction path as PaymentIntent events, so either delivery order is safe.
-            $this->recordIntentPayment($intent, 'succeeded', false);
+            $this->recordIntentPayment($intent, 'succeeded', false, $stripeInvoice->id);
         });
     }
 }

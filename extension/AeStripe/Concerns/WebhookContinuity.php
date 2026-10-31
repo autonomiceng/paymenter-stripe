@@ -138,7 +138,7 @@ trait WebhookContinuity
                     if (($page->has_more ?? false) && !$after) throw new DisplayException('Stripe returned an incomplete webhook list. Save again.');
                 } while ($page->has_more ?? false);
                 $events = ['payment_intent.succeeded', 'payment_intent.payment_failed', 'payment_intent.processing',
-                    'setup_intent.succeeded', 'subscription_schedule.canceled', 'invoice.created', 'invoice.payment_succeeded', 'charge.updated', 'charge.succeeded'];
+                    'setup_intent.succeeded', 'subscription_schedule.canceled', 'invoice.created', 'invoice.payment_succeeded', 'charge.updated', 'charge.succeeded', 'refund.failed', 'refund.updated'];
                 $params = ['url' => $url, 'enabled_events' => $events];
                 $createKey = 'ae_webhook_' . hash('sha256', $gateway->id . ':' . $account . ':' . $url);
                 $createParams = $params + ['api_version' => self::API_VERSION, 'metadata' => ['ae_stripe_create_key' => $createKey]];

@@ -53,8 +53,9 @@ unresolved attempts older than 23 hours require reconciliation, not another sche
 Subscription invoice creation binds a single pending related invoice in Stripe metadata
 before finalizing/paying, recovering the current immutable binding on retries; ambiguous creation and unbound success events require manual
 reconciliation. Success requires that exact related invoice, the same owner and matching
-currency. A bound paid invoice retains a late successful payment; other nonpending
-invoices retain a staff review record. Split payments require manual reconciliation.
+currency. A bound paid invoice retains a late successful payment; a bound closed
+invoice returns the whole receipt automatically. Unbound and mismatched receipts
+retain staff review. Split payments require manual reconciliation.
 Both delivery paths serialize settlement on the customer and use locking current
 reads to skip a successful transaction globally, so one PaymentIntent cannot settle two local invoices. A resumed
 3DS attempt shows and preserves its existing consent without changing payment preferences.
@@ -89,7 +90,7 @@ A Stripe timeout stays pending. After a saved instruction commits, statement err
 amount requires a refresh because the customer has not agreed to the new total.
 Elements 3DS uses `handleNextAction` and completes without another server confirmation.
 The first confirm rechecks the balance; if the invoice changes after authentication starts,
-the original amount can complete and any excess enters the existing payment review.
+the original amount can complete and any excess is automatically returned through the receipt ledger.
 Failed Elements authentication is canceled on the next page load, return or failure webhook,
 after retrieving the current status; a fresh attempt then permits another payment.
 Native manual authentication and bank verification still reconfirm under the server checks. Card/Link saving consent remains explicit and method-specific.
@@ -120,7 +121,7 @@ Currency and card refusals explain the reason and permit another method or a rep
 Cancellation requests have no persistent failure-cache key; replacement still needs a
 Stripe-confirmed cancellation with no received funds.
 
-No schema migration is needed. Existing known IDs are retrieved. Existing unfinished
+Charge-attempt recovery needs no schema migration. Receipt returns have their own extension migration. Existing known IDs are retrieved. Existing unfinished
 automatic intents without the new durable `elements` marker are canceled before replacement, invalidating old tabs. Unconfirmed manual checkout intents are canceled before changing to Elements; existing native authentication stays manual. Switching to native Pay cancels an unfinished Elements intent before creating a manual replacement. Concurrent callers follow the current reservation after a proven replacement. Processing
 intents remain protected until Stripe settles or fails them. Old no-ID records with
 nonconfirming parameters can replay creation safely; digest-only records do so only when
@@ -151,8 +152,8 @@ A 404 or an empty search cannot establish that a confirm never arrived. The exte
 requires a known succeeded or canceled intent and records staff evidence that its funds
 were refunded or credited; late deliveries then cannot apply those funds again. Processing
 intents cannot be released this way. Stripe cannot choose how to account for these funds,
-so staff must verify that step. No refund or credit moves automatically. Known IDs keep retrying after access to the original
-Stripe account is restored. Received funds still need the staff refund or credit choice.
+so staff must verify that legacy reconciliation step. Known IDs keep retrying after access to the original
+Stripe account is restored. New, validated excess receipts use the automatic return flow below.
 Reconcile `ae_stripe_subscription_<service-id>` separately before removing an unresolved
 schedule attempt; subscription behavior is unchanged by charge-attempt recovery.
 Fakes do not
@@ -191,14 +192,57 @@ consent metadata and `off_session` for the actual method type. Bank debits are n
 Verify both method-specific options against pinned Basil before release.
 
 A successful checkout or bound subscription charge on an already paid invoice is
-recorded as another successful transaction. The invoice stays paid; Paymenter does
-not automatically create account credit. Refused successes and extra paid-invoice
-charges retain one `ae_stripe_payment_review` invoice Audit Log entry and one staff
-inbox alert per payment. Alerts run after the settlement commits; a durable pending
-marker retries a failed alert on the next delivery without duplicating it. Check
-Stripe and choose a refund or account credit; this needs a staff decision. No money
-moves automatically. The audit identifies the intent, received amount, currency
-and reason without customer details or client secrets.
+recorded in full. Each validated excess reserves one row in the extension-owned
+`ae_stripe_receipt_returns` table, in the settlement transaction. Install/upgrade
+creates the table; native profile properties contain no receipt history. After
+commit, AE Stripe returns the excess to the original method. The five-minute
+`ae-stripe:receipt-returns` task selects up to 100 indexed due allocations, including
+completed returns whose current notice has not been delivered, and stops on a
+connection or authentication failure. Refund read/write access is required.
+
+Each immutable allocation has a payment/allocation/amount-bound idempotency key.
+Recovery verifies customer, currency, dispute status and complete refund history
+before sending. A first-send marker commits before HTTP. Matching refund metadata
+recovers a lost response; unknown sends are not replayed after our 23-hour boundary
+because Stripe may expire keys after 24 hours. Pending refunds remain reserved.
+Only a proved failed/canceled refund on an undisputed receipt becomes account
+credit. `refund.failed`/`refund.updated` also recover a failure after a succeeded
+notice, keeping the same native adjustment identity. Saving gateway settings adds
+these subscriptions to an existing endpoint in place; verify this on upgrade.
+
+Ordinary receipts retain their full positive native transaction. Completion adds
+one keyed negative transaction, marked as a credit transaction only for credit
+fallback. Credit, adjustment and completion commit atomically. Audit entries and
+customer notices show progress, completion or a problem; notification retries
+compare against the current state/reason, so a prior pending notice cannot hide a
+missing completion notice. Exercise both pending-to-refunded and pending-to-credit
+with notice insertion interrupted after settlement, then recover by the sweep alone.
+
+A successful checkout or exactly bound subscription payment on a closed invoice
+returns the whole receipt automatically.
+Until completion it has no new succeeded native funding. Completion posts the
++receipt/-return pair atomically without native transaction events, preserving the
+closed invoice and preventing activation. Verify with native observers and the
+combined stale-form authentication/cancellation flow. Domains' late-money scan sees
+no new settled funding while pending and zero net funding afterward; AE Stripe's
+`excess` allocation owns the receipt. Check both Domains scans before and after the
+return, with duplicate webhook, return-page and scheduler deliveries.
+For subscriptions, omit checkout metadata from the PaymentIntent. Interrupt the
+first recovery, then run only the receipt sweep: it must re-read the stored Stripe
+invoice and its complete paid-payment list, verify binding/customer/currency/amount,
+and return the whole receipt once. Changed binding or unrelated payment membership
+must stop without a refund or credit. Retiring the checkout property must preserve
+the return allocation and its recovery markers.
+
+External refunds, disputes, incomplete history and expired unknown sends surface
+an invoice-linked problem and resolution path. Access problems keep retrying;
+neither unknown refunds nor a 409 allows another refund or independent credit.
+Customer/currency conflicts still use payment review because ownership cannot be
+proved. Historical excess is not inferred from today's balance. The
+[shared receipt-return API](receipt-returns.md) can adopt a verified historical
+native receipt for a caller's proved entitlement. Refunds created in the Stripe
+Dashboard are not coordinated with this flow; Dashboard actions are not serialized
+with API reads.
 
 Successful transactions and review records use the PaymentIntent's `amount_received`,
 in its original currency. Subscription settlement retrieves the PaymentIntent before
@@ -237,7 +281,7 @@ have no recovery record and require manual reconciliation.
 Unresolved subscription successes retain one `ae_stripe_subscription_review`
 entry per Stripe invoice in System > Audits. This covers
 missing services or bindings and incomplete or split payments. Review the Stripe
-invoice before applying money. Refund and dispute events remain unsupported.
+invoice before applying money. Refund events for owned receipt allocations are handled; other refund and dispute reconciliation remains outside this flow.
 Offline concurrency tests interleave deliveries before lock acquisition; validate
 real database exclusion, migration upgrades, scheduler discovery and staff inbox
 delivery in the Paymenter sandbox before release.
@@ -256,7 +300,11 @@ Rendering never contacts Stripe. Earlier transactions are not backfilled.
 
 With a pristine Paymenter release's dependencies available, also run
 `PAYMENTER_TEST_APP=/path/to/pristine-release php tests/native-transaction-method.php`
-to verify the migration, upgrade, unique key, foreign key and rollback on SQLite.
+to verify migration, upgrade, unique key, foreign key and rollback on SQLite. Run
+`PAYMENTER_TEST_APP=/path/to/pristine-release php tests/native-receipt-returns.php`
+for independent allocation rows beyond the old aggregate TEXT limit, due-work
+indexing, native closed-invoice event suppression and cash/credit classification.
+These tests use disposable in-memory SQLite, never the installed application database.
 
 Optional transaction-method charge retrieval runs before settlement locks. Subscription PaymentIntent reads expand `latest_charge` before acquiring those locks. The locked handler rechecks customer, currency, invoice state and settled-payment replay before storing the label.
 

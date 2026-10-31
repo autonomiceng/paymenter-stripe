@@ -50,6 +50,9 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
     };
     try {
         $gateway->updated($extension);
+        $subscriptionUpdates = array_values(array_filter(Http::$calls, fn ($c) => $c[0] === 'post' && $c[1] === '/webhook_endpoints/we_existing'));
+        check(count($subscriptionUpdates) === 1 && in_array('refund.failed', $endpoints[0]->enabled_events, true)
+            && in_array('refund.updated', $endpoints[0]->enabled_events, true), 'Upgrading subscriptions edits the existing endpoint in place to receive owned refund failures');
         $stateKey = 'ae_stripe_webhook_continuity';
         $state = json_decode($extension->settingValues->values[$stateKey], true);
         check($state['account'] === 'acct_original' && $state['endpoint'] === 'we_existing', 'Saving pins the Stripe account and endpoint without proving the signing secret');

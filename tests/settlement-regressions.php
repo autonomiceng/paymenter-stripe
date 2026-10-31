@@ -5,6 +5,70 @@ use App\Models\{Audit, Gateway, Invoice, InvoiceTransaction, Service, User};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Support\Facades\{DB, Http, Log};
 
+// Subscription PaymentIntents have no checkout binding; the subscription invoice owns it.
+(function () use ($gateway) {
+    $saved = [Gateway::$enabled, Http::$handler, Service::$row, Invoice::$rows, ExtensionHelper::$payments,
+        DB::$tables['ae_stripe_receipt_returns'] ?? [], \App\Models\Credit::$rows, Audit::$rows, \App\Models\Notification::$rows];
+    Gateway::$enabled = true;
+    $invoice = clone Invoice::$row; $invoice->id = 113; $invoice->status = 'cancelled'; $invoice->currency_code = 'usd';
+    Invoice::$rows[113] = $invoice; ExtensionHelper::$payments = []; DB::$tables['ae_stripe_receipt_returns'] = [];
+    \App\Models\Credit::$rows = [];
+    $service = Service::$row = new Service; $service->subscription_id = 'sub_closed';
+    $service->invoiceRows = [(object) ['invoice' => $invoice]];
+    $intent = (object) ['id' => 'pi_closed_subscription', 'status' => 'succeeded', 'amount_received' => 1250,
+        'currency' => 'usd', 'customer' => 'cus_owner', 'metadata' => (object) [],
+        'latest_charge' => (object) ['id' => 'ch_closed', 'disputed' => false]];
+    $remote = (object) ['id' => 'in_closed', 'status' => 'paid', 'customer' => 'cus_owner', 'currency' => 'usd', 'amount_paid' => 1250,
+        'metadata' => (object) ['ae_stripe_invoice_id' => 113],
+        'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) [
+            'subscription' => 'sub_closed', 'metadata' => (object) ['ae_stripe_gateway' => '1']]]];
+    $available = false; $member = $intent->id; $refunds = []; $posts = 0;
+    Http::$handler = function ($verb, $path, $data) use ($intent, $remote, &$available, &$member, &$refunds, &$posts) {
+        if ($path === '/payment_intents/' . $intent->id) return clone $intent;
+        if ($path === '/invoice_payments') return ['has_more' => false, 'data' => [
+            ['status' => 'paid', 'amount_paid' => 1250, 'payment' => ['type' => 'payment_intent', 'payment_intent' => $member]]]];
+        if ($path === '/invoices/in_closed') {
+            if (!$available) throw new ConnectionException('Subscription binding read interrupted');
+            return $remote;
+        }
+        if ($path === '/refunds' && $verb === 'get') return ['has_more' => false, 'data' => array_values($refunds)];
+        if ($path === '/refunds' && $verb === 'post') {
+            ++$posts;
+            $key = end(Http::$calls)[3]['Idempotency-Key'];
+            return $refunds[$key] ??= (object) ['id' => 're_closed', 'payment_intent' => $intent->id, 'amount' => $data['amount'],
+                'currency' => 'usd', 'metadata' => (object) $data['metadata'], 'status' => 'succeeded'];
+        }
+        throw new RuntimeException('Unexpected closed subscription request: ' . $path);
+    };
+    $deliver = fn () => $gateway->webhook(eventRequest($remote, type: 'invoice.payment_succeeded'));
+    $status = fn () => $gateway->receiptReturnStatus($invoice, $intent->id, 'excess');
+    ExtensionHelper::$simulateNativeListeners = true; $activations = ExtensionHelper::$activations;
+    try {
+        $deliver(); $deliver();
+        check($status() !== null && $status()['amount_minor'] === 1250 && !ExtensionHelper::$payments && !$posts,
+            'Bound closed subscription reserves its whole receipt before interrupted recovery, without native funding');
+        $available = true; $remote->metadata->ae_stripe_invoice_id = 999;
+        $gateway->retryReceiptReturns();
+        check($status()['state'] === 'review' && !$posts && !\App\Models\Credit::$rows,
+            'Closed subscription recovery refuses a changed remote invoice binding');
+        $remote->metadata->ae_stripe_invoice_id = 113; $member = 'pi_unrelated';
+        $gateway->retryReceiptReturns();
+        check($status()['state'] === 'review' && !$posts, 'Closed subscription recovery verifies exact current invoice payment membership');
+        $member = $intent->id; $gateway->retryReceiptReturns();
+        $deliver(); $gateway->webhook(eventRequest($intent)); $gateway->retryReceiptReturns();
+        check($status()['state'] === 'refunded' && $posts === 1 && count($refunds) === 1
+            && count(ExtensionHelper::$payments) === 2 && array_sum(array_column(ExtensionHelper::$payments, 'amount')) === 0.0,
+            'Duplicate subscription and metadata-free intent deliveries plus sweep return the whole receipt once');
+        check($invoice->status === 'cancelled' && ExtensionHelper::$activations === $activations
+            && !\App\Models\Credit::$rows && !isset($intent->metadata->invoice_id),
+            'Closed subscription return preserves closure, no activation or Domains funding, and needs no checkout metadata');
+    } finally {
+        ExtensionHelper::$simulateNativeListeners = false;
+        [Gateway::$enabled, Http::$handler, Service::$row, Invoice::$rows, ExtensionHelper::$payments,
+            DB::$tables['ae_stripe_receipt_returns'], \App\Models\Credit::$rows, Audit::$rows, \App\Models\Notification::$rows] = $saved;
+    }
+})();
+
 (function () use ($gateway) {
     $oldHandler = Http::$handler;
     $oldEnabled = Gateway::$enabled;
@@ -32,7 +96,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
             ['status' => 'paid', 'amount_paid' => 1250,
                 'payment' => ['type' => 'payment_intent', 'payment_intent' => $intent->id]]]];
         if ($verb === 'get' && $path === '/payment_intents/' . $intent->id) {
-            check(!DB::$locked, 'Subscription PaymentIntent lookup runs before the settlement transaction');
+            check(!DB::$locked || DB::$userLocked, 'Return verification also serializes on the receipt owner');
             return $intent;
         }
         throw new RuntimeException('Unexpected settlement request: ' . $path);
@@ -71,8 +135,8 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $deliver();
     $deliver();
     check(count(array_filter(array_slice(Http::$calls, $calls), fn ($call) => $call[0] === 'get'
-        && $call[1] === '/payment_intents/pi_subscription_paid')) === 2,
-        'Each subscription delivery fetches the settled PaymentIntent before checking local rows');
+        && $call[1] === '/payment_intents/pi_subscription_paid')) === 3,
+        'Subscription deliveries fetch the settled intent, and the first delivery also attempts return verification');
     check(ExtensionHelper::$applications === $before + 1 && $invoice->status === 'paid'
         && ExtensionHelper::$payments['112:pi_subscription_paid']['amount'] === 12.5,
         'Paid bound subscription invoice retains one successful charge with received units');
@@ -90,13 +154,13 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     check(!invoke($gateway, 'bindSubscriptionInvoice', $stripeInvoice, $service),
         'Invoice creation still refuses an already paid binding');
 
-    foreach (['invoice not pending', 'currency mismatch', 'invoice currency mismatch', 'intent currency mismatch', 'customer mismatch', 'paid currency mismatch'] as $reason) {
-        $invoice->status = $reason === 'invoice not pending' ? 'cancelled' : ($reason === 'paid currency mismatch' ? 'paid' : 'pending');
+    foreach (['currency mismatch', 'invoice currency mismatch', 'intent currency mismatch', 'customer mismatch', 'closed currency mismatch', 'closed customer mismatch', 'paid currency mismatch'] as $reason) {
+        $invoice->status = str_starts_with($reason, 'closed ') ? 'cancelled' : ($reason === 'paid currency mismatch' ? 'paid' : 'pending');
         $intent->id = 'pi_subscription_review_' . str_replace(' ', '_', $reason);
         $intent->currency = $stripeInvoice->currency = str_contains($reason, 'currency') ? 'jpy' : 'usd';
         if ($reason === 'intent currency mismatch') $stripeInvoice->currency = 'usd';
         if ($reason === 'invoice currency mismatch') $intent->currency = 'usd';
-        $intent->customer = $reason === 'customer mismatch' ? 'cus_foreign' : 'cus_owner';
+        $intent->customer = str_contains($reason, 'customer') ? 'cus_foreign' : 'cus_owner';
         $records = count(Audit::$rows);
         $before = ExtensionHelper::$applications;
         $locks = count(DB::$modelLocks);
@@ -109,7 +173,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
             && $record['new_values']['payment_intent_id'] === $intent->id
             && $record['new_values']['amount_minor'] === 1250
             && $record['new_values']['currency'] === $intent->currency
-            && $record['new_values']['reason'] === (str_contains($reason, 'currency') ? 'currency mismatch' : $reason),
+            && $record['new_values']['reason'] === (str_contains($reason, 'currency') ? 'currency mismatch' : 'customer mismatch'),
             'Subscription staff record preserves binding, received units and refusal reason: ' . $reason);
         check(array_slice(DB::$modelLocks, $locks, 4) === [User::class, Service::class, InvoiceTransaction::class, Invoice::class]
             && in_array(Audit::class, array_slice(DB::$modelLocks, $locks), true),

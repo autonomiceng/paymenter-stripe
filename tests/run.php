@@ -61,6 +61,12 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
     };
 };
 
+if (in_array('--receipt-returns', $argv, true)) {
+    require __DIR__ . '/receipt-returns.php';
+    echo "PASS: $count receipt return assertions\n";
+    return;
+}
+
 if (in_array('--charge-attempts', $argv, true)) {
     require __DIR__ . '/charge-attempts.php';
     echo "PASS: $count charge attempt assertions\n";
@@ -230,6 +236,7 @@ $before = count(Http::$calls);
 rejects(fn () => $gateway->setupConsent(new Request(['intent' => $disabledSetupId, 'consent' => true])), 'HTTP 409');
 check(count(Http::$calls) === $before, 'Disabled setup consent makes no HTTP requests');
 Http::$handler = $oldHandler;
+require __DIR__ . '/receipt-returns.php';
 require __DIR__ . '/charge-attempts.php';
 require __DIR__ . '/gateway-lifecycle.php';
 require __DIR__ . '/webhook-continuity.php';

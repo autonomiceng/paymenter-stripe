@@ -20,6 +20,7 @@ if (!function_exists('check')) {
 }
 $user = User::$row = new User(new Properties('cus_owner'));
 $invoice = Invoice::$row = new Invoice($user);
+ExtensionHelper::$payments = []; // This fixture exercises agreement persistence on an unfunded invoice.
 Invoice::$rows = [];
 Gateway::$rows = null;
 Gateway::$enabled = Gateway::$present = true;

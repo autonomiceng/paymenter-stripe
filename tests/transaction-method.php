@@ -5,11 +5,14 @@ use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Support\Facades\{DB, Http};
 
 $oldHandler = Http::$handler;
+$methodPayments = ExtensionHelper::$payments;
+ExtensionHelper::$payments = [];
 Gateway::$enabled = true;
 Gateway::$rows = null;
 Gateway::$bundled = true;
 $user = User::$row = new User(new Properties('cus_owner'));
 $invoice = Invoice::$row = new Invoice($user);
+$invoice->total = 1000; // Independent label receipts stay below the invoice balance; return behavior has its own fixtures.
 Invoice::$rows = [];
 $fixtures = [
     'card' => ['type' => 'card', 'card' => ['brand' => 'visa', 'last4' => '4242', 'fingerprint' => 'never-store']],
@@ -154,3 +157,4 @@ $missingCharge->latest_charge = '../ch_untrusted';
 $gateway->webhook(eventRequest($missingCharge));
 check(count(Http::$calls) === $before && !isset(DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_invalidcharge')]), 'Invalid charge identifier never becomes an API path');
 Http::$handler = $oldHandler;
+ExtensionHelper::$payments = $methodPayments;

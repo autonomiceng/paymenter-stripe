@@ -79,6 +79,8 @@ class AeStripe extends Gateway
         if (app()->runningInConsole()) {
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryChargeAttempts())
                 ->name('ae-stripe:charge-attempts')->everyFiveMinutes()->onOneServer()->withoutOverlapping(60));
+            app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryReceiptReturns())
+                ->name('ae-stripe:receipt-returns')->everyFiveMinutes()->onOneServer()->withoutOverlapping(60));
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryPaymentFees())
                 ->name('ae-stripe:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
             require_once __DIR__ . '/ResolveChargeCommand.php';

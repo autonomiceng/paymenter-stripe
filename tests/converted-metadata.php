@@ -93,7 +93,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         $subscriptions->webhook(eventRequest($subscriptionInvoice, type: 'invoice.created'));
         check(count(Http::$calls) === $calls + 3, 'Converted subscription keeps its existing invoice binding and can finalize');
         $subscriptions->webhook(eventRequest($subscriptionInvoice, type: 'invoice.payment_succeeded'));
-        check(ExtensionHelper::$payments['912:pi_converted_subscription'] === ['gateway' => 'AeStripe', 'amount' => 20.0, 'status' => 'succeeded'], 'Converted nested subscription marker and invoice binding settle the same local invoice');
+        check(ExtensionHelper::$payments['912:pi_converted_subscription'] === ['gateway' => 'AeStripe', 'amount' => 20.0, 'status' => 'succeeded', 'is_credit_transaction' => false], 'Converted nested subscription marker and invoice binding settle the same local invoice');
     } finally {
         Http::$handler = $handler; Gateway::$enabled = $enabled; Gateway::$bundled = $bundled; Auth::$id = $auth;
         ExtensionHelper::$agreements = $agreements; ExtensionHelper::$payments = $payments;
