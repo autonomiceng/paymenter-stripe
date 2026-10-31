@@ -1,7 +1,7 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 use App\Helpers\ExtensionHelper;
-use App\Models\{Audit, BillingAgreement, Gateway, Invoice, Notification, Properties, User};
+use App\Models\{Audit, BillingAgreement, Gateway, Invoice, Notification, Properties, Property, User};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\{DB, Http};
@@ -703,6 +703,38 @@ use Illuminate\Support\Facades\{DB, Http};
             $stripe->loseConfirm = true; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
             $gateway->retryChargeAttempts();
             check(isset(ExtensionHelper::$payments['920:pi_test1']) && count($stripe->charges) === 1, 'Scheduled recovery settles a lost confirmation without customer input');
+        });
+        $run('recovery-priority-query', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); Property::$lastRawOrder = null;
+            $gateway->retryChargeAttempts();
+            check(Property::$lastRawOrder === [
+                'CASE WHEN value LIKE ? OR value NOT LIKE ? OR (value LIKE ? AND value NOT LIKE ?) THEN 0 ELSE 1 END',
+                ['%"retry":true%', '%"version":2%', '%"agreement_id":%', '%"agreement_id":null%'],
+            ], 'The production recovery priority SQL and four bindings match the dependency-free fake');
+        });
+        $run('idle-scan-progress', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $before = User::$row->props->values['ae_stripe_checkout_920'];
+            $gateway->retryChargeAttempts();
+            $after = User::$row->props->values['ae_stripe_checkout_920']; $attempt = json_decode($after, true);
+            check($after !== $before && ($attempt['checks'] ?? 0) === 0 && isset($attempt['scanned_at']),
+                'An idle scan changes the stored value so updated_at advances without counting an active check');
+            $gateway->retryChargeAttempts();
+            check(User::$row->props->values['ae_stripe_checkout_920'] !== $after,
+                'Another idle scan changes the stored value even within the same second');
+        });
+        $run('paused-active-scan', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); $attempt['retry'] = true;
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            Gateway::$enabled = false;
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(($attempt['checks'] ?? 0) === 0 && isset($attempt['scanned_at']), 'Paused active scans leave the recovery check count unchanged');
+            Gateway::$enabled = true;
+            $stripe->failure = fn ($verb, $path) => str_starts_with($path, '/payment_intents/') ? throw new RequestException(403) : null;
+            $gateway->retryChargeAttempts(); DB::transaction(fn () => null);
+            check(!Notification::$rows, 'The first refusal after paused scans does not send a repeated-refusal staff alert');
         });
         $run('idle-access-refusal', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20);

@@ -79,12 +79,12 @@ trait ChargeRecovery
             try {
                 $invoice = Invoice::findOrFail($match[1]);
                 if ($property->model_id != $invoice->user_id || $property->model_type !== $invoice->user->getMorphClass()) continue;
-                $attempt = $this->withPaymentLock($invoice, function ($user, $current) {
+                $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($collect) {
                     $attempt = $this->readPaymentAttempt($user, $current);
                     if (!$attempt) return null;
-                    if (($attempt['version'] ?? 1) !== 2 || !empty($attempt['retry']) || !empty($attempt['agreement_id'])) {
+                    if ($collect && (($attempt['version'] ?? 1) !== 2 || !empty($attempt['retry']) || !empty($attempt['agreement_id']))) {
                         $attempt['checks'] = ($attempt['checks'] ?? 0) + 1;
-                    }
+                    } else $attempt['scanned_at'] = microtime(true); // Keep updated_at moving, even for scans within one second.
                     $this->writePaymentAttempt($user, $current, $attempt);
                     return $attempt;
                 });

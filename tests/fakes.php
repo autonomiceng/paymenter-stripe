@@ -65,6 +65,7 @@ namespace App\Models {
         public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $hook(); } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
     }
     class Property {
+        public static ?array $lastRawOrder = null;
         public static function where(...$args) { return new class($args[2] ?? '') {
             public function __construct(private string $pattern) {}
             private bool $filtered = false;
@@ -72,7 +73,7 @@ namespace App\Models {
             private int $rowLimit = PHP_INT_MAX;
             public function where(...$args) { $this->filtered = true; return $this; }
             public function orderBy($key) { return $this; }
-            public function orderByRaw($sql, $bindings = []) { $this->rawOrder = [$sql, $bindings]; return $this; }
+            public function orderByRaw($sql, $bindings = []) { $this->rawOrder = Property::$lastRawOrder = [$sql, $bindings]; return $this; }
             public function limit($n) { $this->rowLimit = $n; return $this; }
             public function get() {
                 $result = [];
@@ -84,14 +85,12 @@ namespace App\Models {
                     if ($selected) $result[] = (object) ['key' => $key, 'value' => $value, 'model_type' => User::class, 'model_id' => User::$row->id];
                 }
                 if ($this->rawOrder) {
-                    // Execute the production priority expression instead of duplicating its predicate in PHP.
-                    $db = new \PDO('sqlite::memory:');
-                    $db->exec('CREATE TABLE properties (position INTEGER, value TEXT)');
-                    $insert = $db->prepare('INSERT INTO properties VALUES (?, ?)');
-                    foreach ($result as $position => $row) $insert->execute([$position, $row->value]);
-                    $query = $db->prepare('SELECT position FROM properties ORDER BY ' . $this->rawOrder[0] . ', position');
-                    $query->execute($this->rawOrder[1]);
-                    $result = array_map(fn ($position) => $result[$position], $query->fetchAll(\PDO::FETCH_COLUMN));
+                    // The query regression pins this expression and its bindings to the production SQL.
+                    $bindings = $this->rawOrder[1];
+                    $matches = fn ($row, $binding) => str_contains($row->value, trim($binding, '%'));
+                    $priority = fn ($row) => $matches($row, $bindings[0]) || !$matches($row, $bindings[1])
+                        || $matches($row, $bindings[2]) && !$matches($row, $bindings[3]) ? 0 : 1;
+                    usort($result, fn ($a, $b) => $priority($a) <=> $priority($b));
                 }
                 return array_slice($result, 0, $this->rowLimit);
             }
