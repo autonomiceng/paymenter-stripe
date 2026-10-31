@@ -251,7 +251,8 @@ trait ReceiptReturns
                     if ($this->withPaymentLock($invoice, $process)) $this->withPaymentLock($invoice, $process);
                 } catch (\Throwable $e) {
                     report($e);
-                    if ($e instanceof ConnectionException || $e instanceof RequestException && in_array($e->response->status(), [401, 403], true)) $this->receiptStripeUnavailable = true;
+                    if ($e instanceof ConnectionException || $e instanceof RequestException
+                        && (in_array($e->response->status(), [401, 403], true) || $e->response->status() >= 500)) $this->receiptStripeUnavailable = true;
                     $this->withPaymentLock($invoice, function ($user) use ($id, $key) {
                         $receipt = $this->readReceipt($user, $id);
                         // A lost commit acknowledgement can follow a successful local commit.

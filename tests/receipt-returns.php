@@ -212,22 +212,24 @@ use Illuminate\Support\Facades\{DB, Http};
             ExtensionHelper::$simulateNativeListeners = false;
         }
 
-        [$i, $s] = $setup(); $normal = Http::$handler;
-        $customerNotices = fn () => array_filter(Notification::$rows, fn ($n) => $n['user_id'] === $i->user_id);
-        Http::$handler = fn ($verb, $path, $data) => $path === '/refunds'
-            ? throw new \Illuminate\Http\Client\RequestException(401) : $normal($verb, $path, $data);
-        $deliver($s);
-        $a = $status($i);
-        check($a['state'] === 'review' && !empty($a['notified']) && !$customerNotices()
-            && count(Audit::$rows) === 1 && count(Notification::$rows) === 1 && Notification::$rows[0]['user_id'] === 99,
-            'A Stripe access outage records the return audit and staff alert without a customer attention notice');
-        Http::$handler = $normal; $s->intent->customer = 'cus_other'; // Access returns, but verification still holds the same review reason.
-        $gateway->retryReceiptReturns(); $gateway->retryReceiptReturns();
-        check($status($i)['state'] === 'review' && $status($i)['reason'] === $a['reason'] && count($customerNotices()) === 1,
-            'A staff-only outage notice cannot suppress the customer notice when access returns with the same review state');
-        $s->intent->customer = 'cus_owner'; $gateway->retryReceiptReturns(); $gateway->retryReceiptReturns();
-        check($status($i)['state'] === 'refunded' && count($customerNotices()) === 2,
-            'A later return state change sends its customer completion notice exactly once');
+        foreach ([401, 503] as $outageStatus) {
+            [$i, $s] = $setup(); $normal = Http::$handler;
+            $customerNotices = fn () => array_filter(Notification::$rows, fn ($n) => $n['user_id'] === $i->user_id);
+            Http::$handler = fn ($verb, $path, $data) => $path === '/refunds'
+                ? throw new \Illuminate\Http\Client\RequestException($outageStatus) : $normal($verb, $path, $data);
+            $deliver($s);
+            $a = $status($i);
+            check($a['state'] === 'review' && !empty($a['notified']) && !$customerNotices()
+                && count(Audit::$rows) === 1 && count(Notification::$rows) === 1 && Notification::$rows[0]['user_id'] === 99,
+                'HTTP ' . $outageStatus . ': a Stripe access outage records the return audit and staff alert without a customer attention notice');
+            Http::$handler = $normal; $s->intent->customer = 'cus_other'; // Access returns, but verification still holds the same review reason.
+            $gateway->retryReceiptReturns(); $gateway->retryReceiptReturns();
+            check($status($i)['state'] === 'review' && $status($i)['reason'] === $a['reason'] && count($customerNotices()) === 1,
+                'A staff-only outage notice cannot suppress the customer notice when access returns with the same review state');
+            $s->intent->customer = 'cus_owner'; $gateway->retryReceiptReturns(); $gateway->retryReceiptReturns();
+            check($status($i)['state'] === 'refunded' && count($customerNotices()) === 2,
+                'A later return state change sends its customer completion notice exactly once');
+        }
 
         foreach ([new ConnectionException('Offline'), new \Illuminate\Http\Client\RequestException(401), new \Illuminate\Http\Client\RequestException(403)] as $outage) {
             [$i, $s] = $setup(); $s->status = 'pending'; $deliver($s);

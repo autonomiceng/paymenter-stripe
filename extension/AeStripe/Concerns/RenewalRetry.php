@@ -32,7 +32,7 @@ trait RenewalRetry
     {
         if (DB::transactionLevel() !== 0) return null;
         try { return $this->domainsAutoPay()?->renewalAutoPayContext((int) $invoice->id); }
-        catch (\Throwable) { return null; }
+        catch (\Throwable $e) { report($e); return null; }
     }
 
     private function renewalEnrollment($invoice, int $agreementId, ?array $domains): ?array
@@ -75,6 +75,7 @@ trait RenewalRetry
         if ($invoice->status !== 'pending' || $this->paymentBalance($invoice) <= 0) return false;
         if (isset($renewal['domains'])) {
             try {
+                if (!is_int($renewal['domains']['cutoff'] ?? null) || $renewal['domains']['cutoff'] <= time()) return false;
                 $service = Service::where('id', $renewal['domains']['service_id'])->lockForUpdate()->first();
                 if (!$service || $service->user_id != $invoice->user_id
                     || $service->billing_agreement_id != $renewal['agreement_id']) return false;
@@ -83,7 +84,8 @@ trait RenewalRetry
                     || ($agreement->gateway->extension ?? null) !== 'AeStripe') return false;
                 // Revocation during an in-flight confirm may lose that race; normal refunds apply.
                 return $this->domainsAutoPay()?->renewalAutoPayStillAllowed((int) $invoice->id, $renewal['domains']) === true;
-            } catch (\Throwable) { return false; }
+            } catch (\PDOException | \Illuminate\Database\QueryException $e) { throw $e; }
+            catch (\Throwable $e) { report($e); return false; }
         }
         if ((empty($renewal['overdue_once']) && $renewal['cutoff'] <= now()->format('Y-m-d'))
             || $invoice->due_at?->format('Y-m-d') !== $renewal['cutoff']) return false;

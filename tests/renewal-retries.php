@@ -398,6 +398,41 @@ try {
                 'A deferred Domains retry resumes when current consent becomes readable');
         } finally { TestDomainsAutoPay::$context = null; }
     });
+    $run('renewal-domains-confirm-db-failure', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal, $dueRetry) {
+        require_once __DIR__ . '/fixtures/domains-autopay.php';
+        $service = $renewalFixture($invoice, $stripe);
+        $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
+        TestDomainsAutoPay::$context = ['service_id' => $service->id, 'agreement_id' => 4,
+            'operation_id' => 81, 'operation_key' => 'renewal-fixture', 'generation' => 2, 'cutoff' => time() + 7 * 86400];
+        $errors = count($GLOBALS['reportedErrors'] ?? []);
+        try {
+            $initialRefusal($invoice); $dueRetry();
+            $notices = count(Notification::$rows);
+            $stripe->beforeCreate = function () {
+                DB::$beforeServiceLock = fn () => throw new \Illuminate\Database\QueryException('Temporary service read failure');
+            };
+            $gateway->retryChargeAttempts();
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(count($stripe->confirms) === 1 && !$stripe->charges && !empty($attempt['confirmation'])
+                && count(Notification::$rows) === $notices && count($GLOBALS['reportedErrors'] ?? []) === $errors + 1,
+                'A failed Domains service read defers confirmation, reports the error and sends no consent refusal notice');
+        } finally { DB::$beforeServiceLock = null; TestDomainsAutoPay::$context = null; }
+    });
+    $run('renewal-domains-confirm-cutoff', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal, $dueRetry) {
+        require_once __DIR__ . '/fixtures/domains-autopay.php';
+        $service = $renewalFixture($invoice, $stripe);
+        $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
+        TestDomainsAutoPay::$context = ['service_id' => $service->id, 'agreement_id' => 4,
+            'operation_id' => 81, 'operation_key' => 'renewal-fixture', 'generation' => 2, 'cutoff' => time() + 7 * 86400];
+        try {
+            $initialRefusal($invoice); $dueRetry();
+            $stripe->beforeCreate = function () { $GLOBALS['fakeStripeTime'] = TestDomainsAutoPay::$context['cutoff'] + 1; };
+            $gateway->retryChargeAttempts();
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(count($stripe->confirms) === 1 && !$stripe->charges && !empty($attempt['renewal']['domains']),
+                'A Domains retry reserved before cutoff cannot confirm after time passes its frozen cutoff');
+        } finally { unset($GLOBALS['fakeStripeTime']); TestDomainsAutoPay::$context = null; }
+    });
     $run('renewal-domains-boundary', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
         $renewalFixture($invoice, $stripe);
         $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
