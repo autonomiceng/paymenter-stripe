@@ -703,6 +703,7 @@ namespace {
         public function updateOrInsert($identity, $values) {
             if (!\Illuminate\Support\Facades\DB::$userLocked) throw new RuntimeException('Return write needs owner lock');
             $row = $identity + $values;
+            if (strlen($row['return_key']) > 74) throw new \Illuminate\Database\QueryException('Data too long for column return_key');
             if (self::$beforeWrite) (self::$beforeWrite)($row);
             \Illuminate\Support\Facades\DB::$tables['ae_stripe_receipt_returns'][$row['payment_intent_id'] . ':' . $row['allocation_key']] = $row;
         }

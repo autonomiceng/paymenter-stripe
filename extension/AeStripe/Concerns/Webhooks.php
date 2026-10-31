@@ -80,9 +80,15 @@ trait Webhooks
                 $invoice = \App\Models\Invoice::findOrFail($paymentIntent->metadata->invoice_id);
                 $this->retireFailedElementsPayment($invoice, $paymentIntent);
                 break;
+            case 'refund.created':
             case 'refund.failed':
             case 'refund.updated':
-                $this->recordReceiptRefundEvent($object);
+                if (!$this->recordReceiptRefundEvent($object)) $this->recordReceiptReversalEvent($object, 'refund');
+                break;
+            case 'charge.dispute.created':
+            case 'charge.dispute.updated':
+            case 'charge.dispute.closed':
+                $this->recordReceiptReversalEvent($object, 'dispute');
                 break;
             case 'charge.succeeded':
             case 'charge.updated':

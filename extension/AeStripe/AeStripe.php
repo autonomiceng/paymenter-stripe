@@ -55,6 +55,7 @@ require_once __DIR__ . '/PaymentPendingException.php';
 require_once __DIR__ . '/Concerns/ChargeRecovery.php';
 require_once __DIR__ . '/Concerns/RenewalRetry.php';
 require_once __DIR__ . '/Concerns/InvoicePayments.php';
+require_once __DIR__ . '/Concerns/ReceiptReversals.php';
 require_once __DIR__ . '/Concerns/WebhookContinuity.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
 require_once __DIR__ . '/Concerns/AutoPay.php';
@@ -72,7 +73,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -218,7 +219,8 @@ class AeStripe extends Gateway
                 'label' => 'Stripe webhook signing secret',
                 'type' => 'text',
                 'encrypted' => true,
-                'description' => 'Created automatically when you enable the gateway.',
+                'description' => \App\Models\Gateway::where('extension', 'AeStripe')->first()?->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'retry'
+                    ? 'Webhook events could not be verified. Check the Stripe endpoint and API permissions, then save AE Stripe; automatic checks will retry.' : 'Created automatically when you enable the gateway.',
                 'required' => false,
             ],
             [
