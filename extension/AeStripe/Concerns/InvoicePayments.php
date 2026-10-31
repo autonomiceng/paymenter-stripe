@@ -18,6 +18,10 @@ trait InvoicePayments
                 }
                 return true;
             }
+            if (!empty($attempt['renewal_only'])) {
+                $this->replacePaymentAttempt($current, $attempt, keepWaitingRenewal: true);
+                return true; // Only a waiting schedule remains; there is no payable provider intent.
+            }
             // Persist before HTTP so an outage is retried even for a checkout-only form.
             $attempt['retire'] = true;
             $attempt['retry'] = true;
@@ -31,7 +35,7 @@ trait InvoicePayments
                 }
                 if (time() - $attempt['created'] >= 23 * 3600) {
                     // No client secret can have left checkout before its ID was stored.
-                    $this->replacePaymentAttempt($current, $attempt);
+                    $this->replacePaymentAttempt($current, $attempt, keepWaitingRenewal: true);
                     return true;
                 }
                 $intent = $this->request('post', '/payment_intents', $attempt['params'], $attempt['key']);
@@ -57,7 +61,7 @@ trait InvoicePayments
             if ($intent->status === 'canceled' && ($intent->amount_received ?? 0) === 0
                 || $intent->status === 'succeeded' && (!in_array($current->status, ['pending', 'paid'], true)
                     || InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists())) {
-                $this->replacePaymentAttempt($current, $attempt);
+                $this->replacePaymentAttempt($current, $attempt, keepWaitingRenewal: true);
                 // Settlement/review owns received money now. Credit callers must re-read the balance.
                 return $intent->status === 'canceled';
             }

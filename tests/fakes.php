@@ -381,7 +381,17 @@ namespace App\Models {
     }
 }
 namespace App\Helpers {
+    class NotificationHelper {
+        public static int $failures = 0;
+        public static function invoicePaymentFailedNotification($user, $invoice) {
+            ++self::$failures;
+            \App\Models\Notification::create(['user_id' => $user->id, 'title' => 'Native payment failed', 'url' => '']);
+        }
+    }
     class ExtensionHelper {
+        public static function charge($gateway, $invoice, $agreement): bool {
+            return self::getExtension('gateway', $gateway->extension)->charge($invoice, $invoice->total, $agreement);
+        }
         public static function getExtension($type, $extension, $config = []) {
             $class = '\\Paymenter\\Extensions\\' . ucfirst($type) . 's\\' . $extension . '\\' . $extension;
             return new $class($config);

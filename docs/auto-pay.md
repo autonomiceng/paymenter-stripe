@@ -95,6 +95,15 @@ The schedule and count live in the existing durable checkout attempt. A due retr
 first proves the refused intent cancelled, then atomically reserves the next shared
 attempt with the incremented count. Interrupted creation/confirmation resumes the
 same debit; it never consumes another retry or creates a second in-flight payment.
+An expired, proven-unconfirmed creation rotates atomically with its original authority
+and retry count. Automatic native collection without renewal context fails closed.
+A definite refusal and its waiting/stopped transition commit before confirmation locks
+are released; another automatic caller resumes the claimed confirmation identity.
+Retiring a refused intent before applying partial credit preserves the waiting schedule
+and count while a positive balance remains; the due retry rechecks consent and balance.
+Full payment, cancellation and explicit customer Pay end automatic collection. Native
+cron consumes only a renewal refusal whose linked notice has already been delivered;
+other failures keep the native notification path.
 Processing, authentication and uncertain outcomes use existing recovery and review,
 never the refusal timer. Paid/cancelled invoices, opt-out and the original cutoff
 stop new automatic debits; recovery can still account for money already sent.

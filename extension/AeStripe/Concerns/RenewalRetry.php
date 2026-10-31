@@ -16,16 +16,22 @@ trait RenewalRetry
     {
         $cutoff = $invoice->due_at?->format('Y-m-d');
         if (!$cutoff || $cutoff <= now()->format('Y-m-d')) return null;
+        $ids = $this->nativeRenewalServices($invoice);
+        if (!$ids) return null;
+        $renewal = ['services' => $ids, 'agreement_id' => $agreementId,
+            'cutoff' => $cutoff, 'retries' => 0, 'state' => 'active'];
+        return $this->renewalStillAuthorized($invoice, $renewal) ? $renewal : null;
+    }
+
+    private function nativeRenewalServices($invoice): ?array
+    {
         $ids = [];
         foreach ($invoice->items()->lockForUpdate()->get() as $item) {
             if ($item->reference_type !== (new Service)->getMorphClass()) return null;
             $ids[] = (int) $item->reference_id;
         }
-        if (!$ids) return null;
         sort($ids);
-        $renewal = ['services' => array_values(array_unique($ids)), 'agreement_id' => $agreementId,
-            'cutoff' => $cutoff, 'retries' => 0, 'state' => 'active'];
-        return $this->renewalStillAuthorized($invoice, $renewal) ? $renewal : null;
+        return $ids ? array_values(array_unique($ids)) : null;
     }
 
     /** Current per-service consent, calendar and balance, under the payment locks, including at confirm. */
@@ -34,13 +40,7 @@ trait RenewalRetry
         if ($invoice->status !== 'pending' || $this->paymentBalance($invoice) <= 0
             || $renewal['cutoff'] <= now()->format('Y-m-d')
             || $invoice->due_at?->format('Y-m-d') !== $renewal['cutoff']) return false;
-        $ids = [];
-        foreach ($invoice->items()->lockForUpdate()->get() as $item) {
-            if ($item->reference_type !== (new Service)->getMorphClass()) return false;
-            $ids[] = (int) $item->reference_id;
-        }
-        sort($ids);
-        if (array_values(array_unique($ids)) !== $renewal['services']) return false;
+        if ($this->nativeRenewalServices($invoice) !== $renewal['services']) return false;
         foreach ($renewal['services'] as $id) {
             $service = Service::where('id', $id)->lockForUpdate()->first();
             if (!$service || $service->user_id != $invoice->user_id || $service->status !== 'active'
@@ -93,10 +93,12 @@ trait RenewalRetry
             // Never replace uncertainty, money in flight, or a newer customer's payment form.
             if (!empty($attempt['confirmation']) || !empty($attempt['agreement_id'])) return $attempt;
             if (!$this->cancelInvoicePayments($current)) return null;
+            $this->replacePaymentAttempt($current, $attempt); // Consume any retained schedule in this same reservation transaction.
             $data = $this->checkoutPaymentData($current, $this->paymentBalance($current),
                 $user->properties()->where('key', 'stripe_id')->firstOrFail()->value)
                 + ['agreement_id' => $renewal['agreement_id']];
             $next = $this->reservePaymentAttempt($current, $data);
+            $next['automatic_renewal'] = true;
             $next['renewal'] = array_replace($renewal, ['state' => 'active', 'retries' => $renewal['retries'] + 1]);
             $this->writePaymentAttempt($user, $current, $next);
             return $next;

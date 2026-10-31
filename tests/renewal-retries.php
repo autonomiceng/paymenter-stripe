@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 use App\Helpers\ExtensionHelper;
 use App\Models\{BillingAgreement, Notification, Service, User};
-use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\{ConnectionException, RequestException};
+use Illuminate\Support\Facades\DB;
 
 $renewalFixture = function ($invoice, $stripe) {
     $GLOBALS['fakeConsole'] = true;
@@ -23,11 +24,133 @@ $dueRetry = function () {
     $attempt['renewal']['next_at'] = time() - 1;
     User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
 };
+// Initial failures may be delivered by native cron or consumed after the extension notifies.
+$initialRefusal = function ($invoice) use ($gateway) {
+    try { $gateway->charge($invoice, 20, new BillingAgreement); }
+    catch (\App\Exceptions\DisplayException $e) {}
+};
 $savedService = Service::$row;
 try {
-    $run('renewal-cadence-cap', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry) {
+    foreach (['opted-out', 'authorized', 'missing-context'] as $mode) {
+        $run('renewal-expired-create-' . $mode, function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal, $mode) {
+            $service = $renewalFixture($invoice, $stripe); $initialRefusal($invoice); $dueRetry();
+            $stripe->dropCreate = true; $gateway->retryChargeAttempts();
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            $expectedRenewal = $attempt['renewal']; $oldKey = $attempt['key'];
+            $attempt['created'] = time() - 24 * 3600;
+            if ($mode === 'missing-context') unset($attempt['renewal']);
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            if ($mode === 'opted-out') $service->billing_agreement_id = null;
+            $stripe->dropCreate = true; $gateway->retryChargeAttempts(); // Crash again, after rotation commits.
+            $rotated = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check($rotated['key'] !== $oldKey && $rotated['automatic_renewal']
+                && ($rotated['renewal'] ?? null) === ($mode === 'missing-context' ? null : $expectedRenewal),
+                'An interrupted creation rotation durably preserves automatic authority and the original retry count');
+            $stripe->status = 'succeeded'; $stripe->beforeConfirm = function () use ($expectedRenewal) {
+                $current = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                check($current['renewal'] === $expectedRenewal, 'Expired creation carries the original renewal authority, cutoff and retry count to confirm');
+            };
+            $gateway->retryChargeAttempts();
+            if ($mode === 'authorized') {
+                check(count($stripe->charges) === 1 && count($stripe->confirms) === 2,
+                    'An authorized expired creation resumes one scheduled renewal retry');
+            } else {
+                check(!$stripe->charges && count($stripe->confirms) === 1,
+                    'Expired automatic creation cannot charge with ' . $mode . ' renewal authority');
+            }
+        });
+    }
+    foreach (['result', 'http-402'] as $path) {
+        $run('renewal-refusal-lock-' . $path, function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal, $path) {
+            $renewalFixture($invoice, $stripe); $initialRefusal($invoice); $dueRetry();
+            $stripe->beforeConfirm = function ($intent) use ($gateway, $invoice, $stripe) {
+                $stripe->beforeConfirm = null;
+                $intent->last_payment_error = (object) ['code' => 'card_declined', 'advice_code' => 'do_not_try_again'];
+                $compete = function () use (&$compete, $gateway, $invoice) {
+                    if (DB::$locked) { DB::$afterTransaction = $compete; return; }
+                    try { $gateway->charge($invoice, 20, new BillingAgreement); }
+                    catch (\App\Exceptions\DisplayException $e) {}
+                };
+                DB::$afterTransaction = $compete;
+            };
+            if ($path === 'http-402') {
+                $handler = \Illuminate\Support\Facades\Http::$handler;
+                \Illuminate\Support\Facades\Http::$handler = function ($verb, $url, $data) use ($handler) {
+                    $result = $handler($verb, $url, $data);
+                    if (str_ends_with($url, '/confirm')) throw new RequestException(402, ['error' => ['code' => 'card_declined']]);
+                    return $result;
+                };
+            }
+            $gateway->retryChargeAttempts();
+            check(count($stripe->confirms) === 2,
+                'A ' . $path . ' refusal commits no-retry state before a competing automatic caller can confirm');
+        });
+    }
+    $run('renewal-confirmation-claim', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal) {
+        $renewalFixture($invoice, $stripe); $initialRefusal($invoice); $dueRetry();
+        $stripe->beforeCreate = function () use ($gateway, $invoice, $stripe) {
+            $stripe->beforeCreate = null;
+            $compete = function () use (&$compete, $gateway, $invoice, $stripe) {
+                $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                if (DB::$locked || empty($attempt['confirmation'])) { DB::$afterTransaction = $compete; return; }
+                $claimed = $attempt['confirmation']['key'];
+                $gateway->charge($invoice, 20, new BillingAgreement);
+                check(end($stripe->confirms)[0] === $claimed, 'A competing automatic caller resumes the committed confirmation identity');
+            };
+            DB::$afterTransaction = $compete;
+        };
+        $gateway->retryChargeAttempts();
+        check(count($stripe->confirms) === 2, 'The claimed retry has one refusal despite an overlapping automatic caller');
+    });
+    $run('renewal-credit-contract', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal) {
+        $renewalFixture($invoice, $stripe); $initialRefusal($invoice);
+        $original = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['renewal'];
+        DB::transaction(function () use ($gateway, $invoice) {
+            User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
+            \App\Models\Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
+            check($gateway->cancelInvoicePayments($invoice), 'Credit retires the refused payable intent');
+            ExtensionHelper::addPayment($invoice, null, 5, null, 'credit', isCreditTransaction: true);
+        });
+        $after = json_decode(User::$row->props->values['ae_stripe_checkout_920'] ?? 'null', true);
+        check(($after['renewal'] ?? null) === $original, 'Partial credit preserves the waiting schedule, count and cutoff');
+        check($stripe->intents['pi_test1']->status === 'canceled', 'Partial credit still invalidates the old payable intent');
+        $dueRetry(); $stripe->status = 'succeeded'; $stripe->beforeConfirm = null;
+        $gateway->retryChargeAttempts();
+        check(count($stripe->charges) === 1 && $stripe->charges[0][1] === 1500, 'The due retry collects only the balance after contract-based partial credit');
+    });
+    $run('renewal-full-credit-contract', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
+        $renewalFixture($invoice, $stripe); $initialRefusal($invoice);
+        ExtensionHelper::$simulateNativeListeners = true;
+        DB::transaction(function () use ($gateway, $invoice) {
+            User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
+            \App\Models\Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
+            check($gateway->cancelInvoicePayments($invoice), 'Full credit safely retires the refused payable intent');
+            ExtensionHelper::addPayment($invoice, null, 20, null, 'credit', isCreditTransaction: true);
+        });
+        ExtensionHelper::$simulateNativeListeners = false;
+        $gateway->retryChargeAttempts();
+        check(!isset(User::$row->props->values['ae_stripe_checkout_920']) && count($stripe->confirms) === 1,
+            'Full credit ends the retained renewal schedule without a new debit');
+    });
+    $run('renewal-native-cron-notice', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
         $renewalFixture($invoice, $stripe);
-        paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+        $cron = require __DIR__ . '/fixtures/native-cron-charge.php';
+        \App\Helpers\NotificationHelper::$failures = 0;
+        DB::transaction(fn () => $cron->run($invoice, (object) ['billingAgreement' => new BillingAgreement]));
+        check(count(Notification::$rows) === 1 && \App\Helpers\NotificationHelper::$failures === 0,
+            'The native cron catch sends no second notice for an already-notified renewal refusal');
+        $invoice->status = 'cancelled';
+        DB::transaction(fn () => $cron->run($invoice, (object) ['billingAgreement' => new BillingAgreement]));
+        check(\App\Helpers\NotificationHelper::$failures === 1, 'An unrelated exception keeps the native catch despite an older notified renewal refusal');
+        $invoice->status = 'pending';
+        // A non-renewal failure still goes through that same native catch.
+        unset(User::$row->props->values['ae_stripe_checkout_920']); $invoice->items = [];
+        DB::transaction(fn () => $cron->run($invoice, (object) ['billingAgreement' => new BillingAgreement]));
+        check(\App\Helpers\NotificationHelper::$failures === 2, 'Unhandled failures keep the native cron notification path');
+    });
+    $run('renewal-cadence-cap', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal) {
+        $renewalFixture($invoice, $stripe);
+        $initialRefusal($invoice);
         $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
         check(($attempt['renewal']['state'] ?? null) === 'waiting' && $attempt['renewal']['next_at'] >= time() + 48 * 3600 - 2,
             'A native renewal decline durably schedules a new debit after 48 hours');
@@ -44,9 +167,9 @@ try {
         check(count($stripe->confirms) === 4 && count(Notification::$rows) === 4,
             'Three retries is the cap and each refusal has one customer notice');
     });
-    $run('renewal-balance-crash', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry) {
+    $run('renewal-balance-crash', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal) {
         $renewalFixture($invoice, $stripe);
-        paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+        $initialRefusal($invoice);
         $dueRetry();
         ExtensionHelper::$payments['920:credit'] = ['amount' => 5, 'status' => 'succeeded'];
         $stripe->status = 'succeeded'; $stripe->beforeConfirm = null; $stripe->loseConfirm = true;
@@ -56,9 +179,9 @@ try {
         check(!isset(User::$row->props->values['ae_stripe_checkout_920']), 'Settled renewal stops its retry schedule');
     });
     foreach (['opt-out', 'agreement-change', 'account-default-only', 'cancelled', 'paid', 'cutoff', 'service-cancelled', 'new-calendar'] as $stop) {
-        $run('renewal-stop-' . $stop, function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $stop) {
+        $run('renewal-stop-' . $stop, function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $stop, $initialRefusal) {
             $service = $renewalFixture($invoice, $stripe);
-            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)); $dueRetry();
+            $initialRefusal($invoice); $dueRetry();
             match ($stop) {
                 'opt-out', 'account-default-only' => $service->billing_agreement_id = null,
                 'agreement-change' => $service->billing_agreement_id = 5,
@@ -75,9 +198,9 @@ try {
             check(count($stripe->confirms) === 1, 'Renewal retry stops on ' . $stop . ' despite a new-service account default');
         });
     }
-    $run('renewal-reservation-crash-optout', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry) {
+    $run('renewal-reservation-crash-optout', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal) {
         $service = $renewalFixture($invoice, $stripe);
-        paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)); $dueRetry();
+        $initialRefusal($invoice); $dueRetry();
         $stripe->dropCreate = true;
         $gateway->retryChargeAttempts();
         $reserved = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
@@ -88,9 +211,9 @@ try {
         $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
         check(count($stripe->confirms) === 1, 'Recovery rechecks service consent after retry reservation, before confirming');
     });
-    $run('renewal-overlapping-tick', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry) {
+    $run('renewal-overlapping-tick', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal) {
         $renewalFixture($invoice, $stripe);
-        paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)); $dueRetry();
+        $initialRefusal($invoice); $dueRetry();
         // A second tick runs after the first has committed the new reservation, before its HTTP creation.
         $stripe->beforeCreate = function () use ($gateway, $stripe) {
             $stripe->beforeCreate = null;
@@ -99,32 +222,32 @@ try {
         $gateway->retryChargeAttempts();
         check(count($stripe->confirms) === 2, 'Overlapping ticks cannot turn one due retry into two declined debits');
     });
-    $run('renewal-hard-refusal', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry) {
+    $run('renewal-hard-refusal', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal) {
         $renewalFixture($invoice, $stripe);
         $stripe->beforeConfirm = fn ($intent) => $intent->last_payment_error = (object) ['code' => 'card_declined', 'decline_code' => 'stolen_card'];
-        paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)); $dueRetry();
+        $initialRefusal($invoice); $dueRetry();
         $gateway->retryChargeAttempts();
         check(count($stripe->confirms) === 1 && count(Notification::$rows) === 1,
             'A hard card refusal stops automatic collection and gives the customer a payment link');
     });
-    $run('renewal-customer-pay', function ($invoice, $stripe) use ($gateway, $renewalFixture) {
+    $run('renewal-customer-pay', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
         $renewalFixture($invoice, $stripe);
-        paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+        $initialRefusal($invoice);
         $GLOBALS['fakeConsole'] = false;
         $stripe->status = 'succeeded'; $stripe->beforeConfirm = null;
         check($gateway->charge($invoice, 20, new BillingAgreement) && count($stripe->charges) === 1,
             'An explicit customer Pay can pay immediately while the automatic renewal retry is waiting');
     });
-    $run('renewal-domains-boundary', function ($invoice, $stripe) use ($gateway, $renewalFixture) {
+    $run('renewal-domains-boundary', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
         $renewalFixture($invoice, $stripe);
         $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
-        paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+        $initialRefusal($invoice);
         $gateway->retryChargeAttempts();
         $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
         check(empty($attempt['renewal']) && count($stripe->confirms) === 1,
             'Retained Domains invoices cannot acquire a guessed native renewal authority');
     });
-    $run('renewal-processing-uncertain', function ($invoice, $stripe) use ($gateway, $renewalFixture) {
+    $run('renewal-processing-uncertain', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
         $renewalFixture($invoice, $stripe); $stripe->status = 'processing'; $stripe->beforeConfirm = null;
         $gateway->charge($invoice, 20, new BillingAgreement);
         $stripe->failure = fn ($verb, $path) => throw new ConnectionException('Cannot read Stripe');

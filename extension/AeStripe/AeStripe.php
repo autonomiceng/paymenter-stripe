@@ -799,6 +799,13 @@ class AeStripe extends Gateway
             // Core cron ignores the bool and emails failure for every thrown exception.
             if (app()->runningInConsole()) return true;
             throw $e;
+        } catch (DisplayException $e) {
+            if (app()->runningInConsole() && isset($intent) && $this->withPaymentLock($invoice, function ($user, $current) use ($intent) {
+                $attempt = $this->readPaymentAttempt($user, $current);
+                return ($attempt['intent'] ?? null) === $intent->id && !empty($attempt['failure_notified']) && !empty($attempt['failure_reason'])
+                    && in_array($attempt['renewal']['state'] ?? null, ['waiting', 'stopped'], true);
+            })) return false; // This renewal refusal already has its linked notice; core must not send another.
+            throw $e;
         }
     }
 

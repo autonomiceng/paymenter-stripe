@@ -365,6 +365,11 @@ Bulk SQL updates do not dispatch that event. The five-minute recovery job
 also scans checkout-only attempts, including `retry=false`, and retries cancellation
 when Stripe returns. Partial-credit changes retire checkout forms too. Call before
 credit rather than relying on that later sweep to protect an already open tab.
+For a refused renewal awaiting a bounded retry, successful retirement keeps only its
+waiting schedule and count while the invoice has a positive pending balance. The old
+intent remains cancelled. Repeated calls are safe; the due retry rechecks current
+consent and the remaining balance. Full credit/payment or cancellation ends collection;
+explicit customer Pay takes over immediately.
 
 ## Webhook continuity
 
