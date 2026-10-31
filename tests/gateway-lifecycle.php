@@ -16,7 +16,7 @@ use Illuminate\Support\Facades\{DB, Http};
             '/account' => (object) ['id' => 'acct_fixture'],
             '/webhook_endpoints' => (object) ['data' => [(object) ['id' => 'we_fixture', 'url' => route('extensions.gateways.ae-stripe.webhook'),
                 'api_version' => '2025-07-30.basil', 'enabled_events' => ['payment_intent.succeeded', 'payment_intent.payment_failed', 'payment_intent.processing',
-                    'setup_intent.succeeded', 'subscription_schedule.canceled', 'invoice.created', 'invoice.payment_succeeded', 'charge.updated', 'charge.succeeded', 'refund.failed', 'refund.updated']]]],
+                    'setup_intent.succeeded', 'subscription_schedule.canceled', 'invoice.created', 'invoice.payment_succeeded', 'charge.updated', 'charge.succeeded', 'refund.failed', 'refund.updated', 'refund.created', 'charge.dispute.created', 'charge.dispute.updated', 'charge.dispute.closed']]]],
             default => throw new RuntimeException('Unexpected lifecycle request'),
         };
     };

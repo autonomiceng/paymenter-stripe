@@ -13,7 +13,7 @@ use Illuminate\Support\Facades\{DB, Http};
         Invoice::$rows[810] = $invoice; ExtensionHelper::$payments = []; Audit::$rows = []; Notification::$rows = []; Credit::$rows = []; Gateway::$enabled = true; DB::$tables['ae_stripe_receipt_returns'] = [];
         $stripe = new class($amount, $currency) {
             public $refunds = [], $posts = [], $lose = false, $drop = false, $failWrite = false, $status = 'succeeded';
-            public $intent;
+            public $intent, $dispute;
             public function __construct($amount, $currency) {
                 $this->intent = (object) ['id' => 'pi_return', 'status' => 'succeeded', 'amount' => $amount, 'amount_received' => $amount,
                     'currency' => $currency, 'customer' => 'cus_owner', 'latest_charge' => (object) ['id' => 'ch_return', 'disputed' => false],
@@ -21,6 +21,11 @@ use Illuminate\Support\Facades\{DB, Http};
             }
             public function request($verb, $path, $data) {
                 if ($path === '/payment_intents/pi_return') return $this->intent;
+                if ($path === '/charges/ch_return') return (object) ['id' => 'ch_return', 'payment_intent' => 'pi_return', 'customer' => 'cus_owner', 'currency' => $this->intent->currency];
+                if ($this->dispute && $path === '/disputes/' . $this->dispute->id) return $this->dispute;
+                if (str_starts_with($path, '/refunds/')) {
+                    foreach ($this->refunds as $refund) if ($path === '/refunds/' . $refund->id) return $refund;
+                }
                 if ($path === '/refunds' && $verb === 'get') return (object) ['data' => array_values($this->refunds), 'has_more' => false];
                 if ($path !== '/refunds' || $verb !== 'post') throw new RuntimeException('Unexpected return fixture request: ' . $path);
                 check(DB::$locked && DB::$userLocked, 'Return sends serialize with invoice payments');
@@ -245,6 +250,7 @@ use Illuminate\Support\Facades\{DB, Http};
         } catch (RuntimeException $e) { check($e->getMessage() === 'Caller rolled back', 'Domains caller controls its transaction'); }
         check($status($i, 'domains:rollback') === null && count($s->posts) === 1, 'A rolled-back caller reservation cannot send a refund');
 
+        require __DIR__ . '/receipt-reversals.php';
     } finally {
         Notification::$fail = false; ReceiptReturnQuery::$beforeWrite = null; ExtensionHelper::$simulateNativeListeners = false;
         [User::$row, Invoice::$rows, ExtensionHelper::$payments, Http::$handler, Audit::$rows, Notification::$rows, Credit::$rows, Gateway::$enabled, DB::$tables['ae_stripe_receipt_returns']] = $saved;

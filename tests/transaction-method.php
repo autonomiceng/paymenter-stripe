@@ -54,9 +54,9 @@ foreach (['payment_intent.succeeded', 'payment_intent.processing'] as $eventType
     }
 }
 $methodIntent->id = 'pi_retrieved';
-$methodIntent->latest_charge = 'ch_fixture';
+$methodIntent->latest_charge = 'py_fixture';
 Http::$handler = function ($verb, $path) use ($fixtures) {
-    check($verb === 'get' && $path === '/charges/ch_fixture', 'Only one charge retrieve');
+    check($verb === 'get' && $path === '/charges/py_fixture', 'Only one charge retrieve');
     check(!DB::$locked, 'Optional method retrieval must not hold settlement locks');
     return ['payment_method_details' => $fixtures['card']];
 };
@@ -70,7 +70,7 @@ $gateway->webhook(eventRequest($methodIntent));
 check(count(Http::$calls) === $before + 1, 'Unexpanded charge retrieves once across processing and success');
 check(DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_retrieved')]['label'] === $expected['link'], 'The successful charge replaces its processing label and survives replay');
 $methodIntent->id = 'pi_failedlabel';
-$methodIntent->latest_charge = 'ch_fixture';
+$methodIntent->latest_charge = 'py_fixture';
 $before = count(Http::$calls);
 $gateway->webhook(eventRequest($methodIntent, type: 'payment_intent.payment_failed'));
 check(count(Http::$calls) === $before && !isset(DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_failedlabel')]), 'Failed payment captures nothing');

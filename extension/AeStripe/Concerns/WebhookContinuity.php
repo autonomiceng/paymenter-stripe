@@ -11,7 +11,40 @@ use Illuminate\Support\Facades\Route;
 trait WebhookContinuity
 {
     private const WEBHOOK_STATE = 'ae_stripe_webhook_continuity';
+    private const WEBHOOK_EVENTS = 'ae_stripe_webhook_events';
     private const WEBHOOK_OVERLAP = 72 * 3600;
+
+    private function webhookEvents(array $existing = []): array
+    {
+        return in_array('*', $existing, true) ? $existing : array_values(array_unique(array_merge($existing, [
+            'payment_intent.succeeded', 'payment_intent.payment_failed', 'payment_intent.processing',
+            'setup_intent.succeeded', 'subscription_schedule.canceled', 'invoice.created', 'invoice.payment_succeeded', 'charge.updated', 'charge.succeeded', 'refund.failed', 'refund.updated', 'refund.created',
+            'charge.dispute.created', 'charge.dispute.updated', 'charge.dispute.closed'])));
+    }
+
+    private function reconcileWebhookSubscriptions(): void
+    {
+        DB::transaction(function () {
+            $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->lockForUpdate()->first();
+            if (!$gateway || $gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'ready') return;
+            try {
+                $state = $this->savedContinuityState(); $key = $this->config('stripe_secret_key'); $mode = $this->stripeKeyMode($key);
+                $account = $this->continuityRequest($key, 'get', '/account');
+                abort_unless(!empty($account->id) && ($state['account'] ?? $account->id) === $account->id && ($state['mode'] ?? $mode) === $mode, 409);
+                $url = route('extensions.gateways.ae-stripe.webhook'); $urls = [$url, str_replace('/extensions/ae-stripe/webhook', '/extensions/stripe-saved/webhook', $url)];
+                $page = $this->continuityRequest($key, 'get', '/webhook_endpoints', ['limit' => 100]);
+                abort_unless(is_array($page->data ?? null) && ($page->has_more ?? true) === false, 409);
+                $matches = array_values(array_filter($page->data, fn ($e) => $e->id === ($state['endpoint'] ?? null) || in_array($e->url, $urls, true)));
+                abort_unless(count($matches) === 1 && in_array($matches[0]->url, $urls, true) && ($state['endpoint'] ?? $matches[0]->id) === $matches[0]->id, 409);
+                $endpoint = $matches[0]; $events = $this->webhookEvents($endpoint->enabled_events);
+                if (array_diff($events, $endpoint->enabled_events)) $this->continuityRequest($key, 'post', '/webhook_endpoints/' . $endpoint->id, ['enabled_events' => $events]);
+                $status = 'ready';
+            } catch (\Throwable $e) {
+                $status = 'retry'; // No provider details or secrets in the persistent staff action.
+            }
+            $gateway->settings()->updateOrCreate(['key' => self::WEBHOOK_EVENTS], ['value' => $status]);
+        });
+    }
 
     private function continuityState(): array
     {
@@ -137,8 +170,7 @@ trait WebhookContinuity
                     $last = end($page->data); $after = $last->id ?? null;
                     if (($page->has_more ?? false) && !$after) throw new DisplayException('Stripe returned an incomplete webhook list. Save again.');
                 } while ($page->has_more ?? false);
-                $events = ['payment_intent.succeeded', 'payment_intent.payment_failed', 'payment_intent.processing',
-                    'setup_intent.succeeded', 'subscription_schedule.canceled', 'invoice.created', 'invoice.payment_succeeded', 'charge.updated', 'charge.succeeded', 'refund.failed', 'refund.updated'];
+                $events = $this->webhookEvents();
                 $params = ['url' => $url, 'enabled_events' => $events];
                 $createKey = 'ae_webhook_' . hash('sha256', $gateway->id . ':' . $account . ':' . $url);
                 $createParams = $params + ['api_version' => self::API_VERSION, 'metadata' => ['ae_stripe_create_key' => $createKey]];
@@ -153,7 +185,7 @@ trait WebhookContinuity
                     if ($credentials['stripe_webhook_secret'] === '') throw new DisplayException('Copy this endpoint\'s signing secret from Stripe, then save again. Its existing deliveries have been preserved.');
                     // Editing the existing endpoint keeps its signing secret and pending deliveries.
                     $existingEvents = $endpoint->enabled_events ?? [];
-                    $params['enabled_events'] = array_values(array_unique(array_merge($existingEvents, $events)));
+                    $params['enabled_events'] = $this->webhookEvents($existingEvents);
                     if ($endpoint->url !== $url || !in_array('*', $existingEvents, true) && array_diff($events, $existingEvents)) {
                         $this->continuityRequest($key, 'post', '/webhook_endpoints/' . $endpoint->id, $params);
                     }
@@ -177,6 +209,7 @@ trait WebhookContinuity
                     'value' => $value, 'encrypted' => $name !== 'stripe_publishable_key',
                 ]);
                 $gateway->settings()->updateOrCreate(['key' => self::WEBHOOK_STATE], ['value' => json_encode($state, JSON_THROW_ON_ERROR), 'encrypted' => true]);
+                $gateway->settings()->updateOrCreate(['key' => self::WEBHOOK_EVENTS], ['value' => 'ready']);
                 $this->config = array_replace($this->config, $credentials, [self::WEBHOOK_STATE => json_encode($state, JSON_THROW_ON_ERROR), 'stripe_revoke_previous_secrets' => false]);
             } catch (\Throwable $e) {
                 // The core edit has already persisted the submitted fields. Restore verified values.

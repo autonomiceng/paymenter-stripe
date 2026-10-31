@@ -140,7 +140,7 @@ NativePresenter::$domain = (object) ['renewal' => 'On'];
 NativePresenter::$summary = (object) ['renewalIssueAt' => '2026-11-24'];
 $dates = $gateway->autoPayDates($service);
 check($dates['invoice_on'] === '2026-11-24' && $dates['charge_on'] === '2026-11-24', 'Domain opt-ins use actual Domains issue calendar, never hosting offset or due date');
-NativePresenter::$domain->renewNow = ['invoice' => 'https://paymenter.example.test/invoices/retained'];
+NativePresenter::$domain->renewNow = ['invoice' => 'https://paymenter.example.com/invoices/retained'];
 $dates = $gateway->autoPayDates($service);
 check($dates['state'] === 'existing_invoice' && $dates['invoice_url'] === NativePresenter::$domain->renewNow['invoice']
     && $dates['charge_on'] === null, 'Retained domain invoice stays payable from its exact link without a new debit promise');
