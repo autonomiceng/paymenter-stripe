@@ -143,10 +143,10 @@ trait RenewalRetry
                 $this->writePaymentAttempt($user, $current, $attempt);
                 return null;
             }
+            if ($renewal['next_at'] > time()) return null;
             // Missing or revoked Domains authority defers this scan without consuming the schedule.
             if (isset($renewal['domains']) && ($domains !== $renewal['domains']
                 || !$this->renewalStillAuthorized($current, $renewal))) return null;
-            if ($renewal['next_at'] > time()) return null;
             // Never replace uncertainty, money in flight, or a newer customer's payment form.
             if (!empty($attempt['confirmation']) || !empty($attempt['agreement_id'])) return $attempt;
             if (!$this->cancelInvoicePayments($current)) return null;

@@ -4,6 +4,17 @@ use App\Helpers\ExtensionHelper;
 use App\Models\{BillingAgreement, Notification, Service, User};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Support\Facades\DB;
+use function Paymenter\Extensions\Gateways\AeStripe\Concerns\time;
+
+// Match the fixed calendar used by now(), and release the clock after every case.
+$runUnfrozen = $run;
+$run = function ($name, $test) use ($runUnfrozen) {
+    $runUnfrozen($name, function ($invoice, $stripe) use ($test) {
+        $GLOBALS['fakeStripeTime'] = strtotime('2026-10-31');
+        try { $test($invoice, $stripe); }
+        finally { unset($GLOBALS['fakeStripeTime']); }
+    });
+};
 
 $renewalFixture = function ($invoice, $stripe) {
     $GLOBALS['fakeConsole'] = true;
@@ -106,7 +117,7 @@ try {
         DB::$afterTransaction = $takeover;
         $intent = $stripe->intents['pi_test1']; $intent->status = 'requires_payment_method';
         $intent->last_payment_error = (object) ['code' => 'card_declined'];
-        $gateway->webhook(eventRequest($intent, type: 'payment_intent.payment_failed'));
+        $gateway->webhook(eventRequest($intent, time: time(), type: 'payment_intent.payment_failed'));
         $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
         check($confirmation && ($attempt['confirmation'] ?? null) === $confirmation && $attempt['agreement_id'] === 4 && !Notification::$rows,
             'A deferred renewal refusal cannot erase customer Pay confirmation or send its old notice after takeover');
@@ -452,6 +463,7 @@ try {
             'Processing money and unreadable results stay in existing recovery, without arming a new debit');
     });
 } finally {
+    $run = $runUnfrozen;
     Service::$row = $savedService;
     unset($GLOBALS['fakeToday']);
 }
