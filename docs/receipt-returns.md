@@ -47,6 +47,10 @@ Ordinary receipts retain their positive transaction; each completed allocation
 adds one deterministic negative transaction. Credit and its adjustment commit
 together; the negative credit adjustment has `is_credit_transaction = true`,
 while a cash refund has `false`. Include both in net invoice funding.
+If an owned cash refund later fails, the existing return row is locked and checked
+against its invoice, gateway, succeeded status and exact allocation amount. Only
+its credit-classification flag changes, without model events or timestamp changes.
+Initial ordinary return posts retain native events and paid-status behavior.
 
 A successful checkout or exactly bound subscription payment on a closed invoice
 reserves its whole receipt as `excess`.

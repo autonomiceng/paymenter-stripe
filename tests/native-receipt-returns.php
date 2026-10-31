@@ -9,7 +9,7 @@ require __DIR__ . '/../extension/AeStripe/AeStripe.php';
 use App\Events\InvoiceTransaction\{Created, Updated};
 use App\Helpers\ExtensionHelper;
 use App\Listeners\InvoiceTransactionCreatedListener;
-use App\Models\{Invoice, InvoiceTransaction};
+use App\Models\{Credit, Invoice, InvoiceTransaction};
 use Illuminate\Config\Repository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
@@ -87,4 +87,46 @@ foreach (['refunded', 'credited'] as $n => $state) {
     $cash = (float) DB::table('invoice_transactions')->where('invoice_id', $id)->where('status', 'succeeded')->where('is_credit_transaction', false)->sum('amount');
     verifyReturn($cash === ($state === 'credited' ? 20.0 : 0.0), 'Native revenue distinguishes a credit reclassification from outgoing cash');
 }
+// Domains-shaped native guard: general writers cannot change financial classification.
+Schema::create('credits', function ($t) { $t->id(); $t->unsignedBigInteger('user_id'); $t->string('currency_code'); $t->decimal('amount', 12, 2); $t->timestamps(); });
+DB::table('invoices')->insert(['id' => 4, 'user_id' => 1, 'currency_code' => 'USD', 'status' => 'paid']);
+DB::table('invoice_items')->insert(['invoice_id' => 4, 'price' => 10, 'quantity' => 1]);
+$guardRefusals = 0; $initialPosts = 0;
+InvoiceTransaction::updating(function (InvoiceTransaction $row) use (&$guardRefusals) {
+    if ($row->invoice_id === 4 && (int) $row->is_credit_transaction !== (int) $row->getRawOriginal('is_credit_transaction')) {
+        ++$guardRefusals;
+        throw new DomainException('Domain financial evidence is retained; append an audited adjustment.');
+    }
+});
+InvoiceTransaction::created(function (InvoiceTransaction $row) use (&$initialPosts) {
+    if ($row->invoice_id === 4 && $row->amount < 0) ++$initialPosts;
+});
+$receipt['invoice_id'] = 4; $receipt['closed_invoice'] = false; $receipt['payment_intent_id'] = 'pi_guarded';
+$allocation = ['amount_minor' => 1000, 'key' => 'ae-return-guarded', 'refund_id' => 're_guarded', 'state' => 'refunded'];
+ExtensionHelper::addPayment(Invoice::findOrFail(4), 'AeStripe', 20, null, $receipt['payment_intent_id']);
+DB::transaction(fn () => $post->invoke($gateway, Invoice::findOrFail(4), $receipt, $allocation));
+$before = (array) DB::table('invoice_transactions')->where('transaction_id', $allocation['key'])->first();
+$cash = fn () => (float) DB::table('invoice_transactions')->where('invoice_id', 4)->where('status', 'succeeded')->where('is_credit_transaction', false)->sum('amount');
+verifyReturn($initialPosts === 1 && $cash() === 10.0 && Invoice::findOrFail(4)->remaining === 0.0, 'Ordinary initial return keeps native events, cash revenue and invoice totals');
+try {
+    ExtensionHelper::addPayment(Invoice::findOrFail(4), 'AeStripe', -10, null, $allocation['key'], isCreditTransaction: true);
+    throw new RuntimeException('Native classification guard did not run');
+} catch (DomainException) {
+    verifyReturn($guardRefusals === 1 && $cash() === 10.0, 'Native guard rejects a general event-driven classification change');
+}
+$allocation['state'] = 'credited';
+DB::transaction(function () use ($post, $gateway, $receipt, $allocation) {
+    Credit::create(['user_id' => 1, 'currency_code' => 'USD', 'amount' => 10]);
+    $post->invoke($gateway, Invoice::findOrFail(4), $receipt, $allocation);
+});
+$after = (array) DB::table('invoice_transactions')->where('id', $before['id'])->first();
+verifyReturn((bool) $after['is_credit_transaction'] && array_replace($after, ['is_credit_transaction' => $before['is_credit_transaction']]) === $before,
+    'Owned reclassification changes only its flag, preserving invoice, key, amount, gateway, status and timestamps');
+verifyReturn($guardRefusals === 1 && $initialPosts === 1 && DB::table('credits')->count() === 1 && (float) DB::table('credits')->sum('amount') === 10.0,
+    'Later failed-refund credit and owned reclassification commit without triggering the native classification guard');
+verifyReturn($cash() === 20.0 && Invoice::findOrFail(4)->remaining === 0.0 && Invoice::findOrFail(4)->status === 'paid',
+    'Event-free flip restores cash revenue without changing native invoice funding or paid status');
+DB::transaction(fn () => $post->invoke($gateway, Invoice::findOrFail(4), $receipt, $allocation));
+verifyReturn(DB::table('invoice_transactions')->where('invoice_id', 4)->count() === 2 && $guardRefusals === 1,
+    'Repeated owned reclassification retains one native return and leaves the guard active for other writers');
 echo "PASS: $count native receipt storage/accounting assertions\n";

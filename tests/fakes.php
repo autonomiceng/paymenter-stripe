@@ -452,7 +452,7 @@ namespace Illuminate\Support\Facades {
         public static $tables = [], $locks = [], $updates = [];
         public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } }; }
         public static $concurrentAgreements = [], $concurrentPayments = [];
-        public static function table($name) { return match ($name) { 'ae_stripe_receipt_returns' => new \ReceiptReturnQuery, 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
+        public static function table($name) { return match ($name) { 'invoice_transactions' => new \TransactionClassificationQuery, 'ae_stripe_receipt_returns' => new \ReceiptReturnQuery, 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
         public static $beforeUserLock = null, $afterTransaction = null;
         public static function transactionLevel() { return self::$locked ? 1 : 0; }
         private static $afterCommit = [];
@@ -511,6 +511,22 @@ namespace Carbon {
     }
 }
 namespace {
+    class TransactionClassificationQuery {
+        private $id;
+        public function where($key, $value) {
+            if ($key !== 'id') throw new \RuntimeException('Unexpected transaction classification filter');
+            $this->id = $value; return $this;
+        }
+        public function update($values) {
+            if (!\Illuminate\Support\Facades\DB::$locked || !\Illuminate\Support\Facades\DB::$userLocked) throw new \RuntimeException('Classification requires payment locks');
+            foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
+                if (crc32($key) === $this->id) {
+                    \App\Helpers\ExtensionHelper::$payments[$key] = array_replace($row, $values); return 1;
+                }
+            }
+            return 0;
+        }
+    }
     class TransactionMethodQuery {
         private $id;
         public function where($key, $value) { $this->id = $value; return $this; }

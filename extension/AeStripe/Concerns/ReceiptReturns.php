@@ -283,6 +283,18 @@ trait ReceiptReturns
 
     private function postReceiptReturn($invoice, array $receipt, array $allocation): void
     {
+        if ($allocation['state'] === 'credited') {
+            $return = InvoiceTransaction::where('transaction_id', $allocation['key'])->lockForUpdate()->first();
+            if ($return) {
+                abort_unless($return->invoice->id === $invoice->id && ($return->gateway->extension ?? null) === 'AeStripe'
+                    && ($return->status->value ?? $return->status) === 'succeeded'
+                    && $this->toMinorUnits($return->amount, $receipt['currency']) === -$allocation['amount_minor'], 409);
+                // The ledger owns this exact reversal. Change only its classification; native
+                // financial guards reject general edits, and no paid-status event is needed.
+                DB::table('invoice_transactions')->where('id', $return->id)->update(['is_credit_transaction' => true]);
+                return;
+            }
+        }
         $post = function () use ($invoice, $receipt, $allocation) {
             if ($receipt['closed_invoice']) ExtensionHelper::addPayment($invoice, 'AeStripe', $this->fromMinorUnits($receipt['received_minor'], $receipt['currency']), null, $receipt['payment_intent_id']);
             ExtensionHelper::addPayment($invoice, 'AeStripe', -$this->fromMinorUnits($allocation['amount_minor'], $receipt['currency']), null, $allocation['key'], isCreditTransaction: $allocation['state'] === 'credited');
