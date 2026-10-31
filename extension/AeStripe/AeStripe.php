@@ -53,6 +53,7 @@ require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
 require_once __DIR__ . '/Concerns/CheckoutIntent.php';
 require_once __DIR__ . '/PaymentPendingException.php';
 require_once __DIR__ . '/Concerns/ChargeRecovery.php';
+require_once __DIR__ . '/Concerns/RenewalRetry.php';
 require_once __DIR__ . '/Concerns/InvoicePayments.php';
 require_once __DIR__ . '/Concerns/WebhookContinuity.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
@@ -71,7 +72,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -762,7 +763,7 @@ class AeStripe extends Gateway
         }
         try {
             $data = $this->checkoutPaymentData($invoice, $this->toMinorUnits($amount, $invoice->currency_code), $customer)
-                + ['agreement_id' => $billingAgreement->id];
+                + ['agreement_id' => $billingAgreement->id, 'renewal_start' => app()->runningInConsole()];
             if (!$this->gatewayEnabled()) {
                 $this->reservePaymentAttempt($invoice, $data);
                 $this->paymentPending('Payments are paused. We will check this payment when payments resume.');
@@ -797,6 +798,13 @@ class AeStripe extends Gateway
         } catch (PaymentPendingException $e) {
             // Core cron ignores the bool and emails failure for every thrown exception.
             if (app()->runningInConsole()) return true;
+            throw $e;
+        } catch (DisplayException $e) {
+            if (app()->runningInConsole() && isset($intent) && $this->withPaymentLock($invoice, function ($user, $current) use ($intent) {
+                $attempt = $this->readPaymentAttempt($user, $current);
+                return ($attempt['intent'] ?? null) === $intent->id && !empty($attempt['failure_notified']) && !empty($attempt['failure_reason'])
+                    && in_array($attempt['renewal']['state'] ?? null, ['waiting', 'stopped'], true);
+            })) return false; // This renewal refusal already has its linked notice; core must not send another.
             throw $e;
         }
     }
