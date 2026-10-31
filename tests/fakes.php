@@ -68,9 +68,12 @@ namespace App\Models {
         public static function where(...$args) { return new class($args[2] ?? '') {
             public function __construct(private string $pattern) {}
             private bool $filtered = false;
+            private ?array $rawOrder = null;
+            private int $rowLimit = PHP_INT_MAX;
             public function where(...$args) { $this->filtered = true; return $this; }
             public function orderBy($key) { return $this; }
-            public function limit($n) { return $this; }
+            public function orderByRaw($sql, $bindings = []) { $this->rawOrder = [$sql, $bindings]; return $this; }
+            public function limit($n) { $this->rowLimit = $n; return $this; }
             public function get() {
                 $result = [];
                 foreach (User::$row->props->values as $key => $value) {
@@ -80,7 +83,17 @@ namespace App\Models {
                         : str_starts_with($key, 'ae_stripe_checkout_') && (!$this->filtered || ($record['retry'] ?? false) || ($record['version'] ?? null) !== 2 || !empty($record['agreement_id']));
                     if ($selected) $result[] = (object) ['key' => $key, 'value' => $value, 'model_type' => User::class, 'model_id' => User::$row->id];
                 }
-                return $result;
+                if ($this->rawOrder) {
+                    // Execute the production priority expression instead of duplicating its predicate in PHP.
+                    $db = new \PDO('sqlite::memory:');
+                    $db->exec('CREATE TABLE properties (position INTEGER, value TEXT)');
+                    $insert = $db->prepare('INSERT INTO properties VALUES (?, ?)');
+                    foreach ($result as $position => $row) $insert->execute([$position, $row->value]);
+                    $query = $db->prepare('SELECT position FROM properties ORDER BY ' . $this->rawOrder[0] . ', position');
+                    $query->execute($this->rawOrder[1]);
+                    $result = array_map(fn ($position) => $result[$position], $query->fetchAll(\PDO::FETCH_COLUMN));
+                }
+                return array_slice($result, 0, $this->rowLimit);
             }
         }; }
     }

@@ -704,6 +704,35 @@ use Illuminate\Support\Facades\{DB, Http};
             $gateway->retryChargeAttempts();
             check(isset(ExtensionHelper::$payments['920:pi_test1']) && count($stripe->charges) === 1, 'Scheduled recovery settles a lost confirmation without customer input');
         });
+        $run('idle-access-refusal', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            $stripe->failure = fn ($verb, $path) => str_starts_with($path, '/payment_intents/') ? throw new RequestException(403) : null;
+            paymentStops(fn () => $gateway->pay($invoice, 20));
+            DB::transaction(fn () => null); // Flush the fake's queued after-commit staff alert.
+            check(!Notification::$rows, 'Two idle retirement checks cannot turn the first real access refusal into a staff alert');
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(($attempt['checks'] ?? 0) === 0, 'Idle forms do not accumulate active recovery checks');
+        });
+        $run('active-before-idle', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $idle = User::$row->props->values['ae_stripe_checkout_920'];
+            for ($id = 921; $id <= 1020; ++$id) {
+                $other = clone $invoice; $other->id = $id; Invoice::$rows[$id] = $other;
+                $attempt = json_decode($idle, true); $attempt['agreement_id'] = null;
+                User::$row->props->values['ae_stripe_checkout_' . $id] = json_encode($attempt);
+            }
+            $active = clone $invoice; $active->id = 1021; Invoice::$rows[1021] = $active;
+            $gateway->pay($active, 20);
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_1021'], true); $attempt['agreement_id'] = 4;
+            User::$row->props->values['ae_stripe_checkout_1021'] = json_encode($attempt);
+            $gateway->retryChargeAttempts();
+            $paid = array_filter(array_keys(ExtensionHelper::$payments), fn ($key) => str_starts_with($key, '1021:'));
+            check(count($stripe->charges) === 1 && count($paid) === 1,
+                'An active saved-method attempt behind 101 idle forms is recovered in the first 100-row batch');
+            $untouched = json_decode(User::$row->props->values['ae_stripe_checkout_1020'], true);
+            check(!isset($untouched['checks']), 'An explicit null agreement stays idle and cannot outrank an active attempt');
+        });
         $run('outage-batch', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20); $other = clone $invoice; $other->id = 921; Invoice::$rows[921] = $other;
             $gateway->pay($other, 20);

@@ -72,6 +72,8 @@ trait ChargeRecovery
         if ($collect) $this->retryPaymentReviewAlerts();
         $this->paymentStripeUnavailable = false;
         foreach (Property::where('key', 'like', 'ae_stripe_checkout_%')
+            ->orderByRaw('CASE WHEN value LIKE ? OR value NOT LIKE ? OR (value LIKE ? AND value NOT LIKE ?) THEN 0 ELSE 1 END',
+                ['%"retry":true%', '%"version":2%', '%"agreement_id":%', '%"agreement_id":null%'])
             ->orderBy('updated_at')->limit(100)->get() as $property) {
             if (!preg_match('/^ae_stripe_checkout_([0-9]+)$/', $property->key, $match)) continue;
             try {
@@ -80,7 +82,9 @@ trait ChargeRecovery
                 $attempt = $this->withPaymentLock($invoice, function ($user, $current) {
                     $attempt = $this->readPaymentAttempt($user, $current);
                     if (!$attempt) return null;
-                    $attempt['checks'] = ($attempt['checks'] ?? 0) + 1;
+                    if (($attempt['version'] ?? 1) !== 2 || !empty($attempt['retry']) || !empty($attempt['agreement_id'])) {
+                        $attempt['checks'] = ($attempt['checks'] ?? 0) + 1;
+                    }
                     $this->writePaymentAttempt($user, $current, $attempt);
                     return $attempt;
                 });
