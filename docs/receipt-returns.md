@@ -38,12 +38,31 @@ complete before the method returns; inspect the returned state. Rollback discard
 the reservation without refund I/O. Backend callers treat a 409 as a refused
 allocation, never as permission for independent credit.
 
-The native user property `ae_stripe_receipt_<pi>` stores invoice, currency, original
-customer, received amount and keyed allocations. Read/write uses user then invoice
-locks. Keep the ledger permanently, including completed allocations. The positive
-receipt remains; each completed allocation adds one negative native transaction
-with its `key`, and a credit fallback is in that same database transaction.
-Consumers calculating net native funding must include that negative transaction.
+The extension's install/upgrade hook creates `ae_stripe_receipt_returns`: one row
+per allocation, unique on receipt/allocation, with a state/retry/time index for due
+work. Immutable invoice, owner, customer, currency and receipt amounts accompany
+each row. User then invoice locks serialize reservations and completion. Keep
+completed rows permanently. Nothing is stored in the native profile properties.
+Ordinary receipts retain their positive transaction; each completed allocation
+adds one deterministic negative transaction. Credit and its adjustment commit
+together; the negative credit adjustment has `is_credit_transaction = true`,
+while a cash refund has `false`. Include both in net invoice funding.
+
+A successful checkout on a closed invoice reserves its whole receipt as `excess`.
+Core's normal `addPayment` can mark a cancelled invoice paid and activate it, so
+this receipt stays outside succeeded native funding until return completion. Then
++receipt/-return post atomically with transaction events suppressed. The invoice
+stays closed. Domains sees no new settled funding while pending and zero net
+funding afterward; this automatic allocation owns the whole receipt, so Domains
+must not independently credit or refund it.
+
+Owned `refund.failed` and `refund.updated` events reconcile canonical Stripe
+history under the same locks. A refund can fail after a succeeded notice: proved
+failure becomes credit once, updating the existing adjustment identity and credit
+classification. Disputed outcomes are held for reconciliation. A completion notice
+is due until `notified` matches the current state/reason, even after a prior pending
+notice. The five-minute sweep reads at most 100 indexed due allocations and stops
+its batch on a connection or authentication failure.
 
 Recovery reconciles refund metadata before every send, with complete pagination
 (up to our 1,000-refund inspection cap). Incomplete or foreign history, disputes,
@@ -55,4 +74,5 @@ Never clear a reservation to retry.
 
 API references: [partial refunds](https://docs.stripe.com/api/refunds/create),
 [refund listing](https://docs.stripe.com/api/refunds/list),
+[later refund failures](https://docs.stripe.com/refunds#failed-refunds),
 [idempotency lifetime](https://docs.stripe.com/api/idempotent_requests).

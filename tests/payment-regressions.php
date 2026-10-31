@@ -57,57 +57,6 @@ use Illuminate\Support\Facades\{DB, Http, Log};
 })();
 
 (function () use ($gateway) {
-    $oldRows = Invoice::$rows;
-    $oldEnabled = Gateway::$enabled;
-    $oldAudits = Audit::$rows;
-    Gateway::$enabled = true;
-    $invoice = clone Invoice::$row;
-    $invoice->id = 215;
-    $invoice->status = 'cancelled';
-    $invoice->currency_code = 'usd';
-    Invoice::$rows[$invoice->id] = $invoice;
-    $settled = (object) ['id' => 'pi_review_cancelled_checkout', 'status' => 'succeeded', 'customer' => 'cus_owner',
-        'amount' => 2000, 'amount_received' => 1250, 'currency' => 'usd',
-        'metadata' => (object) ['invoice_id' => $invoice->id, 'ae_stripe_gateway' => '1']];
-    $before = ExtensionHelper::$applications;
-    $records = count(Audit::$rows);
-    $calls = count(Http::$calls);
-    $locks = count(DB::$modelLocks);
-    $warnings = count(Log::$warnings);
-    $gateway->webhook(eventRequest($settled));
-    $gateway->webhook(eventRequest($settled));
-    check(ExtensionHelper::$applications === $before && $invoice->status === 'cancelled'
-        && !isset(ExtensionHelper::$payments[$invoice->id . ':' . $settled->id]),
-        'A settled checkout charge cannot be applied to a cancelled invoice');
-    $record = end(Audit::$rows);
-    check(count(Audit::$rows) === $records + 1 && $record['auditable_type'] === $invoice->getMorphClass()
-        && $record['auditable_id'] === $invoice->id
-        && $record['new_values']['payment_intent_id'] === $settled->id
-        && $record['new_values']['amount_minor'] === 1250 && $record['new_values']['currency'] === 'usd'
-        && $record['new_values']['reason'] === 'invoice not pending',
-        'Cancelled checkout success retains one invoice audit with received units and refusal reason');
-    check(array_slice(DB::$modelLocks, $locks, 4) === [\App\Models\User::class, Invoice::class,
-        \App\Models\InvoiceTransaction::class, Audit::class],
-        'Cancelled checkout refusal holds owner and invoice locks before the current audit read');
-    check(count(Http::$calls) === $calls, 'Cancelled checkout refusal makes no Stripe request');
-    check(array_slice(Log::$warnings, $warnings) === array_fill(0, 2, [
-        'AeStripe payment received for nonpending invoice', ['invoice_id' => $invoice->id],
-    ]), 'Cancelled checkout warning contains only the constant message and invoice ID');
-
-    $settled->id = 'pi_review_cancelled_retry';
-    Audit::$fail = true;
-    rejects(fn () => $gateway->webhook(eventRequest($settled)), 'Review record unavailable');
-    $records = count(Audit::$rows);
-    $gateway->webhook(eventRequest($settled));
-    $gateway->webhook(eventRequest($settled));
-    check(count(Audit::$rows) === $records + 1 && ExtensionHelper::$applications === $before,
-        'Cancelled checkout audit failure retries without applying or losing the charge');
-    Invoice::$rows = $oldRows;
-    Audit::$rows = $oldAudits;
-    Gateway::$enabled = $oldEnabled;
-})();
-
-(function () use ($gateway) {
     $invoice = Invoice::$row;
     $user = $invoice->user;
     $oldStatus = $invoice->status;
@@ -130,7 +79,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $gateway->webhook(eventRequest($settled, type: 'payment_intent.processing'));
     $gateway->webhook(eventRequest($settled, type: 'payment_intent.payment_failed'));
     check((ExtensionHelper::$payments[$invoice->id . ':pi_late_success'] ?? null) === [
-        'gateway' => 'AeStripe', 'amount' => 20.0, 'status' => 'succeeded',
+        'gateway' => 'AeStripe', 'amount' => 20.0, 'status' => 'succeeded', 'is_credit_transaction' => false,
     ], 'Late successful charge remains visible as a native transaction');
     check(ExtensionHelper::$applications === $before + 1 && $invoice->status === 'paid',
         'Late success and delayed events preserve one payment and the paid invoice');

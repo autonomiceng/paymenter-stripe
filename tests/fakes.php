@@ -79,9 +79,9 @@ namespace App\Models {
                 $result = [];
                 foreach (User::$row->props->values as $key => $value) {
                     $record = json_decode($value, true);
-                    $selected = str_contains($this->pattern, 'receipt') ? str_starts_with($key, 'ae_stripe_receipt_') && !empty($record['retry']) : (str_contains($this->pattern, 'payment_alert')
+                    $selected = str_contains($this->pattern, 'payment_alert')
                         ? str_starts_with($key, 'ae_stripe_payment_alert_') && !($record['sent'] ?? true)
-                        : str_starts_with($key, 'ae_stripe_checkout_') && (!$this->filtered || ($record['retry'] ?? false) || ($record['version'] ?? null) !== 2 || !empty($record['agreement_id'])));
+                        : str_starts_with($key, 'ae_stripe_checkout_') && (!$this->filtered || ($record['retry'] ?? false) || ($record['version'] ?? null) !== 2 || !empty($record['agreement_id']));
                     if ($selected) $result[] = (object) ['key' => $key, 'value' => $value, 'model_type' => User::class, 'model_id' => User::$row->id];
                 }
                 if ($this->rawOrder) {
@@ -352,6 +352,11 @@ namespace App\Models {
         public function update($row) { $this->amount = $row['amount']; }
     }
     class InvoiceTransaction {
+        public static $eventsSuppressed = false;
+        public static function withoutEvents($callback) {
+            $prior = self::$eventsSuppressed; self::$eventsSuppressed = true;
+            try { return $callback(); } finally { self::$eventsSuppressed = $prior; }
+        }
         public static function where($key, $value) { return new class($value) {
             private $status, $currentRead = false;
             public function __construct(private $id) {}
@@ -377,7 +382,7 @@ namespace App\Helpers {
         public static $agreements = [];
         public static $agreementFailure = false;
         public static $payments = [];
-        public static $applications = 0;
+        public static $applications = 0, $simulateNativeListeners = false, $activations = 0;
         public static $fees = [], $feeWrites = 0;
         public static function addPaymentFee($id, $fee) { ++self::$feeWrites; self::$fees[$id] = $fee; }
         public static function makeBillingAgreement($user, $gateway, $name, $id, $type, $expiry) {
@@ -397,9 +402,13 @@ namespace App\Helpers {
             return new \App\Models\BillingAgreement(self::$agreements[$id]);
         }
         // Native helper updateOrCreate is keyed by invoice + transaction_id under an invoice lock.
-        public static function addPayment($invoice, $gateway, $amount, $fee, $id, $status = 'succeeded') {
+        public static function addPayment($invoice, $gateway, $amount, $fee, $id, $status = 'succeeded', $isCreditTransaction = false) {
             ++self::$applications;
-            self::$payments[$invoice->id . ':' . $id] = compact('gateway', 'amount', 'status');
+            self::$payments[$invoice->id . ':' . $id] = compact('gateway', 'amount', 'status') + ['is_credit_transaction' => $isCreditTransaction];
+            if (self::$simulateNativeListeners && !\App\Models\InvoiceTransaction::$eventsSuppressed) {
+                $net = 0; foreach (self::$payments as $key => $row) if (str_starts_with($key, $invoice->id . ':') && $row['status'] === 'succeeded') $net += $row['amount'];
+                if ($invoice->total - $net <= 0 && $invoice->status !== 'paid') { $invoice->status = 'paid'; ++self::$activations; }
+            }
             return (object) ['id' => crc32($invoice->id . ':' . $id), 'invoice_id' => $invoice->id];
         }
         public static function addProcessingPayment(...$args) { return self::addPayment(...[...$args, 'processing']); }
@@ -443,8 +452,9 @@ namespace Illuminate\Support\Facades {
         public static $tables = [], $locks = [], $updates = [];
         public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } }; }
         public static $concurrentAgreements = [], $concurrentPayments = [];
-        public static function table($name) { return match ($name) { 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
+        public static function table($name) { return match ($name) { 'ae_stripe_receipt_returns' => new \ReceiptReturnQuery, 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
         public static $beforeUserLock = null, $afterTransaction = null;
+        public static function transactionLevel() { return self::$locked ? 1 : 0; }
         private static $afterCommit = [];
         public static function afterCommit($callback) { self::$afterCommit[] = $callback; }
         public static $locked = false, $userLocked = false;
@@ -636,3 +646,34 @@ namespace Filament\Support\Facades {
     }
 }
 namespace Filament\View { class PanelsRenderHook { const PAGE_START = 'panels::page.start'; const CONTENT_START = 'panels::content.start'; } }
+
+namespace {
+    class ReceiptReturnQuery {
+        public static $beforeWrite = null;
+        private $filters = [], $order = [], $limit = PHP_INT_MAX;
+        public function where($key, $value) { return $this->whereIn($key, [$value]); }
+        public function whereIn($key, $values) { $this->filters[$key] = $values; return $this; }
+        public function orderBy($key) { $this->order[] = $key; return $this; }
+        public function limit($value) { $this->limit = $value; return $this; }
+        public function lockForUpdate() { if (!\Illuminate\Support\Facades\DB::$locked) throw new RuntimeException('Return read needs transaction'); return $this; }
+        public function get() {
+            $rows = [];
+            foreach (\Illuminate\Support\Facades\DB::$tables['ae_stripe_receipt_returns'] ?? [] as $row) {
+                foreach ($this->filters as $key => $values) if (!in_array($row[$key], $values)) continue 2;
+                $rows[] = (object) $row;
+            }
+            usort($rows, function ($a, $b) { foreach ($this->order as $key) if ($a->$key !== $b->$key) return $a->$key <=> $b->$key; return 0; });
+            return array_slice($rows, 0, $this->limit);
+        }
+        public function first() { return $this->get()[0] ?? null; }
+        public function updateOrInsert($identity, $values) {
+            if (!\Illuminate\Support\Facades\DB::$userLocked) throw new RuntimeException('Return write needs owner lock');
+            $row = $identity + $values;
+            if (self::$beforeWrite) (self::$beforeWrite)($row);
+            \Illuminate\Support\Facades\DB::$tables['ae_stripe_receipt_returns'][$row['payment_intent_id'] . ':' . $row['allocation_key']] = $row;
+        }
+        public function update($values) {
+            foreach ($this->get() as $row) \Illuminate\Support\Facades\DB::$tables['ae_stripe_receipt_returns'][$row->payment_intent_id . ':' . $row->allocation_key] = array_replace((array) $row, $values);
+        }
+    }
+}

@@ -189,7 +189,7 @@ foreach ([null, 0, -1, 'invalid', 'INF', 'NaN', '1e309'] as $rateIndex => $inval
             check(ExtensionHelper::$fees === $fees,
                 'Unavailable fee conversion preserves existing or absent fee: ' . $feeIntent->id);
             check(ExtensionHelper::$payments['12:' . $feeIntent->id] === $payment
-                && $payment === ['gateway' => 'AeStripe', 'amount' => 20.0, 'status' => 'succeeded']
+                && $payment === ['gateway' => 'AeStripe', 'amount' => 20.0, 'status' => 'succeeded', 'is_credit_transaction' => false]
                 && ExtensionHelper::$applications === $applications + 1,
                 'Unavailable fee conversion preserves the settled payment: ' . $feeIntent->id);
             $pending = DB::$tables['ae_stripe_payment_fees'][$feeIntent->id];

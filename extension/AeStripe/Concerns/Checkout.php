@@ -244,6 +244,7 @@ trait Checkout
 
     private function recordIntentPayment($intent, $status, bool $prepareMethod = true)
     {
+        $this->ensureReceiptReturnSchema();
         $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
         $userId = $invoice->user_id;
         if ($prepareMethod) $intent = $this->prepareTransactionMethod($invoice, $intent, $status);
@@ -269,7 +270,7 @@ trait Checkout
             }
             if ($status === 'succeeded' && !in_array($invoice->status, ['pending', 'paid'], true)) {
                 \Illuminate\Support\Facades\Log::warning('AeStripe payment received for nonpending invoice', ['invoice_id' => $invoice->id]);
-                $this->recordPaymentReview($invoice, $intent, 'invoice not pending');
+                $this->recordReceipt($invoice, $intent, $intent->amount_received, closed: true);
                 return;
             }
             if ($status === 'succeeded' && ($invoice->status === 'paid' || $intent->amount_received > $this->paymentBalance($invoice))) {

@@ -10,12 +10,13 @@ use Illuminate\Support\Facades\{DB, Http};
     $handler = Http::$handler; $rows = Invoice::$rows; $user = User::$row; $console = $GLOBALS['fakeConsole'] ?? true;
     $payments = ExtensionHelper::$payments; $agreements = ExtensionHelper::$agreements;
     $audits = Audit::$rows; $notices = Notification::$rows; $enabled = Gateway::$enabled;
+    $returns = DB::$tables['ae_stripe_receipt_returns'];
     $run = function ($name, $test) use ($gateway) {
         if (($only = getenv('AE_STRIPE_CHARGE_CASE')) && $only !== $name) return;
         $GLOBALS['fakeConsole'] = false;
         User::$row = new User(new Properties('cus_owner'));
         $invoice = new Invoice(User::$row); $invoice->id = 920; Invoice::$rows[920] = $invoice;
-        ExtensionHelper::$payments = []; Audit::$rows = []; Notification::$rows = []; Gateway::$enabled = true;
+        ExtensionHelper::$payments = []; Audit::$rows = []; Notification::$rows = []; Gateway::$enabled = true; DB::$tables['ae_stripe_receipt_returns'] = [];
         ExtensionHelper::$agreements = ['pm_test' => ['id' => 4, 'user_id' => 7, 'gateway_id' => 3],
             'pm_other' => ['id' => 5, 'user_id' => 7, 'gateway_id' => 3]];
         $stripe = new class {
@@ -33,7 +34,7 @@ use Illuminate\Support\Facades\{DB, Http};
                 $key = end(Http::$calls)[3]['Idempotency-Key'] ?? null;
                 if ($verb === 'post' && $key && isset($this->cache[$key])) return clone $this->cache[$key];
                 if ($path === '/refunds') {
-                    if ($verb === 'get') return (object) ['data' => array_values($this->refunds), 'has_more' => false];
+                    if ($verb === 'get') return (object) ['data' => array_values(array_filter($this->refunds, fn ($r) => $r->payment_intent === $data['payment_intent'])), 'has_more' => false];
                     return $this->refunds[$key] ??= (object) ['id' => 're_attempt', 'payment_intent' => $data['payment_intent'],
                         'amount' => $data['amount'], 'currency' => 'usd', 'metadata' => (object) $data['metadata'], 'status' => 'succeeded'];
                 }
@@ -117,9 +118,9 @@ use Illuminate\Support\Facades\{DB, Http};
                     check(!$gateway->cancelInvoicePayments($invoice), 'In-flight money prevents applying credit over the same payment');
                     $intent->status = 'succeeded'; $intent->amount_received = 2000;
                     $gateway->retryChargeAttempts();
-                    $reviews = array_filter(Audit::$rows, fn ($row) => $row['event'] === 'ae_stripe_payment_review'
-                        && $row['new_values']['payment_intent_id'] === $intent->id);
-                    check(count($reviews) === 1, 'A payment already ' . $status . ' follows the existing late-money review path');
+                    check($gateway->receiptReturnStatus($invoice, $intent->id, 'excess')['amount_minor'] === 2000
+                        && !isset(User::$row->props->values['ae_stripe_checkout_920']),
+                        'Closed ' . $status . ' success transfers whole-receipt ownership to the ledger and retires only the checkout attempt');
                 }
                 User::$row->props->values = []; $invoice->status = 'pending';
             }
@@ -158,14 +159,15 @@ use Illuminate\Support\Facades\{DB, Http};
             $gateway->retryChargeAttempts();
             $calls = count(Http::$calls);
             $gateway->retryChargeAttempts();
-            $reviews = array_values(array_filter(Audit::$rows, fn ($row) => $row['event'] === 'ae_stripe_payment_review'
-                && $row['new_values']['payment_intent_id'] === $intent->id));
-            check($invoice->status === 'cancelled' && !ExtensionHelper::$payments && ExtensionHelper::$applications === $applications,
-                'Late 3DS success does not fund or reopen the closed invoice, so the native paid/activation path is not called');
-            check(count($reviews) === 1 && $reviews[0]['new_values']['reason'] === 'invoice not pending',
-                'Repeated late success and recovery enter the existing late-money review path once; automatic return needs the integrated ledger');
-            check(!isset(User::$row->props->values['ae_stripe_checkout_920']) && count(Http::$calls) === $calls,
-                'A handled late success retires the checkout attempt, so another recovery makes no Stripe request');
+            $return = $gateway->receiptReturnStatus($invoice, $intent->id, 'excess');
+            check($invoice->status === 'cancelled' && count(ExtensionHelper::$payments) === 2 && ExtensionHelper::$applications === $applications + 2
+                && array_sum(array_column(ExtensionHelper::$payments, 'amount')) === 0.0,
+                'Late 3DS receipt and return post atomically as zero native funding while the closed invoice stays closed');
+            check($return['state'] === 'refunded' && $return['amount_minor'] === $intent->amount_received && count($stripe->refunds) === 1,
+                'Combined stale-form recovery returns the whole closed-invoice receipt once without a staff step');
+            check(!isset(User::$row->props->values['ae_stripe_checkout_920']) && count(Http::$calls) === $calls
+                && $gateway->receiptReturnStatus($invoice, $intent->id, 'excess')['key'] === $return['key'],
+                'Retiring the checkout attempt preserves its ledger allocation and another attempt sweep makes no Stripe request');
         });
         $run('retire-overlap', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20); $intent = $stripe->intents['pi_test1'];
@@ -1026,6 +1028,7 @@ use Illuminate\Support\Facades\{DB, Http};
     } finally {
         Http::$handler = $handler; Invoice::$rows = $rows; User::$row = $user; Gateway::$enabled = $enabled;
         ExtensionHelper::$payments = $payments; ExtensionHelper::$agreements = $agreements; Audit::$rows = $audits;
+        DB::$tables['ae_stripe_receipt_returns'] = $returns;
         Notification::$rows = $notices; Notification::$fail = false; DB::$beforeUserLock = null; DB::$afterTransaction = null; $GLOBALS['fakeConsole'] = $console;
     }
 })();

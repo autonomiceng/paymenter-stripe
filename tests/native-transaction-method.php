@@ -38,19 +38,19 @@ function verifyNative(bool $condition): void {
 $gateway->installed();
 verifyNative(Schema::hasTable('ae_stripe_transaction_methods'));
 $gateway->upgraded('0.1.0');
-verifyNative(DB::table('migrations')->count() === 2);
+verifyNative(DB::table('migrations')->count() === 3);
 $record = new ReflectionMethod($gateway, 'recordTransactionMethod');
 $intent = json_decode('{"latest_charge":{"payment_method_details":{"type":"card","card":{"brand":"visa","last4":"4242","fingerprint":"never-store"}}}}');
-DB::transaction(fn () => $record->invoke($gateway, (object) ['id' => 1, 'invoice_id' => 12], $intent));
+DB::transaction(fn () => $record->invoke($gateway, (object) ['id' => 1, 'invoice_id' => 12], $intent, false));
 verifyNative(DB::table('ae_stripe_transaction_methods')->value('label') === 'Visa **** 4242');
 $intent->latest_charge->payment_method_details->card->last4 = '5555';
-DB::transaction(fn () => $record->invoke($gateway, (object) ['id' => 1, 'invoice_id' => 12], $intent));
+DB::transaction(fn () => $record->invoke($gateway, (object) ['id' => 1, 'invoice_id' => 12], $intent, false));
 verifyNative(DB::table('ae_stripe_transaction_methods')->count() === 1);
 verifyNative(DB::table('ae_stripe_transaction_methods')->value('label') === 'Visa **** 4242');
 verifyNative(Schema::getColumnListing('ae_stripe_transaction_methods') === ['invoice_transaction_id', 'label']);
 try {
     DB::transaction(function () use ($record, $gateway, $intent) {
-        $record->invoke($gateway, (object) ['id' => 2, 'invoice_id' => 12], $intent);
+        $record->invoke($gateway, (object) ['id' => 2, 'invoice_id' => 12], $intent, false);
         throw new RuntimeException('rollback');
     });
 } catch (RuntimeException $e) { if ($e->getMessage() !== 'rollback') throw $e; }
