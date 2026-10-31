@@ -41,7 +41,7 @@ trait ReceiptReturns
     public function allocateReceiptReturn(Invoice $invoice, string $paymentIntentId, string $allocationKey, int $amountMinor): array
     {
         $this->ensureReceiptReturnSchema();
-        abort_unless(preg_match('/^pi_[a-zA-Z0-9]+$/D', $paymentIntentId) && $allocationKey !== 'excess' && strlen($allocationKey) <= 180 && $allocationKey !== '' && $amountMinor > 0, 409);
+        abort_unless(preg_match('/^pi_[a-zA-Z0-9]+$/D', $paymentIntentId) && $allocationKey !== 'excess' && !$this->isReceiptObservation($allocationKey) && strlen($allocationKey) <= 180 && $allocationKey !== '' && $amountMinor > 0, 409);
         $this->withPaymentLock($invoice, function ($user, $current) use ($paymentIntentId, $allocationKey, $amountMinor) {
             $receipt = $this->readReceipt($user, $paymentIntentId);
             if (!$receipt) {
@@ -72,6 +72,7 @@ trait ReceiptReturns
                 'closed_invoice' => (bool) $row->closed_invoice, 'subscription_invoice_id' => $row->subscription_invoice_id];
             if ($receipt === null) $receipt = $binding + ['allocations' => []];
             abort_unless(array_intersect_key($receipt, $binding) === $binding, 409);
+            if ($this->isReceiptObservation($row->allocation_key)) continue;
             $receipt['allocations'][$row->allocation_key] = ['amount_minor' => (int) $row->amount_minor,
                 'state' => $row->state, 'refund_id' => $row->refund_id, 'credit_id' => $row->credit_id,
                 'key' => $row->return_key, 'sent_at' => $row->sent_at === null ? null : (int) $row->sent_at,
@@ -155,13 +156,13 @@ trait ReceiptReturns
         }
     }
 
-    private function recordReceiptRefundEvent($refund): void
+    private function recordReceiptRefundEvent($refund): bool
     {
         $this->ensureReceiptReturnSchema();
         $row = $this->receiptRows()->where('return_key', $refund->metadata->ae_stripe_return ?? '')->first();
         if (!$row || ($refund->payment_intent ?? null) !== $row->payment_intent_id || ($refund->amount ?? null) !== (int) $row->amount_minor
             || strtolower($refund->currency ?? '') !== $row->currency || empty($refund->id)
-            || $row->refund_id !== null && $row->refund_id !== $refund->id) return;
+            || $row->refund_id !== null && $row->refund_id !== $refund->id) return false;
         $invoice = Invoice::findOrFail($row->invoice_id);
         $this->withPaymentLock($invoice, function ($user, $current) use ($row) {
             $receipt = $this->readReceipt($user, $row->payment_intent_id);
@@ -172,6 +173,7 @@ trait ReceiptReturns
             $this->writeReceipt($user, $row->payment_intent_id, $receipt, $row->allocation_key);
             DB::afterCommit(fn () => $this->processReceiptReturns($current, $row->payment_intent_id, $row->allocation_key));
         });
+        return true;
     }
 
     private function processReceiptReturns($invoice, string $id, ?string $onlyKey = null): void
@@ -202,7 +204,7 @@ trait ReceiptReturns
                             && ($intent->amount_received ?? null) === $receipt['received_minor']
                             && $this->receiptInvoiceMatches($receipt, $intent), 409);
                         $charge = $intent->latest_charge ?? null;
-                        if (!is_object($charge) || !isset($charge->disputed) || $charge->disputed) {
+                        if (!is_object($charge) || !isset($charge->disputed) || $charge->disputed || $this->receiptHasReversalHold($id)) {
                             $a['state'] = 'review'; $a['reason'] = 'Check the original payment and any dispute in Stripe before returning money.';
                         } else {
                             $refund = $this->findReceiptRefund($receipt, $a);

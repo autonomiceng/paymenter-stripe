@@ -3,6 +3,7 @@
 ```php
 $gateway->allocateReceiptReturn($invoice, $paymentIntentId, $allocationKey, $amountMinor);
 $gateway->receiptReturnStatus($invoice, $paymentIntentId, $allocationKey); // array or null
+$gateway->receiptReversals($invoice, $paymentIntentId); // observation arrays, including cleared items
 ```
 
 Use the configured AE Stripe gateway instance. These are internal service methods,
@@ -11,6 +12,7 @@ receipt's currency. `excess` is reserved for automatic overpayment returns. Othe
 callers use stable namespaced keys, such as `domains:failed:123:pi_ABC`. Retry the
 same key with the same amount. A changed amount is refused. A genuinely new
 incremental entitlement gets a different key; keys are at most 180 bytes.
+`stripe:` keys are reserved for gateway observations, not return allocations.
 
 All allocations share one immutable receipt budget. Combined allocations cannot
 exceed `received_minor`, including reserved and pending amounts. AE Stripe owns
@@ -88,6 +90,64 @@ credit. Restore API access or resolve the original payment in Stripe; an existin
 matching refund will be recovered automatically. A missing old refund requires
 Stripe request-log/support evidence before finance takes any external action.
 Never clear a reservation to retry.
+
+## Refund and dispute observations
+
+Dashboard refunds (`refund.created`, `refund.updated`, `refund.failed`) and disputes
+(`charge.dispute.created`, `charge.dispute.updated`, `charge.dispute.closed`) are
+recorded in the same receipt ledger under `stripe:refund:re_…` or
+`stripe:dispute:dp_…`. These rows do not consume allocation budget and never enter
+the money-return worker. Owned return refunds keep their existing reconciliation.
+Foreign refund history still prevents another return, even if that refund failed.
+
+Each signed delivery retrieves the current Stripe object under the customer and
+invoice locks. It must match the succeeded native AE Stripe receipt or an existing
+closed-invoice receipt, its owner, Stripe customer, currency and received amount.
+Charge-only disputes resolve through their charge's PaymentIntent. Events arriving
+before an expected local settlement return a retryable error. Unrelated gateway
+payments are ignored. A failed read or staff notification rolls back, so Stripe
+can retry. Duplicate state creates no repeated audit or alert; stale open events
+cannot reopen a won or lost dispute. No invoice status, service, transaction or
+credit changes are made by observation.
+
+The read-only `receiptReversals()` interface is for the configured gateway instance
+and one local invoice/receipt. It returns `[]` when nothing has been observed,
+never proof that no reversal exists in Stripe. Each result has:
+
+| Field | Meaning |
+| --- | --- |
+| `kind`, `id` | `refund`/`dispute` and its Stripe ID; deduplicate consumers on receipt/kind/ID. |
+| `status` | Refund: `open`, `refunded`, `failed`. Dispute: `open`, `won`, `lost`, `cleared` (closed warning). |
+| `needs_review` | False for failed/canceled refunds, won disputes and closed warnings; true otherwise. |
+| `invoice_id`, `user_id`, `customer`, `payment_intent_id`, `currency` | Verified local and Stripe receipt identity. |
+| `amount_minor` | Refund/dispute amount, not an amount to debit. |
+| `credited_minor` | Completed credit allocations for this receipt in this ledger. |
+| `credit_balance_minor` | Current pooled customer credit in the invoice currency. |
+| `next_step` | Staff action line from the last observed status change. |
+
+Finance work uses the invoice Audit Log (`ae_stripe_receipt_reversal`) and the
+existing native staff inbox, with an invoice link and one next-step line. Open
+disputes ask staff to submit evidence in Stripe before its deadline; lost disputes
+and external refunds ask staff to reconcile Stripe with invoice/credit history.
+The line includes the reversal amount, customer, receipt credit and current
+account balance, including zero after credit has been spent. A won dispute clears
+`needs_review` and posts one resolution audit/alert; older inbox messages remain
+history. The caller must read current status rather than treating an old alert as
+an open work item.
+
+Pooled credit cannot identify which receipt's credit was spent. These amounts are
+context, never an inferred debit or recoverable debt. Credits made outside this
+ledger need the caller's own attribution. The later Domains consumer must combine
+these observations with its recorded credits/obligations, and route proven repair
+to staff; it must not issue another credit or guess a debit. No automatic debit,
+service deletion, or refund on a dispute is provided here.
+
+The schema upgrade cannot verify endpoint settings on its own. For existing
+installs, save the gateway once with its working credentials after upgrade. Setup adds the new event subscriptions to the existing endpoint without
+deleting it or changing its signing secret. Fresh installs subscribe at creation.
+Keep the old signing secret under the overlap rules in
+[verification](verification.md#webhook-continuity); do not recreate the endpoint
+to add events. Reconcile/resend missed refund/dispute events from before the save.
 
 API references: [partial refunds](https://docs.stripe.com/api/refunds/create),
 [refund listing](https://docs.stripe.com/api/refunds/list),

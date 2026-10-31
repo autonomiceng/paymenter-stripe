@@ -1,0 +1,100 @@
+<?php
+// Reuse the return fixture: these events must never create a second return or debit.
+use App\Helpers\ExtensionHelper;
+use App\Models\{Audit, Credit, Notification};
+use Illuminate\Support\Facades\Http;
+
+[$i, $s] = $setup(2000, 20); $deliver($s);
+$foreign = (object) ['id' => 're_dashboard', 'payment_intent' => 'pi_return', 'charge' => 'ch_return',
+    'currency' => 'usd', 'amount' => 500, 'status' => 'succeeded', 'metadata' => (object) []];
+$s->refunds['foreign'] = $foreign;
+$request = eventRequest($foreign, type: 'refund.created');
+$gateway->webhook($request); $gateway->webhook($request);
+$reversals = $gateway->receiptReversals($i, 'pi_return');
+check(count($reversals) === 1 && $reversals[0]['id'] === 're_dashboard' && $reversals[0]['needs_review']
+    && $reversals[0]['amount_minor'] === 500 && count(Audit::$rows) === 1 && count(Notification::$rows) === 1,
+    'A dashboard refund creates one receipt work item, audit and staff alert');
+$return = $gateway->allocateReceiptReturn($i, 'pi_return', 'domains:foreign', 500);
+check($return['state'] === 'review' && !$s->posts && !Credit::$rows,
+    'A foreign refund observation cannot become an allocation or permit another return');
+$s->refunds['foreign']->status = 'failed';
+$gateway->webhook(eventRequest($foreign, type: 'refund.failed'));
+$auditCount = count(Audit::$rows); $gateway->webhook($request); // Old succeeded delivery after canonical failure.
+check(!$gateway->receiptReversals($i, 'pi_return')[0]['needs_review'] && !Credit::$rows && count(Audit::$rows) === $auditCount,
+    'Canonical failed foreign refunds clear finance work and a stale success event cannot reopen it');
+
+[$i, $s] = $setup(); $s->status = 'failed'; $deliver($s);
+$credit = Credit::$rows['7:usd']; $credit->amount = 0; // The customer has already spent all fallback credit.
+$s->dispute = (object) ['id' => 'dp_return', 'charge' => 'ch_return', 'payment_intent' => 'pi_return',
+    'currency' => 'usd', 'amount' => 2000, 'status' => 'needs_response'];
+unset($s->dispute->payment_intent); // Stripe can identify a dispute through its charge alone.
+$event = eventRequest($s->dispute, type: 'charge.dispute.created');
+$before = [count(Audit::$rows), count(Notification::$rows), count($s->posts), ExtensionHelper::$payments, $i->status];
+$callCount = count(Http::$calls);
+$gateway->webhook($event); $gateway->webhook($event);
+check(!array_filter(array_slice(Http::$calls, $callCount), fn ($call) => $call[0] !== 'get'),
+    'Dispute observation makes no provider money writes');
+$work = $gateway->receiptReversals($i, 'pi_return')[0];
+check($work['status'] === 'open' && $work['needs_review'] && $work['credited_minor'] === 1000
+    && $work['credit_balance_minor'] === 0 && $work['user_id'] === 7 && $work['customer'] === 'cus_owner'
+    && $work['amount_minor'] === 2000 && count(Audit::$rows) === $before[0] + 1
+    && count(Notification::$rows) === $before[1] + 1,
+    'A duplicate dispute after spent credit identifies the customer, reversal, credited amount and current balance once');
+check(str_contains(end(Notification::$rows)['body'], 'cus_owner') && str_contains(end(Notification::$rows)['body'], '10 USD'),
+    'Staff receive the customer and credited amount in their next-step line');
+$s->dispute->status = 'lost';
+$gateway->webhook(eventRequest($s->dispute, type: 'charge.dispute.closed'));
+check($gateway->receiptReversals($i, 'pi_return')[0]['status'] === 'lost' && $credit->amount === 0
+    && count($s->posts) === $before[2] && ExtensionHelper::$payments === $before[3] && $i->status === $before[4],
+    'Losing a chargeback retains finance work without debiting spent credit, refunding again or changing invoice status');
+
+[$i, $s] = $setup(2000, 20); $deliver($s);
+$s->dispute = (object) ['id' => 'dp_return', 'charge' => 'ch_return', 'payment_intent' => 'pi_return',
+    'currency' => 'usd', 'amount' => 2000, 'status' => 'won'];
+$gateway->webhook(eventRequest($s->dispute, type: 'charge.dispute.closed'));
+$stale = clone $s->dispute; $stale->status = 'needs_response';
+$gateway->webhook(eventRequest($stale, type: 'charge.dispute.created'));
+check($gateway->receiptReversals($i, 'pi_return')[0]['status'] === 'won'
+    && !$gateway->receiptReversals($i, 'pi_return')[0]['needs_review'] && count(Audit::$rows) === 1,
+    'A closed won dispute before its open event stays cleared on canonical replay');
+
+$s->dispute->status = 'needs_response';
+// A canonical stale read cannot reopen a terminal outcome already recorded.
+$gateway->webhook(eventRequest($stale, type: 'charge.dispute.updated'));
+check(!$gateway->receiptReversals($i, 'pi_return')[0]['needs_review'], 'A terminal dispute never regresses to open');
+
+[$i, $s] = $setup(2000, 20); $deliver($s);
+$s->dispute = (object) ['id' => 'dp_return', 'charge' => 'ch_return', 'payment_intent' => 'pi_return',
+    'currency' => 'usd', 'amount' => 2000, 'status' => 'needs_response'];
+$gateway->webhook(eventRequest($s->dispute, type: 'charge.dispute.created'));
+$return = $gateway->allocateReceiptReturn($i, 'pi_return', 'domains:disputed', 500);
+check($return['state'] === 'review' && !$s->posts && !Credit::$rows,
+    'An observed dispute prevents a return even if the charge snapshot has not caught up');
+$s->dispute->status = 'won';
+$auditCount = count(Audit::$rows); $noticeCount = count(Notification::$rows);
+$gateway->webhook(eventRequest($s->dispute, type: 'charge.dispute.closed'));
+check(!$gateway->receiptReversals($i, 'pi_return')[0]['needs_review'] && count(Audit::$rows) === $auditCount + 1
+    && count(Notification::$rows) === $noticeCount + 1, 'A won dispute clears an existing work item and tells staff once');
+
+[$i, $s] = $setup(2000, 20); $deliver($s);
+$s->refunds['foreign'] = clone $foreign; $s->refunds['foreign']->status = 'succeeded';
+Notification::$fail = true;
+rejects(fn () => $gateway->webhook($request), 'Inbox unavailable');
+Notification::$fail = false;
+check(!$gateway->receiptReversals($i, 'pi_return') && !Audit::$rows, 'Failed staff delivery rolls back the observation for Stripe to retry');
+$gateway->webhook($request);
+check(count(Audit::$rows) === 1 && count(Notification::$rows) === 1, 'Stripe replay completes the rolled-back observation and alert');
+
+$s->refunds['foreign']->currency = 'eur';
+rejects(fn () => $gateway->webhook($request), 'HTTP 409');
+check($gateway->receiptReversals($i, 'pi_return')[0]['currency'] === 'usd', 'Changed refund currency cannot rebind a receipt');
+$s->refunds['foreign']->currency = 'usd';
+ExtensionHelper::$payments['810:pi_return']['gateway'] = 'Other';
+$auditCount = count(Audit::$rows); $gateway->webhook($request);
+check(count(Audit::$rows) === $auditCount, 'A receipt now owned by another gateway receives no finance writes');
+
+[$i, $s] = $setup(2000, 20);
+$s->refunds['foreign'] = clone $foreign; $s->refunds['foreign']->status = 'succeeded';
+rejects(fn () => $gateway->webhook($request), 'HTTP 409');
+$deliver($s); $gateway->webhook($request);
+check(count($gateway->receiptReversals($i, 'pi_return')) === 1, 'An event delivered before local settlement retries against the eventual native receipt');

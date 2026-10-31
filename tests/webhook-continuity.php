@@ -17,6 +17,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
     $gateway = new AeStripe($config);
     $events = ['payment_intent.succeeded', 'payment_intent.payment_failed', 'payment_intent.processing',
         'setup_intent.succeeded', 'subscription_schedule.canceled', 'invoice.created', 'invoice.payment_succeeded', 'charge.updated', 'charge.succeeded'];
+    $reversalEvents = ['refund.created', 'refund.updated', 'refund.failed', 'charge.dispute.created', 'charge.dispute.updated', 'charge.dispute.closed'];
     $endpoint = (object) ['id' => 'we_existing', 'url' => route('extensions.gateways.ae-stripe.webhook'),
         'enabled_events' => $events, 'api_version' => '2025-07-30.basil'];
     $endpoints = [$endpoint]; $failure = null; $oldKeyFailure = null; $secondPage = false; $creationCache = []; $loseCreation = false;
@@ -51,8 +52,9 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
     try {
         $gateway->updated($extension);
         $subscriptionUpdates = array_values(array_filter(Http::$calls, fn ($c) => $c[0] === 'post' && $c[1] === '/webhook_endpoints/we_existing'));
-        check(count($subscriptionUpdates) === 1 && in_array('refund.failed', $endpoints[0]->enabled_events, true)
-            && in_array('refund.updated', $endpoints[0]->enabled_events, true), 'Upgrading subscriptions edits the existing endpoint in place to receive owned refund failures');
+        check(count($subscriptionUpdates) === 1 && !array_diff($reversalEvents, $endpoints[0]->enabled_events)
+            && $endpoints[0]->id === 'we_existing' && $gateway->config('stripe_webhook_secret') === 'whsec_test',
+            'Upgrading adds refund and dispute subscriptions in place with the original endpoint and signing secret');
         $stateKey = 'ae_stripe_webhook_continuity';
         $state = json_decode($extension->settingValues->values[$stateKey], true);
         check($state['account'] === 'acct_original' && $state['endpoint'] === 'we_existing', 'Saving pins the Stripe account and endpoint without proving the signing secret');
@@ -180,7 +182,8 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         rejects(fn () => $gateway->enabled($extension), 'Stripe setup could not be verified. The previous credentials were kept. Check the API key permissions and save again.');
         check(Gateway::$bundledEnabled, 'A lost webhook creation reply leaves bundled Stripe enabled');
         $gateway->updated($extension);
-        check(count($endpoints) === 1, 'A lost creation reply recovers the original endpoint and secret without making a duplicate');
+        check(count($endpoints) === 1 && !array_diff($reversalEvents, $endpoints[0]->enabled_events),
+            'A fresh endpoint subscribes to refunds and disputes and recovers a lost creation reply without duplication');
         check($extension->settingValues->values['stripe_webhook_secret'] === 'whsec_created', 'A fresh gateway creates one webhook and saves its signing secret');
         $creates = array_values(array_filter(array_slice(Http::$calls, $before), fn ($call) => $call[0] === 'post'));
         check(count($creates) === 2 && !empty($creates[0][3]['Idempotency-Key']) && $creates[0][3]['Idempotency-Key'] === $creates[1][3]['Idempotency-Key'], 'Webhook creation uses a stable retry identity');
