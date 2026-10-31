@@ -48,13 +48,26 @@ adds one deterministic negative transaction. Credit and its adjustment commit
 together; the negative credit adjustment has `is_credit_transaction = true`,
 while a cash refund has `false`. Include both in net invoice funding.
 
-A successful checkout on a closed invoice reserves its whole receipt as `excess`.
+A successful checkout or exactly bound subscription payment on a closed invoice
+reserves its whole receipt as `excess`.
 Core's normal `addPayment` can mark a cancelled invoice paid and activate it, so
 this receipt stays outside succeeded native funding until return completion. Then
 +receipt/-return post atomically with transaction events suppressed. The invoice
 stays closed. Domains sees no new settled funding while pending and zero net
 funding afterward; this automatic allocation owns the whole receipt, so Domains
 must not independently credit or refund it.
+
+Closed subscription receipts retain their Stripe subscription-invoice ID in the
+allocation row. Recovery re-reads that paid invoice, verifies its local binding,
+customer, currency and paid amount, then checks its complete payment list contains
+exactly the retained PaymentIntent and amount. Subscription intents do not need
+checkout `metadata.invoice_id`; checkout receipts still require that binding.
+Unbound, changed, split or unreadable subscription funding remains in review with
+a resolution path. No weaker fallback to a guessed invoice is used.
+
+Checkout-attempt retirement deletes only `ae_stripe_checkout_<invoice>` after
+settlement/review. The extension allocation, first-send marker and later recovery
+remain intact; retiring the form cannot discard a pending closed-invoice return.
 
 Owned `refund.failed` and `refund.updated` events reconcile canonical Stripe
 history under the same locks. A refund can fail after a succeeded notice: proved

@@ -242,13 +242,13 @@ trait Checkout
         return $agreement;
     }
 
-    private function recordIntentPayment($intent, $status, bool $prepareMethod = true)
+    private function recordIntentPayment($intent, $status, bool $prepareMethod = true, ?string $subscriptionInvoiceId = null)
     {
         $this->ensureReceiptReturnSchema();
         $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
         $userId = $invoice->user_id;
         if ($prepareMethod) $intent = $this->prepareTransactionMethod($invoice, $intent, $status);
-        DB::transaction(function () use ($intent, $status, $userId) {
+        DB::transaction(function () use ($intent, $status, $userId, $subscriptionInvoiceId) {
             $user = User::where('id', $userId)->lockForUpdate()->firstOrFail();
             $invoice = Invoice::where('id', $intent->metadata->invoice_id)->lockForUpdate()->firstOrFail();
             $this->bindWebhookAttempt($user, $invoice, $intent);
@@ -270,7 +270,7 @@ trait Checkout
             }
             if ($status === 'succeeded' && !in_array($invoice->status, ['pending', 'paid'], true)) {
                 \Illuminate\Support\Facades\Log::warning('AeStripe payment received for nonpending invoice', ['invoice_id' => $invoice->id]);
-                $this->recordReceipt($invoice, $intent, $intent->amount_received, closed: true);
+                $this->recordReceipt($invoice, $intent, $intent->amount_received, closed: true, subscriptionInvoiceId: $subscriptionInvoiceId);
                 return;
             }
             if ($status === 'succeeded' && ($invoice->status === 'paid' || $intent->amount_received > $this->paymentBalance($invoice))) {

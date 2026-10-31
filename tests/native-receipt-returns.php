@@ -36,7 +36,7 @@ $gateway = new AeStripe([]);
 $read = new ReflectionMethod($gateway, 'readReceipt'); $write = new ReflectionMethod($gateway, 'writeReceipt');
 $user = (object) ['id' => 1];
 $receipt = ['invoice_id' => 1, 'payment_intent_id' => 'pi_storage', 'customer' => 'cus_fixture', 'currency' => 'usd',
-    'received_minor' => 20000, 'closed_invoice' => false, 'allocations' => []];
+    'received_minor' => 20000, 'closed_invoice' => false, 'subscription_invoice_id' => 'in_storage', 'allocations' => []];
 for ($n = 0; $n < 167; ++$n) {
     $key = str_pad('domains:' . $n . ':', 180, 'x');
     $receipt['allocations'][$key] = ['amount_minor' => 100, 'key' => 'ae-return-' . hash('sha256', $key), 'sent_at' => time(),
@@ -50,6 +50,7 @@ foreach ($receipt['allocations'] as $key => &$a) {
 unset($a);
 $stored = DB::transaction(fn () => $read->invoke($gateway, $user, 'pi_storage'));
 verifyReturn(count($stored['allocations']) === 167 && array_sum(array_column($stored['allocations'], 'amount_minor')) === 16700, 'Independent SQL rows retain every completed allocation past the old aggregate TEXT limit');
+verifyReturn($stored['subscription_invoice_id'] === 'in_storage', 'Subscription invoice binding survives native storage for recovery');
 verifyReturn(DB::table('ae_stripe_receipt_returns')->where('retry', true)->count() === 0, 'Notified completion leaves the due queue');
 $sample = (array) DB::table('ae_stripe_receipt_returns')->first();
 try { DB::table('ae_stripe_receipt_returns')->insert($sample); throw new RuntimeException('Duplicate allocation accepted'); }

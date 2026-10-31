@@ -53,8 +53,9 @@ unresolved attempts older than 23 hours require reconciliation, not another sche
 Subscription invoice creation binds a single pending related invoice in Stripe metadata
 before finalizing/paying, recovering the current immutable binding on retries; ambiguous creation and unbound success events require manual
 reconciliation. Success requires that exact related invoice, the same owner and matching
-currency. A bound paid invoice retains a late successful payment; other nonpending
-invoices retain a staff review record. Split payments require manual reconciliation.
+currency. A bound paid invoice retains a late successful payment; a bound closed
+invoice returns the whole receipt automatically. Unbound and mismatched receipts
+retain staff review. Split payments require manual reconciliation.
 Both delivery paths serialize settlement on the customer and use locking current
 reads to skip a successful transaction globally, so one PaymentIntent cannot settle two local invoices. A resumed
 3DS attempt shows and preserves its existing consent without changing payment preferences.
@@ -217,7 +218,8 @@ compare against the current state/reason, so a prior pending notice cannot hide 
 missing completion notice. Exercise both pending-to-refunded and pending-to-credit
 with notice insertion interrupted after settlement, then recover by the sweep alone.
 
-A successful checkout on a closed invoice returns the whole receipt automatically.
+A successful checkout or exactly bound subscription payment on a closed invoice
+returns the whole receipt automatically.
 Until completion it has no new succeeded native funding. Completion posts the
 +receipt/-return pair atomically without native transaction events, preserving the
 closed invoice and preventing activation. Verify with native observers and the
@@ -225,6 +227,12 @@ combined stale-form authentication/cancellation flow. Domains' late-money scan s
 no new settled funding while pending and zero net funding afterward; AE Stripe's
 `excess` allocation owns the receipt. Check both Domains scans before and after the
 return, with duplicate webhook, return-page and scheduler deliveries.
+For subscriptions, omit checkout metadata from the PaymentIntent. Interrupt the
+first recovery, then run only the receipt sweep: it must re-read the stored Stripe
+invoice and its complete paid-payment list, verify binding/customer/currency/amount,
+and return the whole receipt once. Changed binding or unrelated payment membership
+must stop without a refund or credit. Retiring the checkout property must preserve
+the return allocation and its recovery markers.
 
 External refunds, disputes, incomplete history and expired unknown sends surface
 an invoice-linked problem and resolution path. Access problems keep retrying;

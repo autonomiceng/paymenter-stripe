@@ -69,7 +69,7 @@ trait ReceiptReturns
             abort_unless((int) $row->user_id === (int) $user->id, 409);
             $binding = ['invoice_id' => (int) $row->invoice_id, 'payment_intent_id' => $id,
                 'customer' => $row->customer, 'currency' => $row->currency, 'received_minor' => (int) $row->received_minor,
-                'closed_invoice' => (bool) $row->closed_invoice];
+                'closed_invoice' => (bool) $row->closed_invoice, 'subscription_invoice_id' => $row->subscription_invoice_id];
             if ($receipt === null) $receipt = $binding + ['allocations' => []];
             abort_unless(array_intersect_key($receipt, $binding) === $binding, 409);
             $receipt['allocations'][$row->allocation_key] = ['amount_minor' => (int) $row->amount_minor,
@@ -91,6 +91,7 @@ trait ReceiptReturns
         $this->receiptRows()->updateOrInsert(['payment_intent_id' => $id, 'allocation_key' => $key], [
             'user_id' => $user->id, 'invoice_id' => $receipt['invoice_id'], 'customer' => $receipt['customer'],
             'currency' => $receipt['currency'], 'received_minor' => $receipt['received_minor'], 'closed_invoice' => $receipt['closed_invoice'],
+            'subscription_invoice_id' => $receipt['subscription_invoice_id'] ?? null,
             'amount_minor' => $a['amount_minor'], 'return_key' => $a['key'], 'state' => $a['state'],
             'refund_id' => $a['refund_id'], 'credit_id' => $a['credit_id'] ?? null, 'sent_at' => $a['sent_at'],
             'reason' => $a['reason'] ?? null, 'notified' => $a['notified'] ?? null, 'recheck' => $a['recheck'] ?? false,
@@ -113,13 +114,14 @@ trait ReceiptReturns
 
     // Ordinary settlement reserves excess with its native receipt. Closed receipts are held
     // here until both native receipt and return can be posted together without activation.
-    private function recordReceipt($invoice, $intent, int $excess, bool $closed = false): array
+    private function recordReceipt($invoice, $intent, int $excess, bool $closed = false, ?string $subscriptionInvoiceId = null): array
     {
         $receipt = $this->readReceipt($invoice->user, $intent->id);
         if (!$receipt) {
             $receipt = ['invoice_id' => $invoice->id, 'payment_intent_id' => $intent->id,
                 'customer' => $intent->customer ?? null, 'currency' => strtolower($intent->currency),
-                'received_minor' => $intent->amount_received, 'closed_invoice' => $closed, 'allocations' => []];
+                'received_minor' => $intent->amount_received, 'closed_invoice' => $closed,
+                'subscription_invoice_id' => $subscriptionInvoiceId, 'allocations' => []];
             if ($excess > 0) {
                 $this->reserveReceiptReturn($receipt, 'excess', $excess);
                 $this->writeReceipt($invoice->user, $intent->id, $receipt, 'excess');
@@ -196,7 +198,7 @@ trait ReceiptReturns
                             && !empty($receipt['customer']) && $receipt['customer'] === $user->properties()->where('key', 'stripe_id')->first()?->value
                             && ($intent->customer ?? null) === $receipt['customer'] && strtolower($intent->currency ?? '') === $receipt['currency']
                             && ($intent->amount_received ?? null) === $receipt['received_minor']
-                            && (!$receipt['closed_invoice'] || (int) ($intent->metadata->invoice_id ?? 0) === $current->id), 409);
+                            && $this->receiptInvoiceMatches($receipt, $intent), 409);
                         $charge = $intent->latest_charge ?? null;
                         if (!is_object($charge) || !isset($charge->disputed) || $charge->disputed) {
                             $a['state'] = 'review'; $a['reason'] = 'Check the original payment and any dispute in Stripe before returning money.';
@@ -258,6 +260,25 @@ trait ReceiptReturns
                 if ($this->receiptStripeUnavailable) break;
             }
         } catch (\Throwable $e) { report($e); } // Settlement is committed; the scheduler retries.
+    }
+
+    private function receiptInvoiceMatches(array $receipt, $intent): bool
+    {
+        if (!$receipt['closed_invoice']) return true; // The succeeded native receipt proves ordinary settlement.
+        if ($receipt['subscription_invoice_id'] === null) return (int) ($intent->metadata->invoice_id ?? 0) === $receipt['invoice_id'];
+        // Subscription intents need no checkout metadata. Revalidate their stored invoice and exact paid receipt.
+        $invoice = $this->request('get', '/invoices/' . $receipt['subscription_invoice_id']);
+        if (($invoice->id ?? null) !== $receipt['subscription_invoice_id'] || ($invoice->status ?? null) !== 'paid'
+            || (int) ($invoice->metadata->ae_stripe_invoice_id ?? 0) !== $receipt['invoice_id']
+            || ($invoice->customer ?? null) !== $receipt['customer'] || strtolower($invoice->currency ?? '') !== $receipt['currency']
+            || ($invoice->amount_paid ?? null) !== $receipt['received_minor']
+            || ($invoice->parent->type ?? null) !== 'subscription_details' || empty($invoice->parent->subscription_details->subscription)) return false;
+        $payments = $this->request('get', '/invoice_payments', ['invoice' => $invoice->id, 'limit' => 100]);
+        $paid = array_values(array_filter($payments->data ?? [], fn ($p) => ($p->status ?? null) === 'paid'));
+        return ($payments->has_more ?? true) === false && count($paid) === 1
+            && ($paid[0]->amount_paid ?? null) === $receipt['received_minor']
+            && ($paid[0]->payment->type ?? null) === 'payment_intent'
+            && ($paid[0]->payment->payment_intent ?? null) === $receipt['payment_intent_id'];
     }
 
     private function postReceiptReturn($invoice, array $receipt, array $allocation): void

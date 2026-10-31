@@ -19,6 +19,7 @@ return new class extends Migration
                 $table->string('currency', 3);
                 $table->unsignedBigInteger('received_minor');
                 $table->boolean('closed_invoice')->default(false);
+                $table->string('subscription_invoice_id')->nullable();
                 $table->unsignedBigInteger('amount_minor');
                 $table->string('return_key', 74)->unique();
                 $table->string('state', 16);
