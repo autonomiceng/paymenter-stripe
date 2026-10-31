@@ -97,6 +97,7 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        require __DIR__ . '/renewal-retries.php';
         $run('retire-core-event', function ($invoice, $stripe) use ($gateway) {
             $gateway->boot(); $gateway->pay($invoice, 20);
             $invoice->status = 'cancelled'; Gateway::$enabled = false;

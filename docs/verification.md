@@ -104,7 +104,8 @@ A lost confirm response is recovered by intent ID, beyond key expiry. An unconfi
 creation can be abandoned after 23 hours because it cannot have taken money. No frozen
 confirmation is replayed. Native bank verification that finishes later is polled and reconfirmed without replaying a consumed token. Automatic Elements payments are read after authentication, not reconfirmed.
 Definite results clear the saved agreement instruction. New confirmations retain the preceding charge ID so an earlier failed row or error cannot cancel a later unknown confirmation. Older confirmations without that baseline honor a known failure and do not retry that debit. Recovery never repeats a failed
-card or bank debit; only a new Pay can send another debit. Authentication resumes keep
+card or bank debit. A new Pay, or the bounded native renewal retry policy in
+[Auto Pay integration](auto-pay.md), can reserve a new debit after definite refusal. Authentication resumes keep
 the agreement in the separate confirmation record. Recovery records definite declines
 for native failed-payment notices and adds one plain customer notice with the invoice link.
 Processing bank debits show pending and block another payment,
@@ -133,7 +134,8 @@ an exact AE Stripe or converted StripeSaved checkout payload can be reconstructe
 R3 version-2 creations with no ID and the invalid automatic/manual parameter pair are replaced automatically: their creation could not charge. The pending saved instruction survives replacement. Known IDs are unchanged.
 Old `confirm=true` payloads are never replayed. A matching attempt metadata key or webhook
 request idempotency key can supply their identity; an invoice metadata search alone cannot.
-Older unresolved records and saved instructions stranded without retry:true are included in automatic recovery without a manual property edit. A failed result still clears the old saved instruction; it never starts another debit.
+Older unresolved records and saved instructions stranded without retry:true are included in automatic recovery without a manual property edit. A failed result still clears the old saved instruction. Only an eligible bounded
+native renewal retry can reserve a later debit; ordinary recovery never replays it.
 
 An unresolved legacy identity, missing known intent or partially received payment keeps
 its attempt and sends one staff alert linked to the invoice, after commit. Stripe cannot

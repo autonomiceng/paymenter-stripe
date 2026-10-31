@@ -53,6 +53,7 @@ require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
 require_once __DIR__ . '/Concerns/CheckoutIntent.php';
 require_once __DIR__ . '/PaymentPendingException.php';
 require_once __DIR__ . '/Concerns/ChargeRecovery.php';
+require_once __DIR__ . '/Concerns/RenewalRetry.php';
 require_once __DIR__ . '/Concerns/InvoicePayments.php';
 require_once __DIR__ . '/Concerns/WebhookContinuity.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
@@ -71,7 +72,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -762,7 +763,7 @@ class AeStripe extends Gateway
         }
         try {
             $data = $this->checkoutPaymentData($invoice, $this->toMinorUnits($amount, $invoice->currency_code), $customer)
-                + ['agreement_id' => $billingAgreement->id];
+                + ['agreement_id' => $billingAgreement->id, 'renewal_start' => app()->runningInConsole()];
             if (!$this->gatewayEnabled()) {
                 $this->reservePaymentAttempt($invoice, $data);
                 $this->paymentPending('Payments are paused. We will check this payment when payments resume.');

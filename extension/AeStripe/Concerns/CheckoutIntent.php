@@ -158,9 +158,16 @@ trait CheckoutIntent
                 if (!isset($data['agreement_id']) && !empty($attempt['agreement_id'])) $data['agreement_id'] = $attempt['agreement_id'];
                 $attempt = null;
             }
-            if (!$attempt) $attempt = $this->newPaymentAttempt($current, array_replace($data, [
-                'customer' => $user->properties()->where('key', 'stripe_id')->firstOrFail()->value,
-            ]), $amount, $elements);
+            if (!$attempt) {
+                $attempt = $this->newPaymentAttempt($current, array_replace($data, [
+                    'customer' => $user->properties()->where('key', 'stripe_id')->firstOrFail()->value,
+                ]), $amount, $elements);
+                if (!empty($data['renewal_start']) && isset($data['agreement_id'])) {
+                    $renewal = $this->nativeRenewal($current, (int) $data['agreement_id']);
+                    if ($renewal) $attempt['renewal'] = $renewal;
+                }
+            }
+            if (array_key_exists('renewal_start', $data) && !$data['renewal_start']) unset($attempt['renewal']); // Explicit customer Pay takes over.
             if (isset($data['agreement_id'])) {
                 $attempt['agreement_id'] = $data['agreement_id'];
                 $attempt['agreement_pending'] = true;
@@ -326,6 +333,9 @@ trait CheckoutIntent
             try {
                 $intent = $this->request('get', '/payment_intents/' . $intentId);
                 if (!in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) return $intent;
+                if (!empty($stored['renewal']) && ($stored['renewal']['state'] !== 'active' || !$this->renewalStillAuthorized($current, $stored['renewal']))) {
+                    return new DisplayException('Auto Pay stopped for this renewal. Open the invoice to pay the amount due.');
+                }
                 $amount = $this->paymentBalance($current);
                 if ($current->status !== 'pending' || $amount <= 0) return new DisplayException('This invoice has no payment due. Refresh the invoice.');
                 if (strtolower($intent->currency) !== strtolower($current->currency_code) || $expectedAmount !== null && $amount !== $expectedAmount) {

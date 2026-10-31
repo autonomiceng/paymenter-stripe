@@ -302,8 +302,11 @@ trait Checkout
             }
             if (in_array($status, ['processing', 'failed'], true)) {
                 $attempt = $this->readPaymentAttempt($user, $invoice);
-                if (($attempt['intent'] ?? null) === $intent->id) $this->writePaymentAttempt($user, $invoice,
-                    array_replace($attempt, ['agreement_id' => null, 'confirmation' => null, 'retry' => $status === 'processing', 'funds_pending' => $status === 'processing' || ($intent->amount_received ?? 0) > 0]));
+                if (($attempt['intent'] ?? null) === $intent->id) {
+                    if ($status === 'failed') $attempt = $this->renewalRefused($invoice, $attempt, $intent);
+                    $this->writePaymentAttempt($user, $invoice,
+                        array_replace($attempt, ['agreement_id' => null, 'confirmation' => null, 'retry' => $status === 'processing', 'funds_pending' => $status === 'processing' || ($intent->amount_received ?? 0) > 0]));
+                }
             }
             if ($status === 'failed') {
                 // The locked success guard above preserves labels on settled payments.

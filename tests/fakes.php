@@ -138,8 +138,10 @@ namespace App\Models {
         public $user_id = 7;
         public $currency_code = 'usd', $status = 'pending';
         public $total = 20;
+        public $due_at = null;
         public $items = [];
         public function __construct(public User $user) {}
+        public function items() { return new NativeModelQuery($this->items); }
         public function getMorphClass() { return self::class; }
         public static function where($key, $id) { return new Query(self::$rows[$id] ?? (self::$row && self::$row->id == $id ? self::$row : null), Invoice::class); }
         public function transactions() { return new class($this->id) {
@@ -547,7 +549,7 @@ namespace {
     }
     function report($error) { $GLOBALS['reportedErrors'][] = $error; }
     function config($key, $default = null) { return $GLOBALS['fakeConfig'][$key] ?? $default; }
-    function now() { return new class { public function format($format) { return (new \DateTimeImmutable('2026-10-31'))->format($format); } public $timestamp = 1700000000; public function startOfDay() { return $this; } }; }
+    function now() { return new class { public function format($format) { return (new \DateTimeImmutable($GLOBALS['fakeToday'] ?? '2026-10-31'))->format($format); } public $timestamp = 1700000000; public function startOfDay() { return $this; } }; }
     function base_path($path) { return ($GLOBALS['paymenterBase'] ?? dirname(__DIR__)) . '/' . (isset($GLOBALS['paymenterBase']) ? $path : str_replace('extensions/Gateways/', 'extension/', $path)); }
     function storage_path($path) { return $GLOBALS['adoptionStorage'] . '/' . $path; }
     function app($class = null) { if ($class) return new $class; return new class { public function bound($class) { return class_exists($class); } public function runningInConsole() { return $GLOBALS['fakeConsole'] ?? true; } public function booted($callback) { $callback(); } }; }
