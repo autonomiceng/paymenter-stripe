@@ -68,6 +68,24 @@ trait CheckoutIntent
             if (empty($intent->id) || isset($attempt['intent']) && $intent->id !== $attempt['intent']) {
                 $this->holdPaymentAttempt($invoice, $attempt, 'Stripe returned a different payment ID. Link the verified payment before continuing.');
             }
+            if (!empty($attempt['automatic_renewal']) && ($intent->amount_received ?? 0) === 0
+                && $this->paymentAttemptFailed($attempt, $intent)) {
+                $refused = $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intent) {
+                    $stored = $this->readPaymentAttempt($user, $current);
+                    if (($stored['key'] ?? null) !== $attempt['key'] || empty($stored['automatic_renewal'])) return false;
+                    try { $fresh = $this->request('get', '/payment_intents/' . $intent->id); }
+                    catch (RequestException | ConnectionException $e) {
+                        $this->paymentStripeUnavailable = true;
+                        $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
+                    }
+                    if (($fresh->amount_received ?? 0) !== 0 || !$this->paymentAttemptFailed($stored, $fresh)) return false;
+                    // Keep the claimed confirmation until refusal and renewal policy commit together.
+                    $this->recordIntentPayment($fresh, 'failed');
+                    return $fresh;
+                });
+                if ($refused) return $refused; // The committed policy prevents this automatic caller from confirming.
+                continue; // The attempt or provider result changed; inspect the current reservation again.
+            }
             // A concurrent page load may have retired this unconfirmed native intent for Elements.
             if (!$this->rememberPaymentIntent($invoice, $attempt, $intent)) continue;
             if ($intent->status === 'succeeded') {

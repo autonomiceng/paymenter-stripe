@@ -86,6 +86,54 @@ try {
                 'A ' . $path . ' refusal commits no-retry state before a competing automatic caller can confirm');
         });
     }
+    foreach (['result', 'http-402'] as $path) {
+        $run('renewal-final-refusal-crash-' . $path, function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal, $path) {
+            $renewalFixture($invoice, $stripe); $initialRefusal($invoice);
+            for ($retry = 1; $retry <= 2; ++$retry) { $dueRetry(); $gateway->retryChargeAttempts(); }
+            $dueRetry();
+            $stripe->beforeConfirm = fn ($intent) => $intent->last_payment_error = (object) [
+                'code' => 'card_declined', 'advice_code' => 'do_not_try_again',
+            ];
+            $handler = \Illuminate\Support\Facades\Http::$handler;
+            \Illuminate\Support\Facades\Http::$handler = function ($verb, $url, $data) use ($handler, $path) {
+                $result = $handler($verb, $url, $data);
+                if (str_ends_with($url, '/confirm')) {
+                    // Stripe has refused; fail the next local attempt write, rolling back the HTTP transaction.
+                    \App\Models\Properties::$beforeWrite = function ($key) {
+                        if (($key['key'] ?? null) !== 'ae_stripe_checkout_920') return;
+                        \App\Models\Properties::$beforeWrite = null;
+                        throw new \PDOException('Connection lost before refusal commit');
+                    };
+                    if ($path === 'http-402') throw new RequestException(402, ['error' => ['code' => 'card_declined']]);
+                }
+                return $result;
+            };
+            $gateway->retryChargeAttempts();
+            $claimed = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(count($stripe->confirms) === 4 && $claimed['renewal']['retries'] === 3
+                && $claimed['renewal']['state'] === 'active' && !empty($claimed['confirmation']['key']),
+                'A failed final-refusal commit preserves the fourth confirmation claim for ' . $path);
+            \Illuminate\Support\Facades\Http::$handler = $handler;
+            $stripe->status = 'succeeded'; $stripe->beforeConfirm = null;
+            // The worker already selected its agreement. A second DB loss while consuming refusal must keep that claim too.
+            \App\Models\Properties::$beforeWrite = function ($key, $data) {
+                if (($key['key'] ?? null) !== 'ae_stripe_checkout_920' || !empty(json_decode($data['value'], true)['confirmation'])) return;
+                \App\Models\Properties::$beforeWrite = null;
+                throw new \PDOException('Connection lost while consuming refusal');
+            };
+            $gateway->charge($invoice, 20, new BillingAgreement);
+            $afterRollback = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check($afterRollback['confirmation']['key'] === $claimed['confirmation']['key'] && !$stripe->charges,
+                'Failed refusal consumption retains the committed confirmation identity for ' . $path);
+            $gateway->charge($invoice, 20, new BillingAgreement); // Competing caller resumes at the public gateway boundary.
+            check(count($stripe->confirms) === 4 && count(array_unique(array_column($stripe->confirms, 0))) === 4 && !$stripe->charges,
+                'A competing automatic caller cannot send a fifth debit after final-refusal rollback for ' . $path);
+            $stopped = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check($stopped['renewal']['state'] === 'stopped' && $stopped['renewal']['retries'] === 3
+                && empty($stopped['confirmation']) && $stopped['failure_notified'],
+                'The retrieved final refusal commits stopped collection and its notice for ' . $path);
+        });
+    }
     $run('renewal-confirmation-claim', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal) {
         $renewalFixture($invoice, $stripe); $initialRefusal($invoice); $dueRetry();
         $stripe->beforeCreate = function () use ($gateway, $invoice, $stripe) {
