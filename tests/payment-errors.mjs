@@ -10,6 +10,7 @@ const theme = readFileSync(new URL('stripe-theme.blade.php', views), 'utf8');
 function render(name) {
     let source = readFileSync(new URL(`${name}.blade.php`, views), 'utf8')
         .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
+        .replace(/@if\(config\('settings.tos'\)\)[\s\S]*?@endif/g, '')
         .replace(/@js\(route\('([^']+)'\)\)/g, (_, route) => JSON.stringify('/' + route))
         .replace("@js(route('invoices.show', $invoice) . '?checkPayment=true')", "'/return'")
         .replace('@js(csrf_token())', "'fixture-csrf'")
@@ -49,7 +50,8 @@ try {
                 }, async fetchUpdates() {
                     if (failure === 'updates') return { error: { type: 'api_connection_error', message: 'Raw update detail' } };
                     return {};
-                }, create() {
+                }, create(type, options) {
+                    window.paymentElementOptions = options;
                     const handlers = {};
                     return { on: (name, fn) => { handlers[name] = fn; }, mount() { handlers.ready(); }, destroy() {} };
                 } }; },
@@ -86,6 +88,7 @@ try {
             });
             await page.locator('#setup-consent').check();
         }
+        assert.deepEqual(await page.evaluate(() => paymentElementOptions.wallets), {link: 'never'}, `${name}: Link save prompt is disabled`);
         const fallback = name === 'pay' ? 'Could not check the payment. Refresh the invoice for its status.' : 'Could not save your payment method. Try again.';
         for (const failure of ['network', 'confirmation', ...(name === 'pay' ? ['updates'] : []), 'consent', 'decline']) {
             await page.evaluate(value => { window.failure = value; }, failure);

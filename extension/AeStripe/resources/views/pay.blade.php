@@ -66,6 +66,7 @@ async function initializePaymentForm() {
             if (customerSessionSecret) options.customerSessionClientSecret = customerSessionSecret;
 
             const paymentElementOptions = {
+                wallets: {link: 'never'},
                 layout: {
                     type: 'accordion',
                     defaultCollapsed: false,

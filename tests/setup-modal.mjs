@@ -13,6 +13,7 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const theme = readFileSync(`${root}extension/AeStripe/resources/views/stripe-theme.blade.php`, 'utf8');
 let view = readFileSync(`${root}extension/AeStripe/resources/views/billing-agreement.blade.php`, 'utf8')
     .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
+    .replace(/@if\(config\('settings.tos'\)\)[\s\S]*?@endif/g, '')
     .replace(/@js\(route\('([^']+)'\)\)/g, (_, name) => `'/${name}'`)
     .replace(/@js\(csrf_token\(\)\)/g, "'fixture-csrf'")
     .replace(/@js\(\$stripePublishableKey\)/g, "'fixture-key'")
@@ -54,7 +55,8 @@ try {
             elements: () => {
                 probe.created++;
                 probe.active++;
-                return { update() {}, create() {
+                return { update() {}, create(type, options) {
+                    if (type !== 'payment' || options.wallets?.link !== 'never') throw new Error('Link prompt must be disabled');
                     let target;
                     const listeners = {};
                     return {
@@ -92,7 +94,7 @@ try {
             return route.fulfill({ json: { components, assets: [] } });
         }
         if (url.pathname.endsWith('setup-consent')) {
-            assert.deepEqual(route.request().postDataJSON(), { intent: 'fixture-intent', consent: true });
+            assert.deepEqual(route.request().postDataJSON(), { intent: 'fixture-intent', consent: true, version: 'off_session_v2' });
             const ok = await page.evaluate(() => { probe.consent++; return !probe.failConsent; });
             if (holdConsent) await new Promise((resolve) => pendingConsent.push(resolve));
             return route.fulfill({ status: ok ? 200 : 503, json: { ok } });

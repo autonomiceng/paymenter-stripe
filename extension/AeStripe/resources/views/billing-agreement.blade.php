@@ -9,9 +9,10 @@
     <div id="payment-element" wire:ignore></div>
     <label class="mt-4 block">
         <input type="checkbox" id="setup-consent" required disabled />
-        I agree to save this payment method and allow charges to it for my future invoices, including renewals, when I am not present.
+        I agree to save this payment method for future charges, including renewals.
+        @if(config('settings.tos'))<a href="{{ config('settings.tos') }}" target="_blank" rel="noopener" class="underline">Terms</a>@endif
     </label>
-    <p class="text-sm">Saving does not turn on Auto Pay; you can choose it for a service later.</p>
+    <p class="text-sm">Auto Pay can charge when you are away. Saving does not turn on Auto Pay.</p>
     <button id="submit" disabled
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
         Save payment method
@@ -115,6 +116,7 @@ Alpine.data('aeStripeSetup', (config) => {
                 const stripe = Stripe(config.publishableKey);
                 const elements = stripe.elements({clientSecret: config.clientSecret, appearance: stripeAppearance(form)});
                 paymentElement = elements.create('payment', {
+                    wallets: {link: 'never'},
                     layout: {type: 'accordion', defaultCollapsed: false, radios: false, spacedAccordionItems: true},
                     defaultValues: {billingDetails: {name: config.name, email: config.email}},
                 });
@@ -134,7 +136,7 @@ Alpine.data('aeStripeSetup', (config) => {
                         const result = await fetch(config.consentUrl, {
                             method: 'POST', signal: controller.signal,
                             headers: {'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': config.csrf},
-                            body: JSON.stringify({intent: config.intent, consent: consent.checked}),
+                            body: JSON.stringify({intent: config.intent, consent: consent.checked, version: 'off_session_v2'}),
                         });
                         if (!result.ok) {
                             showMessage('Could not record your agreement. Try again.');
