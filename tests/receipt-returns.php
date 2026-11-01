@@ -35,7 +35,8 @@ use Illuminate\Support\Facades\{DB, Http};
                 $this->posts[] = [$key, $data];
                 if ($this->drop) throw new ConnectionException('Not sent');
                 $this->refunds[$key] ??= (object) ['id' => 're_' . count($this->refunds), 'payment_intent' => $data['payment_intent'],
-                    'amount' => $data['amount'], 'currency' => $this->intent->currency, 'metadata' => (object) $data['metadata'], 'status' => $this->status];
+                    'amount' => $data['amount'], 'currency' => $this->intent->currency, 'metadata' => (object) $data['metadata'],
+                    'created' => 1793400000, 'status' => $this->status];
                 if ($this->lose) { $this->lose = false; throw new ConnectionException('Lost response'); }
                 return $this->refunds[$key];
             }
@@ -48,6 +49,7 @@ use Illuminate\Support\Facades\{DB, Http};
     try {
         [$i, $s] = $setup(); $deliver($s); $deliver($s); $gateway->retryReceiptReturns();
         $a = $status($i);
+        check($a['provider_created_at'] === 1793400000, 'Owned refund response supplies its provider creation date');
         check($a['state'] === 'refunded' && $a['amount_minor'] === 1000 && count($s->refunds) === 1 && count($s->posts) === 1,
             'Duplicate success and scheduled retries return only the excess once');
         check(ExtensionHelper::$payments['810:pi_return']['amount'] === 20.0 && ExtensionHelper::$payments['810:' . $a['key']]['amount'] === -10.0
@@ -77,9 +79,11 @@ use Illuminate\Support\Facades\{DB, Http};
         [$i, $s] = $setup(); $s->status = 'pending'; $deliver($s); $gateway->retryReceiptReturns();
         check($status($i)['state'] === 'pending' && !Credit::$rows && count($s->posts) === 1, 'A pending refund never becomes account credit');
         current($s->refunds)->status = 'failed';
+        current($s->refunds)->created = 1793489520;
         $gateway->retryReceiptReturns(); $deliver($s);
         check($status($i)['state'] === 'credited' && Credit::$rows['7:usd']->amount === 10.0 && count($s->posts) === 1,
             'A proven failed refund becomes account credit exactly once');
+        check($status($i)['provider_created_at'] === 1793400000, 'A later failed refund response cannot move the stored creation date');
 
         foreach (['succeeded', 'failed'] as $remoteStatus) {
             [$i, $s] = $setup(); $s->status = $remoteStatus;
