@@ -15,7 +15,8 @@ trait ReceiptReturns
     private function ensureReceiptReturnSchema(): void
     {
         if (self::$receiptReturnSchemaReady) return;
-        if (!\Illuminate\Support\Facades\Schema::hasTable('ae_stripe_receipt_returns')) {
+        if (!\Illuminate\Support\Facades\Schema::hasTable('ae_stripe_receipt_returns')
+            || !\Illuminate\Support\Facades\Schema::hasColumn('ae_stripe_receipt_returns', 'provider_created_at')) {
             // MySQL DDL must never commit an enclosing caller/payment transaction.
             abort_unless(DB::transactionLevel() === 0, 409);
             $this->upgraded();
@@ -75,6 +76,7 @@ trait ReceiptReturns
             if ($this->isReceiptObservation($row->allocation_key)) continue;
             $receipt['allocations'][$row->allocation_key] = ['amount_minor' => (int) $row->amount_minor,
                 'state' => $row->state, 'refund_id' => $row->refund_id, 'credit_id' => $row->credit_id,
+                'provider_created_at' => $row->provider_created_at ?? null,
                 'key' => $row->return_key, 'sent_at' => $row->sent_at === null ? null : (int) $row->sent_at,
                 'reason' => $row->reason, 'notified' => $row->notified, 'recheck' => (bool) $row->recheck];
         }
@@ -89,12 +91,14 @@ trait ReceiptReturns
     private function writeReceipt($user, string $id, array $receipt, string $key): void
     {
         $a = $receipt['allocations'][$key];
+        $previous = $this->receiptRows()->where('payment_intent_id', $id)->where('allocation_key', $key)->lockForUpdate()->first();
         $this->receiptRows()->updateOrInsert(['payment_intent_id' => $id, 'allocation_key' => $key], [
             'user_id' => $user->id, 'invoice_id' => $receipt['invoice_id'], 'customer' => $receipt['customer'],
             'currency' => $receipt['currency'], 'received_minor' => $receipt['received_minor'], 'closed_invoice' => $receipt['closed_invoice'],
             'subscription_invoice_id' => $receipt['subscription_invoice_id'] ?? null,
             'amount_minor' => $a['amount_minor'], 'return_key' => $a['key'], 'state' => $a['state'],
             'refund_id' => $a['refund_id'], 'credit_id' => $a['credit_id'] ?? null, 'sent_at' => $a['sent_at'],
+            'provider_created_at' => $previous->provider_created_at ?? $a['provider_created_at'] ?? null,
             'reason' => $a['reason'] ?? null, 'notified' => $a['notified'] ?? null, 'recheck' => $a['recheck'] ?? false,
             'retry' => !in_array($a['state'], ['refunded', 'credited'], true) || !empty($a['recheck'])
                 || ($a['notified'] ?? null) !== $this->receiptNotice($a), 'updated_at' => time(),
@@ -225,6 +229,7 @@ trait ReceiptReturns
                                     && ($refund->metadata->ae_stripe_return ?? null) === $a['key'], 409);
                                 abort_unless($a['refund_id'] === null || $a['refund_id'] === $refund->id, 409);
                                 $a['refund_id'] = $refund->id;
+                                $a['provider_created_at'] ??= $this->providerCreatedAt($refund);
                                 $a['recheck'] = false;
                                 $a['state'] = match ($refund->status ?? '') {
                                     'succeeded' => 'refunded', 'failed', 'canceled' => 'credited', default => 'pending',

@@ -2,12 +2,12 @@
 // Reuse the return fixture: these events must never create a second return or debit.
 use App\Helpers\ExtensionHelper;
 use App\Models\{Audit, Credit, Notification};
-use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\{DB, Http};
 
 // batch3-click/stripe-replay-open.json: invoice 47 received 1099, external refund 100 USD cents.
 [$i, $s] = $setup(1099, 10.99); $deliver($s);
 $foreign = (object) ['id' => 're_123456789012345678901234', 'object' => 'refund', 'livemode' => false, 'payment_intent' => 'pi_return', 'charge' => 'ch_return',
-    'currency' => 'usd', 'amount' => 100, 'status' => 'succeeded', 'metadata' => (object) []];
+    'currency' => 'usd', 'amount' => 100, 'created' => 1793400000, 'status' => 'succeeded', 'metadata' => (object) []];
 $s->refunds['foreign'] = $foreign;
 $request = eventRequest($foreign, type: 'refund.created');
 $gateway->webhook($request); $gateway->webhook($request);
@@ -17,21 +17,34 @@ $reversals = $gateway->receiptReversals($i, 'pi_return');
 check(count($reversals) === 1 && $reversals[0]['id'] === $foreign->id && $reversals[0]['needs_review']
     && $reversals[0]['amount_minor'] === 100 && count(Audit::$rows) === 1 && count(Notification::$rows) === 1,
     'Captured USD 1 refund created/updated replays persist one work item, audit and staff alert within the existing schema');
+$storedKey = 'pi_return:stripe:refund:'.$foreign->id;
+check(DB::$tables['ae_stripe_receipt_returns'][$storedKey]['provider_created_at'] === 1793400000,
+    'External refund stores the canonical Stripe creation date');
+DB::$tables['ae_stripe_receipt_returns'][$storedKey]['provider_created_at'] = null;
+$recorded = DB::$tables['ae_stripe_receipt_returns'][$storedKey]['updated_at'];
+$gateway->webhook($updated);
+check(DB::$tables['ae_stripe_receipt_returns'][$storedKey]['provider_created_at'] === 1793400000
+    && DB::$tables['ae_stripe_receipt_returns'][$storedKey]['updated_at'] === $recorded
+    && count(Audit::$rows) === 1 && count(Notification::$rows) === 1,
+    'Same-state replay fills an old row date without moving recorded time or repeating audit/notice');
 $return = $gateway->allocateReceiptReturn($i, 'pi_return', 'domains:foreign', 500);
 check($return['state'] === 'review' && !$s->posts && !Credit::$rows,
     'A foreign refund observation cannot become an allocation or permit another return');
 $s->refunds['foreign']->status = 'failed';
+$s->refunds['foreign']->created = 1793489520;
 $gateway->webhook(eventRequest($foreign, type: 'refund.failed'));
 $auditCount = count(Audit::$rows); $gateway->webhook($request); // Old succeeded delivery after canonical failure.
 check(!$gateway->receiptReversals($i, 'pi_return')[0]['needs_review'] && !Credit::$rows && count(Audit::$rows) === $auditCount,
     'Canonical failed foreign refunds clear finance work and a stale success event cannot reopen it');
+check(DB::$tables['ae_stripe_receipt_returns'][$storedKey]['provider_created_at'] === 1793400000,
+    'A later canonical status change never moves the original provider date');
 
 // Captured invoice 53: a du_ dispute for 1200 USD cents, closed lost. Reuse spent-credit coverage.
 [$i, $s] = $setup(1200, 2); $s->status = 'failed'; $deliver($s);
 $credit = Credit::$rows['7:usd']; $credit->amount = 0; // The customer has already spent all fallback credit.
 $s->dispute = (object) ['id' => 'du_123456789012345678901234', 'object' => 'dispute', 'livemode' => false,
     'charge' => 'ch_return', 'payment_intent' => 'pi_return', 'currency' => 'usd', 'amount' => 1200,
-    'status' => 'needs_response', 'evidence_details' => (object) ['due_by' => 1794182399], 'metadata' => (object) []];
+    'status' => 'needs_response', 'created' => 1793400001, 'evidence_details' => (object) ['due_by' => 1794182399], 'metadata' => (object) []];
 unset($s->dispute->payment_intent); // Stripe can identify a dispute through its charge alone.
 $event = eventRequest($s->dispute, type: 'charge.dispute.created');
 $before = [count(Audit::$rows), count(Notification::$rows), count($s->posts), ExtensionHelper::$payments, $i->status];
@@ -51,6 +64,7 @@ check(($audit['stripe_id'] ?? null) === $s->dispute->id && !array_key_exists('id
 check(str_contains(end(Notification::$rows)['body'], 'cus_owner') && str_contains(end(Notification::$rows)['body'], '10 USD'),
     'Staff receive the customer and credited amount in their next-step line');
 $s->dispute->status = 'lost';
+$s->dispute->created = 1793489520;
 foreach (['charge.dispute.updated', 'charge.dispute.closed'] as $type) {
     $closed = eventRequest($s->dispute, type: $type);
     $gateway->webhook($closed); $gateway->webhook($closed);
@@ -59,6 +73,8 @@ check($gateway->receiptReversals($i, 'pi_return')[0]['status'] === 'lost' && $cr
     && count(Audit::$rows) === $before[0] + 2 && count(Notification::$rows) === $before[1] + 2
     && count($s->posts) === $before[2] && ExtensionHelper::$payments === $before[3] && $i->status === $before[4],
     'Losing a chargeback retains finance work without debiting spent credit, refunding again or changing invoice status');
+check(DB::$tables['ae_stripe_receipt_returns']['pi_return:stripe:dispute:'.$s->dispute->id]['provider_created_at'] === 1793400001,
+    'Dispute provider creation date survives a later loss');
 
 // Captured invoice 49: 1164 USD cents, canonical won before old open deliveries.
 [$i, $s] = $setup(1164, 11.64); $deliver($s);
@@ -77,6 +93,20 @@ $s->dispute->status = 'needs_response';
 // A canonical stale read cannot reopen a terminal outcome already recorded.
 $gateway->webhook(eventRequest($stale, type: 'charge.dispute.updated'));
 check(!$gateway->receiptReversals($i, 'pi_return')[0]['needs_review'], 'A terminal dispute never regresses to open');
+$s->dispute->status = 'warning_under_review';
+$gateway->webhook(eventRequest($s->dispute, type: 'charge.dispute.updated'));
+check($gateway->receiptReversals($i, 'pi_return')[0]['status'] === 'won', 'A terminal dispute never regresses to inquiry');
+
+foreach (['warning_needs_response', 'warning_under_review'] as $inquiry) {
+    [$i, $s] = $setup(2000, 20); $deliver($s);
+    $s->dispute = (object) ['id' => 'du_inquiry', 'charge' => 'ch_return', 'payment_intent' => 'pi_return',
+        'currency' => 'usd', 'amount' => 2000, 'created' => 1793400000, 'status' => $inquiry];
+    $gateway->webhook(eventRequest($s->dispute, type: 'charge.dispute.created'));
+    $inquiryRow = $gateway->receiptReversals($i, 'pi_return')[0];
+    $return = $gateway->allocateReceiptReturn($i, 'pi_return', 'domains:inquiry', 500);
+    check($inquiryRow['status'] === 'inquiry' && $inquiryRow['needs_review'] && $return['state'] === 'review' && !$s->posts,
+        'Inquiry has its own state and still requires review/holds automatic returns without claiming money was taken');
+}
 
 [$i, $s] = $setup(2000, 20); $deliver($s);
 $s->dispute = (object) ['id' => 'dp_return', 'charge' => 'ch_return', 'payment_intent' => 'pi_return',

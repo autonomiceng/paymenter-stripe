@@ -108,7 +108,7 @@ before an expected local settlement return a retryable error. Unrelated gateway
 payments are ignored. A failed read, ledger write or staff notification rolls back
 and propagates a non-2xx response so Stripe can retry; the original payment stays
 recorded. Duplicate state creates no repeated audit or alert; stale open events
-cannot reopen a won or lost dispute. No invoice status, service, transaction or
+cannot reopen a won, lost or cleared dispute, including stale inquiry events. No invoice status, service, transaction or
 credit changes are made by observation.
 
 For invoice page/PDF display, use `$gateway->invoiceReversalHistory($invoice)` after
@@ -116,13 +116,35 @@ authorizing access to the invoice. This uses unlocked local SELECTs only: no Str
 calls, schema installation, payment lock or writes. It works when the gateway is
 disabled and returns an empty array before the ledger is installed. Results are
 scoped to the stored invoice, owner and currency, with `kind`, `id`, `status`,
-`amount_minor`, `amount` (major units), `currency` and `recorded_at` (epoch seconds).
-`recorded_at` is the last ledger observation time, not Stripe's creation date.
+`payment_intent_id`, `received_minor`, `amount_minor`, `amount` (major units),
+`currency`, `provider_created_at` and `recorded_at` (epoch seconds).
+`provider_created_at` is Stripe's creation date, stored once from its refund/dispute
+response. Later status changes never move it. Same-state observations fill missing
+dates without another audit/notice. Owned refund responses also supply this date.
+An additive nullable-column migration runs on upgrade or before a writer needs it;
+the reader installs nothing and tolerates the old schema. Display the provider
+date when present; otherwise use `recorded_at`, labelled “Recorded.” The latter is
+the last ledger observation time, not Stripe's creation date.
 Owned refund allocations with a Stripe refund ID are included, deduplicated against
 observations; an allocation that fell back to credit shows a failed cash refund.
 Count only refund rows with `status=refunded` in the amount refunded. Disputes and
 pending/failed refunds do not belong in that total. This history is never proof
 that Stripe has no other reversal. Keep its internal IDs off customer displays.
+
+`invoiceReversalSummary($invoice)` returns that same history as `rows`, gross cash
+`totals` in major units and an `overlap` flag. It reads local succeeded, positive,
+non-credit AE Stripe PaymentIntent transactions, including payments without
+reversals, and uses the stored canonical `received_minor` for observed payments.
+For each payment independently it deducts completed refunds, then open disputes,
+then lost disputes, each bounded by the unreturned receipt remainder. Adding those
+per-payment results gives Refunded, Open disputes, Lost to disputes and Net received
+(before Stripe fees). Table rows retain their full observed amounts: a partial
+refund followed by a full lost dispute must not deduct the refunded part twice.
+An inquiry takes no money; won/cleared disputes and pending/failed/review rows
+deduct zero. A refund plus any dispute other than won/cleared on the same payment
+sets `overlap`: show “Refund and dispute on the same payment. Check the balance in
+Stripe.” This is a stored gross cash summary, not a fee calculation or accounting
+journal. Customer refunds and their completed-only total stay separate.
 
 The lock-taking `receiptReversals()` interface is for the configured gateway instance
 and one local invoice/receipt. It returns `[]` when nothing has been observed,
@@ -131,13 +153,17 @@ never proof that no reversal exists in Stripe. Each result has:
 | Field | Meaning |
 | --- | --- |
 | `kind`, `id` | `refund`/`dispute` and its Stripe ID; deduplicate consumers on receipt/kind/ID. |
-| `status` | Refund: `open`, `refunded`, `failed`. Dispute: `open`, `won`, `lost`, `cleared` (closed warning). |
+| `status` | Refund: `open`, `refunded`, `failed`. Dispute: `open`, `won`, `lost`, `cleared` (closed warning), `inquiry` (`warning_needs_response` / `warning_under_review`, no money taken). |
 | `needs_review` | False for failed/canceled refunds, won disputes and closed warnings; true otherwise. |
 | `invoice_id`, `user_id`, `customer`, `payment_intent_id`, `currency` | Verified local and Stripe receipt identity. |
 | `amount_minor` | Refund/dispute amount, not an amount to debit. |
 | `credited_minor` | Completed credit allocations for this receipt in this ledger. |
 | `credit_balance_minor` | Current pooled customer credit in the invoice currency. |
 | `next_step` | Staff action line from the last observed status change. |
+
+Inquiries still need review and hold automatic returns, as they did when labelled
+open; no new hold or staff action is added. A final dispute cannot regress to open
+or inquiry. Inquiry status does not represent a cash deduction.
 
 Finance work uses the invoice Audit Log (`ae_stripe_receipt_reversal`) and the
 existing native staff inbox, with an invoice link and one next-step line. Open

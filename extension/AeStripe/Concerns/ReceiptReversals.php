@@ -23,15 +23,64 @@ trait ReceiptReversals
             } else continue;
             $key = $kind . ':' . $id;
             // The canonical observation wins if an allocation and webhook describe the same refund.
-            if (!$observation && isset($result[$key])) continue;
+            if (!$observation && isset($result[$key])) {
+                $result[$key]['provider_created_at'] ??= $row->provider_created_at ?? null;
+                continue;
+            }
+            $created = $row->provider_created_at ?? $result[$key]['provider_created_at'] ?? null;
             $result[$key] = ['kind' => $kind, 'id' => $id, 'status' => $status,
+                'payment_intent_id' => $row->payment_intent_id, 'received_minor' => (int) $row->received_minor,
                 'amount_minor' => (int) $row->amount_minor, 'currency' => $row->currency,
                 'amount' => $this->fromMinorUnits((int) $row->amount_minor, $row->currency),
-                // The ledger stores its last observation time, not Stripe's creation timestamp.
+                'provider_created_at' => $created === null ? null : (int) $created,
+                // Kept separately for old rows with no provider creation date yet.
                 'recorded_at' => (int) $row->updated_at];
         }
-        uasort($result, fn ($a, $b) => [$a['recorded_at'], $a['id']] <=> [$b['recorded_at'], $b['id']]);
+        uasort($result, fn ($a, $b) => [$a['provider_created_at'] ?? $a['recorded_at'], $a['id']]
+            <=> [$b['provider_created_at'] ?? $b['recorded_at'], $b['id']]);
         return array_values($result);
+    }
+
+    /** Gross Stripe cash position, before fees. Each payment has its own deduction ceiling. */
+    public function invoiceReversalSummary(Invoice $invoice): array
+    {
+        $rows = $this->invoiceReversalHistory($invoice);
+        $payments = [];
+        foreach ($invoice->transactions()->with('gateway')->where('status', 'succeeded')->where('amount', '>', 0)
+            ->where('is_credit_transaction', false)->get() as $payment) {
+            if ($payment->gateway?->extension !== 'AeStripe' || !str_starts_with($payment->transaction_id ?? '', 'pi_')) continue;
+            $payments[$payment->transaction_id] = ['received_minor' => $this->toMinorUnits($payment->amount, $invoice->currency_code)];
+        }
+        foreach ($rows as $row) {
+            $payment = &$payments[$row['payment_intent_id']];
+            $payment['received_minor'] = $row['received_minor']; // Canonical gross receipt, including any fee recovery.
+            $bucket = $row['kind'] === 'refund' ? ($row['status'] === 'refunded' ? 'refunded' : null)
+                : match ($row['status']) { 'open' => 'open_disputes', 'lost' => 'lost_disputes', default => null };
+            if ($bucket) $payment[$bucket] = ($payment[$bucket] ?? 0) + $row['amount_minor'];
+            if ($row['kind'] === 'refund') $payment['has_refund'] = true;
+            elseif (!in_array($row['status'], ['won', 'cleared'], true)) $payment['has_dispute'] = true;
+        }
+        unset($payment);
+        $totals = ['refunded' => 0, 'open_disputes' => 0, 'lost_disputes' => 0, 'net_received' => 0];
+        $overlap = false;
+        foreach ($payments as $payment) {
+            $remaining = $payment['received_minor'];
+            // Completed refunds are known cash returned; disputes can only take the unreturned remainder.
+            foreach (['refunded', 'open_disputes', 'lost_disputes'] as $bucket) {
+                $deduction = min($remaining, $payment[$bucket] ?? 0);
+                $totals[$bucket] += $deduction;
+                $remaining -= $deduction;
+            }
+            $totals['net_received'] += $remaining;
+            $overlap = $overlap || !empty($payment['has_refund']) && !empty($payment['has_dispute']);
+        }
+        return ['rows' => $rows, 'totals' => array_map(fn ($amount) => $this->fromMinorUnits($amount, $invoice->currency_code), $totals),
+            'overlap' => $overlap];
+    }
+
+    private function providerCreatedAt(object $object): ?int
+    {
+        return is_int($object->created ?? null) && $object->created > 0 ? $object->created : null;
     }
 
     // Reserved ledger keys distinguish observations from money-return allocations.
@@ -42,6 +91,7 @@ trait ReceiptReversals
 
     private function receiptHasReversalHold(string $id): bool
     {
+        // Inquiries take no money, but retain the existing hold while the outcome is unresolved.
         foreach ($this->receiptRows()->where('payment_intent_id', $id)->lockForUpdate()->get() as $row) {
             if (str_starts_with($row->allocation_key, 'stripe:refund:')
                 || str_starts_with($row->allocation_key, 'stripe:dispute:') && !in_array($row->state, ['won', 'cleared'], true)) return true;
@@ -69,7 +119,7 @@ trait ReceiptReversals
         [, $kind, $id] = explode(':', $row->allocation_key, 3);
         $credit = Credit::where('user_id', $user->id)->where('currency_code', $invoice->currency_code)->lockForUpdate()->first();
         return ['kind' => $kind, 'id' => $id, 'status' => $row->state,
-            'needs_review' => !in_array($row->state, ['won', 'cleared', 'failed'], true),
+            'needs_review' => !in_array($row->state, ['won', 'cleared', 'failed'], true), // Includes actionable inquiries.
             'invoice_id' => $invoice->id, 'user_id' => $user->id, 'customer' => $receipt['customer'],
             'payment_intent_id' => $receipt['payment_intent_id'], 'currency' => $receipt['currency'],
             'amount_minor' => (int) $row->amount_minor,
@@ -128,19 +178,23 @@ trait ReceiptReversals
                 && $latest->amount > 0 && $latest->amount <= $receipt['received_minor'], 409);
             $state = $kind === 'refund'
                 ? match ($latest->status ?? '') { 'succeeded' => 'refunded', 'failed', 'canceled' => 'failed', default => 'open' }
-                : match ($latest->status ?? '') { 'won' => 'won', 'lost' => 'lost', 'warning_closed' => 'cleared', default => 'open' };
+                : match ($latest->status ?? '') { 'won' => 'won', 'lost' => 'lost', 'warning_closed' => 'cleared',
+                    'warning_needs_response', 'warning_under_review' => 'inquiry', default => 'open' };
             $key = 'stripe:' . $kind . ':' . $id;
             $previous = $this->receiptRows()->where('payment_intent_id', $paymentId)->where('allocation_key', $key)->lockForUpdate()->first();
+            $created = !empty($previous->provider_created_at) ? (int) $previous->provider_created_at : $this->providerCreatedAt($latest);
             if ($previous) {
                 abort_unless((int) $previous->amount_minor === $latest->amount, 409);
-                if ($kind === 'dispute' && in_array($previous->state, ['won', 'lost', 'cleared'], true) && $state === 'open') return;
+                if (empty($previous->provider_created_at) && $created) $this->receiptRows()
+                    ->where('payment_intent_id', $paymentId)->where('allocation_key', $key)->update(['provider_created_at' => $created]);
+                if ($kind === 'dispute' && in_array($previous->state, ['won', 'lost', 'cleared'], true) && in_array($state, ['open', 'inquiry'], true)) return;
                 if ($previous->state === $state) return;
             }
             $values = ['user_id' => $user->id, 'invoice_id' => $current->id, 'customer' => $receipt['customer'],
                 'currency' => $receipt['currency'], 'received_minor' => $receipt['received_minor'], 'closed_invoice' => $receipt['closed_invoice'],
                 'subscription_invoice_id' => $receipt['subscription_invoice_id'] ?? null,
                 'amount_minor' => $latest->amount, 'return_key' => 'ae-obsv-' . hash('sha256', $paymentId . ':' . $key),
-                'state' => $state, 'retry' => false, 'recheck' => false, 'updated_at' => time(),
+                'state' => $state, 'retry' => false, 'recheck' => false, 'updated_at' => time(), 'provider_created_at' => $created,
                 'refund_id' => $kind === 'refund' ? $id : null, 'credit_id' => null, 'sent_at' => null, 'reason' => null, 'notified' => $state];
             $details = $this->receiptReversalDetails($user, $current, $receipt, (object) ($values + ['allocation_key' => $key]));
             $money = fn ($amount) => $this->fromMinorUnits($amount, $receipt['currency']) . ' ' . strtoupper($receipt['currency']);
@@ -149,7 +203,7 @@ trait ReceiptReversals
                 . ': ' . $kind . ' ' . $id . ' ' . $state . ', ' . $money($latest->amount)
                 . '; receipt credit ' . $money($details['credited_minor']) . ', current account credit ' . $money($details['credit_balance_minor']) . '. '
                 . (!$details['needs_review'] ? 'Finance work cleared; check any earlier manual adjustment against Stripe.'
-                    : ($kind === 'dispute' && $state === 'open' ? 'Review the dispute in Stripe and submit evidence before its deadline; '
+                    : ($kind === 'dispute' && in_array($state, ['open', 'inquiry'], true) ? 'Review the dispute in Stripe and submit evidence before its deadline; '
                         : 'Reconcile this reversal in Stripe with the invoice and customer credit history; ')
                     . 'only staff can confirm spent credit and any recovery amount. Do not issue another refund or debit without that proof.');
             $values['reason'] = $line;

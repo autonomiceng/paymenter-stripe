@@ -38,6 +38,21 @@ if ($gateway->invoiceReversalHistory($historyInvoice) !== [] || Schema::hasTable
 (require __DIR__ . '/../extension/AeStripe/database/migrations/2026_10_31_000001_create_ae_stripe_receipt_returns.php')->up();
 $count = 0;
 function verifyReturn(bool $ok, string $message): void { global $count; if (!$ok) throw new RuntimeException($message); ++$count; }
+DB::table('ae_stripe_receipt_returns')->insert(['payment_intent_id' => 'pi_legacy', 'allocation_key' => 'stripe:refund:re_legacy',
+    'invoice_id' => 54, 'user_id' => 1, 'currency' => 'usd', 'received_minor' => 1200, 'amount_minor' => 100,
+    'return_key' => 'legacy', 'state' => 'refunded', 'updated_at' => 1793489520]);
+verifyReturn($gateway->invoiceReversalHistory($historyInvoice)[0]['provider_created_at'] === null
+    && !Schema::hasColumn('ae_stripe_receipt_returns', 'provider_created_at'), 'Old-schema history reads without installing its date column');
+$upgrade = new class extends AeStripe {
+    public function upgraded($oldVersion = null) {
+        (require __DIR__.'/../extension/AeStripe/database/migrations/2026_11_01_000001_add_receipt_provider_created_at.php')->up();
+    }
+};
+(new ReflectionMethod($upgrade, 'ensureReceiptReturnSchema'))->invoke($upgrade);
+$upgrade->upgraded();
+verifyReturn(Schema::hasColumn('ae_stripe_receipt_returns', 'provider_created_at')
+    && DB::table('ae_stripe_receipt_returns')->first()->provider_created_at === null, 'Installed table gets the additive nullable column once, retaining old rows');
+DB::table('ae_stripe_receipt_returns')->where('return_key', 'legacy')->delete();
 $gateway = new AeStripe([]);
 $read = new ReflectionMethod($gateway, 'readReceipt'); $write = new ReflectionMethod($gateway, 'writeReceipt');
 $user = (object) ['id' => 1];
@@ -46,17 +61,20 @@ $receipt = ['invoice_id' => 1, 'payment_intent_id' => 'pi_storage', 'customer' =
 for ($n = 0; $n < 167; ++$n) {
     $key = str_pad('domains:' . $n . ':', 180, 'x');
     $receipt['allocations'][$key] = ['amount_minor' => 100, 'key' => 'ae-return-' . hash('sha256', $key), 'sent_at' => time(),
-        'state' => 'reserved', 'refund_id' => null];
+        'state' => 'reserved', 'refund_id' => null, 'provider_created_at' => 1793400000];
     DB::transaction(fn () => $write->invoke($gateway, $user, 'pi_storage', $receipt, $key));
 }
 foreach ($receipt['allocations'] as $key => &$a) {
     $a['state'] = 'refunded'; $a['refund_id'] = 're_' . hash('sha256', $key); $a['notified'] = 'refunded:';
+    $a['provider_created_at'] = 1793489520;
     DB::transaction(fn () => $write->invoke($gateway, $user, 'pi_storage', $receipt, $key));
 }
 unset($a);
 $stored = DB::transaction(fn () => $read->invoke($gateway, $user, 'pi_storage'));
 verifyReturn(count($stored['allocations']) === 167 && array_sum(array_column($stored['allocations'], 'amount_minor')) === 16700, 'Independent SQL rows retain every completed allocation past the old aggregate TEXT limit');
 verifyReturn($stored['subscription_invoice_id'] === 'in_storage', 'Subscription invoice binding survives native storage for recovery');
+verifyReturn(count(array_unique(array_column($stored['allocations'], 'provider_created_at'))) === 1
+    && current($stored['allocations'])['provider_created_at'] === 1793400000, 'Allocation provider dates survive later state writes unchanged');
 verifyReturn(DB::table('ae_stripe_receipt_returns')->where('retry', true)->count() === 0, 'Notified completion leaves the due queue');
 $sample = (array) DB::table('ae_stripe_receipt_returns')->first();
 try { DB::table('ae_stripe_receipt_returns')->insert($sample); throw new RuntimeException('Duplicate allocation accepted'); }
@@ -142,29 +160,63 @@ $historyRow = function (string $key, array $changes = []) use ($sample) {
     DB::table('ae_stripe_receipt_returns')->insert(array_replace($sample, [
         'payment_intent_id' => 'pi_visible', 'allocation_key' => $key, 'return_key' => hash('sha256', $key.serialize($changes)),
         'invoice_id' => 54, 'user_id' => 1, 'currency' => 'usd', 'amount_minor' => 100,
-        'state' => 'refunded', 'updated_at' => 1793489520, 'refund_id' => null,
+        'state' => 'refunded', 'updated_at' => 1793489520, 'refund_id' => null, 'received_minor' => 1200,
+        'provider_created_at' => null,
     ], $changes));
 };
 $historyRow('stripe:refund:re_first'); $historyRow('stripe:refund:re_second');
 $historyRow('stripe:refund:re_pending', ['state' => 'open']);
 $historyRow('stripe:dispute:du_lost', ['state' => 'lost', 'amount_minor' => 1200]);
-$historyRow('domains:owned', ['refund_id' => 're_owned']);
+$historyRow('domains:owned', ['refund_id' => 're_owned', 'provider_created_at' => 1793400000]);
 $historyRow('stripe:refund:re_owned'); // Same money is displayed and totalled once.
-$historyRow('domains:credit', ['state' => 'credited']);
+$historyRow('domains:credit', ['state' => 'credited', 'refund_id' => 're_failed_cash']);
+$historyRow('domains:pure_credit', ['state' => 'credited']);
 $historyRow('stripe:refund:re_other_invoice', ['invoice_id' => 55]);
 $historyRow('stripe:refund:re_other_owner', ['user_id' => 2]);
 $historyRow('stripe:refund:re_other_currency', ['currency' => 'eur']);
 $unchanged = DB::table('ae_stripe_receipt_returns')->get()->toJson();
 $queries = []; DB::listen(function ($event) use (&$queries) { $queries[] = $event->sql; });
 $history = $gateway->invoiceReversalHistory($historyInvoice);
-verifyReturn(count($history) === 5 && count(array_filter($history, fn ($row) => $row['kind'] === 'refund' && $row['status'] === 'refunded')) === 3,
+verifyReturn(count($history) === 6 && count(array_filter($history, fn ($row) => $row['kind'] === 'refund' && $row['status'] === 'refunded')) === 3,
     'History keeps distinct refunds/disputes, deduplicates allocation observations and excludes credits, other owners, invoices and currencies');
 verifyReturn(array_sum(array_column(array_filter($history, fn ($row) => $row['kind'] === 'refund' && $row['status'] === 'refunded'), 'amount')) === 3.0,
     'USD refunds retain their stored minor-unit scale');
+verifyReturn(count(array_filter($history, fn ($row) => $row['id'] === 're_failed_cash' && $row['status'] === 'failed')) === 1,
+    'A credited allocation with a refund ID displays a failed cash refund and adds nothing to refunded money');
+verifyReturn(count(array_filter($history, fn ($row) => $row['id'] === 're_owned' && $row['provider_created_at'] === 1793400000)) === 1,
+    'A known allocation date survives deduplication with an older undated observation');
 verifyReturn(!array_filter($queries, fn ($sql) => !str_starts_with(strtolower($sql), 'select') || str_contains(strtolower($sql), 'for update'))
     && DB::transactionLevel() === 0 && DB::table('ae_stripe_receipt_returns')->get()->toJson() === $unchanged,
     'History emits only unlocked SELECTs and leaves the ledger unchanged');
 $historyRow('stripe:refund:re_yen', ['currency' => 'jpy']);
 $historyInvoice->currency_code = 'JPY';
 verifyReturn($gateway->invoiceReversalHistory($historyInvoice)[0]['amount'] === 100.0, 'History reuses the gateway zero-decimal currency conversion');
+
+$historyInvoice->currency_code = 'USD'; $historyInvoice->id = 60;
+$case = function (array $rows, array $expected, bool $overlap = false) use ($historyRow, $gateway, $historyInvoice) {
+    static $caseId = 0;
+    ++$caseId;
+    foreach ($rows as $n => $row) {
+        $kind = $row['kind']; unset($row['kind']);
+        $historyRow('stripe:'.$kind.':case'.$caseId.'_'.$n, ['invoice_id' => 60] + $row);
+    }
+    $actual = $gateway->invoiceReversalSummary($historyInvoice);
+    verifyReturn($actual['totals'] === $expected && $actual['overlap'] === $overlap, 'Per-payment gross cash summary case '.$caseId);
+    DB::table('ae_stripe_receipt_returns')->where('invoice_id', 60)->delete();
+};
+$totals = fn ($refund, $open, $lost, $net) => ['refunded' => (float) $refund, 'open_disputes' => (float) $open,
+    'lost_disputes' => (float) $lost, 'net_received' => (float) $net];
+$case([['kind' => 'refund', 'state' => 'refunded', 'amount_minor' => 300]], $totals(3, 0, 0, 9));
+foreach (['open', 'lost', 'won', 'inquiry', 'cleared', 'failed', 'pending', 'review'] as $state) {
+    $case([['kind' => 'dispute', 'state' => $state, 'amount_minor' => 1200]],
+        $totals(0, $state === 'open' ? 12 : 0, $state === 'lost' ? 12 : 0, in_array($state, ['open', 'lost']) ? 0 : 12));
+}
+$overlap = [['kind' => 'refund', 'state' => 'refunded', 'amount_minor' => 300],
+    ['kind' => 'dispute', 'state' => 'lost', 'amount_minor' => 1200]];
+$case($overlap, $totals(3, 0, 9, 0), true);
+$case([...$overlap, ['kind' => 'refund', 'state' => 'refunded', 'payment_intent_id' => 'pi_second', 'received_minor' => 800, 'amount_minor' => 100],
+    ['kind' => 'dispute', 'state' => 'open', 'payment_intent_id' => 'pi_second', 'received_minor' => 800, 'amount_minor' => 800]], $totals(4, 7, 9, 0), true);
+DB::table('invoice_transactions')->insert(['invoice_id' => 60, 'gateway_id' => 1, 'transaction_id' => 'pi_unaffected',
+    'amount' => 5, 'status' => 'succeeded', 'is_credit_transaction' => false]);
+$case($overlap, $totals(3, 0, 9, 5), true);
 echo "PASS: $count native receipt storage/accounting assertions\n";

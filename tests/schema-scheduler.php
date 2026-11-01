@@ -71,7 +71,7 @@ if (in_array($scenario, ['all', 'fee'], true)) {
                 $time = time();
                 $firstGateway->webhook(new \Illuminate\Http\Request(body: $body,
                     signature: 't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.' . $body, 'whsec_test')));
-                check(count(\Illuminate\Database\Migrations\Migrator::$ran) === 3
+                check(count(\Illuminate\Database\Migrations\Migrator::$ran) === 4
                     && (DB::$tables['ae_stripe_payment_fees']['pi_schema']['state'] ?? null) === 'completed',
                     'First charge fee path creates the table and records the fee');
             } else {
