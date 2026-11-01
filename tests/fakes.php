@@ -1,5 +1,8 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
+namespace Paymenter\Extensions\Gateways\AeStripe\Concerns {
+    function time(): int { return $GLOBALS['fakeStripeTime'] ?? \time(); }
+}
 namespace Illuminate\Console {
     class Command {
         const SUCCESS = 0, FAILURE = 1;
@@ -63,7 +66,7 @@ namespace App\Models {
         public function exists() { return (bool) $this->value; }
         public function firstOrFail() { return $this->value ?? throw new \RuntimeException('Missing row'); }
         public function where($key, $value) { return $this; }
-        public function lockForUpdate() { if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $before = \App\Helpers\ExtensionHelper::$payments; $hook(); foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) if (($before[$key] ?? null) !== $row) \Illuminate\Support\Facades\DB::$concurrentPayments[$key] = $row; } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
+        public function lockForUpdate() { if ($this->model === Service::class && ($hook = \Illuminate\Support\Facades\DB::$beforeServiceLock)) $hook(); if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $before = \App\Helpers\ExtensionHelper::$payments; $hook(); foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) if (($before[$key] ?? null) !== $row) \Illuminate\Support\Facades\DB::$concurrentPayments[$key] = $row; } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
     }
     class Property {
         public static ?array $lastRawOrder = null;
@@ -470,7 +473,7 @@ namespace Illuminate\Support\Facades {
         public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } }; }
         public static $concurrentAgreements = [], $concurrentPayments = [];
         public static function table($name) { return match ($name) { 'invoice_transactions' => new \TransactionClassificationQuery, 'ae_stripe_receipt_returns' => new \ReceiptReturnQuery, 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
-        public static $beforeUserLock = null, $afterTransaction = null;
+        public static $beforeUserLock = null, $beforeServiceLock = null, $afterTransaction = null;
         public static function transactionLevel() { return self::$locked ? 1 : 0; }
         private static $afterCommit = [];
         public static function afterCommit($callback) { self::$afterCommit[] = $callback; }

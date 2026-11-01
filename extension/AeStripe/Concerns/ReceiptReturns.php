@@ -251,7 +251,8 @@ trait ReceiptReturns
                     if ($this->withPaymentLock($invoice, $process)) $this->withPaymentLock($invoice, $process);
                 } catch (\Throwable $e) {
                     report($e);
-                    if ($e instanceof ConnectionException || $e instanceof RequestException && in_array($e->response->status(), [401, 403], true)) $this->receiptStripeUnavailable = true;
+                    if ($e instanceof ConnectionException || $e instanceof RequestException
+                        && (in_array($e->response->status(), [401, 403], true) || $e->response->status() >= 500)) $this->receiptStripeUnavailable = true;
                     $this->withPaymentLock($invoice, function ($user) use ($id, $key) {
                         $receipt = $this->readReceipt($user, $id);
                         // A lost commit acknowledgement can follow a successful local commit.
@@ -335,11 +336,11 @@ trait ReceiptReturns
         $this->withPaymentLock($invoice, function ($user, $current) use ($id, $key) {
             $receipt = $this->readReceipt($user, $id);
             $a = &$receipt['allocations'][$key];
-            $notice = $this->receiptNotice($a);
+            $notice = ($this->receiptStripeUnavailable ? 'staff:' : '') . $this->receiptNotice($a);
             if (($a['notified'] ?? null) === $notice) return;
             Audit::create(['event' => 'ae_stripe_receipt_return', 'auditable_type' => $current->getMorphClass(), 'auditable_id' => $current->id,
                 'old_values' => [], 'new_values' => ['payment_intent_id' => $id, 'allocation' => $key] + $a]);
-            Notification::create(['user_id' => $user->id, 'title' => 'Payment return', 'url' => route('invoices.show', $current),
+            if (!$this->receiptStripeUnavailable) Notification::create(['user_id' => $user->id, 'title' => 'Payment return', 'url' => route('invoices.show', $current),
                 'body' => match ($a['state']) {
                     'refunded' => 'A payment of ' . number_format($this->fromMinorUnits($a['amount_minor'], $receipt['currency']), $this->currencyDecimals($receipt['currency']), '.', '') . ' ' . strtoupper($receipt['currency']) . ' has been returned to your original payment method.',
                     'credited' => 'Stripe could not refund your original payment method. The returned amount is now account credit. Open the invoice or contact support for help.',
@@ -348,7 +349,7 @@ trait ReceiptReturns
                 }]);
             if ($a['state'] === 'review' || str_contains($a['reason'] ?? '', 'instructions')) {
                 foreach (\App\Models\User::whereNotNull('role_id')->get() as $staff) Notification::create(['user_id' => $staff->id,
-                    'title' => 'Stripe payment return needs attention', 'url' => url('/admin/invoices/' . $current->id . '/edit'),
+                    'title' => 'Stripe payment return needs attention', 'url' => $this->adminInvoiceUrl($current),
                     'body' => 'Invoice ' . $current->id . ', payment ' . $id . ': ' . $a['reason']]);
             }
             $a['notified'] = $notice;

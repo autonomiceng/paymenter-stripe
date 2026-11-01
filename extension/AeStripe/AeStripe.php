@@ -77,6 +77,12 @@ class AeStripe extends Gateway
 
     private const API_VERSION = '2025-07-30.basil';
 
+    private function adminInvoiceUrl(Invoice $invoice): string
+    {
+        // Paymenter 1.5.9 places InvoiceResource inside InvoiceCluster.
+        return url('/admin/invoice/invoices/' . $invoice->id . '/edit');
+    }
+
     public function boot()
     {
         if (app()->runningInConsole()) {

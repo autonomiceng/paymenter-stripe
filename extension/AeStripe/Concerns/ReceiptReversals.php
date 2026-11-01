@@ -131,7 +131,7 @@ trait ReceiptReversals
                 'new_values' => array_diff_key($details, ['id' => true]) + ['stripe_id' => $id, 'next_step' => $line]]);
             foreach (User::whereNotNull('role_id')->get() as $staff) Notification::create(['user_id' => $staff->id,
                 'title' => $details['needs_review'] ? 'Stripe reversal needs review' : 'Stripe reversal cleared',
-                'url' => url('/admin/invoices/' . $current->id . '/edit'), 'body' => $line]);
+                'url' => $this->adminInvoiceUrl($current), 'body' => $line]);
         });
     }
 }

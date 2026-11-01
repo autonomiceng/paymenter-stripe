@@ -4,6 +4,17 @@ use App\Helpers\ExtensionHelper;
 use App\Models\{BillingAgreement, Notification, Service, User};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Support\Facades\DB;
+use function Paymenter\Extensions\Gateways\AeStripe\Concerns\time;
+
+// Match the fixed calendar used by now(), and release the clock after every case.
+$runUnfrozen = $run;
+$run = function ($name, $test) use ($runUnfrozen) {
+    $runUnfrozen($name, function ($invoice, $stripe) use ($test) {
+        $GLOBALS['fakeStripeTime'] = strtotime('2026-10-31');
+        try { $test($invoice, $stripe); }
+        finally { unset($GLOBALS['fakeStripeTime']); }
+    });
+};
 
 $renewalFixture = function ($invoice, $stripe) {
     $GLOBALS['fakeConsole'] = true;
@@ -81,6 +92,36 @@ try {
             }
         });
     }
+    $run('renewal-refusal-customer-takeover', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
+        $renewalFixture($invoice, $stripe); $stripe->status = 'requires_action'; $stripe->beforeConfirm = null;
+        $initialRefusal($invoice);
+        $confirmation = null;
+        $takeover = function () use (&$takeover, &$confirmation, $gateway, $invoice, $stripe) {
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            if (DB::$locked || ($attempt['renewal']['state'] ?? null) !== 'waiting') { DB::$afterTransaction = $takeover; return; }
+            $GLOBALS['fakeConsole'] = false;
+            $stripe->failure = function ($verb, $path) {
+                $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                if ($verb === 'get' && $path === '/payment_intents/pi_test1' && !empty($attempt['confirmation'])) {
+                    throw new ConnectionException('Customer confirmation reserved; provider read interrupted');
+                }
+            };
+            // Keep the deferred refusal callback queued until the customer's reservation commits.
+            DB::transaction(function () use ($gateway, $invoice, &$confirmation) {
+                try { $gateway->charge($invoice, 20, new BillingAgreement); }
+                catch (\Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException $e) {}
+                $confirmation = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['confirmation'] ?? null;
+            });
+            $stripe->failure = null;
+        };
+        DB::$afterTransaction = $takeover;
+        $intent = $stripe->intents['pi_test1']; $intent->status = 'requires_payment_method';
+        $intent->last_payment_error = (object) ['code' => 'card_declined'];
+        $gateway->webhook(eventRequest($intent, time: time(), type: 'payment_intent.payment_failed'));
+        $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+        check($confirmation && ($attempt['confirmation'] ?? null) === $confirmation && $attempt['agreement_id'] === 4 && !Notification::$rows,
+            'A deferred renewal refusal cannot erase customer Pay confirmation or send its old notice after takeover');
+    });
     foreach (['result', 'http-402'] as $path) {
         $run('renewal-refusal-lock-' . $path, function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal, $path) {
             $renewalFixture($invoice, $stripe); $initialRefusal($invoice); $dueRetry();
@@ -307,14 +348,110 @@ try {
         check($gateway->charge($invoice, 20, new BillingAgreement) && count($stripe->charges) === 1,
             'An explicit customer Pay can pay immediately while the automatic renewal retry is waiting');
     });
+    $run('renewal-domains-revoked', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal, $dueRetry) {
+        require_once __DIR__ . '/fixtures/domains-autopay.php';
+        $service = $renewalFixture($invoice, $stripe);
+        $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
+        TestDomainsAutoPay::$context = ['service_id' => $service->id, 'agreement_id' => 4,
+            'operation_id' => 81, 'operation_key' => 'renewal-fixture', 'generation' => 2,
+            'cutoff' => $invoice->due_at->getTimestamp()];
+        TestDomainsAutoPay::$ownerOn = true; TestDomainsAutoPay::$checks = 0;
+        try {
+            $initialRefusal($invoice);
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(($attempt['renewal']['domains'] ?? null) === TestDomainsAutoPay::$context
+                && $attempt['renewal']['state'] === 'waiting', 'A Domains decline freezes retained authority and schedules the shared retry');
+            $dueRetry();
+            $stripe->beforeCreate = function () { TestDomainsAutoPay::$ownerOn = false; };
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(TestDomainsAutoPay::$checks >= 2 && count($stripe->confirms) === 1 && !$stripe->charges
+                && !empty($attempt['renewal']), 'Owner Auto-renew Off after the frozen context blocks retry confirmation and retains the attempt');
+        } finally { TestDomainsAutoPay::$context = null; TestDomainsAutoPay::$ownerOn = true; }
+    });
+    $run('renewal-domains-agreement-cleared', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal, $dueRetry) {
+        require_once __DIR__ . '/fixtures/domains-autopay.php';
+        $service = $renewalFixture($invoice, $stripe);
+        $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
+        TestDomainsAutoPay::$context = ['service_id' => $service->id, 'agreement_id' => 4,
+            'operation_id' => 81, 'operation_key' => 'renewal-fixture', 'generation' => 2,
+            'cutoff' => $invoice->due_at->getTimestamp()];
+        try {
+            $initialRefusal($invoice); $dueRetry();
+            $stripe->beforeCreate = function () use ($service) {
+                $service->billing_agreement_id = null; // Customer clears Auto Pay after the context was frozen.
+                DB::$modelLocks = [];
+            };
+            $gateway->retryChargeAttempts();
+            check(in_array(Service::class, DB::$modelLocks, true) && count($stripe->confirms) === 1 && !$stripe->charges,
+                'A locking current service read refuses a cleared Domains agreement before retry confirm');
+        } finally { TestDomainsAutoPay::$context = null; }
+    });
+    $run('renewal-domains-context-unavailable', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal, $dueRetry) {
+        require_once __DIR__ . '/fixtures/domains-autopay.php';
+        $service = $renewalFixture($invoice, $stripe);
+        $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
+        TestDomainsAutoPay::$context = ['service_id' => $service->id, 'agreement_id' => 4,
+            'operation_id' => 81, 'operation_key' => 'renewal-fixture', 'generation' => 2,
+            'cutoff' => $invoice->due_at->getTimestamp()];
+        try {
+            $initialRefusal($invoice); $dueRetry();
+            $waiting = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['renewal'];
+            $context = TestDomainsAutoPay::$context; TestDomainsAutoPay::$context = null;
+            $gateway->retryChargeAttempts();
+            $after = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['renewal'];
+            check($after === $waiting && $after['state'] === 'waiting' && $after['retries'] === 0 && count($stripe->confirms) === 1,
+                'A null Domains context preserves the waiting schedule and retry budget without a debit');
+            TestDomainsAutoPay::$context = $context;
+            $gateway->retryChargeAttempts();
+            $after = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['renewal'];
+            check(count($stripe->confirms) === 2 && $after['retries'] === 1,
+                'A deferred Domains retry resumes when current consent becomes readable');
+        } finally { TestDomainsAutoPay::$context = null; }
+    });
+    $run('renewal-domains-confirm-db-failure', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal, $dueRetry) {
+        require_once __DIR__ . '/fixtures/domains-autopay.php';
+        $service = $renewalFixture($invoice, $stripe);
+        $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
+        TestDomainsAutoPay::$context = ['service_id' => $service->id, 'agreement_id' => 4,
+            'operation_id' => 81, 'operation_key' => 'renewal-fixture', 'generation' => 2, 'cutoff' => time() + 7 * 86400];
+        $errors = count($GLOBALS['reportedErrors'] ?? []);
+        try {
+            $initialRefusal($invoice); $dueRetry();
+            $notices = count(Notification::$rows);
+            $stripe->beforeCreate = function () {
+                DB::$beforeServiceLock = fn () => throw new \Illuminate\Database\QueryException('Temporary service read failure');
+            };
+            $gateway->retryChargeAttempts();
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(count($stripe->confirms) === 1 && !$stripe->charges && !empty($attempt['confirmation'])
+                && count(Notification::$rows) === $notices && count($GLOBALS['reportedErrors'] ?? []) === $errors + 1,
+                'A failed Domains service read defers confirmation, reports the error and sends no consent refusal notice');
+        } finally { DB::$beforeServiceLock = null; TestDomainsAutoPay::$context = null; }
+    });
+    $run('renewal-domains-confirm-cutoff', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal, $dueRetry) {
+        require_once __DIR__ . '/fixtures/domains-autopay.php';
+        $service = $renewalFixture($invoice, $stripe);
+        $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
+        TestDomainsAutoPay::$context = ['service_id' => $service->id, 'agreement_id' => 4,
+            'operation_id' => 81, 'operation_key' => 'renewal-fixture', 'generation' => 2, 'cutoff' => time() + 7 * 86400];
+        try {
+            $initialRefusal($invoice); $dueRetry();
+            $stripe->beforeCreate = function () { $GLOBALS['fakeStripeTime'] = TestDomainsAutoPay::$context['cutoff'] + 1; };
+            $gateway->retryChargeAttempts();
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(count($stripe->confirms) === 1 && !$stripe->charges && !empty($attempt['renewal']['domains']),
+                'A Domains retry reserved before cutoff cannot confirm after time passes its frozen cutoff');
+        } finally { unset($GLOBALS['fakeStripeTime']); TestDomainsAutoPay::$context = null; }
+    });
     $run('renewal-domains-boundary', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
         $renewalFixture($invoice, $stripe);
         $invoice->items = [(object) ['reference_type' => null, 'reference_id' => null]];
         $initialRefusal($invoice);
         $gateway->retryChargeAttempts();
         $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
-        check(empty($attempt['renewal']) && count($stripe->confirms) === 1,
-            'Retained Domains invoices cannot acquire a guessed native renewal authority');
+        check(empty($attempt['renewal']) && !empty($attempt['automatic_renewal']) && !$stripe->confirms,
+            'Retained automatic renewal invoices cannot debit without Domains authority');
     });
     $run('renewal-processing-uncertain', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
         $renewalFixture($invoice, $stripe); $stripe->status = 'processing'; $stripe->beforeConfirm = null;
@@ -326,6 +463,7 @@ try {
             'Processing money and unreadable results stay in existing recovery, without arming a new debit');
     });
 } finally {
+    $run = $runUnfrozen;
     Service::$row = $savedService;
     unset($GLOBALS['fakeToday']);
 }
