@@ -154,7 +154,7 @@ never proof that no reversal exists in Stripe. Each result has:
 | --- | --- |
 | `kind`, `id` | `refund`/`dispute` and its Stripe ID; deduplicate consumers on receipt/kind/ID. |
 | `status` | Refund: `open`, `refunded`, `failed`. Dispute: `open`, `won`, `lost`, `cleared` (closed warning), `inquiry` (`warning_needs_response` / `warning_under_review`, no money taken). |
-| `needs_review` | False for failed/canceled refunds, won disputes and closed warnings; true otherwise. |
+| `needs_review` | False for proved clean completed refunds, failed/canceled refunds, won disputes, closed warnings and a current audited staff resolution. |
 | `invoice_id`, `user_id`, `customer`, `payment_intent_id`, `currency` | Verified local and Stripe receipt identity. |
 | `amount_minor` | Refund/dispute amount, not an amount to debit. |
 | `credited_minor` | Completed credit allocations for this receipt in this ledger. |
@@ -168,7 +168,7 @@ or inquiry. Inquiry status does not represent a cash deduction.
 Finance work uses the invoice Audit Log (`ae_stripe_receipt_reversal`) and the
 existing native staff inbox, with an invoice link and one next-step line. Open
 disputes ask staff to submit evidence in Stripe before its deadline; lost disputes
-and external refunds ask staff to reconcile Stripe with invoice/credit history.
+and uncertain external refunds ask staff to reconcile Stripe with invoice/credit history.
 The line includes the reversal amount, customer, receipt credit and current
 account balance, including zero after credit has been spent. A won dispute clears
 `needs_review` and posts one resolution audit/alert; older inbox messages remain
@@ -198,3 +198,28 @@ API references: [partial refunds](https://docs.stripe.com/api/refunds/create),
 [refund listing](https://docs.stripe.com/api/refunds/list),
 [later refund failures](https://docs.stripe.com/refunds#failed-refunds),
 [idempotency lifetime](https://docs.stripe.com/api/idempotent_requests).
+
+## Staff review state
+
+Review is separate from canonical Stripe status and every money-return guard.
+Completed refunds clear automatically when stored receipt evidence has no credit,
+unsettled return, unresolved dispute, conflicting refund amount or over-return.
+Receipt credit remains a conflict even after its pooled balance reaches zero.
+Native invoice credit transactions also prevent automatic clearance. Failed/cancelled
+refunds, won disputes and closed inquiries continue to clear themselves.
+
+`invoiceReversalReviews($invoice)` is an unlocked, local-only display read, keyed by
+`refund:<id>` / `dispute:<id>`. Authorize the invoice before calling it. It returns
+`needs_review`, `review_status` (`cleared`, `resolved`, `needs_review`) and `review_key`.
+`receiptReversals` includes the same fields under its existing owner/invoice locks.
+
+When Stripe cannot prove spent-credit attribution or an unsettled outcome, staff
+with invoice view and update permissions may call
+`resolveReceiptReversal($invoice, $paymentId, $stripeId, $kind, $reviewKey, $note)`.
+The required note (at most 1,000 bytes), actor and complete Stripe ID are stored in
+`ae_stripe_reversal_resolved` on the invoice Audit Log. Duplicate submissions are
+idempotent. A stale key returns 409; reload and check the changed evidence.
+New receipt/allocation/dispute or invoice-credit evidence reopens review.
+Allocation retry/notification timestamps alone do not reopen an unchanged case.
+This writes only an audit entry: no refund, debit, invoice status, canonical reversal
+state, ledger entry or receipt hold is changed. Existing inbox messages remain history.

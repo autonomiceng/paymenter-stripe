@@ -147,6 +147,7 @@ namespace App\Models {
         public static $rows = [];
         public $id = 12;
         public $number = 'INV-12';
+        public $exists = true;
         public $user_id = 7;
         public $currency_code = 'usd', $status = 'pending';
         public $total = 20;
@@ -671,7 +672,7 @@ namespace Illuminate\Support\Facades {
             $rows = $schema === 'paymenter' ? (DB::$tables[$table] ?? []) : (self::$foreignTables[$schema][$table] ?? []);
             return array_keys($rows[array_key_first($rows)] ?? []);
         }
-        public static function hasTable($name) { ++self::$checks; if ($hook = self::$beforeCheck) $hook(); return isset(DB::$tables[$name]); }
+        public static function hasTable($name) { ++self::$checks; if ($hook = self::$beforeCheck) $hook(); return $name === 'audits' || isset(DB::$tables[$name]); }
         public static function create($name, $callback) { if ($hook = self::$beforeCreate) $hook(); if (isset(DB::$tables[$name])) throw new \RuntimeException('Table exists'); DB::$tables[$name] = []; $callback(new \Illuminate\Database\Schema\Blueprint($name)); }
         public static function dropIfExists($name) { unset(DB::$tables[$name], self::$columns[$name]); }
     }

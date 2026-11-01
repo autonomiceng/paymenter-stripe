@@ -56,6 +56,7 @@ require_once __DIR__ . '/Concerns/ChargeRecovery.php';
 require_once __DIR__ . '/Concerns/RenewalRetry.php';
 require_once __DIR__ . '/Concerns/InvoicePayments.php';
 require_once __DIR__ . '/Concerns/ReceiptReversals.php';
+require_once __DIR__ . '/Concerns/ReversalReview.php';
 require_once __DIR__ . '/Concerns/WebhookContinuity.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
 require_once __DIR__ . '/Concerns/AutoPay.php';
@@ -73,7 +74,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 

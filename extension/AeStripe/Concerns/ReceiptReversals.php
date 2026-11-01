@@ -119,12 +119,12 @@ trait ReceiptReversals
         [, $kind, $id] = explode(':', $row->allocation_key, 3);
         $credit = Credit::where('user_id', $user->id)->where('currency_code', $invoice->currency_code)->lockForUpdate()->first();
         return ['kind' => $kind, 'id' => $id, 'status' => $row->state,
-            'needs_review' => !in_array($row->state, ['won', 'cleared', 'failed'], true), // Includes actionable inquiries.
             'invoice_id' => $invoice->id, 'user_id' => $user->id, 'customer' => $receipt['customer'],
             'payment_intent_id' => $receipt['payment_intent_id'], 'currency' => $receipt['currency'],
             'amount_minor' => (int) $row->amount_minor,
             'credited_minor' => array_sum(array_map(fn ($a) => $a['state'] === 'credited' ? $a['amount_minor'] : 0, $receipt['allocations'])),
-            'credit_balance_minor' => $credit ? $this->toMinorUnits($credit->amount, $receipt['currency']) : 0];
+            'credit_balance_minor' => $credit ? $this->toMinorUnits($credit->amount, $receipt['currency']) : 0]
+            + $this->reversalReview($invoice, $row);
     }
 
     private function recordReceiptReversalEvent($object, string $kind): void
@@ -196,7 +196,7 @@ trait ReceiptReversals
                 'amount_minor' => $latest->amount, 'return_key' => 'ae-obsv-' . hash('sha256', $paymentId . ':' . $key),
                 'state' => $state, 'retry' => false, 'recheck' => false, 'updated_at' => time(), 'provider_created_at' => $created,
                 'refund_id' => $kind === 'refund' ? $id : null, 'credit_id' => null, 'sent_at' => null, 'reason' => null, 'notified' => $state];
-            $details = $this->receiptReversalDetails($user, $current, $receipt, (object) ($values + ['allocation_key' => $key]));
+            $details = $this->receiptReversalDetails($user, $current, $receipt, (object) ($values + ['allocation_key' => $key, 'payment_intent_id' => $paymentId]));
             $money = fn ($amount) => $this->fromMinorUnits($amount, $receipt['currency']) . ' ' . strtoupper($receipt['currency']);
             // A pooled balance cannot prove which credit was spent or what can be debited.
             $auditStep = 'Invoice ' . $current->id . ', customer ' . $user->id . ' (' . $receipt['customer'] . '), payment ' . $paymentId

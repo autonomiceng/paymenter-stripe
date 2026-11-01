@@ -14,7 +14,7 @@ $gateway->webhook($request); $gateway->webhook($request);
 $updated = eventRequest($foreign, type: 'refund.updated');
 $gateway->webhook($updated); $gateway->webhook($updated);
 $reversals = $gateway->receiptReversals($i, 'pi_return');
-check(count($reversals) === 1 && $reversals[0]['id'] === $foreign->id && $reversals[0]['needs_review']
+check(count($reversals) === 1 && $reversals[0]['id'] === $foreign->id && !$reversals[0]['needs_review']
     && $reversals[0]['amount_minor'] === 100 && count(Audit::$rows) === 1 && count(Notification::$rows) === 1,
     'Captured USD 1 refund created/updated replays persist one work item, audit and staff alert within the existing schema');
 check(end(Notification::$rows)['body'] === '$1.00 refunded on invoice INV-12.'
@@ -193,3 +193,5 @@ try {
     $gateway->webhook($request);
     check(array_column(Notification::$rows, 'user_id') === [99], 'Only staff who can open the invoice edit destination receive a reversal notice');
 } finally { \App\Models\User::$noticeStaff = null; }
+
+require __DIR__ . '/reversal-review.php';
