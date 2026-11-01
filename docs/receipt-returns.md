@@ -111,7 +111,20 @@ recorded. Duplicate state creates no repeated audit or alert; stale open events
 cannot reopen a won or lost dispute. No invoice status, service, transaction or
 credit changes are made by observation.
 
-The read-only `receiptReversals()` interface is for the configured gateway instance
+For invoice page/PDF display, use `$gateway->invoiceReversalHistory($invoice)` after
+authorizing access to the invoice. This uses unlocked local SELECTs only: no Stripe
+calls, schema installation, payment lock or writes. It works when the gateway is
+disabled and returns an empty array before the ledger is installed. Results are
+scoped to the stored invoice, owner and currency, with `kind`, `id`, `status`,
+`amount_minor`, `amount` (major units), `currency` and `recorded_at` (epoch seconds).
+`recorded_at` is the last ledger observation time, not Stripe's creation date.
+Owned refund allocations with a Stripe refund ID are included, deduplicated against
+observations; an allocation that fell back to credit shows a failed cash refund.
+Count only refund rows with `status=refunded` in the amount refunded. Disputes and
+pending/failed refunds do not belong in that total. This history is never proof
+that Stripe has no other reversal. Keep its internal IDs off customer displays.
+
+The lock-taking `receiptReversals()` interface is for the configured gateway instance
 and one local invoice/receipt. It returns `[]` when nothing has been observed,
 never proof that no reversal exists in Stripe. Each result has:
 

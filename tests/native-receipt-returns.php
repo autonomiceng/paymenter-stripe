@@ -29,6 +29,12 @@ $container->instance('db', $capsule->getDatabaseManager());
 $container->bind('db.schema', fn () => $capsule->getConnection()->getSchemaBuilder());
 $capsule->getConnection()->setTransactionManager(new DatabaseTransactionsManager);
 Facade::setFacadeApplication($container);
+$gateway = new AeStripe([]);
+$historyInvoice = new Invoice;
+$historyInvoice->forceFill(['id' => 54, 'user_id' => 1, 'currency_code' => 'USD']); $historyInvoice->exists = true;
+if ($gateway->invoiceReversalHistory($historyInvoice) !== [] || Schema::hasTable('ae_stripe_receipt_returns')) {
+    throw new RuntimeException('An invoice read must not install the missing ledger');
+}
 (require __DIR__ . '/../extension/AeStripe/database/migrations/2026_10_31_000001_create_ae_stripe_receipt_returns.php')->up();
 $count = 0;
 function verifyReturn(bool $ok, string $message): void { global $count; if (!$ok) throw new RuntimeException($message); ++$count; }
@@ -129,4 +135,36 @@ verifyReturn($cash() === 20.0 && Invoice::findOrFail(4)->remaining === 0.0 && In
 DB::transaction(fn () => $post->invoke($gateway, Invoice::findOrFail(4), $receipt, $allocation));
 verifyReturn(DB::table('invoice_transactions')->where('invoice_id', 4)->count() === 2 && $guardRefusals === 1,
     'Repeated owned reclassification retains one native return and leaves the guard active for other writers');
+
+// Display reads use the real SQL builder: no locks, transactions, migrations, provider calls or writes.
+$sample = (array) DB::table('ae_stripe_receipt_returns')->first();
+$historyRow = function (string $key, array $changes = []) use ($sample) {
+    DB::table('ae_stripe_receipt_returns')->insert(array_replace($sample, [
+        'payment_intent_id' => 'pi_visible', 'allocation_key' => $key, 'return_key' => hash('sha256', $key.serialize($changes)),
+        'invoice_id' => 54, 'user_id' => 1, 'currency' => 'usd', 'amount_minor' => 100,
+        'state' => 'refunded', 'updated_at' => 1793489520, 'refund_id' => null,
+    ], $changes));
+};
+$historyRow('stripe:refund:re_first'); $historyRow('stripe:refund:re_second');
+$historyRow('stripe:refund:re_pending', ['state' => 'open']);
+$historyRow('stripe:dispute:du_lost', ['state' => 'lost', 'amount_minor' => 1200]);
+$historyRow('domains:owned', ['refund_id' => 're_owned']);
+$historyRow('stripe:refund:re_owned'); // Same money is displayed and totalled once.
+$historyRow('domains:credit', ['state' => 'credited']);
+$historyRow('stripe:refund:re_other_invoice', ['invoice_id' => 55]);
+$historyRow('stripe:refund:re_other_owner', ['user_id' => 2]);
+$historyRow('stripe:refund:re_other_currency', ['currency' => 'eur']);
+$unchanged = DB::table('ae_stripe_receipt_returns')->get()->toJson();
+$queries = []; DB::listen(function ($event) use (&$queries) { $queries[] = $event->sql; });
+$history = $gateway->invoiceReversalHistory($historyInvoice);
+verifyReturn(count($history) === 5 && count(array_filter($history, fn ($row) => $row['kind'] === 'refund' && $row['status'] === 'refunded')) === 3,
+    'History keeps distinct refunds/disputes, deduplicates allocation observations and excludes credits, other owners, invoices and currencies');
+verifyReturn(array_sum(array_column(array_filter($history, fn ($row) => $row['kind'] === 'refund' && $row['status'] === 'refunded'), 'amount')) === 3.0,
+    'USD refunds retain their stored minor-unit scale');
+verifyReturn(!array_filter($queries, fn ($sql) => !str_starts_with(strtolower($sql), 'select') || str_contains(strtolower($sql), 'for update'))
+    && DB::transactionLevel() === 0 && DB::table('ae_stripe_receipt_returns')->get()->toJson() === $unchanged,
+    'History emits only unlocked SELECTs and leaves the ledger unchanged');
+$historyRow('stripe:refund:re_yen', ['currency' => 'jpy']);
+$historyInvoice->currency_code = 'JPY';
+verifyReturn($gateway->invoiceReversalHistory($historyInvoice)[0]['amount'] === 100.0, 'History reuses the gateway zero-decimal currency conversion');
 echo "PASS: $count native receipt storage/accounting assertions\n";

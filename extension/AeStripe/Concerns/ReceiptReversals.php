@@ -6,6 +6,34 @@ use App\Models\{Audit, Credit, Invoice, InvoiceTransaction, Notification, User};
 
 trait ReceiptReversals
 {
+    /** Display-only history for an already authorized invoice. No provider calls, migrations or locks. */
+    public function invoiceReversalHistory(Invoice $invoice): array
+    {
+        if (!$invoice->exists || !\Illuminate\Support\Facades\Schema::hasTable('ae_stripe_receipt_returns')) return [];
+        $result = [];
+        foreach ($this->receiptRows()->where('invoice_id', $invoice->id)->where('user_id', $invoice->user_id)
+            ->where('currency', strtolower($invoice->currency_code))->orderBy('updated_at')->get() as $row) {
+            $observation = preg_match('/^stripe:(refund|dispute):(.+)$/D', $row->allocation_key, $parts);
+            if ($observation) {
+                [, $kind, $id] = $parts;
+                $status = $row->state;
+            } elseif (!$this->isReceiptObservation($row->allocation_key) && $row->refund_id) {
+                $kind = 'refund'; $id = $row->refund_id;
+                $status = $row->state === 'credited' ? 'failed' : $row->state;
+            } else continue;
+            $key = $kind . ':' . $id;
+            // The canonical observation wins if an allocation and webhook describe the same refund.
+            if (!$observation && isset($result[$key])) continue;
+            $result[$key] = ['kind' => $kind, 'id' => $id, 'status' => $status,
+                'amount_minor' => (int) $row->amount_minor, 'currency' => $row->currency,
+                'amount' => $this->fromMinorUnits((int) $row->amount_minor, $row->currency),
+                // The ledger stores its last observation time, not Stripe's creation timestamp.
+                'recorded_at' => (int) $row->updated_at];
+        }
+        uasort($result, fn ($a, $b) => [$a['recorded_at'], $a['id']] <=> [$b['recorded_at'], $b['id']]);
+        return array_values($result);
+    }
+
     // Reserved ledger keys distinguish observations from money-return allocations.
     private function isReceiptObservation(string $key): bool
     {
