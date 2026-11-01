@@ -198,13 +198,18 @@ trait PaymentFees
     {
         Audit::create([
             'event' => 'ae_stripe_fee_review', 'auditable_type' => $invoice?->getMorphClass() ?? Invoice::class,
-            'auditable_id' => $row->invoice_id, 'old_values' => [], 'new_values' => array_merge((array) $row, ['state' => 'review']),
+            'auditable_id' => $row->invoice_id, 'old_values' => [], 'new_values' => array_merge((array) $row, ['state' => 'review',
+                'next_step' => 'Check the invoice Audit Log and the balance transaction in Stripe. Record the verified fee on the original transaction.']),
         ]);
-        foreach (User::whereNotNull('role_id')->get() as $staff) {
+        foreach ($this->invoiceNoticeStaff($invoice) as $staff) {
             Notification::create([
                 'user_id' => $staff->id, 'title' => 'Stripe payment fee needs review',
-                'body' => 'Stripe fee missing for invoice ' . $row->invoice_id . ', PaymentIntent ' . $row->payment_intent_id
-                    . '. Check the invoice Audit Log and the balance transaction in Stripe.',
+                'url' => $invoice ? $this->adminInvoiceUrl($invoice) : url('/admin/audits'),
+                'body' => !$invoice ? 'Stripe fee missing for invoice ' . $row->invoice_id . ', PaymentIntent ' . $row->payment_intent_id
+                    . '. Check System > Audits and the balance transaction in Stripe.' : $this->invoiceNoticeBody('fee',
+                    'Fee missing on invoice ' . $this->invoiceLabel($invoice) . '.',
+                    'Stripe fee missing for invoice ' . $this->invoiceLabel($invoice) . ', PaymentIntent ' . $row->payment_intent_id
+                        . '. Check the invoice Audit Log and the balance transaction in Stripe.'),
             ]);
         }
         $this->feeRows()->where('payment_intent_id', $row->payment_intent_id)->update(['state' => 'review', 'last_error' => $row->last_error]);

@@ -93,7 +93,10 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
         $gateway->retryPaymentFees(); $deliver(); $gateway->retryPaymentFees();
         check($row()['state'] === 'review' && count(Notification::$rows) === $notices + 1 && count(Audit::$rows) === $audits + 1,
             'Give up retains one audit and one staff inbox notice: ' . $limit);
-        check(str_contains(end(Notification::$rows)['body'], 'invoice 12, PaymentIntent pi_recovery'), 'Staff notice identifies invoice and PaymentIntent');
+        check(end(Notification::$rows)['body'] === 'Fee missing on invoice INV-12.'
+            && end(Audit::$rows)['new_values']['payment_intent_id'] === 'pi_recovery'
+            && str_contains(end(Audit::$rows)['new_values']['next_step'], 'balance transaction'),
+            'Fee bell uses the invoice number while the invoice audit retains the payment and next step');
         if ($limit === 'age') check(count(Http::$calls) === $calls, '72 hour deadline prevents another remote attempt');
     }
     $reset(); $balance = ['fee' => 42, 'currency' => 'usd'];

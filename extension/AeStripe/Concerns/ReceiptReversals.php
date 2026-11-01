@@ -199,21 +199,30 @@ trait ReceiptReversals
             $details = $this->receiptReversalDetails($user, $current, $receipt, (object) ($values + ['allocation_key' => $key]));
             $money = fn ($amount) => $this->fromMinorUnits($amount, $receipt['currency']) . ' ' . strtoupper($receipt['currency']);
             // A pooled balance cannot prove which credit was spent or what can be debited.
-            $line = 'Invoice ' . $current->id . ', customer ' . $user->id . ' (' . $receipt['customer'] . '), payment ' . $paymentId
+            $auditStep = 'Invoice ' . $current->id . ', customer ' . $user->id . ' (' . $receipt['customer'] . '), payment ' . $paymentId
                 . ': ' . $kind . ' ' . $id . ' ' . $state . ', ' . $money($latest->amount)
                 . '; receipt credit ' . $money($details['credited_minor']) . ', current account credit ' . $money($details['credit_balance_minor']) . '. '
                 . (!$details['needs_review'] ? 'Finance work cleared; check any earlier manual adjustment against Stripe.'
                     : ($kind === 'dispute' && in_array($state, ['open', 'inquiry'], true) ? 'Review the dispute in Stripe and submit evidence before its deadline; '
                         : 'Reconcile this reversal in Stripe with the invoice and customer credit history; ')
                     . 'only staff can confirm spent credit and any recovery amount. Do not issue another refund or debit without that proof.');
-            $values['reason'] = $line;
+            $values['reason'] = $auditStep;
+            $amount = $current->formattedTotal->format($this->fromMinorUnits($latest->amount, $receipt['currency']));
+            $bellText = ($kind === 'refund' ? match ($state) {
+                'refunded' => $amount . ' refunded on invoice ', 'failed' => $amount . ' refund failed on invoice ',
+                default => $amount . ' refund pending on invoice ',
+            } : match ($state) {
+                'won' => 'Dispute won on invoice ', 'cleared' => 'Inquiry closed on invoice ',
+                'lost' => $amount . ' lost to a dispute on invoice ', 'inquiry' => 'Stripe inquiry on invoice ',
+                default => $amount . ' disputed on invoice ',
+            }) . $this->invoiceLabel($current) . '.';
             $this->receiptRows()->updateOrInsert(['payment_intent_id' => $paymentId, 'allocation_key' => $key], $values);
             Audit::create(['event' => 'ae_stripe_receipt_reversal', 'auditable_type' => $current->getMorphClass(), 'auditable_id' => $current->id,
                 'old_values' => $previous ? ['status' => $previous->state] : [],
-                'new_values' => array_diff_key($details, ['id' => true]) + ['stripe_id' => $id, 'next_step' => $line]]);
-            foreach (User::whereNotNull('role_id')->get() as $staff) Notification::create(['user_id' => $staff->id,
+                'new_values' => array_diff_key($details, ['id' => true]) + ['stripe_id' => $id, 'next_step' => $auditStep]]);
+            foreach ($this->invoiceNoticeStaff($current) as $staff) Notification::create(['user_id' => $staff->id,
                 'title' => $details['needs_review'] ? 'Stripe reversal needs review' : 'Stripe reversal cleared',
-                'url' => $this->adminInvoiceUrl($current), 'body' => $line]);
+                'url' => $this->adminInvoiceUrl($current), 'body' => $this->invoiceNoticeBody('reversal', $bellText, $auditStep)]);
         });
     }
 }

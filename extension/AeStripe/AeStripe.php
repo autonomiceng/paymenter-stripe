@@ -83,6 +83,29 @@ class AeStripe extends Gateway
         return url('/admin/invoice/invoices/' . $invoice->id . '/edit');
     }
 
+    private function invoiceLabel(Invoice $invoice): string
+    {
+        return $invoice->number ? (string) $invoice->number : __('invoices.proforma_invoice', ['id' => $invoice->id]);
+    }
+
+    private function invoiceNoticeStaff(?Invoice $invoice): array
+    {
+        $recipients = [];
+        foreach (User::whereNotNull('role_id')->get() as $staff) {
+            // The native invoice destination is an edit page, so view permission alone is insufficient.
+            if ($invoice ? $staff->hasPermission('admin.invoices.view') && $staff->hasPermission('admin.invoices.update')
+                : $staff->hasPermission('admin.audit.viewAny')) $recipients[] = $staff;
+        }
+        return $recipients;
+    }
+
+    private function invoiceNoticeBody(string $type, string $short, string $details): string
+    {
+        // These types have their complete next step in the native invoice Audit Log.
+        // Payment/return reviews retain their full body until the destination has a resolution action/return state.
+        return in_array($type, ['reversal', 'fee'], true) ? $short : $details;
+    }
+
     public function boot()
     {
         if (app()->runningInConsole()) {

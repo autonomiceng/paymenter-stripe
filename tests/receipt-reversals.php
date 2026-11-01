@@ -17,6 +17,10 @@ $reversals = $gateway->receiptReversals($i, 'pi_return');
 check(count($reversals) === 1 && $reversals[0]['id'] === $foreign->id && $reversals[0]['needs_review']
     && $reversals[0]['amount_minor'] === 100 && count(Audit::$rows) === 1 && count(Notification::$rows) === 1,
     'Captured USD 1 refund created/updated replays persist one work item, audit and staff alert within the existing schema');
+check(end(Notification::$rows)['body'] === '$1.00 refunded on invoice INV-12.'
+    && end(Notification::$rows)['user_id'] === 99
+    && str_contains(end(Audit::$rows)['new_values']['next_step'], 'cus_owner'),
+    'Refund bell uses the invoice number while the invoice audit retains reconciliation details');
 $storedKey = 'pi_return:stripe:refund:'.$foreign->id;
 check(DB::$tables['ae_stripe_receipt_returns'][$storedKey]['provider_created_at'] === 1793400000,
     'External refund stores the canonical Stripe creation date');
@@ -61,8 +65,9 @@ check($work['status'] === 'open' && $work['needs_review'] && $work['credited_min
 $audit = end(Audit::$rows)['new_values'];
 check(($audit['stripe_id'] ?? null) === $s->dispute->id && !array_key_exists('id', $audit) && $work['id'] === $s->dispute->id,
     'Invoice reversal audits retain the full Stripe ID without the native integer ID cast, while receipt readers keep id');
-check(str_contains(end(Notification::$rows)['body'], 'cus_owner') && str_contains(end(Notification::$rows)['body'], '10 USD'),
-    'Staff receive the customer and credited amount in their next-step line');
+check(!str_contains(end(Notification::$rows)['body'], 'cus_owner')
+    && str_contains(end(Audit::$rows)['new_values']['next_step'], '10 USD'),
+    'Staff reconciliation details stay in the invoice audit rather than the bell');
 $s->dispute->status = 'lost';
 $s->dispute->created = 1793489520;
 foreach (['charge.dispute.updated', 'charge.dispute.closed'] as $type) {
@@ -176,3 +181,15 @@ invoke($gateway, 'sendAttemptReview', $i);
 $links = array_merge($links, array_column(array_filter(Notification::$rows, fn ($notice) => $notice['user_id'] !== $i->user_id), 'url'));
 check($links === array_fill(0, 5, url('/admin/invoice/invoices/' . $i->id . '/edit')),
     'Refund, dispute, return, checkout and charge recovery notices open the native staff invoice page');
+
+// A staff role without access to the destination must not receive invoice details.
+[$i, $s] = $setup(1099, 10.99); $deliver($s);
+$allowed = new \App\Models\User(new \App\Models\Properties('')); $allowed->id = 99;
+$allowed->permissions = ['admin.invoices.view', 'admin.invoices.update'];
+$denied = clone $allowed; $denied->id = 98; $denied->permissions = ['admin.invoices.view'];
+\App\Models\User::$noticeStaff = [$denied, $allowed];
+try {
+    $s->refunds['foreign'] = clone $foreign; $s->refunds['foreign']->status = 'succeeded';
+    $gateway->webhook($request);
+    check(array_column(Notification::$rows, 'user_id') === [99], 'Only staff who can open the invoice edit destination receive a reversal notice');
+} finally { \App\Models\User::$noticeStaff = null; }

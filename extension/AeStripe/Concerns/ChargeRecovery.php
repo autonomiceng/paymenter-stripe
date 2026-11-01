@@ -53,9 +53,11 @@ trait ChargeRecovery
                     $this->withPaymentLock($current, function ($user, $invoice) {
                         $attempt = $this->readPaymentAttempt($user, $invoice);
                         if (($attempt['state'] ?? null) !== 'reconcile' || ($attempt['alert_sent'] ?? false)) return;
-                        foreach (User::whereNotNull('role_id')->get() as $staff) Notification::create([
+                        foreach ($this->invoiceNoticeStaff($invoice) as $staff) Notification::create([
                             'user_id' => $staff->id, 'title' => 'Stripe payment needs review',
-                            'body' => 'Invoice ' . $invoice->id . ': ' . $attempt['reason'] . ' Use ae-stripe:resolve-charge.',
+                            'body' => $this->invoiceNoticeBody('payment',
+                                'Payment on invoice ' . $this->invoiceLabel($invoice) . '.',
+                                'Invoice ' . $this->invoiceLabel($invoice) . ': ' . $attempt['reason'] . ' Use ae-stripe:resolve-charge.'),
                             'url' => $this->adminInvoiceUrl($invoice),
                         ]);
                         $attempt['alert_sent'] = true;
@@ -213,11 +215,14 @@ trait ChargeRecovery
                         ->where('event', 'ae_stripe_access_refused')->where('new_values->key_fingerprint', $fingerprint)->lockForUpdate()->first()) return;
                     Audit::create(['event' => 'ae_stripe_access_refused', 'auditable_type' => $gateway->getMorphClass(),
                         'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => ['key_fingerprint' => $fingerprint]]);
-                    foreach (User::whereNotNull('role_id')->get() as $staff) Notification::create([
-                        'user_id' => $staff->id, 'title' => 'Stripe access needs attention',
-                        'body' => 'Stripe refused payment checks. Check the API key and its permissions.',
-                        'url' => url('/admin/gateways/' . $gateway->id . '/edit'),
-                    ]);
+                    foreach (User::whereNotNull('role_id')->get() as $staff) {
+                        if (!$staff->hasPermission('admin.gateways.update')) continue;
+                        Notification::create([
+                            'user_id' => $staff->id, 'title' => 'Stripe access needs attention',
+                            'body' => 'Stripe refused payment checks. Check the API key and its permissions.',
+                            'url' => url('/admin/gateways/' . $gateway->id . '/edit'),
+                        ]);
+                    }
                 });
             } catch (\Throwable $e) { report($e); } // Failed delivery rolls back the marker; the next refused check retries.
         });

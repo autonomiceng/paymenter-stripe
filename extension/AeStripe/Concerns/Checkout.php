@@ -356,12 +356,14 @@ trait Checkout
                 if (!$stored) return;
                 $alert = json_decode($stored, true, flags: JSON_THROW_ON_ERROR);
                 if ($alert['sent']) return;
-                foreach (User::whereNotNull('role_id')->get() as $staff) {
+                foreach ($this->invoiceNoticeStaff($invoice) as $staff) {
                     Notification::create([
                         'user_id' => $staff->id, 'title' => 'Stripe payment needs review',
                         'url' => $this->adminInvoiceUrl($invoice),
-                        'body' => 'Invoice ' . $invoice->id . ', payment ' . $intentId . ': ' . $alert['reason']
-                            . '. Check Stripe and choose a refund or account credit; this needs your decision.',
+                        'body' => $this->invoiceNoticeBody('payment',
+                            'Payment on invoice ' . $this->invoiceLabel($invoice) . '.',
+                            'Invoice ' . $this->invoiceLabel($invoice) . ', payment ' . $intentId . ': ' . $alert['reason']
+                                . '. Check Stripe and choose a refund or account credit; this needs your decision.'),
                     ]);
                 }
                 $alert['sent'] = true;
