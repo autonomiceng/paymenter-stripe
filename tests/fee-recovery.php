@@ -139,10 +139,19 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
         'pi_recovery' => $pending,
     ];
     $balance = ['fee' => 42, 'currency' => 'usd']; $notices = count(Notification::$rows);
-    $gateway->retryPaymentFees(); $gateway->retryPaymentFees();
+    $allowed = new User(new \App\Models\Properties('')); $allowed->id = 99; $allowed->role_id = 1;
+    $allowed->permissions = ['admin.audit.viewAny'];
+    $denied = clone $allowed; $denied->id = 98; $denied->permissions = ['admin.audits.viewAny'];
+    User::$noticeStaff = [$denied, $allowed];
+    try { $gateway->retryPaymentFees(); $gateway->retryPaymentFees(); }
+    finally { User::$noticeStaff = null; }
     check(DB::$tables['ae_stripe_payment_fees']['pi_deleted']['state'] === 'review'
         && count(Notification::$rows) === $notices + 1 && $row()['state'] === 'completed',
         'Deleted transaction notifies once without blocking other fee records');
+    $orphanNotices = array_slice(Notification::$rows, $notices);
+    check(array_column($orphanNotices, 'user_id') === [99] && $orphanNotices[0]['url'] === url('/admin/audits')
+        && str_contains($orphanNotices[0]['body'], 'pi_deleted'),
+        'Orphan fee notices retain reconciliation details and go only to staff allowed by the native audit policy');
     DB::$tables['ae_stripe_payment_fees']['pi_deleted']['state'] = 'pending';
     FeeQuery::$beforeRead = function () { DB::$tables['ae_stripe_payment_fees']['pi_deleted']['state'] = 'completed'; };
     $notices = count(Notification::$rows); $gateway->retryPaymentFees();

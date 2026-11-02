@@ -138,7 +138,7 @@ namespace App\Models {
         public static function whereNotNull($key) { return new class { public function get() {
             if (User::$noticeStaff !== null) return User::$noticeStaff;
             $staff = new User(new Properties('')); $staff->id = 99; $staff->role_id = 1;
-            $staff->permissions = ['admin.invoices.view', 'admin.invoices.update', 'admin.gateways.update', 'admin.audit.viewAny'];
+            $staff->permissions = ['admin.invoices.viewAny', 'admin.invoices.view', 'admin.invoices.update', 'admin.gateways.viewAny', 'admin.gateways.update', 'admin.audit.viewAny'];
             return [$staff];
         } }; }
     }

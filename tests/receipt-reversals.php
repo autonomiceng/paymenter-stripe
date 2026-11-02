@@ -184,10 +184,11 @@ check($links === array_fill(0, 5, url('/admin/invoice/invoices/' . $i->id . '/ed
 
 // A staff role without access to the destination must not receive invoice details.
 [$i, $s] = $setup(1099, 10.99); $deliver($s);
-$allowed = new \App\Models\User(new \App\Models\Properties('')); $allowed->id = 99;
-$allowed->permissions = ['admin.invoices.view', 'admin.invoices.update'];
-$denied = clone $allowed; $denied->id = 98; $denied->permissions = ['admin.invoices.view'];
-\App\Models\User::$noticeStaff = [$denied, $allowed];
+$allowed = new \App\Models\User(new \App\Models\Properties('')); $allowed->id = 99; $allowed->role_id = 1;
+$allowed->permissions = ['admin.invoices.viewAny', 'admin.invoices.view', 'admin.invoices.update'];
+$denied = clone $allowed; $denied->id = 98; $denied->permissions = ['admin.invoices.viewAny', 'admin.invoices.view'];
+$noList = clone $allowed; $noList->id = 97; $noList->permissions = ['admin.invoices.view', 'admin.invoices.update'];
+\App\Models\User::$noticeStaff = [$denied, $noList, $allowed];
 try {
     $s->refunds['foreign'] = clone $foreign; $s->refunds['foreign']->status = 'succeeded';
     $gateway->webhook($request);

@@ -93,8 +93,8 @@ class AeStripe extends Gateway
     {
         $recipients = [];
         foreach (User::whereNotNull('role_id')->get() as $staff) {
-            // The native invoice destination is an edit page, so view permission alone is insufficient.
-            if ($invoice ? $staff->hasPermission('admin.invoices.view') && $staff->hasPermission('admin.invoices.update')
+            // Filament checks resource viewAny before the invoice edit page's own permissions.
+            if ($invoice ? $staff->hasPermission('admin.invoices.viewAny') && $staff->hasPermission('admin.invoices.view') && $staff->hasPermission('admin.invoices.update')
                 : $staff->hasPermission('admin.audit.viewAny')) $recipients[] = $staff;
         }
         return $recipients;

@@ -216,7 +216,7 @@ trait ChargeRecovery
                     Audit::create(['event' => 'ae_stripe_access_refused', 'auditable_type' => $gateway->getMorphClass(),
                         'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => ['key_fingerprint' => $fingerprint]]);
                     foreach (User::whereNotNull('role_id')->get() as $staff) {
-                        if (!$staff->hasPermission('admin.gateways.update')) continue;
+                        if (!$staff->hasPermission('admin.gateways.viewAny') || !$staff->hasPermission('admin.gateways.update')) continue;
                         Notification::create([
                             'user_id' => $staff->id, 'title' => 'Stripe access needs attention',
                             'body' => 'Stripe refused payment checks. Check the API key and its permissions.',
