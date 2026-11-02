@@ -53,7 +53,7 @@ trait ChargeRecovery
                     $this->withPaymentLock($current, function ($user, $invoice) {
                         $attempt = $this->readPaymentAttempt($user, $invoice);
                         if (($attempt['state'] ?? null) !== 'reconcile' || ($attempt['alert_sent'] ?? false)) return;
-                        foreach ($this->invoiceNoticeStaff($invoice) as $staff) Notification::create([
+                        foreach ($this->noticeStaff('invoice') as $staff) Notification::create([
                             'user_id' => $staff->id, 'title' => 'Stripe payment needs review',
                             'body' => $this->invoiceNoticeBody('payment',
                                 'Payment on invoice ' . $this->invoiceLabel($invoice) . '.',
@@ -215,8 +215,7 @@ trait ChargeRecovery
                         ->where('event', 'ae_stripe_access_refused')->where('new_values->key_fingerprint', $fingerprint)->lockForUpdate()->first()) return;
                     Audit::create(['event' => 'ae_stripe_access_refused', 'auditable_type' => $gateway->getMorphClass(),
                         'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => ['key_fingerprint' => $fingerprint]]);
-                    foreach (User::whereNotNull('role_id')->get() as $staff) {
-                        if (!$staff->hasPermission('admin.gateways.viewAny') || !$staff->hasPermission('admin.gateways.update')) continue;
+                    foreach ($this->noticeStaff('gateway') as $staff) {
                         Notification::create([
                             'user_id' => $staff->id, 'title' => 'Stripe access needs attention',
                             'body' => 'Stripe refused payment checks. Check the API key and its permissions.',

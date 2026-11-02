@@ -220,7 +220,7 @@ trait ReceiptReversals
             Audit::create(['event' => 'ae_stripe_receipt_reversal', 'auditable_type' => $current->getMorphClass(), 'auditable_id' => $current->id,
                 'old_values' => $previous ? ['status' => $previous->state] : [],
                 'new_values' => array_diff_key($details, ['id' => true]) + ['stripe_id' => $id, 'next_step' => $auditStep]]);
-            foreach ($this->invoiceNoticeStaff($current) as $staff) Notification::create(['user_id' => $staff->id,
+            foreach ($this->noticeStaff('invoice') as $staff) Notification::create(['user_id' => $staff->id,
                 'title' => $details['needs_review'] ? 'Stripe reversal needs review' : 'Stripe reversal cleared',
                 'url' => $this->adminInvoiceUrl($current), 'body' => $this->invoiceNoticeBody('reversal', $bellText, $auditStep)]);
         });

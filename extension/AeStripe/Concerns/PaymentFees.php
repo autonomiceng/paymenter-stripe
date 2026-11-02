@@ -201,7 +201,7 @@ trait PaymentFees
             'auditable_id' => $row->invoice_id, 'old_values' => [], 'new_values' => array_merge((array) $row, ['state' => 'review',
                 'next_step' => 'Check the invoice Audit Log and the balance transaction in Stripe. Record the verified fee on the original transaction.']),
         ]);
-        foreach ($this->invoiceNoticeStaff($invoice) as $staff) {
+        foreach ($this->noticeStaff($invoice ? 'invoice' : 'audit') as $staff) {
             Notification::create([
                 'user_id' => $staff->id, 'title' => 'Stripe payment fee needs review',
                 'url' => $invoice ? $this->adminInvoiceUrl($invoice) : url('/admin/audits'),

@@ -89,15 +89,21 @@ class AeStripe extends Gateway
         return $invoice->number ? (string) $invoice->number : __('invoices.proforma_invoice', ['id' => $invoice->id]);
     }
 
-    private function invoiceNoticeStaff(?Invoice $invoice): array
+    private function noticeStaff(string $destination): array
     {
-        $recipients = [];
-        foreach (User::whereNotNull('role_id')->get() as $staff) {
-            // Filament checks resource viewAny before the invoice edit page's own permissions.
-            if ($invoice ? $staff->hasPermission('admin.invoices.viewAny') && $staff->hasPermission('admin.invoices.view') && $staff->hasPermission('admin.invoices.update')
-                : $staff->hasPermission('admin.audit.viewAny')) $recipients[] = $staff;
+        // Filament checks resource viewAny before the edit page's own permissions.
+        $permissions = match ($destination) {
+            'invoice' => ['admin.invoices.viewAny', 'admin.invoices.view', 'admin.invoices.update'],
+            'audit' => ['admin.audit.viewAny'],
+            'gateway' => ['admin.gateways.viewAny', 'admin.gateways.update'],
+        };
+        $staff = []; $recipients = [];
+        foreach (User::whereNotNull('role_id')->get() as $candidate) {
+            $staff[] = $candidate;
+            if (!array_filter($permissions, fn ($permission) => !$candidate->hasPermission($permission))) $recipients[] = $candidate;
         }
-        return $recipients;
+        // Keep the pre-filter audience rather than lose a warning when no staff can open its link.
+        return $recipients ?: $staff;
     }
 
     private function invoiceNoticeBody(string $type, string $short, string $details): string

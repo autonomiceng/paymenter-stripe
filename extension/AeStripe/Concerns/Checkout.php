@@ -356,7 +356,7 @@ trait Checkout
                 if (!$stored) return;
                 $alert = json_decode($stored, true, flags: JSON_THROW_ON_ERROR);
                 if ($alert['sent']) return;
-                foreach ($this->invoiceNoticeStaff($invoice) as $staff) {
+                foreach ($this->noticeStaff('invoice') as $staff) {
                     Notification::create([
                         'user_id' => $staff->id, 'title' => 'Stripe payment needs review',
                         'url' => $this->adminInvoiceUrl($invoice),

@@ -243,6 +243,23 @@ use Illuminate\Support\Facades\{DB, Http};
             $stripe->failure = null; $gateway->retryChargeAttempts();
             check(count($stripe->charges) === 1, 'Fixing the key resumes the unsent renewal once');
         });
+        $run('recovery-refusals-without-access', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); $attempt['retry'] = true;
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            $staff = new User(new Properties('')); $staff->id = 98; $staff->role_id = 1;
+            $staff->permissions = ['admin.gateways.update'];
+            User::$noticeStaff = [$staff]; $GLOBALS['fakeConsole'] = true;
+            try {
+                $stripe->failure = fn () => throw new RequestException(401);
+                $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+                check(array_column(Notification::$rows, 'user_id') === [98], 'An access refusal still reaches staff when nobody can open its destination');
+                $staff->permissions[] = 'admin.gateways.viewAny';
+                $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+                check(array_column(Notification::$rows, 'user_id') === [98] && !$stripe->charges,
+                    'Restoring staff access preserves the same-key warning dedupe without sending a charge');
+            } finally { User::$noticeStaff = null; }
+        });
         $run('replacement-renewal', function ($invoice, $stripe) use ($gateway) {
             foreach (['canceled', 'automatic'] as $shape) {
                 $gateway->pay($invoice, 20); $id = array_key_last($stripe->intents);

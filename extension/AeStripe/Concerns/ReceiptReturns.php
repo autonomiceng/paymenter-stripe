@@ -353,7 +353,7 @@ trait ReceiptReturns
                     default => 'Your payment return needs attention. We are checking it automatically. Contact support with invoice ' . $this->invoiceLabel($current) . ' for help.',
                 }]);
             if ($a['state'] === 'review' || str_contains($a['reason'] ?? '', 'instructions')) {
-                foreach ($this->invoiceNoticeStaff($current) as $staff) Notification::create(['user_id' => $staff->id,
+                foreach ($this->noticeStaff('invoice') as $staff) Notification::create(['user_id' => $staff->id,
                     'title' => 'Stripe payment return needs attention', 'url' => $this->adminInvoiceUrl($current),
                     'body' => 'Invoice ' . $this->invoiceLabel($current) . ', payment ' . $id . ': ' . $a['reason']]);
             }
