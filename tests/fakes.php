@@ -120,6 +120,10 @@ namespace App\Models {
     class User {
         public static $row;
         public static $staff = false, $gatewayUpdate = false;
+        public static $noticeStaff = null;
+        public $role_id = null;
+        public $permissions = [];
+        public function hasPermission($permission) { return in_array($permission, $this->permissions, true); }
         public function canAccessPanel($panel) { return self::$staff; }
         public function can($ability, $model) { return self::$gatewayUpdate; }
         public $id = 7;
@@ -131,13 +135,19 @@ namespace App\Models {
         public function __get($key) { return $this->props; }
         public static function where($key, $id) { return new Query(self::$row && self::$row->$key == $id ? self::$row : null, User::class); }
         public static function findOrFail($id) { return self::$row; }
-        public static function whereNotNull($key) { return new class { public function get() { return [(object) ['id' => 99]]; } }; }
+        public static function whereNotNull($key) { return new class { public function get() {
+            if (User::$noticeStaff !== null) return User::$noticeStaff;
+            $staff = new User(new Properties('')); $staff->id = 99; $staff->role_id = 1;
+            $staff->permissions = ['admin.invoices.viewAny', 'admin.invoices.view', 'admin.invoices.update', 'admin.gateways.viewAny', 'admin.gateways.update', 'admin.audit.viewAny'];
+            return [$staff];
+        } }; }
     }
     class Invoice {
         public static $row;
         public static $rows = [];
         public $id = 12;
         public $number = 'INV-12';
+        public $exists = true;
         public $user_id = 7;
         public $currency_code = 'usd', $status = 'pending';
         public $total = 20;
@@ -162,6 +172,10 @@ namespace App\Models {
             }
             public function exists() { return (\App\Helpers\ExtensionHelper::$payments[$this->invoiceId . ':' . $this->id]['status'] ?? null) === 'succeeded'; }
         }; }
+        public function __get($key) {
+            if ($key === 'formattedTotal') return new class { public function format($amount) { return '$' . number_format($amount, 2, '.', ''); } };
+            return null;
+        }
         public static function findOrFail($id) {
             return self::$rows[$id] ?? ($id == self::$row->id ? self::$row : throw new \RuntimeException('Missing invoice'));
         }

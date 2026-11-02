@@ -221,20 +221,44 @@ use Illuminate\Support\Facades\{DB, Http};
             $stripe->failure = null; $gateway->pay($invoice, 20);
             $GLOBALS['fakeConsole'] = true;
             $other = new Invoice(User::$row); $other->id = 921; Invoice::$rows[921] = $other;
-            $stripe->failure = fn () => throw new RequestException(401);
-            check($gateway->charge($other, 20, new BillingAgreement) === true && isset(User::$row->props->values['ae_stripe_checkout_921']), 'A bad API key keeps a cron instruction pending');
-            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); $attempt['retry'] = true;
-            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
-            $stripe->failure = fn () => throw new RequestException(403);
-            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
-            $staff = array_filter(Notification::$rows, fn ($notice) => $notice['user_id'] !== 7);
-            check(count($staff) === 1, 'Persistent refused reads alert staff once');
+            $allowed = new User(new Properties('')); $allowed->id = 99; $allowed->role_id = 1;
+            $allowed->permissions = ['admin.gateways.viewAny', 'admin.gateways.update'];
+            $noList = clone $allowed; $noList->id = 98; $noList->permissions = ['admin.gateways.update'];
+            $noUpdate = clone $allowed; $noUpdate->id = 97; $noUpdate->permissions = ['admin.gateways.viewAny'];
+            User::$noticeStaff = [$noList, $noUpdate, $allowed];
+            try {
+                $stripe->failure = fn () => throw new RequestException(401);
+                check($gateway->charge($other, 20, new BillingAgreement) === true && isset(User::$row->props->values['ae_stripe_checkout_921']), 'A bad API key keeps a cron instruction pending');
+                $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); $attempt['retry'] = true;
+                User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+                $stripe->failure = fn () => throw new RequestException(403);
+                $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+                $staff = array_filter(Notification::$rows, fn ($notice) => $notice['user_id'] !== 7);
+                check(array_column($staff, 'user_id') === [99], 'Persistent refused reads alert only staff who can open the gateway edit destination');
+            } finally { User::$noticeStaff = null; }
             $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); $attempt['retry'] = false;
             User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
             $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
             check(count(array_filter(Notification::$rows, fn ($notice) => $notice['user_id'] !== 7)) === 1, 'The same key refusal on another invoice does not add staff alerts');
             $stripe->failure = null; $gateway->retryChargeAttempts();
             check(count($stripe->charges) === 1, 'Fixing the key resumes the unsent renewal once');
+        });
+        $run('recovery-refusals-without-access', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true); $attempt['retry'] = true;
+            User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            $staff = new User(new Properties('')); $staff->id = 98; $staff->role_id = 1;
+            $staff->permissions = ['admin.gateways.update'];
+            User::$noticeStaff = [$staff]; $GLOBALS['fakeConsole'] = true;
+            try {
+                $stripe->failure = fn () => throw new RequestException(401);
+                $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+                check(array_column(Notification::$rows, 'user_id') === [98], 'An access refusal still reaches staff when nobody can open its destination');
+                $staff->permissions[] = 'admin.gateways.viewAny';
+                $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+                check(array_column(Notification::$rows, 'user_id') === [98] && !$stripe->charges,
+                    'Restoring staff access preserves the same-key warning dedupe without sending a charge');
+            } finally { User::$noticeStaff = null; }
         });
         $run('replacement-renewal', function ($invoice, $stripe) use ($gateway) {
             foreach (['canceled', 'automatic'] as $shape) {

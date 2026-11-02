@@ -56,6 +56,7 @@ require_once __DIR__ . '/Concerns/ChargeRecovery.php';
 require_once __DIR__ . '/Concerns/RenewalRetry.php';
 require_once __DIR__ . '/Concerns/InvoicePayments.php';
 require_once __DIR__ . '/Concerns/ReceiptReversals.php';
+require_once __DIR__ . '/Concerns/ReversalReview.php';
 require_once __DIR__ . '/Concerns/WebhookContinuity.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
 require_once __DIR__ . '/Concerns/AutoPay.php';
@@ -73,7 +74,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -81,6 +82,35 @@ class AeStripe extends Gateway
     {
         // Paymenter 1.5.9 places InvoiceResource inside InvoiceCluster.
         return url('/admin/invoice/invoices/' . $invoice->id . '/edit');
+    }
+
+    private function invoiceLabel(Invoice $invoice): string
+    {
+        return $invoice->number ? (string) $invoice->number : __('invoices.proforma_invoice', ['id' => $invoice->id]);
+    }
+
+    private function noticeStaff(string $destination): array
+    {
+        // Filament checks resource viewAny before the edit page's own permissions.
+        $permissions = match ($destination) {
+            'invoice' => ['admin.invoices.viewAny', 'admin.invoices.view', 'admin.invoices.update'],
+            'audit' => ['admin.audit.viewAny'],
+            'gateway' => ['admin.gateways.viewAny', 'admin.gateways.update'],
+        };
+        $staff = []; $recipients = [];
+        foreach (User::whereNotNull('role_id')->get() as $candidate) {
+            $staff[] = $candidate;
+            if (!array_filter($permissions, fn ($permission) => !$candidate->hasPermission($permission))) $recipients[] = $candidate;
+        }
+        // Keep the pre-filter audience rather than lose a warning when no staff can open its link.
+        return $recipients ?: $staff;
+    }
+
+    private function invoiceNoticeBody(string $type, string $short, string $details): string
+    {
+        // These types have their complete next step in the native invoice Audit Log.
+        // Payment/return reviews retain their full body until the destination has a resolution action/return state.
+        return in_array($type, ['reversal', 'fee'], true) ? $short : $details;
     }
 
     public function boot()

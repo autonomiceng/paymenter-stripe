@@ -7,6 +7,8 @@ use Illuminate\Support\Facades\{DB, Http};
 
 (function () use ($gateway) {
     $saved = [User::$row, Invoice::$rows, ExtensionHelper::$payments, Http::$handler, Audit::$rows, Notification::$rows, Credit::$rows, Gateway::$enabled, DB::$tables['ae_stripe_receipt_returns']];
+    $hadAuditTable = isset(DB::$tables['audits']);
+    DB::$tables['audits'] ??= []; // This fixture exercises native invoice audit display reads.
     $setup = function ($amount = 2000, $total = 10, $currency = 'usd') use ($gateway) {
         User::$row = new User(new Properties('cus_owner'));
         $invoice = new Invoice(User::$row); $invoice->id = 810; $invoice->total = $total; $invoice->currency_code = $currency;
@@ -277,5 +279,6 @@ use Illuminate\Support\Facades\{DB, Http};
     } finally {
         Notification::$fail = false; ReceiptReturnQuery::$beforeWrite = null; ExtensionHelper::$simulateNativeListeners = false;
         [User::$row, Invoice::$rows, ExtensionHelper::$payments, Http::$handler, Audit::$rows, Notification::$rows, Credit::$rows, Gateway::$enabled, DB::$tables['ae_stripe_receipt_returns']] = $saved;
+        if (!$hadAuditTable) unset(DB::$tables['audits']);
     }
 })();

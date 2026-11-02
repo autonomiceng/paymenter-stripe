@@ -350,12 +350,12 @@ trait ReceiptReturns
                     'refunded' => 'A payment of ' . number_format($this->fromMinorUnits($a['amount_minor'], $receipt['currency']), $this->currencyDecimals($receipt['currency']), '.', '') . ' ' . strtoupper($receipt['currency']) . ' has been returned to your original payment method.',
                     'credited' => 'Stripe could not refund your original payment method. The returned amount is now account credit. Open the invoice or contact support for help.',
                     'pending' => 'Your payment return is processing. We are checking it automatically. Open the invoice or contact support for help.',
-                    default => 'Your payment return needs attention. We are checking it automatically. Contact support with invoice ' . $current->id . ' for help.',
+                    default => 'Your payment return needs attention. We are checking it automatically. Contact support with invoice ' . $this->invoiceLabel($current) . ' for help.',
                 }]);
             if ($a['state'] === 'review' || str_contains($a['reason'] ?? '', 'instructions')) {
-                foreach (\App\Models\User::whereNotNull('role_id')->get() as $staff) Notification::create(['user_id' => $staff->id,
+                foreach ($this->noticeStaff('invoice') as $staff) Notification::create(['user_id' => $staff->id,
                     'title' => 'Stripe payment return needs attention', 'url' => $this->adminInvoiceUrl($current),
-                    'body' => 'Invoice ' . $current->id . ', payment ' . $id . ': ' . $a['reason']]);
+                    'body' => 'Invoice ' . $this->invoiceLabel($current) . ', payment ' . $id . ': ' . $a['reason']]);
             }
             $a['notified'] = $notice;
             $this->writeReceipt($user, $id, $receipt, $key);

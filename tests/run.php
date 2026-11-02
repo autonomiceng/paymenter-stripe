@@ -61,6 +61,13 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
     };
 };
 
+if (in_array('--payment-fees', $argv, true)) {
+    require __DIR__ . '/fee-recovery.php';
+    require __DIR__ . '/fee-recovery-review.php';
+    echo "PASS: $count payment fee assertions\n";
+    return;
+}
+
 if (in_array('--receipt-returns', $argv, true)) {
     require __DIR__ . '/receipt-returns.php';
     echo "PASS: $count receipt return assertions\n";
