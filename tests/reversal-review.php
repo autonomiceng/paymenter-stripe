@@ -23,10 +23,15 @@ $work = $gateway->receiptReversals($i, 'pi_return')[0];
 check($work['needs_review'], 'A zero pooled balance does not clear a refund against spent receipt credit');
 $actor = \App\Models\User::$row;
 $actor->role_id = 1; $actor->permissions = ['admin.invoices.view'];
+$rejectedAudits = Audit::$rows;
 rejects(fn () => $gateway->resolveReceiptReversal($i, 'pi_return', $work['id'], $work['kind'], $work['review_key'], 'Checked in Stripe.'), 'HTTP 403');
 $actor->permissions[] = 'admin.invoices.update';
 rejects(fn () => $gateway->resolveReceiptReversal($i, 'pi_return', $work['id'], $work['kind'], $work['review_key'], '  '), 'HTTP 422');
 rejects(fn () => $gateway->resolveReceiptReversal($i, 'pi_return', $work['id'], $work['kind'], str_repeat('0', 64), 'Checked in Stripe.'), 'HTTP 409');
+// Same owner and currency: the payment must still belong to this exact invoice.
+$otherInvoice = clone $i; $otherInvoice->id = 811; \App\Models\Invoice::$rows[811] = $otherInvoice;
+rejects(fn () => $gateway->resolveReceiptReversal($otherInvoice, 'pi_return', $work['id'], $work['kind'], $work['review_key'], 'Checked in Stripe.'), 'HTTP 409');
+check(Audit::$rows === $rejectedAudits, 'Rejected permission, note, stale-key and wrong-invoice requests leave no audit row');
 $moneyBefore = serialize([DB::$tables, Credit::$rows, ExtensionHelper::$payments, $s->posts]);
 $auditsBefore = count(Audit::$rows);
 $resolve = fn () => $gateway->resolveReceiptReversal($i, 'pi_return', $work['id'], $work['kind'], $work['review_key'], 'Checked spent credit and settled recovery in Stripe.');
