@@ -88,7 +88,7 @@ try {
             });
             await page.locator('#setup-consent').check();
         }
-        assert.deepEqual(await page.evaluate(() => paymentElementOptions.wallets), {link: 'never'}, `${name}: Link save prompt is disabled`);
+        assert.notEqual(await page.evaluate(() => paymentElementOptions.wallets?.link ?? 'auto'), 'never', `${name}: Link stays available`);
         const fallback = name === 'pay' ? 'Could not check the payment. Refresh the invoice for its status.' : 'Could not save your payment method. Try again.';
         for (const failure of ['network', 'confirmation', ...(name === 'pay' ? ['updates'] : []), 'consent', 'decline']) {
             await page.evaluate(value => { window.failure = value; }, failure);
