@@ -56,7 +56,7 @@ try {
                 probe.created++;
                 probe.active++;
                 return { update() {}, create(type, options) {
-                    if (type !== 'payment' || options.wallets?.link !== 'never') throw new Error('Link prompt must be disabled');
+                    if (type !== 'payment' || options.wallets?.link === 'never') throw new Error('Link must stay available');
                     let target;
                     const listeners = {};
                     return {

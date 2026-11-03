@@ -116,7 +116,6 @@ Alpine.data('aeStripeSetup', (config) => {
                 const stripe = Stripe(config.publishableKey);
                 const elements = stripe.elements({clientSecret: config.clientSecret, appearance: stripeAppearance(form)});
                 paymentElement = elements.create('payment', {
-                    wallets: {link: 'never'},
                     layout: {type: 'accordion', defaultCollapsed: false, radios: false, spacedAccordionItems: true},
                     defaultValues: {billingDetails: {name: config.name, email: config.email}},
                 });

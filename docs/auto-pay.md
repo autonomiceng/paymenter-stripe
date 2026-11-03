@@ -128,13 +128,13 @@ from the invoice issue date (Domains issues renewals ahead of expiry). A future
 adapter can attach that context to the same shared attempt and retry policy; Stripe
 must not inspect or update Domains tables. No Domains files change here.
 
-## Stripe Link save prompt
+## Stripe Link
 
-Both Payment Elements use `wallets: {link: 'never'}`. Stripe's current
-[Payment Element option reference](https://docs.stripe.com/js/elements_object/create_payment_element#payment_element_create-options-wallets)
-lists `link` and documents `never`. This hides Link in these Elements, including its
-separate save prompt, rather than manipulating a cross-origin checkbox. Cards,
-other wallets and native saved-agreement records stay intact. This does not change
-Stripe Dashboard settings. Stripe also documents the default-on accelerated signup
+Both Payment Elements leave Link on (no `wallets` option), so customers can pay
+with or save a Link wallet. Stripe's own Link sign-up box ("Save my information for
+faster checkout") keeps its default: ticked. Stripe documents that default-on sign-up
 in [Link in the Payment Element](https://docs.stripe.com/payments/link/payment-element-link#enable-accelerated-sign-up).
-Docs checked 2026-10-31; actual Stripe.js behavior still needs the authorized TEST click.
+That box signs the customer up for a Stripe Link account; it is not this
+extension's saving consent. Ticked, it may ask for a mobile number.
+Automated card tests that type into real Stripe Elements untick the optional
+`input[name="linkOptIn"]` inside the Stripe frame, so they need no phone number.

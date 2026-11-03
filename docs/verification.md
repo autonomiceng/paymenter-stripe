@@ -82,8 +82,8 @@ Ilya checked creation in Stripe test mode on 2026-10-30 at 12:00 PM PT (2025-07-
 The live pass on 2026-10-30 then proved Elements tokens are rejected on manual intents.
 Elements now uses the documented automatic flow; its real Stripe acceptance must be checked again.
 Klarna, Cash App and bank methods remain available under the same exclusions.
-New Payment Elements also set `wallets.link: never`, removing the separate Link
-sign-up/save prompt. Existing agreements are not removed.
+Payment Elements keep Link and its default-on sign-up box (see [Auto Pay](auto-pay.md#stripe-link));
+automated card tests untick `linkOptIn` in the Stripe frame.
 Submission sends a ConfirmationToken to the authenticated,
 CSRF-protected confirm endpoint. Under user then invoice locks, the server retrieves
 the intent, rechecks the balance, customer and active saved agreement, updates the amount,
