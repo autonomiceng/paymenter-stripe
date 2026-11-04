@@ -1,5 +1,8 @@
 <form id="payment-form" class="mt-2">
     <div id="error-message" role="alert" class="text-red-600 dark:text-red-400"></div>
+    <div id="express-checkout" class="mb-4" hidden>
+        <div id="express-checkout-element"></div>
+    </div>
     <div id="payment-element">
 
     </div>
@@ -65,6 +68,7 @@ async function initializePaymentForm() {
             const customerSessionSecret = @js($customerSessionSecret);
             if (customerSessionSecret) options.customerSessionClientSecret = customerSessionSecret;
 
+            const linkDisplay = @js($linkDisplay);
             const paymentElementOptions = {
                 layout: {
                     type: 'accordion',
@@ -75,9 +79,11 @@ async function initializePaymentForm() {
                 defaultValues: {
                     billingDetails: {
                         name: {{ \Illuminate\Support\Js::from(auth()->user()->name) }},
-                        email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }},
                     }
                 }
+            }
+            if (linkDisplay === 'stripe_default') {
+                paymentElementOptions.defaultValues.billingDetails.email = {{ \Illuminate\Support\Js::from(auth()->user()->email) }};
             }
 
             // Deferred Elements + ConfirmationToken: the server checks the balance before confirming.
@@ -86,22 +92,52 @@ async function initializePaymentForm() {
             const paymentElement = elements.create('payment', paymentElementOptions);
             const resuming = @js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true));
             const savedConsent = @js(($intent->metadata->ae_stripe_consent ?? null) === '1');
+            const expressCheckout = linkDisplay === 'above_card' && !resuming ? elements.create('expressCheckout', {
+                paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
+                    amazonPay: 'never', paypal: 'never', klarna: 'never'},
+            }) : null;
             let canSave = resuming && savedConsent;
+            let linkAvailable = false;
             let loading = false;
             const saveCard = document.getElementById('save-card');
+            function updateSaveCard() {
+                saveCard.disabled = resuming || loading || !(canSave || linkAvailable);
+                if (!(canSave || linkAvailable)) saveCard.checked = false;
+            }
+            function updateLinkAvailability(methods) {
+                linkAvailable = !!methods?.link;
+                document.getElementById('express-checkout').hidden = !linkAvailable;
+                updateSaveCard();
+            }
+            expressCheckout?.on('ready', ({availablePaymentMethods}) => updateLinkAvailability(availablePaymentMethods));
+            expressCheckout?.on('availablepaymentmethodschange', ({paymentMethods}) => updateLinkAvailability(paymentMethods));
             // https://docs.stripe.com/js/element/events/on_change?type=paymentElement
             paymentElement.on('change', (event) => {
                 if (!loading) clearMessage();
                 canSave = resuming ? savedConsent : ['card', 'link'].includes(event.value?.type);
-                saveCard.disabled = resuming || loading || !canSave;
-                if (!canSave) saveCard.checked = false;
+                updateSaveCard();
             });
 
             saveCard.addEventListener('change', clearMessage);
             const stopThemeSync = syncStripeTheme(form, elements);
 
-            form.addEventListener('submit', async (event) => {
+            form.addEventListener('submit', (event) => {
                 event.preventDefault();
+                confirmPayment();
+            });
+            expressCheckout?.on('confirm', (event) => confirmPayment(event));
+
+            async function confirmPayment(expressEvent = null) {
+                if (!ready || loading) {
+                    expressEvent?.paymentFailed({reason: 'fail'});
+                    return;
+                }
+                // Link uses the same explicit opt-in, even when another method is selected below it.
+                const save = resuming ? savedConsent : (expressEvent !== null || canSave) && saveCard.checked;
+                function failPayment(message) {
+                    showMessage(message);
+                    expressEvent?.paymentFailed({reason: 'fail'});
+                }
                 clearMessage();
                 setLoading(true);
                 
@@ -122,10 +158,10 @@ async function initializePaymentForm() {
                             headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
                                 'X-CSRF-TOKEN': @js(csrf_token())},
                             body: JSON.stringify({intent: @js($intent->id), confirmation_token: token,
-                                amount: @js($intent->amount), save: resuming ? savedConsent : canSave && saveCard.checked}),
+                                amount: @js($intent->amount), save}),
                         });
                         const result = await response.json();
-                        if (!response.ok) { showMessage(result.message || 'Could not confirm your payment. Refresh the invoice for its status.'); return; }
+                        if (!response.ok) { failPayment(result.message || 'Could not confirm your payment. Refresh the invoice for its status.'); return; }
                         if (result.status === 'requires_action') {
                             const next = await stripe.handleNextAction({clientSecret: result.client_secret});
                             if (next.error) throw next.error;
@@ -136,17 +172,17 @@ async function initializePaymentForm() {
                             window.location.assign(@js(route('invoices.show', $invoice) . '?checkPayment=true'));
                             return;
                         }
-                        showMessage('This payment was declined. Choose another payment method.');
+                        failPayment('This payment was declined. Choose another payment method.');
                         return;
                     }
-                    showMessage('Payment still needs authentication. Refresh the invoice to continue.');
+                    failPayment('Payment still needs authentication. Refresh the invoice to continue.');
                 } catch (error) {
-                    showMessage(['card_error', 'validation_error'].includes(error?.type) && error.message
+                    failPayment(['card_error', 'validation_error'].includes(error?.type) && error.message
                         ? error.message : 'Could not check the payment. Refresh the invoice for its status.');
                 } finally {
                     setLoading(false);
                 }
-            });
+            }
 
             // The alert region stays mounted so screen readers announce new text; it keeps the
             // error until the customer edits the form or submits again.
@@ -165,7 +201,8 @@ async function initializePaymentForm() {
             function setLoading(isLoading) {
                 loading = isLoading;
                 document.getElementById("payment-element").inert = isLoading;
-                saveCard.disabled = resuming || isLoading || !canSave;
+                document.getElementById('express-checkout').inert = isLoading;
+                updateSaveCard();
                 if (isLoading) {
                     // Disable the button and show a spinner
                     document.querySelector("#submit").disabled = true;
@@ -178,12 +215,14 @@ async function initializePaymentForm() {
 
             paymentElement.on('ready', () => { ready = true; setLoading(false); });
             paymentElement.on('loaderror', initializationError);
+            expressCheckout?.mount('#express-checkout-element');
             paymentElement.mount('#payment-element');
 
             $wire.on('invoice.payment.cancelled', () => {
                 // destroy the payment element
                 stopThemeSync();
                 paymentElement.destroy();
+                expressCheckout?.destroy();
             });
             } catch (error) { initializationError(); }
         };

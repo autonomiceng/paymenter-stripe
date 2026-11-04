@@ -251,6 +251,16 @@ class AeStripe extends Gateway
                 'required' => false,
             ],
             [
+                'name' => 'stripe_link_display',
+                'label' => 'Link at checkout',
+                'type' => 'select',
+                'options' => ['above_card' => 'Link button above card', 'inside_card' => 'Inside card form',
+                    'stripe_default' => 'Stripe default'],
+                'default' => 'above_card',
+                'hint' => fn () => new \Illuminate\Support\HtmlString('<span tabindex="0" title="Choose where Link appears. Stripe default also prefills the customer email.">?</span>'),
+                'required' => true,
+            ],
+            [
                 'name' => 'stripe_webhook_secret',
                 'label' => 'Stripe webhook signing secret',
                 'type' => 'text',

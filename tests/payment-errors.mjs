@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const views = new URL('../extension/AeStripe/resources/views/', import.meta.url);
 const theme = readFileSync(new URL('stripe-theme.blade.php', views), 'utf8');
-function render(name) {
+function render(name, linkDisplay = 'above_card') {
     let source = readFileSync(new URL(`${name}.blade.php`, views), 'utf8')
         .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
         .replace(/@if\(config\('settings.tos'\)\)[\s\S]*?@endif/g, '')
@@ -18,6 +18,7 @@ function render(name) {
         .replaceAll('@js($intent->client_secret)', "'fixture-secret'")
         .replaceAll('@js($intent->id)', "'fixture-intent'")
         .replace('@js($customerSessionSecret)', 'null')
+        .replace('@js($linkDisplay)', JSON.stringify(linkDisplay))
         .replace("@js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true))", 'false')
         .replaceAll('@js($intent->amount)', '2000').replace("@js(strtolower($intent->currency))", "'usd'")
         .replace("@js(($intent->metadata->ae_stripe_consent ?? null) === '1')", 'false')
@@ -29,7 +30,9 @@ function render(name) {
 }
 const browser = await chromium.launch({ headless: true });
 try {
-    for (const name of (process.argv.slice(2).length ? process.argv.slice(2) : ['pay', 'billing-agreement'])) {
+    const forms = process.argv.slice(2).length ? process.argv.slice(2) : ['pay', 'billing-agreement'];
+    for (const [name, linkDisplay] of forms.flatMap(name => name === 'pay'
+        ? ['above_card', 'inside_card', 'stripe_default'].map(mode => [name, mode]) : [[name, null]])) {
         const page = await browser.newPage();
         await page.route('**/*', route => route.fulfill({ contentType: 'text/javascript', body: '' }));
         page.setDefaultTimeout(5000);
@@ -37,6 +40,8 @@ try {
         await page.evaluate(() => {
             window.failure = 'network';
             window.confirms = 0;
+            window.elementCalls = [];
+            window.elementHandlers = {};
             window.fetch = async () => {
                 if (failure === 'network') throw new TypeError('Failed to fetch');
                 return { ok: failure !== 'consent', async json() { return {message: 'Could not record payment preferences. Refresh the invoice.', status: 'requires_action', client_secret: 'fixture-secret'}; } };
@@ -44,18 +49,23 @@ try {
             window.$wire = { on() {} };
             window.Alpine = { data: (_, factory) => { window.setupFactory = factory; } };
             window.Stripe = () => ({
-                elements: (options) => { window.elementOptions = options; return { update() {}, async submit() {
+                elements: (options) => { window.elementOptions = options; return window.elementsInstance = { update() {}, async submit() {
                     if (failure === 'updates') return { error: { type: 'api_connection_error' } };
                     return {};
                 }, async fetchUpdates() {
                     if (failure === 'updates') return { error: { type: 'api_connection_error', message: 'Raw update detail' } };
                     return {};
                 }, create(type, options) {
-                    window.paymentElementOptions = options;
-                    const handlers = {};
-                    return { on: (name, fn) => { handlers[name] = fn; }, mount() { handlers.ready(); }, destroy() {} };
+                    elementCalls.push({type, options});
+                    if (type === 'payment') window.paymentElementOptions = options;
+                    const handlers = elementHandlers[type] = {};
+                    return { on: (name, fn) => { handlers[name] = fn; }, mount(selector) {
+                        if (type === 'expressCheckout') document.querySelector(selector).textContent = 'Pay with Link';
+                        handlers.ready?.({availablePaymentMethods: {link: true}});
+                    }, destroy() {} };
                 } }; },
-                async createConfirmationToken() {
+                async createConfirmationToken({elements}) {
+                    if (elements !== elementsInstance) throw new Error('Token must use the mounted Elements instance');
                     if (failure === 'confirmation') throw new TypeError('Failed to tokenize');
                     if (failure === 'decline') return {error: {type: 'card_error', message: 'Your card was declined.'}};
                     return {confirmationToken: {id: 'ctoken_fixture'}};
@@ -70,7 +80,7 @@ try {
                 return { error: { type: 'card_error', message: 'Your card was declined.' } };
             }
         });
-        await page.setContent(render(name));
+        await page.setContent(render(name, linkDisplay));
         if (name === 'pay') {
             await page.waitForFunction(() => !!document.querySelector('script[src]'));
             await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
@@ -80,6 +90,16 @@ try {
             assert.equal(options.currency, 'usd');
             assert.equal(options.clientSecret, undefined);
             assert.deepEqual(options.excludedPaymentMethodTypes, ['blik', 'acss_debit', 'customer_balance']);
+            const calls = await page.evaluate(() => elementCalls);
+            const payment = calls.find(call => call.type === 'payment').options;
+            assert.equal(payment.defaultValues.billingDetails.email, linkDisplay === 'stripe_default' ? 'Fixture' : undefined,
+                `${linkDisplay}: only Stripe default prefills email`);
+            assert.equal(payment.layout.type, 'accordion');
+            assert.equal(payment.layout.defaultCollapsed, false);
+            assert.deepEqual(calls.filter(call => call.type === 'expressCheckout').map(call => call.options),
+                linkDisplay === 'above_card' ? [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
+                    amazonPay: 'never', paypal: 'never', klarna: 'never'}}] : [],
+                `${linkDisplay}: only the above-card choice mounts Link-only Express Checkout`);
         } else {
             await page.evaluate(async () => {
                 window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf' });
@@ -102,6 +122,42 @@ try {
             if (['network', 'consent', 'updates'].includes(failure)) assert.equal(await page.evaluate(() => confirms), before, 'Failed preparation cannot confirm');
         }
         if (name === 'pay') {
+            if (linkDisplay === 'above_card') {
+                assert.equal(await page.evaluate(() => typeof elementHandlers.expressCheckout.confirm), 'function',
+                    'Link Express Checkout has a confirm handler');
+                assert.equal(await page.locator('#express-checkout').isVisible(), true, 'Available Link appears above the card form');
+                assert.equal(await page.evaluate(() => document.querySelector('#express-checkout').compareDocumentPosition(
+                    document.querySelector('#payment-element')) & Node.DOCUMENT_POSITION_FOLLOWING), 4);
+                await page.evaluate(() => {
+                    window.failure = 'action-success';
+                    window.linkRequests = [];
+                    window.linkFailures = [];
+                    window.fetch = async (url, options) => {
+                        linkRequests.push({url, method: options.method, csrf: options.headers['X-CSRF-TOKEN'], body: JSON.parse(options.body)});
+                        return {ok: false, async json() { return {message: 'The invoice balance changed. Refresh before paying.'}; }};
+                    };
+                    elementHandlers.payment.change({value: {type: 'sepa_debit'}});
+                });
+                for (const save of [false, true]) {
+                    await page.locator('#save-card').setChecked(save);
+                    await page.evaluate(async () => {
+                        await elementHandlers.expressCheckout.confirm({expressPaymentType: 'link', paymentFailed: value => linkFailures.push(value)});
+                    });
+                    assert.equal(await page.locator('[role=alert]').textContent(), 'The invoice balance changed. Refresh before paying.');
+                    assert.equal(await page.locator('#submit').isEnabled(), true, 'A refused Link payment permits retry');
+                }
+                await page.locator('#submit').click();
+                await page.waitForFunction(() => linkRequests.length === 3);
+                assert.deepEqual(await page.evaluate(() => linkRequests), [false, true, false].map(save => ({
+                    url: '/extensions.gateways.ae-stripe.confirm', method: 'POST', csrf: 'fixture-csrf',
+                    body: {intent: 'fixture-intent', confirmation_token: 'ctoken_fixture', amount: 2000, save},
+                })), 'Link uses the same deferred server confirm route and amount; a bank form cannot inherit Link saving');
+                assert.deepEqual(await page.evaluate(() => linkFailures), [{reason: 'fail'}, {reason: 'fail'}],
+                    'Server refusal also dismisses the Express payment UI');
+                await page.evaluate(() => elementHandlers.expressCheckout.availablepaymentmethodschange({paymentMethods: null}));
+                assert.equal(await page.locator('#express-checkout').isVisible(), false, 'Unsupported Link leaves the card form usable');
+                assert.equal(await page.locator('#save-card').isEnabled(), false, 'A bank method alone cannot opt into card saving');
+            }
             const requests = [], actions = [];
             await page.exposeFunction('onRequest', body => requests.push(body));
             await page.exposeFunction('onAction', options => actions.push(options));
@@ -116,13 +172,22 @@ try {
                         ? {status: 'requires_action', client_secret: 'fixture-secret'} : {status: 'succeeded'}; }};
                 };
             });
-            await page.locator('#submit').click();
+            if (linkDisplay === 'above_card') {
+                await page.evaluate(() => {
+                    elementHandlers.expressCheckout.availablepaymentmethodschange({paymentMethods: {link: true}});
+                    elementHandlers.expressCheckout.confirm({expressPaymentType: 'link', paymentFailed() {
+                        throw new Error('Successful Link must not report failure');
+                    }});
+                });
+            } else {
+                await page.locator('#submit').click();
+            }
             await page.waitForURL('https://example.com/return');
             assert.deepEqual(actions, [{clientSecret: 'fixture-secret'}]);
             assert.deepEqual(requests, [
                 {intent: 'fixture-intent', confirmation_token: 'ctoken_fixture', amount: 2000, save: false},
                 {intent: 'fixture-intent', confirmation_token: null, amount: 2000, save: false},
-            ], 'Authentication reads the same payment without replaying its token before redirecting');
+            ], `${linkDisplay}: authentication reads the same payment without replaying its token before redirecting`);
         }
         await page.close();
     }

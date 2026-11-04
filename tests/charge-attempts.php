@@ -306,6 +306,24 @@ use Illuminate\Support\Facades\{DB, Http};
                 ExtensionHelper::$agreements = ['pm_test' => ['id' => 4, 'user_id' => 7, 'gateway_id' => 3]];
             }
         });
+        $run('link-display-settings', function ($invoice, $stripe) use ($gateway) {
+            $settings = array_column($gateway->getConfig(), null, 'name');
+            $setting = $settings['stripe_link_display'] ?? [];
+            check(($setting['label'] ?? null) === 'Link at checkout' && ($setting['type'] ?? null) === 'select',
+                'The gateway offers one Link at checkout selector');
+            check(($setting['options'] ?? null) === ['above_card' => 'Link button above card',
+                'inside_card' => 'Inside card form', 'stripe_default' => 'Stripe default']
+                && ($setting['default'] ?? null) === 'above_card' && isset($setting['hint']),
+                'Link display has three plain choices, hover help and the above-card default');
+            foreach ([null, '', 'unknown', 'above_card', 'inside_card', 'stripe_default'] as $value) {
+                $configured = new \Paymenter\Extensions\Gateways\AeStripe\AeStripe(array_replace($gateway->config,
+                    $value === null ? [] : ['stripe_link_display' => $value]));
+                $view = $configured->pay($invoice, 20);
+                check(($view['data']['linkDisplay'] ?? null) === (in_array($value, ['inside_card', 'stripe_default'], true) ? $value : 'above_card'),
+                    'Checkout reads the saved choice and defaults old or empty gateways to Link above card');
+            }
+            check(!$stripe->charges, 'Choosing the Link display never charges on opening checkout');
+        });
         $run('create-elements', function ($invoice, $stripe) use ($gateway) {
             $view = $gateway->pay($invoice, 20);
             check($view['data']['intent']->confirmation_method === 'automatic' && !$stripe->charges, 'Opening Elements reserves an unconfirmed automatic intent without a debit');
