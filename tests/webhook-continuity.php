@@ -311,6 +311,19 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         check(json_decode($extension->settingValues->values[$stateKey], true)['previous'] === []
             && array_column(array_slice(Http::$calls, $before), 1) === ['/account', '/webhook_endpoints'],
             'Explicit CLI secret revocation runs verification even with unchanged credentials');
+        // Stripe signs endpoint deliveries with the endpoint's own secret, never the CLI one.
+        $endpoints = [$endpoint]; $cliBefore = json_decode($extension->settingValues->values[$stateKey], true);
+        $extension->settingValues->values['stripe_revoke_previous_secrets'] = true;
+        rejects(fn () => $gateway->updated($extension), 'Copy this endpoint\'s signing secret from Stripe, then save again. Its existing deliveries have been preserved.');
+        check(json_decode($extension->settingValues->values[$stateKey], true) === $cliBefore,
+            'A new endpoint cannot inherit the CLI forwarding secret');
+        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_endpoint_new';
+        $gateway->updated($extension);
+        $moved = json_decode($extension->settingValues->values[$stateKey], true);
+        check($moved['delivery'] === 'endpoint' && $moved['endpoint'] === 'we_existing'
+            && $moved['credentials']['stripe_webhook_secret'] === 'whsec_endpoint_new',
+            'Saving the endpoint signing secret moves CLI forwarding to the endpoint');
+        $endpoints = [];
 
         $liveConfig = ['stripe_secret_key' => 'rk_live_original', 'stripe_publishable_key' => 'pk_live_original', 'stripe_webhook_secret' => 'whsec_live_fixture'];
         $extension->settingValues->values = $liveConfig;

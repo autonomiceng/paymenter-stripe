@@ -376,7 +376,8 @@ explicit customer Pay takes over immediately.
 Before the first credential rotation after upgrade, save the existing working keys
 and signing secret once. That first save, credential changes and explicit secret
 revocation verify `GET /v1/account` and the paginated webhook list. Other setting
-changes make no Stripe requests or credential changes. Keep the same Stripe account
+changes make no Stripe requests or credential changes, except while webhook events show
+retry: then every save runs the same check. Keep the same Stripe account
 and test/live mode; API-key replacement is allowed on that account. The restricted key needs account-read and endpoint-read
 permissions plus endpoint-write when creating or updating setup. Use the account's
 matching publishable key; Stripe's account read does not prove a publishable key's

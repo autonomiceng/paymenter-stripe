@@ -186,7 +186,9 @@ trait WebhookContinuity
                     if (($recovered->id ?? null) === $endpoint->id) $credentials['stripe_webhook_secret'] = $recovered->secret ?? '';
                 }
                 if ($endpoint) {
-                    if ($credentials['stripe_webhook_secret'] === '') throw new DisplayException('Copy this endpoint\'s signing secret from Stripe, then save again. Its existing deliveries have been preserved.');
+                    // Stripe signs endpoint deliveries with the endpoint's own secret, not the CLI one.
+                    $keepsCliSecret = ($state['delivery'] ?? null) === 'stripe_cli' && $credentials['stripe_webhook_secret'] === $old['stripe_webhook_secret'];
+                    if ($credentials['stripe_webhook_secret'] === '' || $keepsCliSecret) throw new DisplayException('Copy this endpoint\'s signing secret from Stripe, then save again. Its existing deliveries have been preserved.');
                     // Editing the existing endpoint keeps its signing secret and pending deliveries.
                     $existingEvents = $endpoint->enabled_events ?? [];
                     $params['enabled_events'] = $this->webhookEvents($existingEvents);
