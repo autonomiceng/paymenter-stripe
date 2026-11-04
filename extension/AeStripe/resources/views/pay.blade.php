@@ -19,6 +19,7 @@
 @script
 <script>
     @include('gateways.ae-stripe::stripe-theme')
+    @include('gateways.ae-stripe::stripe-elements')
 async function initializePaymentForm() {
     // Livewire effects run before Alpine teleports the modal into body.
     const paymentForm = await new Promise((resolve) => {
@@ -68,34 +69,16 @@ async function initializePaymentForm() {
             const customerSessionSecret = @js($customerSessionSecret);
             if (customerSessionSecret) options.customerSessionClientSecret = customerSessionSecret;
 
-            const linkDisplay = @js($linkDisplay);
-            const paymentElementOptions = {
-                layout: {
-                    type: 'accordion',
-                    defaultCollapsed: false,
-                    radios: false,
-                    spacedAccordionItems: true
-                },
-                defaultValues: {
-                    billingDetails: {
-                        name: {{ \Illuminate\Support\Js::from(auth()->user()->name) }},
-                    }
-                }
-            }
-            if (linkDisplay === 'stripe_default') {
-                paymentElementOptions.defaultValues.billingDetails.email = {{ \Illuminate\Support\Js::from(auth()->user()->email) }};
-            }
-
-            // Deferred Elements + ConfirmationToken: the server checks the balance before confirming.
-            // https://docs.stripe.com/payments/finalize-payments-on-the-server
-            const elements = stripe.elements(options);
-            const paymentElement = elements.create('payment', paymentElementOptions);
             const resuming = @js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true));
             const savedConsent = @js(($intent->metadata->ae_stripe_consent ?? null) === '1');
-            const expressCheckout = linkDisplay === 'above_card' && !resuming ? elements.create('expressCheckout', {
-                paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
-                    amazonPay: 'never', paypal: 'never', klarna: 'never'},
-            }) : null;
+            // The server still checks the invoice balance before confirming.
+            const {elements, paymentElement, expressCheckout} = createStripeElements(stripe, options, {
+                linkDisplay: @js($linkDisplay),
+                name: {{ \Illuminate\Support\Js::from(auth()->user()->name) }},
+                email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }},
+                allowExpress: !resuming,
+                onLinkAvailability: updateLinkAvailability,
+            });
             let canSave = resuming && savedConsent;
             let linkAvailable = false;
             let loading = false;
@@ -104,13 +87,11 @@ async function initializePaymentForm() {
                 saveCard.disabled = resuming || loading || !(canSave || linkAvailable);
                 if (!(canSave || linkAvailable)) saveCard.checked = false;
             }
-            function updateLinkAvailability(methods) {
-                linkAvailable = !!methods?.link;
+            function updateLinkAvailability(available) {
+                linkAvailable = available;
                 document.getElementById('express-checkout').hidden = !linkAvailable;
                 updateSaveCard();
             }
-            expressCheckout?.on('ready', ({availablePaymentMethods}) => updateLinkAvailability(availablePaymentMethods));
-            expressCheckout?.on('availablepaymentmethodschange', ({paymentMethods}) => updateLinkAvailability(paymentMethods));
             // https://docs.stripe.com/js/element/events/on_change?type=paymentElement
             paymentElement.on('change', (event) => {
                 if (!loading) clearMessage();

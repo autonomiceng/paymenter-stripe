@@ -1,11 +1,14 @@
 <form id="payment-form" class="mt-2" x-data="aeStripeSetup({
     publishableKey: @js($stripePublishableKey), clientSecret: @js($intent->client_secret),
-    intent: @js($intent->id), consentUrl: @js(route('extensions.gateways.ae-stripe.setup-consent')),
+    linkDisplay: @js($linkDisplay), intent: @js($intent->id), consentUrl: @js(route('extensions.gateways.ae-stripe.setup-consent')),
     returnUrl: @js(route('extensions.gateways.ae-stripe.setup-agreement')), csrf: @js(csrf_token()),
     name: {{ \Illuminate\Support\Js::from(auth()->user()->name) }},
     email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }}
 })">
     <div id="error-message" role="alert" class="text-red-600 dark:text-red-400"></div>
+    <div id="express-checkout" class="mb-4" hidden wire:ignore>
+        <div id="express-checkout-element"></div>
+    </div>
     <div id="payment-element" wire:ignore></div>
     <label class="mt-4 block">
         <input type="checkbox" id="setup-consent" required disabled />
@@ -74,6 +77,7 @@ function loadStripe() {
 }
 Alpine.data('aeStripeSetup', (config) => {
     @include('gateways.ae-stripe::stripe-theme')
+    @include('gateways.ae-stripe::stripe-elements')
     let disposed = false;
     let cleanup = () => {};
     return {
@@ -83,8 +87,10 @@ Alpine.data('aeStripeSetup', (config) => {
             const submit = form.querySelector('#submit');
             const message = form.querySelector('#error-message');
             const container = form.querySelector('#payment-element');
+            const expressContainer = form.querySelector('#express-checkout');
             const controller = new AbortController();
             let paymentElement;
+            let expressCheckout;
             let stopThemeSync = () => {};
             let ready = false;
             let loading = false;
@@ -92,6 +98,8 @@ Alpine.data('aeStripeSetup', (config) => {
                 controller.abort();
                 stopThemeSync();
                 paymentElement?.destroy();
+                expressCheckout?.destroy();
+                expressCheckout = null;
                 paymentElement = null;
                 stopThemeSync = () => {};
             };
@@ -100,6 +108,7 @@ Alpine.data('aeStripeSetup', (config) => {
                 if (disposed) return;
                 consent.disabled = isLoading || !ready;
                 container.inert = isLoading;
+                expressContainer.inert = isLoading;
                 submit.disabled = isLoading || !ready || !consent.checked;
                 submit.classList.toggle('hidden', isLoading);
             }
@@ -114,22 +123,35 @@ Alpine.data('aeStripeSetup', (config) => {
                 await loadStripe();
                 if (disposed || !form.isConnected) return;
                 const stripe = Stripe(config.publishableKey);
-                const elements = stripe.elements({clientSecret: config.clientSecret, appearance: stripeAppearance(form)});
-                paymentElement = elements.create('payment', {
-                    layout: {type: 'accordion', defaultCollapsed: false, radios: false, spacedAccordionItems: true},
-                    defaultValues: {billingDetails: {name: config.name, email: config.email}},
+                const created = createStripeElements(stripe, {clientSecret: config.clientSecret, appearance: stripeAppearance(form)}, {
+                    linkDisplay: config.linkDisplay, name: config.name, email: config.email,
+                    onLinkAvailability: available => { if (!disposed) expressContainer.hidden = !available; },
                 });
+                const {elements} = created;
+                paymentElement = created.paymentElement;
+                expressCheckout = created.expressCheckout;
                 stopThemeSync = syncStripeTheme(form, elements);
                 consent.addEventListener('change', () => { if (!loading) setLoading(false); }, {signal: controller.signal});
                 paymentElement.on('change', () => { if (!loading) message.replaceChildren(); });
-                form.addEventListener('submit', async (event) => {
+                form.addEventListener('submit', (event) => {
                     event.preventDefault();
-                    if (disposed || loading || !ready) return;
+                    confirmSetup();
+                }, {signal: controller.signal});
+                expressCheckout?.on('confirm', event => confirmSetup(event));
+                async function confirmSetup(expressEvent = null) {
+                    if (disposed || loading || !ready) {
+                        expressEvent?.paymentFailed({reason: 'fail'});
+                        return;
+                    }
+                    function failSetup(value) {
+                        showMessage(value);
+                        expressEvent?.paymentFailed({reason: 'fail'});
+                    }
                     message.replaceChildren();
                     setLoading(true);
                     try {
                         if (!consent.checked) {
-                            showMessage('Agree to future charges before saving your payment method.');
+                            failSetup('Agree to future charges before saving your payment method.');
                             return;
                         }
                         const result = await fetch(config.consentUrl, {
@@ -138,7 +160,7 @@ Alpine.data('aeStripeSetup', (config) => {
                             body: JSON.stringify({intent: config.intent, consent: consent.checked, version: 'off_session_v2'}),
                         });
                         if (!result.ok) {
-                            showMessage('Could not record your agreement. Try again.');
+                            failSetup('Could not record your agreement. Try again.');
                             return;
                         }
                         if (disposed) return;
@@ -146,12 +168,12 @@ Alpine.data('aeStripeSetup', (config) => {
                         if (error) throw error;
                     } catch (error) {
                         if (disposed) return;
-                        showMessage(['card_error', 'validation_error'].includes(error?.type) && error.message
+                        failSetup(['card_error', 'validation_error'].includes(error?.type) && error.message
                             ? error.message : 'Could not save your payment method. Try again.');
                     } finally {
                         setLoading(false);
                     }
-                }, {signal: controller.signal});
+                }
                 function showMessage(value) {
                     const text = document.createElement('p');
                     text.className = 'mb-2';
@@ -160,6 +182,7 @@ Alpine.data('aeStripeSetup', (config) => {
                 }
                 paymentElement.on('ready', () => { ready = true; setLoading(false); });
                 paymentElement.on('loaderror', initializationError);
+                expressCheckout?.mount(form.querySelector('#express-checkout-element'));
                 paymentElement.mount(container);
             } catch (error) {
                 cleanup();

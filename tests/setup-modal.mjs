@@ -13,6 +13,8 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const theme = readFileSync(`${root}extension/AeStripe/resources/views/stripe-theme.blade.php`, 'utf8');
 let view = readFileSync(`${root}extension/AeStripe/resources/views/billing-agreement.blade.php`, 'utf8')
     .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
+    .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(`${root}extension/AeStripe/resources/views/stripe-elements.blade.php`, 'utf8'))
+    .replace('@js($linkDisplay)', "'above_card'")
     .replace(/@if\(config\('settings.tos'\)\)[\s\S]*?@endif/g, '')
     .replace(/@js\(route\('([^']+)'\)\)/g, (_, name) => `'/${name}'`)
     .replace(/@js\(csrf_token\(\)\)/g, "'fixture-csrf'")
@@ -46,7 +48,7 @@ try {
     const pendingConsent = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.addInitScript(() => {
-        window.probe = { created: 0, destroyed: 0, active: 0, confirms: 0, consent: 0, scripts: 0, failConsent: false, themeListeners: 0 };
+        window.probe = { created: 0, destroyed: 0, active: 0, confirms: 0, consent: 0, scripts: 0, expressCreated: 0, expressDestroyed: 0, failConsent: false, themeListeners: 0 };
         const add = MediaQueryList.prototype.addEventListener;
         const remove = MediaQueryList.prototype.removeEventListener;
         MediaQueryList.prototype.addEventListener = function (type, ...args) { if (type === 'change') probe.themeListeners++; return add.call(this, type, ...args); };
@@ -56,7 +58,8 @@ try {
                 probe.created++;
                 probe.active++;
                 return { update() {}, create(type, options) {
-                    if (type !== 'payment' || options.wallets?.link === 'never') throw new Error('Link must stay available');
+                    if (!['payment', 'expressCheckout'].includes(type) || options.wallets?.link === 'never') throw new Error('Link must stay available');
+                    if (type === 'expressCheckout') probe.expressCreated++;
                     let target;
                     const listeners = {};
                     return {
@@ -64,10 +67,13 @@ try {
                         mount(container) {
                             target = typeof container === 'string' ? document.querySelector(container) : container;
                             assertTarget(target);
-                            target.innerHTML = '<input aria-label="Card number" value="4242" />';
-                            listeners.ready?.();
+                            target.innerHTML = type === 'payment' ? '<input aria-label="Card number" value="4242" />' : '<button type="button">Pay with Link</button>';
+                            listeners.ready?.({availablePaymentMethods: {link: true}});
                         },
-                        destroy() { probe.active--; probe.destroyed++; target?.replaceChildren(); },
+                        destroy() {
+                            if (type === 'payment') { probe.active--; probe.destroyed++; } else probe.expressDestroyed++;
+                            target?.replaceChildren();
+                        },
                     };
                 } };
             },
@@ -141,6 +147,8 @@ try {
     const counts = await page.evaluate(() => probe);
     assert.equal(counts.active, 0, 'Closing disposes every Element');
     assert.equal(counts.created, counts.destroyed, 'No leaked Elements');
+    assert.equal(counts.expressCreated, counts.created, 'Every open mounts Link Express alongside the Payment Element');
+    assert.equal(counts.expressCreated, counts.expressDestroyed, 'Closing disposes every Express Element');
     assert.equal(counts.themeListeners, 0, 'No leaked theme listeners');
     assert.equal(counts.scripts, 1, 'Stripe.js loads once across reopen cycles');
     assert.equal(counts.consent, 7, 'Repeated submits during a consent request are ignored');

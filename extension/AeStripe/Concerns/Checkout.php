@@ -70,16 +70,19 @@ trait Checkout
             ]);
         }
 
-        $linkDisplay = $this->config('stripe_link_display');
-        if (!in_array($linkDisplay, ['above_card', 'inside_card', 'stripe_default'], true)) $linkDisplay = 'above_card';
-
         return view('gateways.ae-stripe::pay', [
             'invoice' => $invoice, 'total' => $total, 'intent' => $intent,
             'autoPayDates' => $this->invoiceAutoPayDates($invoice),
             'customerSessionSecret' => $session?->client_secret,
             'stripePublishableKey' => $this->config('stripe_publishable_key'),
-            'linkDisplay' => $linkDisplay,
+            'linkDisplay' => $this->stripeLinkDisplay(),
         ]);
+    }
+
+    private function stripeLinkDisplay(): string
+    {
+        $value = $this->config('stripe_link_display');
+        return in_array($value, ['above_card', 'inside_card', 'stripe_default'], true) ? $value : 'above_card';
     }
 
     private function checkoutPaymentData($invoice, int $amount, string $customer): array
