@@ -182,8 +182,8 @@ Alpine.data('aeStripeSetup', (config) => {
                 }
                 paymentElement.on('ready', () => { ready = true; setLoading(false); });
                 paymentElement.on('loaderror', initializationError);
-                expressCheckout?.mount(form.querySelector('#express-checkout-element'));
                 paymentElement.mount(container);
+                created.mountExpress(form.querySelector('#express-checkout-element'));
             } catch (error) {
                 cleanup();
                 initializationError();

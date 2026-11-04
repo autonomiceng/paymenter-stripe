@@ -34,7 +34,8 @@ let activePage;
 try {
     const forms = process.argv.slice(2).length ? process.argv.slice(2) : ['pay', 'billing-agreement'];
     const cases = forms.flatMap(name => [
-        [name, 'above_card', true],
+        [name, 'above_card', 'create'],
+        [name, 'above_card', 'mount'],
         ...['above_card', 'inside_card', 'stripe_default'].map(mode => [name, mode, false]),
     ]);
     for (const [name, linkDisplay, expressThrows] of cases) {
@@ -63,10 +64,11 @@ try {
                     return {};
                 }, create(type, options) {
                     elementCalls.push({type, options});
-                    if (type === 'expressCheckout' && expressThrows) throw new Error('Express Checkout is unsupported');
+                    if (type === 'expressCheckout' && expressThrows === 'create') throw new Error('Express Checkout is unsupported');
                     if (type === 'payment') window.paymentElementOptions = options;
                     const handlers = elementHandlers[type] = {};
                     return { on: (name, fn) => { handlers[name] = fn; }, mount(selector) {
+                        if (type === 'expressCheckout' && expressThrows === 'mount') throw new Error('Express Checkout cannot mount');
                         (typeof selector === 'string' ? document.querySelector(selector) : selector).textContent =
                             type === 'payment' ? 'Card form' : 'Pay with Link';
                         handlers.ready?.({availablePaymentMethods: {link: true}});
@@ -129,11 +131,11 @@ try {
             assert.deepEqual(calls.filter(call => call.type === 'expressCheckout').map(call => call.options),
                 linkDisplay === 'above_card' ? [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
                     amazonPay: 'never', paypal: 'never', klarna: 'never'}}] : []);
-            if (expressThrows) assert.equal(await page.locator('#setup-consent').isEnabled(), true, 'Card setup stays ready when Express creation throws');
+            if (expressThrows) assert.equal(await page.locator('#setup-consent').isEnabled(), true, 'Card setup stays ready when Express fails');
             await page.locator('#setup-consent').check();
         }
         if (expressThrows) {
-            assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${name}: card form mounts when Express creation throws`);
+            assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${name}: card form mounts when Express fails`);
             assert.equal(await page.locator('#express-checkout').isVisible(), false, `${name}: failed Express row stays hidden`);
             assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: card submission remains available`);
         }

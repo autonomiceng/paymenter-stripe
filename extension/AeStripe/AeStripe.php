@@ -258,7 +258,8 @@ class AeStripe extends Gateway
                     'stripe_default' => 'Stripe default'],
                 'default' => 'above_card',
                 'hint' => fn () => new \Illuminate\Support\HtmlString('<span tabindex="0" title="Choose where Link appears. Stripe default also prefills the customer email.">?</span>'),
-                'required' => true,
+                // Gateways saved before this setting have no value; they read as the default.
+                'required' => false,
             ],
             [
                 'name' => 'stripe_webhook_secret',

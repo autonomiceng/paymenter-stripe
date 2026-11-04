@@ -72,7 +72,7 @@ async function initializePaymentForm() {
             const resuming = @js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true));
             const savedConsent = @js(($intent->metadata->ae_stripe_consent ?? null) === '1');
             // The server still checks the invoice balance before confirming.
-            const {elements, paymentElement, expressCheckout} = createStripeElements(stripe, options, {
+            const {elements, paymentElement, expressCheckout, mountExpress} = createStripeElements(stripe, options, {
                 linkDisplay: @js($linkDisplay),
                 name: {{ \Illuminate\Support\Js::from(auth()->user()->name) }},
                 email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }},
@@ -196,8 +196,8 @@ async function initializePaymentForm() {
 
             paymentElement.on('ready', () => { ready = true; setLoading(false); });
             paymentElement.on('loaderror', initializationError);
-            expressCheckout?.mount('#express-checkout-element');
             paymentElement.mount('#payment-element');
+            mountExpress('#express-checkout-element');
 
             $wire.on('invoice.payment.cancelled', () => {
                 // destroy the payment element

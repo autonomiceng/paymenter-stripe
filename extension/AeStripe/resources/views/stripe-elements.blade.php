@@ -26,5 +26,14 @@ function createStripeElements(stripe, options, {linkDisplay, name, email, allowE
     expressCheckout?.on('ready', ({availablePaymentMethods}) => updateAvailability(availablePaymentMethods));
     expressCheckout?.on('availablepaymentmethodschange', ({paymentMethods}) => updateAvailability(paymentMethods));
     expressCheckout?.on('loaderror', () => onLinkAvailability(false));
-    return {elements, paymentElement, expressCheckout};
+    // Mount the card form first. A failed Link mount only hides its row.
+    function mountExpress(target) {
+        if (!expressCheckout) return;
+        try {
+            expressCheckout.mount(target);
+        } catch (error) {
+            queueMicrotask(() => onLinkAvailability(false));
+        }
+    }
+    return {elements, paymentElement, expressCheckout, mountExpress};
 }
