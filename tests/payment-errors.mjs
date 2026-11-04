@@ -36,6 +36,7 @@ try {
     const cases = forms.flatMap(name => [
         [name, 'above_card', 'create'],
         [name, 'above_card', 'mount'],
+        [name, 'above_card', 'unavailable'],
         ...['above_card', 'inside_card', 'stripe_default'].map(mode => [name, mode, false]),
     ]);
     for (const [name, linkDisplay, expressThrows] of cases) {
@@ -71,7 +72,8 @@ try {
                         if (type === 'expressCheckout' && expressThrows === 'mount') throw new Error('Express Checkout cannot mount');
                         (typeof selector === 'string' ? document.querySelector(selector) : selector).textContent =
                             type === 'payment' ? 'Card form' : 'Pay with Link';
-                        handlers.ready?.({availablePaymentMethods: {link: true}});
+                        // No available methods also models Link being disabled on the account.
+                        handlers.ready?.({availablePaymentMethods: expressThrows === 'unavailable' ? null : {link: true}});
                     }, destroy() {} };
                 } }; },
                 async createConfirmationToken({elements}) {
@@ -139,7 +141,12 @@ try {
             assert.equal(await page.locator('#express-checkout').isVisible(), false, `${name}: failed Express row stays hidden`);
             assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: card submission remains available`);
         }
-        assert.notEqual(await page.evaluate(() => paymentElementOptions.wallets?.link ?? 'auto'), 'never', `${name}: Link stays available`);
+        assert.deepEqual(await page.evaluate(() => paymentElementOptions.wallets),
+            linkDisplay === 'above_card' ? {link: 'never'} : undefined,
+            `${name}: ${linkDisplay} keeps Link only in Express Checkout while other modes keep Stripe's defaults`);
+        if (linkDisplay === 'above_card') {
+            assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${name}: above-card always mounts the card form`);
+        }
         const fallback = name === 'pay' ? 'Could not check the payment. Refresh the invoice for its status.' : 'Could not save your payment method. Try again.';
         for (const failure of ['network', 'confirmation', ...(name === 'pay' ? ['updates'] : []), 'consent', 'decline']) {
             await page.evaluate(value => { window.failure = value; }, failure);

@@ -4,6 +4,8 @@ function createStripeElements(stripe, options, {linkDisplay, name, email, allowE
         layout: {type: 'accordion', defaultCollapsed: false, radios: false, spacedAccordionItems: true},
         defaultValues: {billingDetails: {name}},
     };
+    // Keep returning Link users in the button above, leaving the card fields visible.
+    if (linkDisplay === 'above_card' && allowExpress) paymentOptions.wallets = {link: 'never'};
     if (linkDisplay === 'stripe_default') paymentOptions.defaultValues.billingDetails.email = email;
     const elements = stripe.elements(options);
     const paymentElement = elements.create('payment', paymentOptions);
