@@ -39,7 +39,9 @@ foreach (['pay', 'billing-agreement'] as $name) {
     $formScript = $name === 'pay' ? $script : substr($script, strpos($script, "Alpine.data('aeStripeSetup'"));
     check(!str_contains($formScript, 'setTimeout'), "$name: payment errors are never hidden on a timer");
     check(str_contains($view, '<div id="error-message" role="alert"'), "$name: errors are announced and stay mounted");
-    check(preg_match('/preventDefault\(\);\s+(?:if \(disposed \|\| loading \|\| !ready\) return;\s+)?(clearMessage\(\)|message\.replaceChildren\(\));\s+setLoading\(true\)/', $view) === 1,
+    // The form and the Link button share one confirm function; it clears the previous error before loading.
+    check(preg_match('/preventDefault\(\);\s+confirm(Payment|Setup)\(\);/', $view, $submit) === 1
+        && preg_match('/async function confirm' . $submit[1] . '\(expressEvent = null\) \{.*?(clearMessage\(\)|message\.replaceChildren\(\));\s+setLoading\(true\)/s', $view) === 1,
         "$name: the next submit clears the previous error");
     check(!preg_match("/theme:\s*'(night|stripe)'/", $view), "$name: Stripe theme is not hard-coded");
     check(str_contains($view, "@include('gateways.ae-stripe::stripe-theme')")
@@ -87,7 +89,7 @@ check(!$recordsConsentBeforeConfirmation(str_replace($confirmSetupCall, '', $set
     'Setup order check rejects missing confirmation');
 check(!$recordsConsentBeforeConfirmation(strtr($setupView, [$recordConsentCall => $confirmSetupCall, $confirmSetupCall => $recordConsentCall])),
     'Setup order check rejects confirmation before consent recording');
-$consentFailureGuard = "if (!result.ok) {\n                            showMessage('Could not record your agreement. Try again.');\n                            return;\n                        }";
+$consentFailureGuard = "if (!result.ok) {\n                            failSetup('Could not record your agreement. Try again.');\n                            return;\n                        }";
 $guardsConsentBeforeConfirmation = static function ($view) use ($recordConsentCall, $consentFailureGuard, $confirmSetupCall) {
     $consentPosition = strpos($view, $recordConsentCall);
     $guardPosition = strpos($view, $consentFailureGuard);
@@ -108,7 +110,7 @@ check(str_contains($setupView, 'if (error) throw error;') && str_contains($setup
 
 $payView = file_get_contents($views . 'pay.blade.php');
 check(str_contains($payView, "@checked(in_array($" . "intent->status, ['requires_action', 'requires_confirmation']")
-    && str_contains($payView, 'save: resuming ? savedConsent :')
+    && str_contains($payView, 'const save = resuming ? savedConsent :') && str_contains($payView, 'amount: @js($intent->amount), save}')
     && str_contains($payView, 'saveCard.disabled = resuming ||'), '3DS resume visibly preserves its recorded save choice');
 
 check(str_contains($payView, 'if (customerSessionSecret) options.customerSessionClientSecret = customerSessionSecret;'),

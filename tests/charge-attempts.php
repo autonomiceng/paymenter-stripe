@@ -20,13 +20,19 @@ use Illuminate\Support\Facades\{DB, Http};
         ExtensionHelper::$agreements = ['pm_test' => ['id' => 4, 'user_id' => 7, 'gateway_id' => 3],
             'pm_other' => ['id' => 5, 'user_id' => 7, 'gateway_id' => 3]];
         $stripe = new class {
-            public array $intents = [], $cache = [], $charges = [], $confirms = [], $refunds = [];
+            public array $intents = [], $setups = [], $cache = [], $charges = [], $confirms = [], $refunds = [];
             public $beforeCreate, $beforeConfirm, $failure;
             public string $status = 'succeeded';
             public bool $loseCreate = false, $loseConfirm = false, $dropCreate = false;
             public function request($verb, $path, $data) {
                 if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
                 if ($path === '/customer_sessions') return ['client_secret' => 'cuss_test'];
+                if ($path === '/setup_intents') {
+                    $id = 'seti_display';
+                    return $this->setups[$id] = (object) ['id' => $id, 'status' => 'requires_payment_method',
+                        'customer' => $data['customer'], 'client_secret' => 'fixture-secret', 'metadata' => (object) $data['metadata']];
+                }
+                if ($path === '/setup_intents/seti_display') return $this->setups['seti_display'];
                 if (str_starts_with($path, '/payment_methods/')) return (object) ['id' => substr($path, 17), 'customer' => 'cus_owner', 'type' => 'card'];
                 if ($path === '/payment_intents/search') return (object) ['data' => [], 'has_more' => false];
                 if ($this->failure) ($this->failure)($verb, $path, $data);
@@ -305,6 +311,27 @@ use Illuminate\Support\Facades\{DB, Http};
                 $invoice->id++; Invoice::$rows[$invoice->id] = $invoice;
                 ExtensionHelper::$agreements = ['pm_test' => ['id' => 4, 'user_id' => 7, 'gateway_id' => 3]];
             }
+        });
+        $run('link-display-settings', function ($invoice, $stripe) use ($gateway) {
+            $settings = array_column($gateway->getConfig(), null, 'name');
+            $setting = $settings['stripe_link_display'] ?? [];
+            check(($setting['label'] ?? null) === 'Link at checkout' && ($setting['type'] ?? null) === 'select',
+                'The gateway offers one Link at checkout selector');
+            check(($setting['options'] ?? null) === ['above_card' => 'Link button above card',
+                'inside_card' => 'Inside card form', 'stripe_default' => 'Stripe default']
+                && ($setting['default'] ?? null) === 'above_card' && isset($setting['hint']),
+                'Link display has three plain choices, hover help and the above-card default');
+            foreach ([null, '', 'unknown', 'above_card', 'inside_card', 'stripe_default'] as $value) {
+                $configured = new \Paymenter\Extensions\Gateways\AeStripe\AeStripe(array_replace($gateway->config,
+                    $value === null ? [] : ['stripe_link_display' => $value]));
+                $view = $configured->pay($invoice, 20);
+                check(($view['data']['linkDisplay'] ?? null) === (in_array($value, ['inside_card', 'stripe_default'], true) ? $value : 'above_card'),
+                    'Checkout reads the saved choice and defaults old or empty gateways to Link above card');
+                $setup = $configured->createBillingAgreement($invoice->user);
+                check(($setup['data']['linkDisplay'] ?? null) === (in_array($value, ['inside_card', 'stripe_default'], true) ? $value : 'above_card'),
+                    'Save-a-card reads the same saved choice and default as checkout');
+            }
+            check(!$stripe->charges, 'Choosing the Link display never charges on opening checkout');
         });
         $run('create-elements', function ($invoice, $stripe) use ($gateway) {
             $view = $gateway->pay($invoice, 20);

@@ -251,6 +251,17 @@ class AeStripe extends Gateway
                 'required' => false,
             ],
             [
+                'name' => 'stripe_link_display',
+                'label' => 'Link at checkout',
+                'type' => 'select',
+                'options' => ['above_card' => 'Link button above card', 'inside_card' => 'Inside card form',
+                    'stripe_default' => 'Stripe default'],
+                'default' => 'above_card',
+                'hint' => fn () => new \Illuminate\Support\HtmlString('<span tabindex="0" title="Choose where Link appears. Stripe default also prefills the customer email.">?</span>'),
+                // Gateways saved before this setting have no value; they read as the default.
+                'required' => false,
+            ],
+            [
                 'name' => 'stripe_webhook_secret',
                 'label' => 'Stripe webhook signing secret',
                 'type' => 'text',
@@ -634,6 +645,7 @@ class AeStripe extends Gateway
 
         // Return the client secret to the frontend to complete the setup
         return view('gateways.ae-stripe::billing-agreement', ['intent' => $setupIntent, 'type' => 'setup', 'stripePublishableKey' => $this->config('stripe_publishable_key'),
+            'linkDisplay' => $this->stripeLinkDisplay(),
             'autoPayConsentVersion' => self::AUTO_PAY_CONSENT, 'autoPayDefault' => $this->autoPayDefault($user)]);
     }
 

@@ -75,7 +75,14 @@ trait Checkout
             'autoPayDates' => $this->invoiceAutoPayDates($invoice),
             'customerSessionSecret' => $session?->client_secret,
             'stripePublishableKey' => $this->config('stripe_publishable_key'),
+            'linkDisplay' => $this->stripeLinkDisplay(),
         ]);
+    }
+
+    private function stripeLinkDisplay(): string
+    {
+        $value = $this->config('stripe_link_display');
+        return in_array($value, ['above_card', 'inside_card', 'stripe_default'], true) ? $value : 'above_card';
     }
 
     private function checkoutPaymentData($invoice, int $amount, string $customer): array
