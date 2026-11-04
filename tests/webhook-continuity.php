@@ -115,6 +115,31 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         $stateKey = 'ae_stripe_webhook_continuity';
         $state = json_decode($extension->settingValues->values[$stateKey], true);
         check($state['account'] === 'acct_original' && $state['endpoint'] === 'we_existing', 'Saving pins the Stripe account and endpoint without proving the signing secret');
+        $extension->settingValues->values['stripe_link_display'] = 'inside_card';
+        $beforeSettings = $extension->settingValues->values; $before = count(Http::$calls);
+        $failure = 'get'; // An unrelated edit must also succeed while Stripe is unreachable.
+        $gateway->updated($extension);
+        check(count(Http::$calls) === $before && $extension->settingValues->values === $beforeSettings,
+            'Changing only Link at checkout makes zero Stripe requests and leaves verified credentials and state untouched');
+        $failure = null;
+        foreach (['stripe_secret_key' => 'rk_test_single_change', 'stripe_publishable_key' => 'pk_test_single_change',
+            'stripe_webhook_secret' => 'whsec_single_change'] as $name => $value) {
+            $original = $extension->settingValues->values[$name];
+            $extension->settingValues->values[$name] = $value; $before = count(Http::$calls);
+            $gateway->updated($extension);
+            $requests = array_slice(Http::$calls, $before);
+            check(array_column($requests, 1) === ['/account', '/webhook_endpoints'] && $gateway->config($name) === $value,
+                'Changing one Stripe credential still checks the account and full endpoint list: ' . $name);
+            $extension->settingValues->values[$name] = $original; $gateway->updated($extension);
+        }
+        // The retry notice tells staff to save; that save must check Stripe even with unchanged keys.
+        $extension->settingValues->values['ae_stripe_webhook_events'] = 'retry'; $before = count(Http::$calls);
+        $gateway->updated($extension);
+        check(array_slice(array_column(array_slice(Http::$calls, $before), 1), 0, 2) === ['/account', '/webhook_endpoints']
+            && $extension->settingValues->values['ae_stripe_webhook_events'] === 'ready',
+            'A save while webhook events wait for retry runs the full check and clears the retry notice');
+        $extension->settingValues->values = $beforeSettings;
+        $gateway = new AeStripe($beforeSettings);
         $before = count(Http::$calls); $secondPage = true;
         $extension->settingValues->values['stripe_secret_key'] = 'rk_test_replacement';
         $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_rotated';
@@ -182,6 +207,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         rejects(fn () => $gateway->updated($extension), "Copy this endpoint's signing secret from Stripe, then save again. Its existing deliveries have been preserved.");
         check($extension->settingValues->values['stripe_webhook_secret'] === 'whsec_second_rotation', 'Clearing the signing secret preserves the old accepted secret and endpoint');
         $endpoint->url = 'https://old.example.invalid/extensions/ae-stripe/webhook';
+        $extension->settingValues->values['stripe_publishable_key'] = 'pk_test_site_moved';
         $gateway->updated($extension);
         check($endpoint->url === route('extensions.gateways.ae-stripe.webhook'), 'A site URL change updates the same endpoint, keeping pending deliveries and its signing secret');
         $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_emergency';
@@ -246,6 +272,59 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         check(count($creates) === 2 && !empty($creates[0][3]['Idempotency-Key']) && $creates[0][3]['Idempotency-Key'] === $creates[1][3]['Idempotency-Key'], 'Webhook creation uses a stable retry identity');
         check(!array_filter(Http::$calls, fn ($call) => $call[0] === 'delete'), 'No credential edit deletes a Stripe endpoint');
 
+        $endpoints = [];
+        $extension->settingValues->values = $config;
+        $gateway = new AeStripe($config); $before = count(Http::$calls);
+        $gateway->updated($extension);
+        $cliState = json_decode($extension->settingValues->values[$stateKey], true);
+        check($cliState['account'] === 'acct_original' && $cliState['mode'] === 'test'
+            && $cliState['endpoint'] === null && $cliState['delivery'] === 'stripe_cli'
+            && $cliState['credentials'] === $config && $cliState['previous'] === [],
+            'TEST mode with a saved secret and no endpoint saves verified CLI forwarding state');
+        check(array_column(array_slice(Http::$calls, $before), 1) === ['/account', '/webhook_endpoints'],
+            'CLI forwarding verifies the account and endpoint list without creating an endpoint');
+        $configFields = array_column((new AeStripe)->getConfig(), null, 'name');
+        check(str_contains($configFields['stripe_webhook_secret']['description'], 'Webhooks: Stripe CLI forwarding (test mode)'),
+            'The gateway webhook setting plainly shows test-mode CLI forwarding');
+        check($gateway->webhook(eventRequest((object) ['id' => 'pi_cli', 'metadata' => (object) ['ae_stripe_gateway' => '1']]))['status'] === 200,
+            'CLI-forwarded events authenticate with the saved signing secret');
+        $extension->settingValues->values['stripe_link_display'] = 'stripe_default';
+        $beforeSettings = $extension->settingValues->values; $before = count(Http::$calls);
+        $gateway->updated($extension);
+        check(count(Http::$calls) === $before && $extension->settingValues->values === $beforeSettings,
+            'Unrelated saves of verified CLI forwarding make zero Stripe requests');
+        foreach ([['stripe_secret_key' => 'rk_test_otheraccount'],
+            ['stripe_secret_key' => 'rk_live_original', 'stripe_publishable_key' => 'pk_live_original']] as $replacement) {
+            $extension->settingValues->values = array_replace($beforeSettings, $replacement);
+            rejects(fn () => $gateway->updated($extension), 'Keep this gateway on its original Stripe account and mode. Use a separate gateway for another account.');
+            check(array_intersect_key($extension->settingValues->values, $config) === $config
+                && json_decode($extension->settingValues->values[$stateKey], true) === $cliState,
+                'CLI forwarding retains the original account and mode lock and restores refused credentials');
+        }
+        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_cli_rotated';
+        $gateway->updated($extension);
+        $rotatedCli = json_decode($extension->settingValues->values[$stateKey], true);
+        check($rotatedCli['delivery'] === 'stripe_cli' && $rotatedCli['previous'] === [['secret' => 'whsec_test', 'until' => null]],
+            'CLI forwarding retains outgoing secrets until a signed delivery proves the replacement');
+        $extension->settingValues->values['stripe_revoke_previous_secrets'] = true; $before = count(Http::$calls);
+        $gateway->updated($extension);
+        check(json_decode($extension->settingValues->values[$stateKey], true)['previous'] === []
+            && array_column(array_slice(Http::$calls, $before), 1) === ['/account', '/webhook_endpoints'],
+            'Explicit CLI secret revocation runs verification even with unchanged credentials');
+
+        $liveConfig = ['stripe_secret_key' => 'rk_live_original', 'stripe_publishable_key' => 'pk_live_original', 'stripe_webhook_secret' => 'whsec_live_fixture'];
+        $extension->settingValues->values = $liveConfig;
+        $gateway = new AeStripe($liveConfig); $before = count(Http::$calls);
+        rejects(fn () => $gateway->updated($extension), 'The saved Stripe webhook is missing. Restore its endpoint or verify its delivery history before changing setup.');
+        check(!isset($extension->settingValues->values[$stateKey])
+            && array_intersect_key($extension->settingValues->values, $liveConfig) === $liveConfig
+            && array_column(array_slice(Http::$calls, $before), 1) === ['/account', '/webhook_endpoints'],
+            'Live mode keeps the missing-endpoint refusal and credentials without creating CLI state or an endpoint');
+        $configFields = array_column((new AeStripe)->getConfig(), null, 'name');
+        check(!str_contains($configFields['stripe_webhook_secret']['description'], 'Stripe CLI forwarding'),
+            'The live gateway never shows test-mode CLI forwarding');
+
+        $endpoints = [$endpoint];
         foreach ([401, 403, 'timeout'] as $oldKeyFailure) {
             $extension->settingValues->values = array_replace($config, ['stripe_secret_key' => 'rk_test_otheraccount']);
             $gateway = new AeStripe(array_replace($config, ['stripe_secret_key' => 'rk_test_revoked']));

@@ -374,9 +374,10 @@ explicit customer Pay takes over immediately.
 ## Webhook continuity
 
 Before the first credential rotation after upgrade, save the existing working keys
-and signing secret once. Each save verifies `GET /v1/account` and the paginated
-webhook list. Keep the same Stripe account and test/live mode; API-key replacement
-is allowed on that account. The restricted key needs account-read and endpoint-read
+and signing secret once. That first save, credential changes and explicit secret
+revocation verify `GET /v1/account` and the paginated webhook list. Other setting
+changes make no Stripe requests or credential changes. Keep the same Stripe account
+and test/live mode; API-key replacement is allowed on that account. The restricted key needs account-read and endpoint-read
 permissions plus endpoint-write when creating or updating setup. Use the account's
 matching publishable key; Stripe's account read does not prove a publishable key's
 account identity.
@@ -395,9 +396,13 @@ secret Stripe is still using. Signature timestamps retain the five-minute replay
 Stripe's [three-day automatic delivery retry window](https://docs.stripe.com/webhooks#automatic-retries).
 Do not log, copy into reports, or screenshot signing secrets or API keys.
 
-Existing endpoints are reused, including the legacy StripeSaved route. URL changes
-update the same endpoint; pending deliveries, API version, enabled/disabled status
-and existing event subscriptions remain. The [endpoint update API](https://docs.stripe.com/api/webhook_endpoints/update)
+In test mode, a saved signing secret with no matching endpoint records Stripe CLI
+forwarding and shows that status beside the webhook setting. Live mode still refuses
+a missing endpoint. Account, mode, key-pairing and secret-rotation checks still apply.
+
+Existing endpoints are reused, including the legacy StripeSaved route. A credential
+save after a URL change updates the same endpoint; pending deliveries, API version,
+enabled/disabled status and existing event subscriptions remain. The [endpoint update API](https://docs.stripe.com/api/webhook_endpoints/update)
 supports URL and event edits; API version is only set when creating a new endpoint.
 An existing endpoint with a missing local secret is preserved and asks for its secret
 from Stripe, since Stripe's list API cannot recover it. No endpoint is deleted.

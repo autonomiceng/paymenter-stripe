@@ -127,6 +127,10 @@ trait WebhookContinuity
             $credentials = [];
             foreach ($names as $name) $credentials[$name] = (string) ($gateway->settings()->where('key', $name)->first()?->value ?? '');
             $revokePrevious = (bool) $gateway->settings()->where('key', 'stripe_revoke_previous_secrets')->first()?->value;
+            // The retry notice asks staff to save, so that save must verify even with unchanged credentials.
+            $eventsRetry = $gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'retry';
+            // Compare persisted fields under the same lock as verification, not the stale form snapshot.
+            if ($state && !$revokePrevious && !$eventsRetry && !array_diff_assoc($credentials, $state['credentials'] ?? [])) return null;
             $gateway->settings()->updateOrCreate(['key' => 'stripe_revoke_previous_secrets'], ['value' => false]);
             // Paymenter's edit hook runs after settings writes, with its previously loaded settings
             // still supplied to this instance. Keep that snapshot on the first upgraded save too.
@@ -189,7 +193,8 @@ trait WebhookContinuity
                     if ($endpoint->url !== $url || !in_array('*', $existingEvents, true) && array_diff($events, $existingEvents)) {
                         $this->continuityRequest($key, 'post', '/webhook_endpoints/' . $endpoint->id, $params);
                     }
-                } else {
+                } elseif ($mode !== 'test' || $credentials['stripe_webhook_secret'] === '') {
+                    // Only a test-mode secret may come from Stripe CLI without a registered endpoint.
                     if ($credentials['stripe_webhook_secret'] !== '' || !empty($state['endpoint'])) throw new DisplayException('The saved Stripe webhook is missing. Restore its endpoint or verify its delivery history before changing setup.');
                     $endpoint = $this->continuityRequest($key, 'post', '/webhook_endpoints', $createParams, $createKey);
                     if (empty($endpoint->id) || empty($endpoint->secret)) throw new DisplayException('Stripe did not return the new webhook details. Save again to recover the same endpoint.');
@@ -203,7 +208,8 @@ trait WebhookContinuity
                     $previous[] = ['secret' => $old['stripe_webhook_secret'], 'until' => null];
                 }
                 if ($revokePrevious) $previous = [];
-                $state = ['account' => $account, 'mode' => $mode, 'endpoint' => $endpoint->id,
+                $state = ['account' => $account, 'mode' => $mode, 'endpoint' => $endpoint->id ?? null,
+                    'delivery' => $endpoint ? 'endpoint' : 'stripe_cli',
                     'credentials' => $credentials, 'previous' => $previous];
                 foreach ($credentials as $name => $value) $gateway->settings()->updateOrCreate(['key' => $name], [
                     'value' => $value, 'encrypted' => $name !== 'stripe_publishable_key',
