@@ -33,12 +33,17 @@ const browser = await chromium.launch({ headless: true });
 let activePage;
 try {
     const forms = process.argv.slice(2).length ? process.argv.slice(2) : ['pay', 'billing-agreement'];
-    for (const [name, linkDisplay] of forms.flatMap(name => ['above_card', 'inside_card', 'stripe_default'].map(mode => [name, mode]))) {
+    const cases = forms.flatMap(name => [
+        [name, 'above_card', true],
+        ...['above_card', 'inside_card', 'stripe_default'].map(mode => [name, mode, false]),
+    ]);
+    for (const [name, linkDisplay, expressThrows] of cases) {
         const page = activePage = await browser.newPage();
         await page.route('**/*', route => route.fulfill({ contentType: 'text/javascript', body: '' }));
         page.setDefaultTimeout(5000);
         await page.setContent('<html><body></body></html>');
-        await page.evaluate(() => {
+        await page.evaluate(expressThrows => {
+            window.expressThrows = expressThrows;
             window.failure = 'network';
             window.confirms = 0;
             window.elementCalls = [];
@@ -58,10 +63,12 @@ try {
                     return {};
                 }, create(type, options) {
                     elementCalls.push({type, options});
+                    if (type === 'expressCheckout' && expressThrows) throw new Error('Express Checkout is unsupported');
                     if (type === 'payment') window.paymentElementOptions = options;
                     const handlers = elementHandlers[type] = {};
                     return { on: (name, fn) => { handlers[name] = fn; }, mount(selector) {
-                        if (type === 'expressCheckout') (typeof selector === 'string' ? document.querySelector(selector) : selector).textContent = 'Pay with Link';
+                        (typeof selector === 'string' ? document.querySelector(selector) : selector).textContent =
+                            type === 'payment' ? 'Card form' : 'Pay with Link';
                         handlers.ready?.({availablePaymentMethods: {link: true}});
                     }, destroy() {} };
                 } }; },
@@ -84,7 +91,7 @@ try {
                 if (failure === 'action-success') return {};
                 return { error: { type: 'card_error', message: 'Your card was declined.' } };
             }
-        });
+        }, expressThrows);
         await page.setContent(render(name, linkDisplay));
         if (name === 'pay') {
             await page.waitForFunction(() => !!document.querySelector('script[src]'));
@@ -122,7 +129,13 @@ try {
             assert.deepEqual(calls.filter(call => call.type === 'expressCheckout').map(call => call.options),
                 linkDisplay === 'above_card' ? [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
                     amazonPay: 'never', paypal: 'never', klarna: 'never'}}] : []);
+            if (expressThrows) assert.equal(await page.locator('#setup-consent').isEnabled(), true, 'Card setup stays ready when Express creation throws');
             await page.locator('#setup-consent').check();
+        }
+        if (expressThrows) {
+            assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${name}: card form mounts when Express creation throws`);
+            assert.equal(await page.locator('#express-checkout').isVisible(), false, `${name}: failed Express row stays hidden`);
+            assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: card submission remains available`);
         }
         assert.notEqual(await page.evaluate(() => paymentElementOptions.wallets?.link ?? 'auto'), 'never', `${name}: Link stays available`);
         const fallback = name === 'pay' ? 'Could not check the payment. Refresh the invoice for its status.' : 'Could not save your payment method. Try again.';
@@ -137,7 +150,7 @@ try {
             assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: retry stays available after ${failure}`);
             if (['network', 'consent', 'updates'].includes(failure)) assert.equal(await page.evaluate(() => confirms), before, 'Failed preparation cannot confirm');
         }
-        if (name === 'billing-agreement' && linkDisplay === 'above_card') {
+        if (name === 'billing-agreement' && linkDisplay === 'above_card' && !expressThrows) {
             assert.equal(await page.locator('#express-checkout').isVisible(), true);
             assert.equal(await page.evaluate(() => document.querySelector('#express-checkout').compareDocumentPosition(
                 document.querySelector('#payment-element')) & Node.DOCUMENT_POSITION_FOLLOWING), 4);
@@ -190,12 +203,19 @@ try {
             await confirmLink();
             await page.evaluate(async () => { releaseConsent(); await setupPending; });
             assert.equal(await page.evaluate(() => confirms), beforeDuplicate + 1, 'Only one setup confirms during an in-flight consent request');
+            await page.evaluate(() => elementHandlers.expressCheckout.loaderror?.({error: {message: 'Link failed to load'}}));
+            assert.equal(await page.locator('#express-checkout').isVisible(), false, 'A Link load error hides the setup Express row');
+            await page.evaluate(() => { window.fetch = async () => ({ok: true}); });
+            const beforeCard = await page.evaluate(() => confirms);
+            await page.locator('#submit').click();
+            await page.waitForFunction(before => confirms === before + 1, beforeCard);
+            assert.equal(await page.locator('[role=alert]').textContent(), '', 'Card setup still confirms after a Link load error');
             await page.evaluate(() => elementHandlers.expressCheckout.availablepaymentmethodschange({paymentMethods: {link: {available: false}}}));
             assert.equal(await page.locator('#express-checkout').isVisible(), false);
             assert.equal(await page.locator('#submit').isEnabled(), true, 'Setup card form works without Link');
         }
         if (name === 'pay') {
-            if (linkDisplay === 'above_card') {
+            if (linkDisplay === 'above_card' && !expressThrows) {
                 assert.equal(await page.evaluate(() => typeof elementHandlers.expressCheckout.confirm), 'function',
                     'Link Express Checkout has a confirm handler');
                 assert.equal(await page.locator('#express-checkout').isVisible(), true, 'Available Link appears above the card form');
@@ -211,6 +231,10 @@ try {
                     };
                     elementHandlers.payment.change({value: {type: 'sepa_debit'}});
                 });
+                await page.evaluate(() => elementHandlers.expressCheckout.loaderror?.({error: {message: 'Link failed to load'}}));
+                assert.equal(await page.locator('#express-checkout').isVisible(), false, 'A Link load error hides the pay Express row');
+                assert.equal(await page.locator('#save-card').isEnabled(), false, 'A failed Link cannot enable saving a bank method');
+                await page.evaluate(() => elementHandlers.expressCheckout.availablepaymentmethodschange({paymentMethods: {link: {available: true}}}));
                 await page.evaluate(() => elementHandlers.expressCheckout.availablepaymentmethodschange({paymentMethods: {link: {available: false}}}));
                 assert.equal(await page.locator('#express-checkout').isVisible(), false, 'Unavailable Link hides the Express row');
                 assert.equal(await page.locator('#save-card').isEnabled(), false, 'Unavailable Link cannot enable saving a bank method');
@@ -249,7 +273,7 @@ try {
                         ? {status: 'requires_action', client_secret: 'fixture-secret'} : {status: 'succeeded'}; }};
                 };
             });
-            if (linkDisplay === 'above_card') {
+            if (linkDisplay === 'above_card' && !expressThrows) {
                 await page.evaluate(() => {
                     elementHandlers.expressCheckout.availablepaymentmethodschange({paymentMethods: {link: {available: true}}});
                     elementHandlers.expressCheckout.confirm({expressPaymentType: 'link', paymentFailed() {
@@ -265,6 +289,14 @@ try {
                 {intent: 'fixture-intent', confirmation_token: 'ctoken_fixture', amount: 2000, save: false},
                 {intent: 'fixture-intent', confirmation_token: null, amount: 2000, save: false},
             ], `${linkDisplay}: authentication reads the same payment without replaying its token before redirecting`);
+        }
+        if (name === 'billing-agreement' && expressThrows) {
+            await page.evaluate(() => { window.failure = 'action-success'; });
+            const before = await page.evaluate(() => confirms);
+            await page.locator('#submit').click();
+            await page.waitForFunction(before => confirms === before + 1, before);
+            assert.equal(await page.locator('[role=alert]').textContent(), '', 'Card setup confirms after Express creation fails');
+            assert.deepEqual(await page.evaluate(() => setupConfirmParams), {return_url: '/return'});
         }
         await page.close();
     }
