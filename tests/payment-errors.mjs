@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const views = new URL('../extension/AeStripe/resources/views/', import.meta.url);
 const theme = readFileSync(new URL('stripe-theme.blade.php', views), 'utf8');
-function render(name, linkDisplay = 'above_card') {
+function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hosting') {
     let source = readFileSync(new URL(`${name}.blade.php`, views), 'utf8')
         .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
         .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(new URL('stripe-elements.blade.php', views), 'utf8'))
@@ -20,6 +20,7 @@ function render(name, linkDisplay = 'above_card') {
         .replaceAll('@js($intent->id)', "'fixture-intent'")
         .replace('@js($customerSessionSecret)', 'null')
         .replace('@js($linkDisplay)', JSON.stringify(linkDisplay))
+        .replace('@js($businessName)', JSON.stringify(businessName))
         .replace("@js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true))", 'false')
         .replaceAll('@js($intent->amount)', '2000').replace("@js(strtolower($intent->currency))", "'usd'")
         .replace("@js(($intent->metadata->ae_stripe_consent ?? null) === '1')", 'false')
@@ -38,8 +39,9 @@ try {
         [name, 'above_card', 'mount'],
         [name, 'above_card', 'unavailable'],
         ...['above_card', 'inside_card', 'stripe_default'].map(mode => [name, mode, false]),
+        [name, 'above_card', false, null],
     ]);
-    for (const [name, linkDisplay, expressThrows] of cases) {
+    for (const [name, linkDisplay, expressThrows, businessName = 'Fixture Hosting'] of cases) {
         const page = activePage = await browser.newPage();
         await page.route('**/*', route => route.fulfill({ contentType: 'text/javascript', body: '' }));
         page.setDefaultTimeout(5000);
@@ -96,7 +98,7 @@ try {
                 return { error: { type: 'card_error', message: 'Your card was declined.' } };
             }
         }, expressThrows);
-        await page.setContent(render(name, linkDisplay));
+        await page.setContent(render(name, linkDisplay, businessName));
         if (name === 'pay') {
             await page.waitForFunction(() => !!document.querySelector('script[src]'));
             await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
@@ -117,11 +119,11 @@ try {
                     amazonPay: 'never', paypal: 'never', klarna: 'never'}}] : [],
                 `${linkDisplay}: only the above-card choice mounts Link-only Express Checkout`);
         } else {
-            await page.evaluate(async linkDisplay => {
-                window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf', name: 'Fixture', email: 'Fixture', linkDisplay });
+            await page.evaluate(async ({linkDisplay, businessName}) => {
+                window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf', name: 'Fixture', email: 'Fixture', linkDisplay, businessName });
                 component.$el = document.querySelector('form');
                 await component.init();
-            }, linkDisplay);
+            }, {linkDisplay, businessName});
             assert.equal(await page.locator('#submit').isEnabled(), false, 'Setup requires explicit consent');
             const options = await page.evaluate(() => elementOptions);
             assert.equal(options.clientSecret, 'fixture-secret', 'Setup keeps the existing SetupIntent flow');
@@ -141,6 +143,8 @@ try {
             assert.equal(await page.locator('#express-checkout').isVisible(), false, `${name}: failed Express row stays hidden`);
             assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: card submission remains available`);
         }
+        assert.deepEqual(await page.evaluate(() => paymentElementOptions.business),
+            businessName ? {name: businessName} : undefined, `${name}: the Payment Element names the site, or leaves it to Stripe`);
         assert.deepEqual(await page.evaluate(() => paymentElementOptions.wallets),
             linkDisplay === 'above_card' ? {link: 'never'} : undefined,
             `${name}: ${linkDisplay} keeps Link only in Express Checkout while other modes keep Stripe's defaults`);

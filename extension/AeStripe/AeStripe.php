@@ -650,7 +650,7 @@ class AeStripe extends Gateway
 
         // Return the client secret to the frontend to complete the setup
         return view('gateways.ae-stripe::billing-agreement', ['intent' => $setupIntent, 'type' => 'setup', 'stripePublishableKey' => $this->config('stripe_publishable_key'),
-            'linkDisplay' => $this->stripeLinkDisplay(),
+            'linkDisplay' => $this->stripeLinkDisplay(), 'businessName' => $this->stripeBusinessName(),
             'autoPayConsentVersion' => self::AUTO_PAY_CONSENT, 'autoPayDefault' => $this->autoPayDefault($user)]);
     }
 

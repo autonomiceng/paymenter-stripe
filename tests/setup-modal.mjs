@@ -15,6 +15,7 @@ let view = readFileSync(`${root}extension/AeStripe/resources/views/billing-agree
     .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
     .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(`${root}extension/AeStripe/resources/views/stripe-elements.blade.php`, 'utf8'))
     .replace('@js($linkDisplay)', "'above_card'")
+    .replace('@js($businessName)', "'Fixture Hosting'")
     .replace(/@if\(config\('settings.tos'\)\)[\s\S]*?@endif/g, '')
     .replace(/@js\(route\('([^']+)'\)\)/g, (_, name) => `'/${name}'`)
     .replace(/@js\(csrf_token\(\)\)/g, "'fixture-csrf'")
@@ -60,6 +61,7 @@ try {
                 return { update() {}, create(type, options) {
                     if (!['payment', 'expressCheckout'].includes(type) || options.wallets?.link === 'never') throw new Error('Link must stay available');
                     if (type === 'expressCheckout') probe.expressCreated++;
+                    else probe.businessName = options.business?.name;
                     let target;
                     const listeners = {};
                     return {
@@ -140,6 +142,7 @@ try {
         }
         await page.getByRole('alert').filter({ hasText: 'Test decline' }).waitFor();
         assert.equal(await page.evaluate(() => probe.confirms), cycle, `cycle ${cycle}: exactly one submit handler`);
+        assert.equal(await page.evaluate(() => probe.businessName), 'Fixture Hosting', 'The rendered setup view names the site');
         await page.getByRole('button', { name: 'Close', exact: true }).click();
         await page.getByRole('dialog').waitFor({ state: 'detached' });
     }

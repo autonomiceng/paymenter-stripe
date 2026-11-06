@@ -1,9 +1,11 @@
 // Both pages share display options; each retains its own confirmation and consent flow.
-function createStripeElements(stripe, options, {linkDisplay, name, email, allowExpress = true, onLinkAvailability}) {
+function createStripeElements(stripe, options, {linkDisplay, name, email, businessName, allowExpress = true, onLinkAvailability}) {
     const paymentOptions = {
         layout: {type: 'accordion', defaultCollapsed: false, radios: false, spacedAccordionItems: true},
         defaultValues: {billingDetails: {name}},
     };
+    // Without a name, Stripe shows the Stripe account's name in its consent text.
+    if (businessName) paymentOptions.business = {name: businessName};
     // Keep returning Link users in the button above, leaving the card fields visible.
     if (linkDisplay === 'above_card' && allowExpress) paymentOptions.wallets = {link: 'never'};
     if (linkDisplay === 'stripe_default') paymentOptions.defaultValues.billingDetails.email = email;
