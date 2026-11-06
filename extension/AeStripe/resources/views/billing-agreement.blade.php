@@ -3,7 +3,8 @@
     linkDisplay: @js($linkDisplay), intent: @js($intent->id), consentUrl: @js(route('extensions.gateways.ae-stripe.setup-consent')),
     returnUrl: @js(route('extensions.gateways.ae-stripe.setup-agreement')), csrf: @js(csrf_token()),
     name: {{ \Illuminate\Support\Js::from(auth()->user()->name) }},
-    email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }}
+    email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }},
+    businessName: @js($businessName)
 })">
     <div id="error-message" role="alert" class="text-red-600 dark:text-red-400"></div>
     <div id="express-checkout" class="mb-4" hidden wire:ignore>
@@ -124,7 +125,7 @@ Alpine.data('aeStripeSetup', (config) => {
                 if (disposed || !form.isConnected) return;
                 const stripe = Stripe(config.publishableKey);
                 const created = createStripeElements(stripe, {clientSecret: config.clientSecret, appearance: stripeAppearance(form)}, {
-                    linkDisplay: config.linkDisplay, name: config.name, email: config.email,
+                    linkDisplay: config.linkDisplay, name: config.name, email: config.email, businessName: config.businessName,
                     onLinkAvailability: available => { if (!disposed) expressContainer.hidden = !available; },
                 });
                 const {elements} = created;

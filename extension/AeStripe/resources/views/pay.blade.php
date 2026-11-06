@@ -76,6 +76,7 @@ async function initializePaymentForm() {
                 linkDisplay: @js($linkDisplay),
                 name: {{ \Illuminate\Support\Js::from(auth()->user()->name) }},
                 email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }},
+                businessName: @js($businessName),
                 allowExpress: !resuming,
                 onLinkAvailability: updateLinkAvailability,
             });

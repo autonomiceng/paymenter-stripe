@@ -15,6 +15,7 @@ let view = readFileSync(`${root}extension/AeStripe/resources/views/billing-agree
     .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
     .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(`${root}extension/AeStripe/resources/views/stripe-elements.blade.php`, 'utf8'))
     .replace('@js($linkDisplay)', "'above_card'")
+    .replace('@js($businessName)', "'Fixture Hosting'")
     .replace(/@if\(config\('settings.tos'\)\)[\s\S]*?@endif/g, '')
     .replace(/@js\(route\('([^']+)'\)\)/g, (_, name) => `'/${name}'`)
     .replace(/@js\(csrf_token\(\)\)/g, "'fixture-csrf'")
@@ -57,9 +58,13 @@ try {
             elements: () => {
                 probe.created++;
                 probe.active++;
+                const group = {};
                 return { update() {}, create(type, options) {
-                    if (!['payment', 'expressCheckout'].includes(type) || options.wallets?.link === 'never') throw new Error('Link must stay available');
-                    if (type === 'expressCheckout') probe.expressCreated++;
+                    // Like Stripe.js, reject unknown Elements and invalid wallet values.
+                    if (!['payment', 'expressCheckout'].includes(type)) throw new Error(`Unknown Element: ${type}`);
+                    if (!['auto', 'never', undefined].includes(options.wallets?.link)) throw new Error('Invalid wallets.link');
+                    if (type === 'expressCheckout') { probe.expressCreated++; group.expressLink = options.paymentMethods?.link; probe.expressBusinessName = options.business?.name; }
+                    else { probe.businessName = options.business?.name; group.paymentHidesLink = options.wallets?.link === 'never'; }
                     let target;
                     const listeners = {};
                     return {
@@ -67,6 +72,8 @@ try {
                         mount(container) {
                             target = typeof container === 'string' ? document.querySelector(container) : container;
                             assertTarget(target);
+                            // Above card moves Link out of the card form; it must then be in Express Checkout.
+                            if (type === 'payment' && group.paymentHidesLink && group.expressLink !== 'auto') throw new Error('Link must stay available');
                             target.innerHTML = type === 'payment' ? '<input aria-label="Card number" value="4242" />' : '<button type="button">Pay with Link</button>';
                             listeners.ready?.({availablePaymentMethods: {link: true}});
                         },
@@ -140,6 +147,8 @@ try {
         }
         await page.getByRole('alert').filter({ hasText: 'Test decline' }).waitFor();
         assert.equal(await page.evaluate(() => probe.confirms), cycle, `cycle ${cycle}: exactly one submit handler`);
+        assert.equal(await page.evaluate(() => probe.businessName), 'Fixture Hosting', 'The rendered setup view names the site');
+        assert.equal(await page.evaluate(() => probe.expressBusinessName), 'Fixture Hosting', 'The setup Link button names the site');
         await page.getByRole('button', { name: 'Close', exact: true }).click();
         await page.getByRole('dialog').waitFor({ state: 'detached' });
     }

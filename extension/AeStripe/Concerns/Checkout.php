@@ -76,7 +76,15 @@ trait Checkout
             'customerSessionSecret' => $session?->client_secret,
             'stripePublishableKey' => $this->config('stripe_publishable_key'),
             'linkDisplay' => $this->stripeLinkDisplay(),
+            'businessName' => $this->stripeBusinessName(),
         ]);
+    }
+
+    // Paymenter's Company Name; null lets Stripe fall back to the account name.
+    private function stripeBusinessName(): ?string
+    {
+        $name = trim((string) config('settings.company_name', ''));
+        return $name === '' ? null : $name;
     }
 
     private function stripeLinkDisplay(): string

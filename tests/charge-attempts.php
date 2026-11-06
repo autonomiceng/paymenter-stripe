@@ -333,6 +333,17 @@ use Illuminate\Support\Facades\{DB, Http};
             }
             check(!$stripe->charges, 'Choosing the Link display never charges on opening checkout');
         });
+        $run('business-name', function ($invoice) use ($gateway) {
+            $names = fn () => [$gateway->pay($invoice, 20)['data'], $gateway->createBillingAgreement($invoice->user)['data']];
+            foreach (['Beco Technologies' => 'Beco Technologies', '  Beco  ' => 'Beco', '' => null, ' ' => null] as $value => $expected) {
+                $GLOBALS['fakeConfig']['settings.company_name'] = (string) $value;
+                foreach ($names() as $data) check(array_key_exists('businessName', $data) && $data['businessName'] === $expected,
+                    'Both Stripe forms name the site\'s Company Name, or nothing when it is empty');
+            }
+            unset($GLOBALS['fakeConfig']['settings.company_name']);
+            foreach ($names() as $data) check(array_key_exists('businessName', $data) && $data['businessName'] === null,
+                'An unset Company Name passes no business name');
+        });
         $run('create-elements', function ($invoice, $stripe) use ($gateway) {
             $view = $gateway->pay($invoice, 20);
             check($view['data']['intent']->confirmation_method === 'automatic' && !$stripe->charges, 'Opening Elements reserves an unconfirmed automatic intent without a debit');
