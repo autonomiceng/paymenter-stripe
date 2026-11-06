@@ -116,7 +116,7 @@ try {
             assert.equal(payment.layout.defaultCollapsed, false);
             assert.deepEqual(calls.filter(call => call.type === 'expressCheckout').map(call => call.options),
                 linkDisplay === 'above_card' ? [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
-                    amazonPay: 'never', paypal: 'never', klarna: 'never'}}] : [],
+                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, ...(businessName ? {business: {name: businessName}} : {})}] : [],
                 `${linkDisplay}: only the above-card choice mounts Link-only Express Checkout`);
         } else {
             await page.evaluate(async ({linkDisplay, businessName}) => {
@@ -134,7 +134,7 @@ try {
             assert.equal(calls.find(call => call.type === 'payment').options.layout.defaultCollapsed, false);
             assert.deepEqual(calls.filter(call => call.type === 'expressCheckout').map(call => call.options),
                 linkDisplay === 'above_card' ? [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
-                    amazonPay: 'never', paypal: 'never', klarna: 'never'}}] : []);
+                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, ...(businessName ? {business: {name: businessName}} : {})}] : []);
             if (expressThrows) assert.equal(await page.locator('#setup-consent').isEnabled(), true, 'Card setup stays ready when Express fails');
             await page.locator('#setup-consent').check();
         }

@@ -63,7 +63,7 @@ try {
                     // Like Stripe.js, reject unknown Elements and invalid wallet values.
                     if (!['payment', 'expressCheckout'].includes(type)) throw new Error(`Unknown Element: ${type}`);
                     if (!['auto', 'never', undefined].includes(options.wallets?.link)) throw new Error('Invalid wallets.link');
-                    if (type === 'expressCheckout') { probe.expressCreated++; group.expressLink = options.paymentMethods?.link; }
+                    if (type === 'expressCheckout') { probe.expressCreated++; group.expressLink = options.paymentMethods?.link; probe.expressBusinessName = options.business?.name; }
                     else { probe.businessName = options.business?.name; group.paymentHidesLink = options.wallets?.link === 'never'; }
                     let target;
                     const listeners = {};
@@ -148,6 +148,7 @@ try {
         await page.getByRole('alert').filter({ hasText: 'Test decline' }).waitFor();
         assert.equal(await page.evaluate(() => probe.confirms), cycle, `cycle ${cycle}: exactly one submit handler`);
         assert.equal(await page.evaluate(() => probe.businessName), 'Fixture Hosting', 'The rendered setup view names the site');
+        assert.equal(await page.evaluate(() => probe.expressBusinessName), 'Fixture Hosting', 'The setup Link button names the site');
         await page.getByRole('button', { name: 'Close', exact: true }).click();
         await page.getByRole('dialog').waitFor({ state: 'detached' });
     }

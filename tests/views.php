@@ -64,10 +64,12 @@ foreach (['pay', 'billing-agreement'] as $name) {
     check($handlerPosition !== false && $mountPosition !== false && $handlerPosition < $mountPosition, "$name: submit handler is installed before mounting");
 }
 // CI has no browser; payment-errors.mjs checks the options Stripe receives.
-check(str_contains(file_get_contents($views . 'stripe-elements.blade.php'), 'if (businessName) paymentOptions.business = {name: businessName};')
+$elementsView = file_get_contents($views . 'stripe-elements.blade.php');
+check(str_contains($elementsView, 'const business = businessName ? {business: {name: businessName}} : {};')
+    && substr_count($elementsView, '...business,') === 2
     && str_contains(file_get_contents($views . 'pay.blade.php'), 'businessName: @js($businessName),')
     && str_contains(file_get_contents($views . 'billing-agreement.blade.php'), 'businessName: config.businessName'),
-    'Both Payment Elements name the site when it has a name');
+    'Both Payment Elements and the Link button name the site when it has a name');
 $setupView = file_get_contents($views . 'billing-agreement.blade.php');
 check(str_contains($setupView, 'id="setup-consent" required disabled') && str_contains($setupView, 'I agree to save this payment method for future charges, including renewals.')
     && str_contains($setupView, 'Auto Pay can charge when you are away. Saving does not turn on Auto Pay.'), 'Setup has an explicit future off-session opt-in');
