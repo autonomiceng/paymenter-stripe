@@ -58,10 +58,13 @@ try {
             elements: () => {
                 probe.created++;
                 probe.active++;
+                const group = {};
                 return { update() {}, create(type, options) {
-                    if (!['payment', 'expressCheckout'].includes(type) || options.wallets?.link === 'never') throw new Error('Link must stay available');
-                    if (type === 'expressCheckout') probe.expressCreated++;
-                    else probe.businessName = options.business?.name;
+                    // Like Stripe.js, reject unknown Elements and invalid wallet values.
+                    if (!['payment', 'expressCheckout'].includes(type)) throw new Error(`Unknown Element: ${type}`);
+                    if (!['auto', 'never', undefined].includes(options.wallets?.link)) throw new Error('Invalid wallets.link');
+                    if (type === 'expressCheckout') { probe.expressCreated++; group.expressLink = options.paymentMethods?.link; }
+                    else { probe.businessName = options.business?.name; group.paymentHidesLink = options.wallets?.link === 'never'; }
                     let target;
                     const listeners = {};
                     return {
@@ -69,6 +72,8 @@ try {
                         mount(container) {
                             target = typeof container === 'string' ? document.querySelector(container) : container;
                             assertTarget(target);
+                            // Above card moves Link out of the card form; it must then be in Express Checkout.
+                            if (type === 'payment' && group.paymentHidesLink && group.expressLink !== 'auto') throw new Error('Link must stay available');
                             target.innerHTML = type === 'payment' ? '<input aria-label="Card number" value="4242" />' : '<button type="button">Pay with Link</button>';
                             listeners.ready?.({availablePaymentMethods: {link: true}});
                         },
