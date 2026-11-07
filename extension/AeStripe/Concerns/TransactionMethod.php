@@ -20,8 +20,10 @@ trait TransactionMethod
         $existing = InvoiceTransaction::where('transaction_id', $intent->id)->first();
         // Failure can be recorded from confirmation while its locks are already held.
         // The error's embedded method is enough there; optional reads must not extend the lock.
-        if ($status === 'failed' && (DB::transactionLevel() > 0 || $existing
-            && DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $existing->id)->first()?->failure_reason)) return $intent;
+        if ($status === 'failed') {
+            $stored = $existing ? DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $existing->id)->first() : null;
+            if (DB::transactionLevel() > 0 || !empty($stored->failure_reason) && !empty($stored->label)) return $intent;
+        }
         // A failed attempt may replace this label before success acquires its locks.
         if ($status === 'processing' && $existing && DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $existing->id)->exists()) return $intent;
         if (is_string($charge) && preg_match('/^(?:ch|py)_[a-zA-Z0-9]+$/D', $charge)) {
@@ -40,7 +42,7 @@ trait TransactionMethod
     private function recordTransactionMethod($transaction, $intent, bool $succeeded, bool $failed = false): void
     {
         $table = DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $transaction->id);
-        if ($failed && $table->first()?->failure_reason) return;
+        $stored = $failed ? $table->first() : null;
         // The locked success guard permits only the first successful settlement here.
         if ($succeeded || $failed) $table->delete();
         elseif ($table->exists()) return;
@@ -48,10 +50,13 @@ trait TransactionMethod
         $details = is_object($charge) ? ($charge->payment_method_details ?? null) : null;
         if ($failed) $details ??= $intent->last_payment_error->payment_method ?? null;
         $label = $this->transactionMethodLabel($details);
+        if ($failed && !empty($stored->failure_reason)) $label ??= $stored->label;
         if ($label === null && !$failed) return;
+        $reason = !empty($intent->last_payment_error) ? $this->transactionFailureReason($intent)
+            : ($stored->failure_reason ?? $this->transactionFailureReason($intent));
         DB::table('ae_stripe_transaction_methods')->insertOrIgnore([
             'invoice_transaction_id' => $transaction->id, 'label' => $label ?? '',
-        ] + ($failed ? ['failure_reason' => $this->transactionFailureReason($intent)] : []));
+        ] + ($failed ? ['failure_reason' => $reason] : []));
     }
 
     private function transactionMethodLabel($details): ?string

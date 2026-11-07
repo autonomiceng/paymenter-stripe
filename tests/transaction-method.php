@@ -19,6 +19,9 @@ $declined = (object) ['id' => 'pi_declinedlabel', 'currency' => 'usd', 'amount' 
     'customer' => 'cus_owner', 'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1'],
     'last_payment_error' => (object) ['code' => 'card_declined', 'decline_code' => 'insufficient_funds', 'message' => 'never-store',
         'payment_method' => (object) ['type' => 'card', 'card' => (object) ['brand' => 'visa', 'last4' => '0002']]]];
+$incompleteDecline = clone $declined;
+$incompleteDecline->last_payment_error = (object) ['code' => 'card_declined'];
+$gateway->webhook(eventRequest($incompleteDecline, type: 'payment_intent.payment_failed'));
 $gateway->webhook(eventRequest($declined, type: 'payment_intent.payment_failed'));
 $gateway->webhook(eventRequest($declined, type: 'payment_intent.payment_failed'));
 $failure = DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_declinedlabel')] ?? null;
