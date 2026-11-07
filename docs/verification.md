@@ -92,13 +92,17 @@ and confirms. Locks remain held through confirmation to keep the balance and car
 Every Stripe request has a five-second timeout and a two-second connection timeout;
 the four-call confirmation section is bounded by those individual request limits.
 A Stripe timeout stays pending. After a saved instruction commits, statement errors and raw PDO commit errors also stay pending for automatic recovery, without a failed-payment email. A first-lock failure before reservation surfaces as a failure because nothing was saved to retry. Paused saved charges are reserved without HTTP and resume when the gateway is enabled. A changed checkout
-amount requires a refresh because the customer has not agreed to the new total.
+amount or currency requires a refresh because the customer has not agreed to the new total.
+Accepted saved-method quotes retain both minor units and currency through interrupted creation
+and recovery. The Pay button shows the exact intent amount and currency, including resumed payments.
 Elements 3DS uses `handleNextAction` and completes without another server confirmation.
 The first confirm rechecks the balance; if the invoice changes after authentication starts,
 the original amount can complete and any excess is automatically returned through the receipt ledger.
 Failed Elements authentication is canceled on the next page load, return or failure webhook,
 after retrieving the current status; a fresh attempt then permits another payment.
-Native manual authentication and bank verification still reconfirm under the server checks. Card/Link saving consent remains explicit and method-specific.
+Native manual authentication and bank verification still reconfirm under the server checks.
+After a resumed payment declines, the form requires a refresh before accepting another card;
+the refreshed checkout retires the unfunded old payment before preparing a replacement. Card/Link saving consent remains explicit and method-specific.
 The GET payment return compares Stripe's redirect secret before any write. Missing or wrong secrets show read-only status with an invoice link; the webhook, recovery or authenticated payment form can still finish it.
 
 A lost confirm response is recovered by intent ID, beyond key expiry. An unconfirmed

@@ -160,7 +160,7 @@ use Illuminate\Support\Facades\{DB, Http};
                     check($old->status === 'canceled' && $view['data']['intent']->id === 'pi_test2',
                         'One-time checkout retires a known unfunded reservation after Off');
                     $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
-                    check(!isset($attempt['auto_pay_agreement'], $attempt['accepted_amount'], $attempt['accepted_currency']),
+                    check(!isset($attempt['auto_pay_agreement']) && !isset($attempt['accepted_amount']) && !isset($attempt['accepted_currency']),
                         'Only proven cancellation releases the old quote and Auto Pay constraints');
                     $result = $gateway->confirmPayment(new Request(['intent' => 'pi_test2', 'confirmation_token' => 'ctoken_new', 'amount' => 2000]));
                     check(($result['data']['status'] ?? null) === 'succeeded' && count($stripe->charges) === 1,
