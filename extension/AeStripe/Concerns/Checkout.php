@@ -73,6 +73,8 @@ trait Checkout
 
         return view('gateways.ae-stripe::pay', [
             'invoice' => $invoice, 'total' => $total, 'intent' => $intent,
+            'paymentAmount' => number_format($this->fromMinorUnits($intent->amount, $intent->currency),
+                $this->currencyDecimals($intent->currency), '.', '') . ' ' . strtoupper($intent->currency),
             'autoPayDates' => $this->invoiceAutoPayDates($invoice),
             'customerSessionSecret' => $session?->client_secret,
             'stripePublishableKey' => $this->config('stripe_publishable_key'),

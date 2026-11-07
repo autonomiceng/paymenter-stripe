@@ -9,7 +9,7 @@
     </label>
     <button id="submit" disabled
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
-        {{ __('Pay :amount', ['amount' => $invoice->formattedRemaining]) }}
+        {{ __('Pay :amount', ['amount' => $paymentAmount]) }}
     </button>
     {{-- Link is offered below Pay, small enough that Pay stays the main button. --}}
     <div id="express-checkout" hidden>

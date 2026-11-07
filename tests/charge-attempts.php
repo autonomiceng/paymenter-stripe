@@ -108,13 +108,27 @@ use Illuminate\Support\Facades\{DB, Http};
     };
     try {
         require __DIR__ . '/renewal-retries.php';
+        foreach (['usd' => '20.00 USD', 'jpy' => '20 JPY', 'ugx' => '20 UGX', 'isk' => '20 ISK'] as $currency => $label) {
+            $run('displayed-resume-'.$currency, function ($invoice, $stripe) use ($gateway, $currency, $label) {
+                $invoice->currency_code = $currency;
+                $gateway->pay($invoice, 20);
+                $stripe->intents['pi_test1']->status = 'requires_action';
+                $stale = clone $invoice; $stale->total = 99;
+                $view = $gateway->pay($stale, 99);
+                check(($view['data']['paymentAmount'] ?? null) === $label && $view['data']['intent']->id === 'pi_test1',
+                    'A resumed payment displays its exact amount and currency despite a stale caller invoice');
+            });
+        }
         foreach (['unconfirmed', 'failed', 'canceled', 'processing', 'partial', 'unread', 'unknown'] as $outcome) {
             $run('one-time-after-off-'.$outcome, function ($invoice, $stripe) use ($gateway, $outcome) {
+                foreach (ExtensionHelper::$agreements as &$row) $row['gateway_id'] = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+                unset($row);
                 User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode([
                     'version' => $gateway::AUTO_PAY_CONSENT, 'user_id' => 7, 'accepted_at' => time(), 'agreement_id' => 4,
                 ]);
                 $stripe->loseCreate = true;
                 paymentStops(fn () => $gateway->chargeAutoPayAccepted($invoice, 20, new BillingAgreement));
+                check(isset($stripe->intents['pi_test1']), 'The old creation reached Stripe before its response was lost');
                 $old = $stripe->intents['pi_test1'];
                 if ($outcome === 'failed') $old->last_payment_error = (object) ['code' => 'card_declined'];
                 if (in_array($outcome, ['canceled', 'processing', 'unknown'], true)) $old->status = $outcome;

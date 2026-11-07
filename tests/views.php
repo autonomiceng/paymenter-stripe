@@ -160,3 +160,6 @@ $syncTheme = substr($theme, $syncPosition);
 check(str_contains($syncTheme, 'for (let node = form; node; node = node.parentElement)')
     && str_contains($syncTheme, "observer.observe(node, {attributes: true, attributeFilter: ['class', 'data-theme', 'style']})"),
     'Theme observer follows every ancestor read by stripeAppearance');
+
+check(str_contains($payView, "['amount' => \$paymentAmount]") && !str_contains($payView, '$invoice->formattedRemaining'),
+    'The Pay button uses the formatted intent amount passed by checkout');
