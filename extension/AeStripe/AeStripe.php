@@ -253,7 +253,7 @@ class AeStripe extends Gateway
                 'name' => 'stripe_create_customers',
                 'label' => 'Send address and phone to Stripe',
                 'type' => 'checkbox',
-                'description' => 'Include address, phone and company details for Stripe Tax and addresses on Stripe receipts.',
+                'description' => 'Copy the customer\'s address, phone and company to Stripe when their Stripe customer is first created. Used on Stripe receipts. Later profile changes are not sent.',
                 'required' => false,
             ],
             [
