@@ -14,6 +14,17 @@ $user = User::$row = new User(new Properties('cus_owner'));
 $invoice = Invoice::$row = new Invoice($user);
 $invoice->total = 1000; // Independent label receipts stay below the invoice balance; return behavior has its own fixtures.
 Invoice::$rows = [];
+// A failed charge keeps its own card and a safe reason, including webhook redelivery.
+$declined = (object) ['id' => 'pi_declinedlabel', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 0,
+    'customer' => 'cus_owner', 'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1'],
+    'last_payment_error' => (object) ['code' => 'card_declined', 'decline_code' => 'insufficient_funds', 'message' => 'never-store',
+        'payment_method' => (object) ['type' => 'card', 'card' => (object) ['brand' => 'visa', 'last4' => '0002']]]];
+$gateway->webhook(eventRequest($declined, type: 'payment_intent.payment_failed'));
+$gateway->webhook(eventRequest($declined, type: 'payment_intent.payment_failed'));
+$failure = DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_declinedlabel')] ?? null;
+check(($failure['label'] ?? null) === 'Visa **** 0002', 'Failed payment retains the declined card');
+check(($failure['failure_reason'] ?? null) === 'Insufficient funds.', 'Failed payment retains a plain decline reason');
+check(!str_contains(json_encode($failure), 'never-store'), 'Raw provider errors are not stored');
 $fixtures = [
     'card' => ['type' => 'card', 'card' => ['brand' => 'visa', 'last4' => '4242', 'fingerprint' => 'never-store']],
     'link' => ['type' => 'link', 'link' => ['email' => 'payer@example.com']],

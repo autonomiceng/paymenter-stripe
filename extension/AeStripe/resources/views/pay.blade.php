@@ -70,6 +70,7 @@ async function initializePaymentForm() {
 
             const resuming = @js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true));
             const savedConsent = @js(($intent->metadata->ae_stripe_consent ?? null) === '1');
+            let intentId = @js($intent->id);
             // The server still checks the invoice balance before confirming.
             const {elements, paymentElement, expressCheckout, mountExpress} = createStripeElements(stripe, options, {
                 linkDisplay: @js($linkDisplay),
@@ -138,10 +139,11 @@ async function initializePaymentForm() {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
                                 'X-CSRF-TOKEN': @js(csrf_token())},
-                            body: JSON.stringify({intent: @js($intent->id), confirmation_token: token,
+                            body: JSON.stringify({intent: intentId, confirmation_token: token,
                                 amount: @js($intent->amount), save}),
                         });
                         const result = await response.json();
+                        if (result.intent) intentId = result.intent;
                         if (!response.ok) { failPayment(result.message || 'Could not confirm your payment. Refresh the invoice for its status.'); return; }
                         if (result.status === 'requires_action') {
                             const next = await stripe.handleNextAction({clientSecret: result.client_secret});

@@ -165,6 +165,13 @@ trait Checkout
             $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
             abort_unless(Auth::id() == $invoice->user_id && $customer && $intent->customer === $customer
                 && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 403);
+            // The open Elements form can submit a new token after a definite decline. The
+            // retired intent identifies the invoice, while checkoutIntent serializes its replacement.
+            if ($request->input('confirmation_token') && in_array($intent->status, ['requires_payment_method', 'canceled'], true)
+                && ($intent->amount_received ?? 0) === 0
+                && InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->exists()) {
+                $intent = $this->checkoutIntent($invoice, $this->checkoutPaymentData($invoice, (int) $request->input('amount'), $customer), elements: true);
+            }
             $intent = $this->retireFailedElementsPayment($invoice, $intent);
             if ($intent->status === 'canceled') throw new DisplayException('This payment was not completed. Refresh the invoice to try another payment.');
             $agreement = null;
@@ -188,9 +195,9 @@ trait Checkout
                 $this->recordIntentPayment($intent, 'succeeded');
                 $this->saveConsentedMethod($intent);
             }
-            return response()->json(['status' => $intent->status, 'client_secret' => $intent->status === 'requires_action' ? $intent->client_secret : null]);
+            return response()->json(['intent' => $intent->id, 'status' => $intent->status, 'client_secret' => $intent->status === 'requires_action' ? $intent->client_secret : null]);
         } catch (DisplayException $e) {
-            return response()->json(['message' => $e->getMessage()], 409);
+            return response()->json(['message' => $e->getMessage(), 'intent' => $intent->id ?? null], 409);
         } catch (RequestException | ConnectionException $e) {
             return response()->json(['message' => 'Stripe is unavailable. We will check this payment automatically.'], 503);
         }
@@ -311,9 +318,7 @@ trait Checkout
             };
             $amount = $status === 'succeeded' ? $intent->amount_received : $intent->amount;
             $transaction = ExtensionHelper::{$helper}($invoice, 'AeStripe', $this->fromMinorUnits($amount, $intent->currency), null, $intent->id);
-            if (in_array($status, ['succeeded', 'processing'], true)) {
-                $this->recordTransactionMethod($transaction, $intent, $status === 'succeeded');
-            }
+            $this->recordTransactionMethod($transaction, $intent, $status === 'succeeded', $status === 'failed');
             if ($status === 'succeeded') {
                 $attempt = $this->readPaymentAttempt($user, $invoice);
                 if (($attempt['intent'] ?? null) === $intent->id) {
@@ -329,10 +334,6 @@ trait Checkout
                     $this->writePaymentAttempt($user, $invoice,
                         array_replace($attempt, ['agreement_id' => null, 'confirmation' => null, 'retry' => $status === 'processing', 'funds_pending' => $status === 'processing' || ($intent->amount_received ?? 0) > 0]));
                 }
-            }
-            if ($status === 'failed') {
-                // The locked success guard above preserves labels on settled payments.
-                DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $transaction->id)->delete();
             }
         });
     }

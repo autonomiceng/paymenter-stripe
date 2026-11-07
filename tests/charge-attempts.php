@@ -364,6 +364,30 @@ use Illuminate\Support\Facades\{DB, Http};
             check($response['status'] === 409 && str_contains($response['data']['message'], 'form changed') && !$stripe->confirms,
                 'An older manual checkout tab must refresh before it can send an Elements token');
         });
+        $run('elements-repeat-decline', function ($invoice, $stripe) use ($gateway) {
+            $view = $gateway->pay($invoice, 20); $original = $view['data']['intent']->id;
+            $stripe->beforeConfirm = function ($intent) {
+                $intent->status = 'requires_payment_method'; $intent->latest_charge = 'ch_declined';
+                $intent->last_payment_error = (object) ['code' => 'card_declined', 'decline_code' => 'insufficient_funds'];
+                throw new RequestException(402, ['error' => ['code' => 'card_declined']]);
+            };
+            foreach (['ctoken_first', 'ctoken_second'] as $index => $token) {
+                $response = $gateway->confirmPayment(new Request(['intent' => $original, 'save' => false,
+                    'confirmation_token' => $token, 'amount' => 2000]));
+                check($response['status'] === 409, 'A declined payment returns a customer error');
+                check(count(ExtensionHelper::$payments) === $index + 1, 'Each submit from the same open form records its own decline');
+            }
+            foreach ($stripe->intents as $failed) {
+                $gateway->webhook(eventRequest($failed, type: 'payment_intent.payment_failed'));
+                $gateway->webhook(eventRequest($failed, type: 'payment_intent.payment_failed'));
+            }
+            check(count(ExtensionHelper::$payments) === 2, 'Repeated webhooks do not duplicate declined attempts');
+            $stripe->beforeConfirm = null;
+            $response = $gateway->confirmPayment(new Request(['intent' => $original, 'save' => false,
+                'confirmation_token' => 'ctoken_recovery', 'amount' => 2000]));
+            check($response['data']['status'] === 'succeeded' && count($stripe->charges) === 1
+                && count(ExtensionHelper::$payments) === 3, 'The same form recovers with one payment and both declines retained');
+        });
         $run('elements-authentication', function ($invoice, $stripe) use ($gateway) {
             $stripe->loseCreate = true; paymentStops(fn () => $gateway->pay($invoice, 20));
             $view = $gateway->pay($invoice, 20); $id = $view['data']['intent']->id;
