@@ -27,7 +27,7 @@ session, Accept application/json and X-CSRF-TOKEN:
 
 `agreement_id` is the native numeric ID, not the Stripe reference or ULID. The account
 scope requires fresh authenticated acceptance even for an existing saved card; the older
-new-services-only `auto_pay_new_services_v2` record reads as Off. Off: `{"enabled":false}`.
+new-services-only `auto_pay_new_services_v2` record grants nothing new. Off: `{"enabled":false}`.
 A 200 returns `ok`, `enabled` and, when on, `services` (how many were linked); preserve the
 control on errors. No default is inferred from setup completion.
 
@@ -37,8 +37,13 @@ card, under the user lock; off unlinks every service. Stripe subscriptions keep 
 billing either way. Native Service Created applies the record to new recurring services
 without a selected agreement or subscription; Service Updated never reapplies it.
 Linking charges nothing: native renewal charges happen when an invoice is issued, so open
-invoices stay for the customer to pay. Removing the account card deletes the record and
-unlinks the services it paid for, so Auto Pay reads Off.
+invoices stay for the customer to pay. On and Off both stop a renewal retry waiting on an
+open invoice, so the confirm can say open invoices are not charged. Removing the account card
+deletes the record and unlinks the services it paid for, so Auto Pay reads Off.
+
+Services linked one at a time before the account switch keep their card and still renew
+with it, with or without a record. Show the switch as On while any service is linked, naming
+the card of the newest link, and say so when links use different cards. Off unlinks them too.
 
 ## Dates for every service opt-in
 
@@ -91,10 +96,10 @@ due date retain their original cutoff, including after an interrupted attempt.
 Before reserving and confirming each retry, current locked reads check the unpaid
 balance, invoice items, service ownership, active recurring service, unchanged
 expiry, cancellation and the same active owned AE Stripe agreement selected on
-**each service**. The v2 account default applies only when a service is created;
-turning it off does not revoke existing service choices and turning it on does not
-authorize this invoice. Turn off Auto Pay on the service to stop its future retries.
-Changing the selected agreement also stops this schedule; pay the open invoice.
+**each service**. Turning the account switch on or off stops a waiting retry at once,
+and Off also unlinks every service, so later scans find nothing to retry. Turning it on
+never authorizes an open invoice. Changing or removing the card also stops this schedule;
+pay the open invoice.
 A customer-initiated Pay takes over without the automatic retry policy.
 
 The schedule and count live in the existing durable checkout attempt. A due retry

@@ -122,9 +122,25 @@ $gateway->saveAutoPayDefault(new Request($choice));
 check($current->billing_agreement_id === 91, 'Turning Auto Pay on moves every current service to the account card');
 Gateway::$enabled = false;
 rejects(fn () => $gateway->saveAutoPayDefault(new Request($choice)), 'HTTP 409');
+$retry = fn ($state) => json_encode(['key' => 'k', 'renewal' => ['state' => $state, 'agreement_id' => 91, 'retries' => 1]]);
+$user->props->values['ae_stripe_checkout_18'] = $retry('waiting');
+$user->props->values['ae_stripe_checkout_19'] = $retry('active');
 $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
 Gateway::$enabled = true;
 check($current->billing_agreement_id === null, 'Turning Auto Pay off unlinks current services, even while the gateway is paused');
+check(json_decode($user->props->values['ae_stripe_checkout_18'], true)['renewal']['state'] === 'stopped'
+    && $user->props->values['ae_stripe_checkout_19'] === $retry('active'), 'Turning Auto Pay off stops a waiting renewal retry and leaves a charge in flight');
+// A service linked before the account switch (no account record) is also unlinked by Off.
+$legacy = $newService(); $legacy->billing_agreement_id = 91;
+check($gateway->autoPayDefault($user) === null, 'Legacy link has no account record');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+check($legacy->billing_agreement_id === null, 'Off unlinks a service linked per service before the account switch');
+// Turning it on never lets a waiting retry charge an open invoice: the confirm says open invoices are not charged.
+$user->props->values['ae_stripe_checkout_18'] = $retry('waiting');
+$gateway->saveAutoPayDefault(new Request($choice));
+check(json_decode($user->props->values['ae_stripe_checkout_18'], true)['renewal']['state'] === 'stopped', 'Turning Auto Pay on stops a waiting renewal retry');
+unset($user->props->values['ae_stripe_checkout_18'], $user->props->values['ae_stripe_checkout_19']);
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
 $service = $newService(); $created($service);
 check($service->billing_agreement_id === null && $gateway->autoPayDefault($user) === null, 'Off enrolls no new service');
 check($enrolled->billing_agreement_id === 91 && count(ExtensionHelper::$agreements) === 1, 'The switch never changes saved cards');

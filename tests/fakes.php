@@ -105,7 +105,12 @@ namespace App\Models {
         public static $beforeWrite = null;
         public array $values = [];
         public function __construct(public string $customer) {}
-        public function where($key, $value) {
+        public function where($key, $value, $like = null) {
+            if ($value === 'like') { // Prefix scans only, as AutoPay uses them.
+                $rows = [];
+                foreach ($this->values as $name => $stored) if (str_starts_with($name, rtrim($like, '%'))) $rows[] = (object) ['key' => $name, 'value' => $stored];
+                return new class($rows) { public function __construct(private $rows) {} public function lockForUpdate() { return $this; } public function get() { return $this->rows; } };
+            }
             $stored = $value === 'stripe_id' ? $this->customer : ($this->values[$value] ?? null);
             return new class($stored ? (object) ['value' => $stored] : null, $this, $value) extends Query {
                 public function __construct($stored, private Properties $properties, private string $key) { parent::__construct($stored); }

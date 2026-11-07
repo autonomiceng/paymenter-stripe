@@ -30,8 +30,9 @@ trait AutoPay
 
     /**
      * Authenticated account switch, independent of paying any invoice. Off needs no consent. On links every recurring
-     * service to the chosen card; off unlinks them all. Open invoices are never charged by this: native renewal charges
-     * happen only when an invoice is issued. Stripe subscriptions keep their own billing.
+     * service to the chosen card; off unlinks them all, including links set per service before the account switch.
+     * Open invoices are never charged by this: native renewal charges happen only when an invoice is issued, and either
+     * way the switch stops any waiting renewal retry. Stripe subscriptions keep their own billing.
      */
     public function saveAutoPayDefault(Request $request)
     {
@@ -45,6 +46,7 @@ trait AutoPay
         return DB::transaction(function () use ($request) {
             $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
             if (!$request->boolean('enabled')) {
+                $this->stopWaitingRenewals($user);
                 $user->properties()->where('key', self::AUTO_PAY_PROPERTY)->delete();
                 foreach ($this->autoPayServices($user) as $service) {
                     if ($service->billing_agreement_id) $service->update(['billing_agreement_id' => null]);
@@ -56,6 +58,7 @@ trait AutoPay
             $agreement = BillingAgreement::where('id', $request->input('agreement_id'))
                 ->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
             abort_unless($agreement, 403);
+            $this->stopWaitingRenewals($user);
             $record = ['version' => self::AUTO_PAY_CONSENT, 'user_id' => (int) $user->id,
                 'accepted_at' => time(), 'agreement_id' => (int) $agreement->id];
             $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_PROPERTY], ['value' => json_encode($record, JSON_THROW_ON_ERROR)]);
@@ -77,6 +80,20 @@ trait AutoPay
             if ($service->user_id == $user->id && !$service->subscription_id) $services[] = $service;
         }
         return $services;
+    }
+
+    /**
+     * The switch is the customer's latest word, so a renewal retry waiting on an open invoice stops and that invoice is
+     * paid by hand. Attempts live on the locked user row; an in-flight charge is left to finish.
+     */
+    private function stopWaitingRenewals(User $user): void
+    {
+        foreach ($user->properties()->where('key', 'like', 'ae_stripe_checkout_%')->lockForUpdate()->get() as $row) {
+            $attempt = json_decode((string) $row->value, true);
+            if (!is_array($attempt) || ($attempt['renewal']['state'] ?? null) !== 'waiting') continue;
+            $attempt['renewal']['state'] = 'stopped';
+            $user->properties()->updateOrCreate(['key' => $row->key], ['value' => json_encode($attempt, JSON_THROW_ON_ERROR)]);
+        }
     }
 
     /** A removed card turns account Auto Pay off when it was the account card, and unlinks the services it paid. */

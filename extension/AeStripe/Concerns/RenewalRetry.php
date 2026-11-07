@@ -118,7 +118,7 @@ trait RenewalRetry
                 : date('Y-m-d', $attempt['renewal']['next_at']) < $attempt['renewal']['cutoff']);
         $attempt['renewal']['state'] = $willRetry ? 'waiting' : 'stopped';
         $attempt['failure_reason'] = $this->paymentFailureReason($intent->last_payment_error->code ?? null)
-            . ' Open the invoice to pay now or update Auto Pay on your service.'
+            . ' Open the invoice to pay now, or change the Auto Pay card in Payment methods.'
             . ($willRetry
                 ? ' We may retry in two days, before the renewal due date.' : ' Automatic retries have stopped.');
         $attempt['failure_notified'] = false;
