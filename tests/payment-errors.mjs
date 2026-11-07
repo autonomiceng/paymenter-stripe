@@ -42,7 +42,7 @@ try {
         [name, 'above_card', false, null],
     ]);
     for (const [name, linkDisplay, expressThrows, businessName = 'Fixture Hosting'] of cases) {
-        const page = activePage = await browser.newPage();
+        const page = activePage = await browser.newPage({viewport: {width: 390, height: 844}});
         await page.route('**/*', route => route.fulfill({ contentType: 'text/javascript', body: '' }));
         page.setDefaultTimeout(5000);
         await page.setContent('<html><body></body></html>');
@@ -78,7 +78,15 @@ try {
                             type === 'payment' ? 'Card form' : 'Pay with Link';
                         // No available methods also models Link being disabled on the account.
                         handlers.ready?.({availablePaymentMethods: expressThrows === 'unavailable' ? null : {link: true}});
-                    }, clear() { if (type === 'payment') clears++; }, destroy() {} };
+                    }, clear() {
+                        if (type !== 'payment') return;
+                        clears++;
+                        // Stripe reports the empty form after clear() returns and submission unlocks.
+                        window.clearChange = new Promise(resolve => requestAnimationFrame(() => {
+                            handlers.change?.({empty: true, complete: false, value: {type: 'card'}});
+                            resolve();
+                        }));
+                    }, destroy() {} };
                 } }; },
                 async createConfirmationToken({elements}) {
                     if (elements !== elementsInstance) throw new Error('Token must use the mounted Elements instance');
@@ -153,6 +161,10 @@ try {
         if (linkDisplay === 'above_card') {
             assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${name}: above-card always mounts the card form`);
         }
+        if (name === 'pay') {
+            // A tall Stripe form puts the alert above the viewport when Pay is clicked on mobile.
+            await page.locator('#payment-element').evaluate(element => { element.style.minHeight = '900px'; });
+        }
         const fallback = name === 'pay' ? 'Could not check the payment. Refresh the invoice for its status.' : 'Could not save your payment method. Try again.';
         for (const failure of ['network', 'confirmation', ...(name === 'pay' ? ['updates', 'server-decline'] : []), 'consent', 'decline']) {
             await page.evaluate(value => { window.failure = value; }, failure);
@@ -162,10 +174,22 @@ try {
             const expected = failure === 'decline' ? 'Your card was declined.' : failure === 'server-decline' ? 'Server decline wording.' : failure === 'consent'
                 ? (name === 'pay' ? 'Could not record payment preferences. Refresh the invoice.' : 'Could not record your agreement. Try again.') : fallback;
             await page.waitForFunction(() => document.querySelector('[role=alert]').textContent.length > 0);
+            await page.evaluate(() => window.clearChange);
             assert.equal(await page.locator('[role=alert]').textContent(), expected, `${name}: ${failure}`);
             assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: retry stays available after ${failure}`);
             // Only a decline of the entered details clears them, so the customer types a different card.
             assert.equal(await page.evaluate(() => clears) - clearsBefore, failure === 'server-decline' ? 1 : 0, `${name}: ${failure} clears the card form only after a decline`);
+            if (failure === 'server-decline') {
+                const alert = await page.locator('[role=alert]').boundingBox();
+                assert(alert && alert.y >= 0 && alert.y + alert.height <= 844,
+                    'The decline stays in view at 390px after clearing the card');
+                await page.evaluate(() => elementHandlers.payment.change({empty: true, complete: false, value: {type: 'card'}}));
+                assert.equal(await page.locator('[role=alert]').textContent(), expected,
+                    'Further empty form updates keep the decline visible');
+                await page.evaluate(() => elementHandlers.payment.change({empty: false, complete: false, value: {type: 'card'}}));
+                assert.equal(await page.locator('[role=alert]').textContent(), '',
+                    'Entering another card clears the decline');
+            }
             if (['network', 'consent', 'updates'].includes(failure)) assert.equal(await page.evaluate(() => confirms), before, 'Failed preparation cannot confirm');
         }
         if (name === 'billing-agreement' && linkDisplay === 'above_card' && !expressThrows) {

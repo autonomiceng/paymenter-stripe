@@ -95,7 +95,8 @@ async function initializePaymentForm() {
             }
             // https://docs.stripe.com/js/element/events/on_change?type=paymentElement
             paymentElement.on('change', (event) => {
-                if (!loading) clearMessage();
+                // clear() also reports an empty form after submission has finished.
+                if (!loading && event.empty !== true) clearMessage();
                 canSave = resuming ? savedConsent : ['card', 'link'].includes(event.value?.type);
                 updateSaveCard();
             });
@@ -179,7 +180,9 @@ async function initializePaymentForm() {
                 const message = document.createElement('p');
                 message.className = 'mb-2';
                 message.textContent = messageText;
-                document.getElementById('error-message').replaceChildren(message);
+                const alert = document.getElementById('error-message');
+                alert.replaceChildren(message);
+                alert.scrollIntoView({block: 'nearest', behavior: 'instant'});
             }
 
             function clearMessage() {
