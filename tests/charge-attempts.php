@@ -474,6 +474,82 @@ use Illuminate\Support\Facades\{DB, Http};
             $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
             check($attempt['retry'] && !empty($attempt['agreement_id']) && !ExtensionHelper::$payments, 'An unknown post-refusal read retains recovery and cannot record failure');
         });
+        foreach (['recover', 'expired', 'canceled', 'invalid-params'] as $replacement) {
+            $run('accepted-lost-create-'.$replacement, function ($invoice, $stripe) use ($gateway, $replacement) {
+                $stripe->loseCreate = true;
+                paymentStops(fn () => $gateway->chargeAccepted($invoice, 20, new BillingAgreement));
+                $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                if ($replacement === 'expired') $attempt['created'] = time() - 24 * 3600;
+                if ($replacement === 'canceled') $stripe->intents['pi_test1']->status = 'canceled';
+                if ($replacement === 'invalid-params') $attempt['params']['automatic_payment_methods'] = ['enabled' => 'true'];
+                User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+                $invoice->total = 25;
+                $gateway->retryChargeAttempts();
+                check(!$stripe->charges && !$stripe->confirms && !ExtensionHelper::$payments,
+                    'Lost creation followed by a raised invoice refuses without charging through '.$replacement.' recovery');
+                check(count(Notification::$rows) === 1 && str_contains(Notification::$rows[0]['body'], 'amount due changed'),
+                    'Recovery explains that the accepted invoice amount changed');
+            });
+        }
+        foreach (['reservation', 'confirmation'] as $stage) {
+            foreach (['switched', 'off'] as $change) {
+                $run('accepted-card-'.$stage.'-'.$change, function ($invoice, $stripe) use ($gateway, $change, $stage) {
+                    foreach (ExtensionHelper::$agreements as &$row) $row['gateway_id'] = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+                    unset($row);
+                    User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode([
+                        'version' => $gateway::AUTO_PAY_CONSENT, 'user_id' => 7, 'accepted_at' => time(), 'agreement_id' => 4,
+                    ]);
+                    check($gateway->autoPayDefault(User::$row)['agreement_id'] === 4, 'The endpoint initially sees the accepted card');
+                    $changeCard = function () use ($change) {
+                        if ($change === 'off') unset(User::$row->props->values['ae_stripe_auto_pay_default']);
+                        else User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode([
+                            'version' => 'auto_pay_account_v1', 'user_id' => 7, 'accepted_at' => time(), 'agreement_id' => 5,
+                        ]);
+                    };
+                    // Another tab commits before the reservation lock, or after it commits but before confirmation.
+                    if ($stage === 'reservation') DB::$beforeUserLock = $changeCard;
+                    else $stripe->beforeCreate = $changeCard;
+                    $refused = false;
+                    try { $gateway->chargeAccepted($invoice, 20, new BillingAgreement, true); }
+                    catch (\App\Exceptions\DisplayException $e) { $refused = str_contains($e->getMessage(), 'Auto Pay card changed'); }
+                    check($refused && !$stripe->charges && !$stripe->confirms && !ExtensionHelper::$payments,
+                        'An Auto Pay card '.$change.' before '.$stage.' refuses without charging');
+                    if ($stage === 'reservation') check(!isset(User::$row->props->values['ae_stripe_checkout_920']), 'A refused card reserves no payment');
+                });
+            }
+        }
+        $run('accepted-auto-pay-recovery', function ($invoice, $stripe) use ($gateway) {
+            foreach (ExtensionHelper::$agreements as &$row) $row['gateway_id'] = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+            unset($row);
+            User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode([
+                'version' => $gateway::AUTO_PAY_CONSENT, 'user_id' => 7, 'accepted_at' => time(), 'agreement_id' => 4,
+            ]);
+            $stripe->beforeCreate = function () {
+                $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                check(!DB::$locked && $attempt['accepted_amount'] === 2000 && $attempt['auto_pay_agreement'] === 4,
+                    'The accepted amount and Auto Pay card commit before Stripe creation');
+            };
+            $stripe->loseCreate = true;
+            paymentStops(fn () => $gateway->chargeAutoPayAccepted($invoice, 20, new BillingAgreement));
+            $gateway->retryChargeAttempts();
+            check(count($stripe->charges) === 1 && $stripe->charges[0][1] === 2000 && count($stripe->confirms) === 1,
+                'An unchanged accepted Auto Pay payment recovers once after lost creation');
+        });
+        $run('accepted-settled-recovery', function ($invoice, $stripe) use ($gateway) {
+            foreach (ExtensionHelper::$agreements as &$row) $row['gateway_id'] = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+            unset($row);
+            User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode([
+                'version' => $gateway::AUTO_PAY_CONSENT, 'user_id' => 7, 'accepted_at' => time(), 'agreement_id' => 4,
+            ]);
+            $stripe->loseConfirm = true;
+            paymentStops(fn () => $gateway->chargeAutoPayAccepted($invoice, 20, new BillingAgreement));
+            unset(User::$row->props->values['ae_stripe_auto_pay_default']);
+            $invoice->total = 25;
+            $gateway->retryChargeAttempts();
+            check(count($stripe->charges) === 1 && count($stripe->confirms) === 1
+                && (ExtensionHelper::$payments['920:pi_test1']['amount'] ?? null) === 20.0,
+                'Recovery still records an already sent payment after Auto Pay is disabled and the balance changes');
+        });
         $run('charge-accepted-amount', function ($invoice, $stripe) use ($gateway) {
             // The customer accepted 20.00, then the invoice was raised before the charge reached the payment lock.
             $invoice->total = 25;

@@ -815,12 +815,18 @@ class AeStripe extends Gateway
      * A customer's saved-method payment of the amount they accepted. Unlike charge(), which always confirms today's
      * balance, confirmation refuses a different balance under the payment lock, so a raised invoice is never charged.
      */
-    public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $billingAgreement)
+    public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $billingAgreement, bool $requireAutoPay = false)
     {
-        return $this->charge($invoice, $amount, $billingAgreement, $this->toMinorUnits($amount, $invoice->currency_code));
+        return $this->charge($invoice, $amount, $billingAgreement, $this->toMinorUnits($amount, $invoice->currency_code), $requireAutoPay);
     }
 
-    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement, ?int $acceptedAmount = null)
+    /** Pay the open-invoice offer only while its accepted card is still the account Auto Pay card. */
+    public function chargeAutoPayAccepted(Invoice $invoice, $amount, BillingAgreement $billingAgreement)
+    {
+        return $this->chargeAccepted($invoice, $amount, $billingAgreement, true);
+    }
+
+    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement, ?int $acceptedAmount = null, bool $requireAutoPay = false)
     {
         $this->paymentRetryReserved = false;
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
@@ -830,6 +836,8 @@ class AeStripe extends Gateway
         try {
             $data = $this->checkoutPaymentData($invoice, $this->toMinorUnits($amount, $invoice->currency_code), $customer)
                 + ['agreement_id' => $billingAgreement->id, 'renewal_start' => app()->runningInConsole()];
+            if ($acceptedAmount !== null) $data['accepted_amount'] = $acceptedAmount;
+            if ($requireAutoPay) $data['auto_pay_agreement'] = (int) $billingAgreement->id;
             if (!$this->gatewayEnabled()) {
                 $this->reservePaymentAttempt($invoice, $data);
                 $this->paymentPending('Payments are paused. We will check this payment when payments resume.');

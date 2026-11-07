@@ -20,9 +20,16 @@ charged by turning it on; offer Pay now for those.
 
 To pay an open invoice the customer accepted with a saved method, call
 `chargeAccepted($invoice, $amount, $agreement)` with the amount they saw. It is the
-saved-method charge with one difference: confirmation refuses a different balance under
-the payment lock ("The amount due changed."), so a raised invoice is never charged.
-`charge()` keeps confirming today's balance for renewals and recovery.
+saved-method charge with an accepted amount stored in the payment reservation before
+Stripe requests. Confirmation refuses a different balance under the payment lock
+("The amount due changed."), including after interrupted creation or replacement.
+For the account Auto Pay open-invoice offer, use
+`chargeAutoPayAccepted($invoice, $amount, $agreement)`. It also checks the account
+Auto Pay card while reserving and confirming the payment. Both transactions lock
+the user first, as does changing or disabling Auto Pay.
+`charge()` keeps confirming today's balance for renewals and recovery instructions
+that have no accepted amount. Themes must require `chargeAutoPayAccepted()` before
+offering account Auto Pay invoice payments.
 
 POST JSON to `route('extensions.gateways.ae-stripe.auto-pay-default')` with the normal
 session, Accept application/json and X-CSRF-TOKEN:

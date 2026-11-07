@@ -16,7 +16,7 @@ trait CheckoutIntent
     {
         for ($round = 0; $round < 4; ++$round) {
             $attempt = $this->reservePaymentAttempt($invoice, $data, $elements);
-            foreach (['renewal', 'automatic_renewal', 'customer_payment'] as $key) {
+            foreach (['renewal', 'automatic_renewal', 'customer_payment', 'accepted_amount', 'auto_pay_agreement'] as $key) {
                 if (array_key_exists($key, $attempt)) $data[$key] = $attempt[$key];
             }
             if (!empty($attempt['agreement_id'])) $data['agreement_id'] ??= $attempt['agreement_id'];
@@ -175,7 +175,14 @@ trait CheckoutIntent
             if ($current->status !== 'pending' || $amount <= 0) throw new DisplayException('This invoice has no payment due. Refresh the invoice.');
             $attempt = $this->readPaymentAttempt($user, $current);
             $customerPay = $elements || array_key_exists('renewal_start', $data) && !$data['renewal_start'];
-            $context = array_intersect_key($attempt ?? $data, array_flip(['renewal', 'automatic_renewal', 'customer_payment']));
+            $context = array_intersect_key($attempt ?? $data, array_flip(['renewal', 'automatic_renewal', 'customer_payment', 'accepted_amount', 'auto_pay_agreement']));
+            foreach (['accepted_amount', 'auto_pay_agreement'] as $key) {
+                if (array_key_exists($key, $data)) $context[$key] = $data[$key];
+            }
+            if (isset($context['auto_pay_agreement']) && empty($attempt['confirmation']) && empty($attempt['funds_pending'])
+                && (int) ($this->autoPayDefault($user, true)['agreement_id'] ?? 0) !== $context['auto_pay_agreement']) {
+                throw new DisplayException('The Auto Pay card changed. Refresh Payment methods before paying.');
+            }
             if (!empty($attempt['renewal_only'])) {
                 if (!$customerPay) throw new DisplayException('This renewal is waiting for its next automatic retry. Open the invoice to pay now.');
                 $attempt = null;
@@ -222,6 +229,7 @@ trait CheckoutIntent
                 $attempt['agreement_pending'] = true;
                 $attempt['retry'] = true;
             }
+            $attempt = array_replace($attempt, array_intersect_key($context, array_flip(['accepted_amount', 'auto_pay_agreement'])));
             $this->writePaymentAttempt($user, $current, $attempt);
             return $attempt + ['due_amount' => $amount];
         });
@@ -373,6 +381,7 @@ trait CheckoutIntent
         $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($intentId, $params, $agreement, $expectedAmount) {
             $attempt = $this->readPaymentAttempt($user, $current);
             if (($attempt['intent'] ?? null) !== $intentId) $this->paymentPending('Payment changed. Refresh the invoice to check its status.');
+            $expectedAmount = $attempt['accepted_amount'] ?? $expectedAmount;
             if (!empty($attempt['automatic_renewal'])) {
                 if (($attempt['renewal']['state'] ?? null) !== 'active') throw new DisplayException('Auto Pay stopped for this renewal. Open the invoice to pay the amount due.');
                 if (!empty($attempt['confirmation'])) return $attempt; // Resume the claimed instruction, never replace its identity.
@@ -387,6 +396,7 @@ trait CheckoutIntent
             $this->writePaymentAttempt($user, $current, $attempt);
             return $attempt;
         });
+        $expectedAmount = $attempt['accepted_amount'] ?? $expectedAmount;
         if (!empty($attempt['automatic_renewal'])) {
             $params = $attempt['confirmation']['params'];
             $expectedAmount = $attempt['confirmation']['amount'];
@@ -401,6 +411,10 @@ trait CheckoutIntent
                 if (!empty($stored['automatic_renewal']) && (empty($stored['renewal'])
                     || $stored['renewal']['state'] !== 'active' || !$this->renewalStillAuthorized($current, $stored['renewal']))) {
                     return new DisplayException('Auto Pay stopped for this renewal. Open the invoice to pay the amount due.');
+                }
+                if (isset($stored['auto_pay_agreement'])
+                    && (int) ($this->autoPayDefault($user, true)['agreement_id'] ?? 0) !== $stored['auto_pay_agreement']) {
+                    return new DisplayException('The Auto Pay card changed. Refresh Payment methods before paying.');
                 }
                 $amount = $this->paymentBalance($current);
                 if ($current->status !== 'pending' || $amount <= 0) return new DisplayException('This invoice has no payment due. Refresh the invoice.');
