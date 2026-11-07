@@ -51,6 +51,7 @@ trait Checkout
         // API assumptions must be verified against the pinned Basil version in a sandbox.
         // https://docs.stripe.com/api/customer_sessions/create
         // Removal is disabled: native agreements may still reference a removed method.
+        // Redisplay is disabled: the theme lists saved methods beside this form, so Stripe shows only a new one.
         $session = null;
         try {
             $session = $this->request('post', '/customer_sessions', [
@@ -58,7 +59,7 @@ trait Checkout
                 'components' => ['payment_element' => [
                     'enabled' => 'true',
                     'features' => [
-                        'payment_method_redisplay' => 'enabled',
+                        'payment_method_redisplay' => 'disabled',
                         'payment_method_save' => 'disabled',
                         'payment_method_remove' => 'disabled',
                     ],

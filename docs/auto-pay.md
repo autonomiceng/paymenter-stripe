@@ -11,10 +11,11 @@ Read `autoPayDefault($user)`: null means Off; otherwise `agreement_id` identifie
 selected native BillingAgreement. Do not choose a first card or derive consent from
 boolean properties or old Stripe metadata.
 
-Show an unchecked choice, “Use Auto Pay for new services”, and an owned saved-method
-picker. Explain: “Existing services keep their Auto Pay settings.” Consent can say
-“Charge renewal invoices when they are issued.” Keep the configured Terms link beside
-it. Future services have no exact calendar until provisioned; show their invoice and
+Show an Off switch for Auto Pay that names the card it charges and when: “Renewals are
+charged to <card> when each invoice is issued.” Explain: “Applies to new orders. Current
+services keep their own setting.” Turning the switch on is the consent; keep the configured
+Terms link in its help. With one owned saved method the switch uses it; with more, the
+customer picks one first and nothing is preselected. Future services have no exact calendar until provisioned; show their invoice and
 charge dates on the service page once scheduled. Never substitute their expiry date.
 
 POST JSON to `route('extensions.gateways.ae-stripe.auto-pay-default')` with the normal
