@@ -820,7 +820,7 @@ class AeStripe extends Gateway
      */
     public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $billingAgreement, bool $requireAutoPay = false)
     {
-        return $this->charge($invoice, $amount, $billingAgreement, $this->toMinorUnits($amount, $invoice->currency_code), $requireAutoPay);
+        return $this->charge($invoice, $amount, $billingAgreement, $this->toMinorUnits($amount, $invoice->currency_code), $requireAutoPay, strtolower($invoice->currency_code));
     }
 
     /** Pay the open-invoice offer only while its accepted card is still the account Auto Pay card. */
@@ -829,7 +829,7 @@ class AeStripe extends Gateway
         return $this->chargeAccepted($invoice, $amount, $billingAgreement, true);
     }
 
-    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement, ?int $acceptedAmount = null, bool $requireAutoPay = false)
+    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement, ?int $acceptedAmount = null, bool $requireAutoPay = false, ?string $acceptedCurrency = null)
     {
         $this->paymentRetryReserved = false;
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
@@ -839,7 +839,10 @@ class AeStripe extends Gateway
         try {
             $data = $this->checkoutPaymentData($invoice, $this->toMinorUnits($amount, $invoice->currency_code), $customer)
                 + ['agreement_id' => $billingAgreement->id, 'renewal_start' => app()->runningInConsole()];
-            if ($acceptedAmount !== null) $data['accepted_amount'] = $acceptedAmount;
+            if ($acceptedAmount !== null) {
+                $data['accepted_amount'] = $acceptedAmount;
+                $data['accepted_currency'] = strtolower($acceptedCurrency ?? $invoice->currency_code);
+            }
             if ($requireAutoPay) $data['auto_pay_agreement'] = (int) $billingAgreement->id;
             if (!$this->gatewayEnabled()) {
                 $this->reservePaymentAttempt($invoice, $data);

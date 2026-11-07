@@ -108,6 +108,33 @@ use Illuminate\Support\Facades\{DB, Http};
     };
     try {
         require __DIR__ . '/renewal-retries.php';
+        $run('accepted-currency', function ($invoice, $stripe) use ($gateway) {
+            $accepted = clone $invoice;
+            $invoice->currency_code = 'eur';
+            $message = paymentStops(fn () => $gateway->chargeAccepted($accepted, 20, new BillingAgreement));
+            check(str_contains($message, 'changed') && !$stripe->intents && !$stripe->confirms && !$stripe->charges,
+                'An accepted USD quote cannot create or confirm EUR under the invoice lock');
+        });
+        foreach (['recover', 'expired', 'canceled', 'invalid-params'] as $replacement) {
+            foreach (['eur', 'jpy'] as $currency) {
+                $run('accepted-currency-'.$replacement.'-'.$currency, function ($invoice, $stripe) use ($gateway, $replacement, $currency) {
+                    $stripe->loseCreate = true;
+                    paymentStops(fn () => $gateway->chargeAccepted($invoice, 20, new BillingAgreement));
+                    $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                    check(($attempt['accepted_currency'] ?? null) === 'usd', 'Accepted currency commits before creation');
+                    if ($replacement === 'expired') $attempt['created'] = time() - 24 * 3600;
+                    if ($replacement === 'canceled') $stripe->intents['pi_test1']->status = 'canceled';
+                    if ($replacement === 'invalid-params') $attempt['params']['automatic_payment_methods'] = ['enabled' => 'true'];
+                    User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+                    $invoice->currency_code = $currency;
+                    $gateway->retryChargeAttempts();
+                    check(!$stripe->confirms && !$stripe->charges && count($stripe->intents) === 1,
+                        'Recovery cannot replace or confirm a quote in another currency, including a different minor-unit scale');
+                    check(count(Notification::$rows) === 1 && str_contains(Notification::$rows[0]['body'], 'changed'),
+                        'Currency refusal gives the customer an invoice refresh action');
+                });
+            }
+        }
         $run('retire-core-event', function ($invoice, $stripe) use ($gateway) {
             $gateway->boot(); $gateway->pay($invoice, 20);
             $invoice->status = 'cancelled'; Gateway::$enabled = false;
