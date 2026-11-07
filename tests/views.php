@@ -53,7 +53,11 @@ foreach (['pay', 'billing-agreement'] as $name) {
 check(str_contains($theme, '[data-theme="dark"], [data-theme="light"], .dark, .light'), 'Explicit page theme markers win');
 check(str_contains($theme, "matchMedia('(prefers-color-scheme: dark)')"), 'OS colour scheme is the last fallback');
 check(str_contains($theme, 'elements.update({appearance})'), 'Open forms update without remounting');
-check(!preg_match('/#[0-9a-f]{3,6}\b|colorPrimary/i', $theme), 'No brand colours are hard-coded');
+check(!preg_match('/#[0-9a-f]{3,6}\b/i', $theme), 'No brand colours are hard-coded');
+check(str_contains($theme, "getPropertyValue('--ae-stripe-' + name)") && str_contains($theme, 'colorPrimary: primary,')
+    && str_contains($theme, 'colorBackground: input,') && str_contains($theme, "if (border) rules['.Input']")
+    && str_contains($theme, 'JSON.stringify(appearance) === current'),
+    'Stripe fields take the theme colours from --ae-stripe-* properties and follow their changes');
 foreach (['pay', 'billing-agreement'] as $name) {
     $view = file_get_contents($views . $name . '.blade.php');
     check(str_contains($view, 'Js::from(auth()->user()->name)') && str_contains($view, 'Js::from(auth()->user()->email)'), "$name: customer details use script-safe values");
@@ -71,7 +75,7 @@ check(str_contains($elementsView, 'const business = businessName ? {business: {n
     && str_contains(file_get_contents($views . 'billing-agreement.blade.php'), 'businessName: config.businessName'),
     'Both Payment Elements and the Link button name the site when it has a name');
 $setupView = file_get_contents($views . 'billing-agreement.blade.php');
-check(str_contains($setupView, 'id="setup-consent" required disabled') && str_contains($setupView, 'I agree to save this payment method for future charges, including renewals.')
+check(preg_match('/id="setup-consent"[^>]*\brequired disabled\b/', $setupView) === 1 && str_contains($setupView, 'I agree to save this payment method for future charges, including renewals.')
     && str_contains($setupView, 'Auto Pay can charge when you are away. Saving does not turn on Auto Pay.'), 'Setup has an explicit future off-session opt-in');
 check(str_contains($setupView, "document.querySelector('script[src^=\"https://js.stripe.com/v3\"]')"), 'Setup reuses an existing Stripe.js script');
 check(str_contains($setupView, 'if (window.Stripe) {')
@@ -81,6 +85,25 @@ check(str_contains($setupView, '}, existingScript ? 5000 : 30000)')
     && str_contains($setupView, 'clearTimeout(timeout)'), 'Setup allows fresh requests thirty seconds, bounds reused waits at five seconds and clears the timer');
 check(str_contains($setupView, 'if (!existingScript) script.remove();'), 'Setup removes failed scripts only when it owns them');
 $recordConsentCall = 'await fetch(config.consentUrl';
+$order = array_map(fn ($needle) => strpos($setupView, $needle),
+    ['id="payment-element"', 'id="setup-consent"', 'id="error-message"', 'id="submit"', 'id="express-checkout"']);
+$sortedOrder = $order;
+sort($sortedOrder);
+check(!in_array(false, $order, true) && $order === $sortedOrder,
+    'Setup shows the card fields, then the consent and its reason line just above Save, then Link');
+check(preg_match('/id="express-checkout"[^>]*\binert\b/', $setupView) === 1
+    && str_contains($setupView, 'container.inert = isLoading || !ready;')
+    && str_contains($setupView, 'expressContainer.inert = container.inert || !consent.checked;')
+    && str_contains($setupView, 'submit.disabled = isLoading || !ready;'),
+    'Setup keeps Link inactive until consent, while the card fields and Save stay live');
+check(preg_match("/if \(!consent\.checked\) \{\s+failSetup\(expressEvent \? 'Tick the box to save with Link\.' : 'Tick the box to save this card\.'\);\s+consent\.focus\(\);\s+return;\s+\}\s+message\.replaceChildren\(\);\s+setLoading\(true\);/", $setupView) === 1,
+    'Save without the tick says why next to the box and moves focus to it, before any request');
+check(str_contains($setupView, '<form id="payment-form" class="mt-2" novalidate '),
+    'The browser does not stop Save with its own bubble, so the form can say why in its message');
+check(str_contains($setupView, "showMessage('Tick the box to save with Link.');"), 'A click on the waiting Link button says why it waits');
+check(str_contains($setupView, 'Save card') && !str_contains($setupView, 'Save payment method'), 'Setup button names what it saves');
+check(str_contains($setupView, 'ownTerms: true,') && str_contains($elementsView, "if (ownTerms) paymentOptions.terms = {card: 'never'};"),
+    'Setup shows one consent text: Stripe card terms are hidden where the form has its own');
 $confirmSetupCall = 'await stripe.confirmSetup(';
 $recordsConsentBeforeConfirmation = static function ($view) use ($recordConsentCall, $confirmSetupCall) {
     $consentPosition = strpos($view, $recordConsentCall);
@@ -116,6 +139,14 @@ check(str_contains($setupView, 'if (error) throw error;') && str_contains($setup
     && str_contains($setupView, 'finally {') && str_contains($setupView, 'setLoading(false);'), 'Setup errors remain in alert and unlock retry');
 
 $payView = file_get_contents($views . 'pay.blade.php');
+check(str_contains($payView, "paymentMethodTypes: ['card', 'link'],") && !str_contains($payView, 'excludedPaymentMethodTypes'),
+    'The pay form offers only card and Link');
+foreach (['pay' => $payView, 'billing-agreement' => $setupView] as $name => $view) {
+    check(strpos($view, 'id="express-checkout"') > strpos($view, 'id="submit"') && str_contains($view, '<div id="express-checkout-element" class="shrink-0" style="width: 160px"></div>'),
+        "$name: Link is a small button below the main button");
+}
+check(str_contains($elementsView, "layout: 'tabs',") && str_contains($elementsView, 'buttonHeight: 40,'),
+    'Card fields show without a panel around them and the Link button keeps its smallest height');
 check(str_contains($payView, "@checked(in_array($" . "intent->status, ['requires_action', 'requires_confirmation']")
     && str_contains($payView, 'const save = resuming ? savedConsent :') && str_contains($payView, 'amount: @js($intent->amount), save}')
     && str_contains($payView, 'saveCard.disabled = resuming ||'), '3DS resume visibly preserves its recorded save choice');
@@ -129,3 +160,6 @@ $syncTheme = substr($theme, $syncPosition);
 check(str_contains($syncTheme, 'for (let node = form; node; node = node.parentElement)')
     && str_contains($syncTheme, "observer.observe(node, {attributes: true, attributeFilter: ['class', 'data-theme', 'style']})"),
     'Theme observer follows every ancestor read by stripeAppearance');
+
+check(str_contains($payView, "['amount' => \$paymentAmount]") && !str_contains($payView, '$invoice->formattedRemaining'),
+    'The Pay button uses the formatted intent amount passed by checkout');

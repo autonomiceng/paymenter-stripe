@@ -41,7 +41,7 @@ $existing = new Service;
 $existing->subscription_id = null;
 $existing->plan->type = 'recurring';
 $beforeCalls = count(Http::$calls);
-foreach ([null, 'off_session_v1', 'off_session_v2', true] as $version) {
+foreach ([null, 'off_session_v1', 'off_session_v2', 'auto_pay_new_services_v2', true] as $version) {
     rejects(fn () => $gateway->saveAutoPayDefault(new Request(array_replace($choice, ['version' => $version]))), 'HTTP 422');
 }
 rejects(fn () => $gateway->saveAutoPayDefault(new Request(array_replace($choice, ['consent' => false]))), 'HTTP 422');
@@ -55,11 +55,66 @@ foreach (['user_id' => 8, 'gateway_id' => $gatewayId + 1, 'deleted_at' => '2026-
     rejects(fn () => $gateway->saveAutoPayDefault(new Request($choice)), 'HTTP 403');
     ExtensionHelper::$agreements['pm_default'][$field] = $saved;
 }
+Service::$row = $existing;
+// Bundled Stripe retains ownership until adoption, including existing service links.
+$existing->billing_agreement_id = 55;
+Gateway::$bundled = true; Gateway::$bundledEnabled = true;
+$beforeProperties = $user->props->values;
+rejects(fn () => $gateway->saveAutoPayDefault(new Request($choice)), 'HTTP 409');
+check($existing->billing_agreement_id === 55 && $user->props->values === $beforeProperties,
+    'Refused enrollment leaves existing gateway links, preferences and consent unchanged');
+$gateway->saveAutoPayDefault(new Request(['agreement_id' => 91]));
+check($gateway->autoPayCard($user) === 91 && $existing->billing_agreement_id === 55,
+    'A preference-only save remains usable during gateway coexistence');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+check($existing->billing_agreement_id === null && $gateway->autoPayDefault($user) === null,
+    'Off remains usable while bundled Stripe owns collection');
+Gateway::$bundled = false; Gateway::$bundledEnabled = false;
 $gateway->saveAutoPayDefault(new Request($choice));
 $record = $gateway->autoPayDefault($user);
 check($record['version'] === AeStripe::AUTO_PAY_CONSENT && $record['user_id'] === 7
     && $record['agreement_id'] === 91 && is_int($record['accepted_at']), 'New account scope records authenticated consent, time and exact agreement');
-check($existing->billing_agreement_id === null, 'Account opt-in leaves existing service opt-outs alone');
+check($existing->billing_agreement_id === 91, 'Account switch links current recurring services to the chosen card');
+// Off revokes charging consent without discarding the customer's card choice.
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+check($gateway->autoPayDefault($user) === null, 'Off still revokes account charging consent');
+check($gateway->autoPayCard($user) === 91, 'Off keeps the explicitly chosen Auto Pay card for the next visit');
+$gateway->saveAutoPayDefault(new Request($choice));
+check($gateway->autoPayCard($user) === 91, 'Off then On keeps the same card');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+ExtensionHelper::$agreements['pm_selected'] = ['id' => 92, 'user_id' => 7, 'gateway_id' => $gatewayId,
+    'external_reference' => 'pm_selected', 'deleted_at' => null];
+$gateway->saveAutoPayDefault(new Request(['agreement_id' => 92]));
+check($gateway->autoPayCard($user) === 92 && $gateway->autoPayDefault($user) === null
+    && $existing->billing_agreement_id === null, 'Choosing an Auto Pay card while Off persists without enabling charges');
+// Saving another method must not take over the chosen card.
+ExtensionHelper::$agreements['pm_added'] = ['id' => 93, 'user_id' => 7, 'gateway_id' => $gatewayId,
+    'external_reference' => 'pm_added', 'deleted_at' => null];
+check($gateway->autoPayCard($user) === 92, 'A newly saved card cannot replace the explicit choice');
+foreach (['user_id' => 8, 'gateway_id' => $gatewayId + 1, 'deleted_at' => '2026-11-07'] as $field => $value) {
+    $saved = ExtensionHelper::$agreements['pm_added'][$field];
+    ExtensionHelper::$agreements['pm_added'][$field] = $value;
+    rejects(fn () => $gateway->saveAutoPayDefault(new Request(['agreement_id' => 93])), 'HTTP 403');
+    check($gateway->autoPayCard($user) === 92, 'A refused selection preserves the current choice');
+    ExtensionHelper::$agreements['pm_added'][$field] = $saved;
+}
+$gateway->saveAutoPayDefault(new Request($choice));
+$gateway->saveAutoPayDefault(new Request(['agreement_id' => 92]));
+check($gateway->autoPayDefault($user)['agreement_id'] === 91 && $existing->billing_agreement_id === 91,
+    'A card preference alone cannot change existing charging consent');
+unset(ExtensionHelper::$agreements['pm_selected'], ExtensionHelper::$agreements['pm_added']);
+$gateway->saveAutoPayDefault(new Request($choice));
+
+foreach (['subscription_id' => 'sub_existing', 'status' => Service::STATUS_CANCELLED, 'user_id' => 8] as $field => $value) {
+    $kept = $existing->$field; $existing->$field = $value; $existing->billing_agreement_id = null;
+    $gateway->saveAutoPayDefault(new Request($choice));
+    check($existing->billing_agreement_id === null, 'Account switch skips a service by ' . $field);
+    $existing->$field = $kept;
+}
+$existing->plan->type = 'onetime';
+$gateway->saveAutoPayDefault(new Request($choice));
+check($existing->billing_agreement_id === null, 'Account switch skips one-time services');
+$existing->plan->type = 'recurring';
 $newService = function () use ($user) {
     $service = new Service;
     $service->subscription_id = null;
@@ -89,7 +144,7 @@ check($service->billing_agreement_id === null, 'Bundled gateway ownership preven
 $service = $newService();
 Event::$listeners[\App\Events\Service\Updated::class](new \App\Events\Service\Updated($service));
 check($service->billing_agreement_id === null, 'Updating an existing opted-out service cannot re-enable Auto Pay');
-foreach (['1', 'true', json_encode(array_replace($record, ['version' => 'off_session_v1'])),
+foreach (['1', 'true', json_encode(array_replace($record, ['version' => 'off_session_v1'])), json_encode(array_replace($record, ['version' => 'auto_pay_new_services_v2'])),
     json_encode(array_replace($record, ['user_id' => 99]))] as $legacy) {
     $user->props->values[$property] = $legacy;
     $service = $newService(); $created($service);
@@ -106,15 +161,41 @@ ExtensionHelper::$agreements['pm_default']['deleted_at'] = null;
 DB::$beforeUserLock = function () use ($user, $property) { unset($user->props->values[$property]); };
 $service = $newService(); $created($service);
 check($service->billing_agreement_id === null, 'Opt-out committed before the user lock prevents new-service enrollment');
+$current = $newService(); $current->billing_agreement_id = 55;
 $gateway->saveAutoPayDefault(new Request($choice));
+check($current->billing_agreement_id === 91, 'Turning Auto Pay on moves every current service to the account card');
 Gateway::$enabled = false;
 rejects(fn () => $gateway->saveAutoPayDefault(new Request($choice)), 'HTTP 409');
+$retry = fn ($state) => json_encode(['key' => 'k', 'renewal' => ['state' => $state, 'agreement_id' => 91, 'retries' => 1]]);
+$user->props->values['ae_stripe_checkout_18'] = $retry('waiting');
+$user->props->values['ae_stripe_checkout_19'] = $retry('active');
 $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
 Gateway::$enabled = true;
+check($current->billing_agreement_id === null, 'Turning Auto Pay off unlinks current services, even while the gateway is paused');
+check(json_decode($user->props->values['ae_stripe_checkout_18'], true)['renewal']['state'] === 'stopped'
+    && $user->props->values['ae_stripe_checkout_19'] === $retry('active'), 'Turning Auto Pay off stops a waiting renewal retry and leaves a charge in flight');
+// A service linked before the account switch (no account record) is also unlinked by Off.
+$legacy = $newService(); $legacy->billing_agreement_id = 91;
+check($gateway->autoPayDefault($user) === null, 'Legacy link has no account record');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+check($legacy->billing_agreement_id === null, 'Off unlinks a service linked per service before the account switch');
+// Turning it on never lets a waiting retry charge an open invoice: the confirm says open invoices are not charged.
+$user->props->values['ae_stripe_checkout_18'] = $retry('waiting');
+$gateway->saveAutoPayDefault(new Request($choice));
+check(json_decode($user->props->values['ae_stripe_checkout_18'], true)['renewal']['state'] === 'stopped', 'Turning Auto Pay on stops a waiting renewal retry');
+unset($user->props->values['ae_stripe_checkout_18'], $user->props->values['ae_stripe_checkout_19']);
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
 $service = $newService(); $created($service);
-check($service->billing_agreement_id === null && $gateway->autoPayDefault($user) === null, 'Turning the default off only affects future services');
-check($existing->billing_agreement_id === null && $enrolled->billing_agreement_id === 91 && count(ExtensionHelper::$agreements) === 1, 'Opt-ins and opt-outs do not change saved cards or old services');
+check($service->billing_agreement_id === null && $gateway->autoPayDefault($user) === null, 'Off enrolls no new service');
+check($enrolled->billing_agreement_id === 91 && count(ExtensionHelper::$agreements) === 1, 'The switch never changes saved cards');
 check(count(Http::$calls) === $beforeCalls, 'Account consent and new-service assignment need no Stripe calls');
+// Removing the account card turns Auto Pay off and unlinks what it paid for.
+$gateway->saveAutoPayDefault(new Request($choice));
+Http::$handler = function ($verb, $path) { if ($verb === 'get') return ['customer' => null]; throw new RuntimeException('Unexpected request'); };
+check($gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements['pm_default'])) === true
+    && $current->billing_agreement_id === null && !isset($user->props->values[$property]), 'Removing the account card turns Auto Pay off');
+check($gateway->autoPayCard($user) === null, 'Removing the chosen card clears its saved preference');
+Http::$handler = null;
 
 // Hosting dates follow the real native cron setting. A pending invoice is not a new automatic debit.
 $service = $newService(); $service->expires_at = new \DateTimeImmutable('2026-12-15');

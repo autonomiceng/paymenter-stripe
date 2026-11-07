@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const views = new URL('../extension/AeStripe/resources/views/', import.meta.url);
 const theme = readFileSync(new URL('stripe-theme.blade.php', views), 'utf8');
-function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hosting') {
+function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hosting', resuming = false, savedConsent = false) {
     let source = readFileSync(new URL(`${name}.blade.php`, views), 'utf8')
         .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
         .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(new URL('stripe-elements.blade.php', views), 'utf8'))
@@ -21,10 +21,10 @@ function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hostin
         .replace('@js($customerSessionSecret)', 'null')
         .replace('@js($linkDisplay)', JSON.stringify(linkDisplay))
         .replace('@js($businessName)', JSON.stringify(businessName))
-        .replace("@js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true))", 'false')
+        .replace("@js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true))", JSON.stringify(resuming))
         .replaceAll('@js($intent->amount)', '2000').replace("@js(strtolower($intent->currency))", "'usd'")
-        .replace("@js(($intent->metadata->ae_stripe_consent ?? null) === '1')", 'false')
-        .replace(/@checked\([^\n]+? disabled/, 'disabled')
+        .replace("@js(($intent->metadata->ae_stripe_consent ?? null) === '1')", JSON.stringify(savedConsent))
+        .replace(/@checked\([^\n]+? disabled/, resuming && savedConsent ? 'checked disabled' : 'disabled')
         .replace(/\{\{[^\n]+?\}\}/g, "'Fixture'")
         .replaceAll('@script', '').replaceAll('@endscript', '');
     assert(!/@js|@checked|\{\{|@include/.test(source), 'Blade expressions are rendered');
@@ -42,7 +42,7 @@ try {
         [name, 'above_card', false, null],
     ]);
     for (const [name, linkDisplay, expressThrows, businessName = 'Fixture Hosting'] of cases) {
-        const page = activePage = await browser.newPage();
+        const page = activePage = await browser.newPage({viewport: {width: 390, height: 844}});
         await page.route('**/*', route => route.fulfill({ contentType: 'text/javascript', body: '' }));
         page.setDefaultTimeout(5000);
         await page.setContent('<html><body></body></html>');
@@ -50,10 +50,12 @@ try {
             window.expressThrows = expressThrows;
             window.failure = 'network';
             window.confirms = 0;
+            window.clears = 0;
             window.elementCalls = [];
             window.elementHandlers = {};
             window.fetch = async () => {
                 if (failure === 'network') throw new TypeError('Failed to fetch');
+                if (failure === 'server-decline') return { ok: false, async json() { return {message: 'Server decline wording.', intent: 'fixture-intent', declined: true}; } };
                 return { ok: failure !== 'consent', async json() { return {message: 'Could not record payment preferences. Refresh the invoice.', status: 'requires_action', client_secret: 'fixture-secret'}; } };
             };
             window.$wire = { on() {} };
@@ -76,6 +78,14 @@ try {
                             type === 'payment' ? 'Card form' : 'Pay with Link';
                         // No available methods also models Link being disabled on the account.
                         handlers.ready?.({availablePaymentMethods: expressThrows === 'unavailable' ? null : {link: true}});
+                    }, clear() {
+                        if (type !== 'payment') return;
+                        clears++;
+                        // Stripe reports the empty form after clear() returns and submission unlocks.
+                        window.clearChange = new Promise(resolve => requestAnimationFrame(() => {
+                            handlers.change?.({empty: true, complete: false, value: {type: 'card'}});
+                            resolve();
+                        }));
                     }, destroy() {} };
                 } }; },
                 async createConfirmationToken({elements}) {
@@ -107,16 +117,17 @@ try {
             assert.equal(options.amount, 2000);
             assert.equal(options.currency, 'usd');
             assert.equal(options.clientSecret, undefined);
-            assert.deepEqual(options.excludedPaymentMethodTypes, ['blik', 'acss_debit', 'customer_balance']);
+            assert.deepEqual(options.paymentMethodTypes, ['card', 'link'], 'The pay form offers only card and Link');
+            assert.equal(options.excludedPaymentMethodTypes, undefined);
             const calls = await page.evaluate(() => elementCalls);
             const payment = calls.find(call => call.type === 'payment').options;
             assert.equal(payment.defaultValues.billingDetails.email, linkDisplay === 'stripe_default' ? 'Fixture' : undefined,
                 `${linkDisplay}: only Stripe default prefills email`);
-            assert.equal(payment.layout.type, 'accordion');
-            assert.equal(payment.layout.defaultCollapsed, false);
+            assert.equal(payment.layout, 'tabs');
+            assert.equal(payment.terms, undefined, 'The pay form keeps Stripe card terms');
             assert.deepEqual(calls.filter(call => call.type === 'expressCheckout').map(call => call.options),
                 linkDisplay === 'above_card' ? [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
-                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, ...(businessName ? {business: {name: businessName}} : {})}] : [],
+                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, buttonHeight: 40, ...(businessName ? {business: {name: businessName}} : {})}] : [],
                 `${linkDisplay}: only the above-card choice mounts Link-only Express Checkout`);
         } else {
             await page.evaluate(async ({linkDisplay, businessName}) => {
@@ -124,17 +135,24 @@ try {
                 component.$el = document.querySelector('form');
                 await component.init();
             }, {linkDisplay, businessName});
-            assert.equal(await page.locator('#submit').isEnabled(), false, 'Setup requires explicit consent');
+            assert.equal(await page.locator('#submit').isEnabled(), true, 'Save stays live so it can say why it waits');
+            await page.locator('#submit').click();
+            assert.equal(await page.locator('[role=alert]').textContent(), 'Tick the box to save this card.');
+            assert.equal(await page.evaluate(() => document.activeElement?.id), 'setup-consent', 'The reason moves focus to the box');
+            assert.equal(await page.evaluate(() => confirms), 0, 'Save without the tick confirms nothing');
+            assert.equal(await page.locator('#payment-element').evaluate(element => element.inert), false, 'Card fields are live before the tick');
+            assert.equal(await page.locator('#express-checkout').evaluate(element => element.inert), true, 'Link waits for the tick');
             const options = await page.evaluate(() => elementOptions);
             assert.equal(options.clientSecret, 'fixture-secret', 'Setup keeps the existing SetupIntent flow');
             assert.equal(options.mode, undefined);
             const calls = await page.evaluate(() => elementCalls);
             assert.equal(calls.find(call => call.type === 'payment').options.defaultValues.billingDetails.email,
                 linkDisplay === 'stripe_default' ? 'Fixture' : undefined, `${linkDisplay}: setup only prefills email for Stripe default`);
-            assert.equal(calls.find(call => call.type === 'payment').options.layout.defaultCollapsed, false);
+            assert.equal(calls.find(call => call.type === 'payment').options.layout, 'tabs');
+            assert.deepEqual(calls.find(call => call.type === 'payment').options.terms, {card: 'never'}, 'Setup shows its own consent only');
             assert.deepEqual(calls.filter(call => call.type === 'expressCheckout').map(call => call.options),
                 linkDisplay === 'above_card' ? [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
-                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, ...(businessName ? {business: {name: businessName}} : {})}] : []);
+                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, buttonHeight: 40, ...(businessName ? {business: {name: businessName}} : {})}] : []);
             if (expressThrows) assert.equal(await page.locator('#setup-consent').isEnabled(), true, 'Card setup stays ready when Express fails');
             await page.locator('#setup-consent').check();
         }
@@ -151,22 +169,41 @@ try {
         if (linkDisplay === 'above_card') {
             assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${name}: above-card always mounts the card form`);
         }
+        if (name === 'pay') {
+            // A tall Stripe form puts the alert above the viewport when Pay is clicked on mobile.
+            await page.locator('#payment-element').evaluate(element => { element.style.minHeight = '900px'; });
+        }
         const fallback = name === 'pay' ? 'Could not check the payment. Refresh the invoice for its status.' : 'Could not save your payment method. Try again.';
-        for (const failure of ['network', 'confirmation', ...(name === 'pay' ? ['updates'] : []), 'consent', 'decline']) {
+        for (const failure of ['network', 'confirmation', ...(name === 'pay' ? ['updates', 'server-decline'] : []), 'consent', 'decline']) {
             await page.evaluate(value => { window.failure = value; }, failure);
             const before = await page.evaluate(() => confirms);
+            const clearsBefore = await page.evaluate(() => clears);
             await page.locator('#submit').click();
-            const expected = failure === 'decline' ? 'Your card was declined.' : failure === 'consent'
+            const expected = failure === 'decline' ? 'Your card was declined.' : failure === 'server-decline' ? 'Server decline wording.' : failure === 'consent'
                 ? (name === 'pay' ? 'Could not record payment preferences. Refresh the invoice.' : 'Could not record your agreement. Try again.') : fallback;
             await page.waitForFunction(() => document.querySelector('[role=alert]').textContent.length > 0);
+            await page.evaluate(() => window.clearChange);
             assert.equal(await page.locator('[role=alert]').textContent(), expected, `${name}: ${failure}`);
             assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: retry stays available after ${failure}`);
+            // Only a decline of the entered details clears them, so the customer types a different card.
+            assert.equal(await page.evaluate(() => clears) - clearsBefore, failure === 'server-decline' ? 1 : 0, `${name}: ${failure} clears the card form only after a decline`);
+            if (failure === 'server-decline') {
+                const alert = await page.locator('[role=alert]').boundingBox();
+                assert(alert && alert.y >= 0 && alert.y + alert.height <= 844,
+                    'The decline stays in view at 390px after clearing the card');
+                await page.evaluate(() => elementHandlers.payment.change({empty: true, complete: false, value: {type: 'card'}}));
+                assert.equal(await page.locator('[role=alert]').textContent(), expected,
+                    'Further empty form updates keep the decline visible');
+                await page.evaluate(() => elementHandlers.payment.change({empty: false, complete: false, value: {type: 'card'}}));
+                assert.equal(await page.locator('[role=alert]').textContent(), '',
+                    'Entering another card clears the decline');
+            }
             if (['network', 'consent', 'updates'].includes(failure)) assert.equal(await page.evaluate(() => confirms), before, 'Failed preparation cannot confirm');
         }
         if (name === 'billing-agreement' && linkDisplay === 'above_card' && !expressThrows) {
             assert.equal(await page.locator('#express-checkout').isVisible(), true);
-            assert.equal(await page.evaluate(() => document.querySelector('#express-checkout').compareDocumentPosition(
-                document.querySelector('#payment-element')) & Node.DOCUMENT_POSITION_FOLLOWING), 4);
+            assert.equal(await page.evaluate(() => document.querySelector('#submit').compareDocumentPosition(
+                document.querySelector('#express-checkout')) & Node.DOCUMENT_POSITION_FOLLOWING), 4, 'Link sits below Save');
             await page.evaluate(() => {
                 window.setupRequests = [];
                 window.linkFailures = [];
@@ -180,7 +217,7 @@ try {
             const before = await page.evaluate(() => confirms);
             const confirmLink = () => page.evaluate(() => elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)}));
             await confirmLink();
-            assert.equal(await page.locator('[role=alert]').textContent(), 'Agree to future charges before saving your payment method.');
+            assert.equal(await page.locator('[role=alert]').textContent(), 'Tick the box to save with Link.');
             assert.equal(await page.evaluate(() => confirms), before);
             assert.deepEqual(await page.evaluate(() => setupRequests), [], 'Unchecked consent never reaches the server');
             await page.locator('#setup-consent').check();
@@ -231,9 +268,9 @@ try {
             if (linkDisplay === 'above_card' && !expressThrows) {
                 assert.equal(await page.evaluate(() => typeof elementHandlers.expressCheckout.confirm), 'function',
                     'Link Express Checkout has a confirm handler');
-                assert.equal(await page.locator('#express-checkout').isVisible(), true, 'Available Link appears above the card form');
-                assert.equal(await page.evaluate(() => document.querySelector('#express-checkout').compareDocumentPosition(
-                    document.querySelector('#payment-element')) & Node.DOCUMENT_POSITION_FOLLOWING), 4);
+                assert.equal(await page.locator('#express-checkout').isVisible(), true, 'Available Link appears below Pay');
+                assert.equal(await page.evaluate(() => document.querySelector('#submit').compareDocumentPosition(
+                    document.querySelector('#express-checkout')) & Node.DOCUMENT_POSITION_FOLLOWING), 4);
                 await page.evaluate(() => {
                     window.failure = 'action-success';
                     window.linkRequests = [];
@@ -311,6 +348,62 @@ try {
             assert.equal(await page.locator('[role=alert]').textContent(), '', 'Card setup confirms after Express creation fails');
             assert.deepEqual(await page.evaluate(() => setupConfirmParams), {return_url: '/return'});
         }
+        await page.close();
+    }
+    // A resumed manual intent has no new token. After a proven decline the customer must
+    // refresh into a new checkout before a different card can be submitted.
+    for (const decline of ['response', 'status', 'sdk-error']) {
+        const page = activePage = await browser.newPage();
+        page.setDefaultTimeout(5000);
+        await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
+        await page.route('https://example.com/resume', route => route.fulfill({contentType: 'text/html', body: '<html><body></body></html>'}));
+        await page.goto('https://example.com/resume');
+        await page.evaluate(decline => {
+            window.requests = []; window.tokens = 0; window.handlers = {}; window.actions = 0;
+            window.$wire = {on() {}};
+            window.fetch = async (_, options) => {
+                requests.push(JSON.parse(options.body));
+                if (requests.length === 1) return {ok: true, async json() {
+                    return {intent: 'fixture-intent', status: 'requires_action', client_secret: 'fixture-secret'};
+                }};
+                return {ok: decline !== 'response', async json() { return decline === 'response'
+                    ? {message: 'Your bank declined this card.', declined: true}
+                    : {status: 'requires_payment_method'}; }};
+            };
+            window.Stripe = () => ({
+                elements: () => ({update() {}, async submit() {return {};}, create(type) {
+                    if (type !== 'payment') throw new Error('A resumed payment cannot offer Express Checkout');
+                    return {on(name, fn) {handlers[name] = fn;}, mount() {handlers.ready();},
+                        clear() {handlers.change?.({empty: true});}, destroy() {}};
+                }}),
+                async handleNextAction() {actions++; return decline === 'sdk-error'
+                    ? {error: {type: 'card_error', message: 'Authentication declined.'}} : {};},
+                async createConfirmationToken() {tokens++; return {confirmationToken: {id: 'ctoken_new'}};},
+            });
+        }, decline);
+        await page.setContent(render('pay', 'above_card', 'Fixture Hosting', true, true));
+        await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
+        assert.equal(await page.locator('#save-card').isChecked(), true, 'Resume keeps the original save consent');
+        await page.locator('#submit').click();
+        await page.waitForFunction(() => requests.length >= 1 && !document.querySelector('#submit').classList.contains('hidden'));
+        assert.equal(await page.locator('#submit').isDisabled(), true,
+            'A declined resumed payment cannot submit another card in tokenless mode');
+        assert.match(await page.locator('[role=alert]').textContent(), /[Rr]efresh/);
+        assert.equal(await page.locator('#refresh-payment').isVisible(), true, 'A visible refresh action prepares a new card checkout');
+        assert.equal(await page.locator('#payment-element').evaluate(element => element.inert), true);
+        await page.evaluate(() => {
+            handlers.change({empty: false, value: {type: 'card'}});
+            document.querySelector('form').dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+        });
+        const requestCount = decline === 'sdk-error' ? 1 : 2;
+        assert.equal(await page.evaluate(() => requests.length), requestCount, 'A second card cannot send another tokenless request');
+        assert.equal(await page.evaluate(() => tokens), 0);
+        assert.deepEqual(await page.evaluate(() => requests), Array.from({length: requestCount}, () => ({
+            intent: 'fixture-intent', confirmation_token: null, amount: 2000, save: true,
+        })), 'Authentication keeps the resumed intent, amount and consent');
+        await page.route('https://example.com/resume', route => route.fulfill({contentType: 'text/html', body: 'Fresh payment checkout'}));
+        await page.locator('#refresh-payment').click();
+        await page.getByText('Fresh payment checkout').waitFor();
         await page.close();
     }
     console.log('Pay and setup network failures, retry and card declines passed.');

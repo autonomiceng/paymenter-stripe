@@ -114,10 +114,13 @@ trait ChargeRecovery
                 if (!empty($attempt['authentication_check']) && empty($attempt['funds_pending'])
                     && $attempt['authentication_check']['key'] === ($attempt['confirmation']['key'] ?? null)
                     && $attempt['authentication_check']['at'] > time() - 3600) continue;
-                // Recovery never replays a frozen charge. Every confirmation uses today's balance
-                // and an active agreement; checkout tokens resume only at the same displayed amount.
+                // Recovery keeps customer-accepted constraints; ordinary renewals use today's balance.
+                // No frozen confirmation is replayed, and every saved agreement must still be active.
                 $data = $attempt['params'] ?? $this->checkoutPaymentData($invoice, 0,
                     $invoice->user->properties()->where('key', 'stripe_id')->firstOrFail()->value);
+                foreach (['accepted_amount', 'accepted_currency', 'auto_pay_agreement'] as $key) {
+                    if (array_key_exists($key, $attempt)) $data[$key] = $attempt[$key];
+                }
                 if (!isset($attempt['intent']) && !empty($attempt['agreement_id'])) $data['agreement_id'] = $attempt['agreement_id'];
                 $intent = $this->checkoutIntent($invoice, $data);
                 if ($intent->status === 'succeeded') { $this->recordIntentPayment($intent, 'succeeded'); continue; }

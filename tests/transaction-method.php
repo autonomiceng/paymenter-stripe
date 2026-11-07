@@ -14,6 +14,20 @@ $user = User::$row = new User(new Properties('cus_owner'));
 $invoice = Invoice::$row = new Invoice($user);
 $invoice->total = 1000; // Independent label receipts stay below the invoice balance; return behavior has its own fixtures.
 Invoice::$rows = [];
+// A failed charge keeps its own card and a safe reason, including webhook redelivery.
+$declined = (object) ['id' => 'pi_declinedlabel', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 0,
+    'customer' => 'cus_owner', 'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1'],
+    'last_payment_error' => (object) ['code' => 'card_declined', 'decline_code' => 'insufficient_funds', 'message' => 'never-store',
+        'payment_method' => (object) ['type' => 'card', 'card' => (object) ['brand' => 'visa', 'last4' => '0002']]]];
+$incompleteDecline = clone $declined;
+$incompleteDecline->last_payment_error = (object) ['code' => 'card_declined'];
+$gateway->webhook(eventRequest($incompleteDecline, type: 'payment_intent.payment_failed'));
+$gateway->webhook(eventRequest($declined, type: 'payment_intent.payment_failed'));
+$gateway->webhook(eventRequest($declined, type: 'payment_intent.payment_failed'));
+$failure = DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_declinedlabel')] ?? null;
+check(($failure['label'] ?? null) === 'Visa **** 0002', 'Failed payment retains the declined card');
+check(($failure['failure_reason'] ?? null) === 'Insufficient funds.', 'Failed payment retains a plain decline reason');
+check(!str_contains(json_encode($failure), 'never-store'), 'Raw provider errors are not stored');
 $fixtures = [
     'card' => ['type' => 'card', 'card' => ['brand' => 'visa', 'last4' => '4242', 'fingerprint' => 'never-store']],
     'link' => ['type' => 'link', 'link' => ['email' => 'payer@example.com']],
@@ -73,8 +87,11 @@ $methodIntent->id = 'pi_failedlabel';
 $methodIntent->latest_charge = 'py_fixture';
 $before = count(Http::$calls);
 $gateway->webhook(eventRequest($methodIntent, type: 'payment_intent.payment_failed'));
-check(count(Http::$calls) === $before && !isset(DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_failedlabel')]), 'Failed payment captures nothing');
-// A PaymentIntent can fail and then reuse its transaction for another card.
+check(count(Http::$calls) === $before + 1 && DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_failedlabel')]['label'] === 'Visa **** 4242', 'Failed payment retrieves and retains its card');
+$before = count(Http::$calls);
+$gateway->webhook(eventRequest($methodIntent, type: 'payment_intent.payment_failed'));
+check(count(Http::$calls) === $before && DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_failedlabel')]['label'] === 'Visa **** 4242', 'Failure redelivery retains its known card without optional I/O');
+// A legacy PaymentIntent can fail and then reuse its transaction for another card.
 $retryIntent = clone $methodIntent;
 $retryIntent->id = 'pi_labelretry';
 $retryIntent->latest_charge = (object) ['payment_method_details' => json_decode(json_encode($fixtures['card']))];
@@ -83,7 +100,7 @@ $gateway->webhook(eventRequest($retryIntent, type: 'payment_intent.processing'))
 check(DB::$tables['ae_stripe_transaction_methods'][$retryId]['label'] === 'Visa **** 4242', 'Processing records the first attempt card');
 $gateway->webhook(eventRequest($retryIntent, type: 'payment_intent.payment_failed'));
 $gateway->webhook(eventRequest($retryIntent, type: 'payment_intent.payment_failed'));
-check(!isset(DB::$tables['ae_stripe_transaction_methods'][$retryId]), 'Failure and its replay clear the failed attempt label');
+check(DB::$tables['ae_stripe_transaction_methods'][$retryId]['label'] === 'Visa **** 4242' && isset(DB::$tables['ae_stripe_transaction_methods'][$retryId]['failure_reason']), 'Failure and its replay retain the failed card and reason');
 $retryIntent->latest_charge = 'ch_retrycard';
 Http::$handler = function ($verb, $path) {
     check($verb === 'get' && $path === '/charges/ch_retrycard' && !DB::$locked, 'Retry retrieves its new charge before locking');

@@ -1,41 +1,69 @@
 # Auto Pay integration
 
-Saving a payment method and enabling Auto Pay are separate actions. Auto Pay belongs
-to an account default for **new services**, or to an individual service. Paying an
-invoice never grants invoice-wide Auto Pay. Customer and staff views use the same words.
+Saving a payment method and enabling Auto Pay are separate actions. Auto Pay is one
+account switch: on, every recurring service, current and new, renews with the account
+card; off, none do. Paying an invoice never turns it on. Customer and staff views use
+the same words.
 
-## Account default (theme integration)
+## Account switch (theme integration)
 
 Resolve AE Stripe through `ExtensionHelper::getExtension('gateway', 'AeStripe')`.
 Read `autoPayDefault($user)`: null means Off; otherwise `agreement_id` identifies the
-selected native BillingAgreement. Do not choose a first card or derive consent from
-boolean properties or old Stripe metadata.
+account card, a native BillingAgreement. Read `autoPayCard($user)` for the chosen numeric
+agreement ID while Off as well as On. This preference grants no charging consent.
+Do not derive consent from boolean properties or old Stripe metadata.
 
-Show an unchecked choice, “Use Auto Pay for new services”, and an owned saved-method
-picker. Explain: “Existing services keep their Auto Pay settings.” Consent can say
-“Charge renewal invoices when they are issued.” Keep the configured Terms link beside
-it. Future services have no exact calendar until provisioned; show their invoice and
-charge dates on the service page once scheduled. Never substitute their expiry date.
+Show an Off switch for Auto Pay. Turning it on is the consent: confirm what it covers in
+one line, for example “Renewals for all 3 services charge Visa **** 4242.”, and keep the
+configured Terms link in its help. With one owned saved method the switch uses it; with
+more, retain their saved choice. With no choice yet, use the oldest saved method so
+adding a new card or Link cannot silently replace the displayed card. Open invoices are not
+charged by turning it on; offer Pay now for those.
+
+To pay an open invoice the customer accepted with a saved method, call
+`chargeAccepted($invoice, $amount, $agreement)` with the amount they saw. It is the
+saved-method charge with an accepted amount stored in the payment reservation before
+Stripe requests. Confirmation refuses a different balance under the payment lock
+("The amount due changed."), including after interrupted creation or replacement.
+For the account Auto Pay open-invoice offer, use
+`chargeAutoPayAccepted($invoice, $amount, $agreement)`. It also checks the account
+Auto Pay card while reserving and confirming the payment. Both transactions lock
+the user first, as does changing or disabling Auto Pay.
+`charge()` keeps confirming today's balance for renewals and recovery instructions
+that have no accepted amount. Themes must require `chargeAutoPayAccepted()` before
+offering account Auto Pay invoice payments.
 
 POST JSON to `route('extensions.gateways.ae-stripe.auto-pay-default')` with the normal
 session, Accept application/json and X-CSRF-TOKEN:
 
 ```json
-{"enabled":true,"agreement_id":123,"consent":true,"version":"auto_pay_new_services_v2"}
+{"enabled":true,"agreement_id":123,"consent":true,"version":"auto_pay_account_v1"}
 ```
 
-`agreement_id` is the native numeric ID, not the Stripe reference or ULID. The new
-scope requires fresh authenticated acceptance even for an existing saved card. Off:
-`{"enabled":false}`. A 200 returns `ok` and `enabled`; preserve the control on errors.
-Apply this account choice after a newly saved agreement appears in the native list,
-not to an unfinished SetupIntent. No default is inferred from setup completion.
+`agreement_id` is the native numeric ID, not the Stripe reference or ULID. The account
+scope requires fresh authenticated acceptance even for an existing saved card; the older
+new-services-only `auto_pay_new_services_v2` record grants nothing new. Off: `{"enabled":false}`.
+To save only the card preference, post `{"agreement_id":123}` without `enabled`.
+This checks ownership and saves the choice without changing any account or service
+charging consent. On always requires the full fresh consent request above.
+A 200 returns `ok`; switch requests also return `enabled` and, when on,
+`services` (how many were linked). Preserve the
+control on errors. No default is inferred from setup completion.
 
 The property `ae_stripe_auto_pay_default` records version, user ID, server acceptance
-time and agreement ID. Native Service Created applies it under user/service locks
-and current reads, only for recurring services without a selected agreement or
-subscription. Service Updated never reapplies it. No existing service backfill,
-card changes, new charge or consent migration occurs. A removed agreement makes the
-default ineffective; the next opt-in must select an active owned AE Stripe agreement.
+time and agreement ID. On links every recurring, uncancelled service of the user to the
+card, under the user lock; off unlinks every service and keeps the card choice in
+`ae_stripe_auto_pay_card`, separately from charging consent. Stripe subscriptions keep their own
+billing either way. Native Service Created applies the record to new recurring services
+without a selected agreement or subscription; Service Updated never reapplies it.
+Linking charges nothing: native renewal charges happen when an invoice is issued, so open
+invoices stay for the customer to pay. On and Off both stop a renewal retry waiting on an
+open invoice, so the confirm can say open invoices are not charged. Removing the account card
+deletes its consent and card choice and unlinks the services it paid for, so Auto Pay reads Off.
+
+Services linked one at a time before the account switch keep their card and still renew
+with it, with or without a record. Show the switch as On while any service is linked, naming
+the card of the newest link, and say so when links use different cards. Off unlinks them too.
 
 ## Dates for every service opt-in
 
@@ -88,10 +116,10 @@ due date retain their original cutoff, including after an interrupted attempt.
 Before reserving and confirming each retry, current locked reads check the unpaid
 balance, invoice items, service ownership, active recurring service, unchanged
 expiry, cancellation and the same active owned AE Stripe agreement selected on
-**each service**. The v2 account default applies only when a service is created;
-turning it off does not revoke existing service choices and turning it on does not
-authorize this invoice. Turn off Auto Pay on the service to stop its future retries.
-Changing the selected agreement also stops this schedule; pay the open invoice.
+**each service**. Turning the account switch on or off stops a waiting retry at once,
+and Off also unlinks every service, so later scans find nothing to retry. Turning it on
+never authorizes an open invoice. Changing or removing the card also stops this schedule;
+pay the open invoice.
 A customer-initiated Pay takes over without the automatic retry policy.
 
 The schedule and count live in the existing durable checkout attempt. A due retry

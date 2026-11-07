@@ -129,8 +129,8 @@ $calls = Http::$calls;
 check($calls[1][2]['customer'] === $calls[2][2]['customer'], 'Intent and session share the invoice customer');
 check(!isset($calls[1][2]['setup_future_usage']), 'No saving on initial intent');
 check($calls[2][2]['components']['payment_element']['features'] === [
-    'payment_method_redisplay' => 'enabled', 'payment_method_save' => 'disabled', 'payment_method_remove' => 'disabled',
-], 'Stripe draws saved methods; native consent/removal disabled');
+    'payment_method_redisplay' => 'disabled', 'payment_method_save' => 'disabled', 'payment_method_remove' => 'disabled',
+], 'Saved methods are listed natively, not again in the Stripe form; native consent/removal disabled');
 // The remaining consent endpoint checks exercise an older manual intent.
 $intent->confirmation_method = 'manual';
 Auth::$id = 99;
@@ -279,6 +279,7 @@ require __DIR__ . '/schema-scheduler.php';
 require __DIR__ . '/transaction-method.php';
 require __DIR__ . '/native-upgrade.php';
 require __DIR__ . '/agreement-persistence.php';
+require __DIR__ . '/card-expiry.php';
 require __DIR__ . '/card-dedupe.php';
 require __DIR__ . '/card-dedupe-races.php';
 require __DIR__ . '/converted-card-dedupe.php';

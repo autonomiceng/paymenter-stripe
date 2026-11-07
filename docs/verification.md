@@ -20,7 +20,9 @@ SetupIntent's user, customer, purpose and unfinished status, then records
 Legacy forms without a version retain `off_session_v1`; a v1 authentication resume
 keeps its original metadata. Both versions save only a payment method. Neither can
 enroll services through a webhook or redirect. Existing agreements stay unchanged.
-The separate account default requires fresh `auto_pay_new_services_v2` consent;
+The consent checkbox appears before the Stripe controls. Both the Payment Element
+and Link stay inactive until it is accepted, so Link cannot open and then fail on
+the page’s unchecked consent. The separate account switch requires fresh `auto_pay_account_v1` consent;
 see [Auto Pay integration](auto-pay.md) for the theme calls and dates.
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.
@@ -77,11 +79,10 @@ parameters before HTTP and never confirms or supplies a card. Elements attempts 
 automatic confirmation; native saved-method and bank-debit attempts use manual confirmation.
 The rendered checkout never includes the PaymentIntent client secret. Only a locked confirm
 result requiring authentication returns it. Opening checkout only prepares the form. Elements uses deferred `mode: payment` with the intent's integer amount and lowercase currency,
-plus manual payment-method creation. BLIK and ACSS are excluded because this integration path does not support them; this form also excludes customer balance.
+plus manual payment-method creation. It offers only card and Link (`paymentMethodTypes`).
 Ilya checked creation in Stripe test mode on 2026-10-30 at 12:00 PM PT (2025-07-30.basil): manual confirmation alone returned 200; adding automatic_payment_methods returned 400.
 The live pass on 2026-10-30 then proved Elements tokens are rejected on manual intents.
 Elements now uses the documented automatic flow; its real Stripe acceptance must be checked again.
-Klarna, Cash App and bank methods remain available under the same exclusions.
 Payment Elements keep Link and its default-on sign-up box (see [Auto Pay](auto-pay.md#stripe-link));
 automated card tests untick `linkOptIn` in the Stripe frame.
 Submission sends a ConfirmationToken to the authenticated,
@@ -91,13 +92,17 @@ and confirms. Locks remain held through confirmation to keep the balance and car
 Every Stripe request has a five-second timeout and a two-second connection timeout;
 the four-call confirmation section is bounded by those individual request limits.
 A Stripe timeout stays pending. After a saved instruction commits, statement errors and raw PDO commit errors also stay pending for automatic recovery, without a failed-payment email. A first-lock failure before reservation surfaces as a failure because nothing was saved to retry. Paused saved charges are reserved without HTTP and resume when the gateway is enabled. A changed checkout
-amount requires a refresh because the customer has not agreed to the new total.
+amount or currency requires a refresh because the customer has not agreed to the new total.
+Accepted saved-method quotes retain both minor units and currency through interrupted creation
+and recovery. The Pay button shows the exact intent amount and currency, including resumed payments.
 Elements 3DS uses `handleNextAction` and completes without another server confirmation.
 The first confirm rechecks the balance; if the invoice changes after authentication starts,
 the original amount can complete and any excess is automatically returned through the receipt ledger.
 Failed Elements authentication is canceled on the next page load, return or failure webhook,
 after retrieving the current status; a fresh attempt then permits another payment.
-Native manual authentication and bank verification still reconfirm under the server checks. Card/Link saving consent remains explicit and method-specific.
+Native manual authentication and bank verification still reconfirm under the server checks.
+After a resumed payment declines, the form requires a refresh before accepting another card;
+the refreshed checkout retires the unfunded old payment before preparing a replacement. Card/Link saving consent remains explicit and method-specific.
 The GET payment return compares Stripe's redirect secret before any write. Missing or wrong secrets show read-only status with an invoice link; the webhook, recovery or authenticated payment form can still finish it.
 
 A lost confirm response is recovered by intent ID, beyond key expiry. An unconfirmed
@@ -176,13 +181,14 @@ compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
   account setup redisplay. Test card, wallet and Link with saving checked/clear.
 - First verify ConfirmationTokens with deferred Elements (`mode`, amount, currency), Customer Sessions and automatic confirmation
   on pinned Basil, including card, Link, SEPA/ACH mandates, declines, 3DS and bank redirects.
-  Check the client exclusions for ACSS, BLIK and customer balance; verify available methods before release.
+  Check that the pay form and account setup offer only card and Link before release.
   Check the bank/3DS error page and its invoice link. Check clearing method-specific future usage with `''` and preserving consent after authentication.
 - Run concurrent success deliveries/setup redirects against the real database;
   assert one agreement/transaction, preserved success after late failed/processing
   events, no automatic service assignment from saving a method, and unchanged existing Auto Pay.
 - With fresh account-default consent, create a recurring service and verify it inherits
-  the chosen card. Turning the default off must leave existing services unchanged.
+  the chosen card. Turning it off must unlink every service, including ones linked before
+  the account switch, and stop any waiting renewal retry.
 - Reject bad/stale signatures; disable the fork and confirm 503/no effects.
   Rehearse migration and legacy subscription billing/cancellation end to end.
 

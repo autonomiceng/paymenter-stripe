@@ -51,6 +51,7 @@ trait Checkout
         // API assumptions must be verified against the pinned Basil version in a sandbox.
         // https://docs.stripe.com/api/customer_sessions/create
         // Removal is disabled: native agreements may still reference a removed method.
+        // Redisplay is disabled: the theme lists saved methods beside this form, so Stripe shows only a new one.
         $session = null;
         try {
             $session = $this->request('post', '/customer_sessions', [
@@ -58,7 +59,7 @@ trait Checkout
                 'components' => ['payment_element' => [
                     'enabled' => 'true',
                     'features' => [
-                        'payment_method_redisplay' => 'enabled',
+                        'payment_method_redisplay' => 'disabled',
                         'payment_method_save' => 'disabled',
                         'payment_method_remove' => 'disabled',
                     ],
@@ -72,6 +73,8 @@ trait Checkout
 
         return view('gateways.ae-stripe::pay', [
             'invoice' => $invoice, 'total' => $total, 'intent' => $intent,
+            'paymentAmount' => number_format($this->fromMinorUnits($intent->amount, $intent->currency),
+                $this->currencyDecimals($intent->currency), '.', '') . ' ' . strtoupper($intent->currency),
             'autoPayDates' => $this->invoiceAutoPayDates($invoice),
             'customerSessionSecret' => $session?->client_secret,
             'stripePublishableKey' => $this->config('stripe_publishable_key'),
@@ -164,6 +167,14 @@ trait Checkout
             $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
             abort_unless(Auth::id() == $invoice->user_id && $customer && $intent->customer === $customer
                 && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 403);
+            $acceptedCurrency = strtolower($intent->currency);
+            // The open Elements form can submit a new token after a definite decline. The
+            // retired intent identifies the invoice, while checkoutIntent serializes its replacement.
+            if ($request->input('confirmation_token') && in_array($intent->status, ['requires_payment_method', 'canceled'], true)
+                && ($intent->amount_received ?? 0) === 0
+                && InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->exists()) {
+                $intent = $this->checkoutIntent($invoice, $this->checkoutPaymentData($invoice, (int) $request->input('amount'), $customer), elements: true);
+            }
             $intent = $this->retireFailedElementsPayment($invoice, $intent);
             if ($intent->status === 'canceled') throw new DisplayException('This payment was not completed. Refresh the invoice to try another payment.');
             $agreement = null;
@@ -181,12 +192,16 @@ trait Checkout
             }
             // Automatic authentication completes in Stripe.js. Only native manual payments reconfirm.
             if ($request->input('confirmation_token') || $intent->status === 'requires_confirmation' && ($intent->confirmation_method ?? null) === 'manual') {
-                $intent = $this->confirmAttempt($invoice, $intent->id, $params, $agreement, expectedAmount: (int) $request->input('amount'));
+                $intent = $this->confirmAttempt($invoice, $intent->id, $params, $agreement, expectedAmount: (int) $request->input('amount'), expectedCurrency: $acceptedCurrency);
             }
-            if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
-            return response()->json(['status' => $intent->status, 'client_secret' => $intent->status === 'requires_action' ? $intent->client_secret : null]);
+            if ($intent->status === 'succeeded') {
+                $this->recordIntentPayment($intent, 'succeeded');
+                $this->saveConsentedMethod($intent);
+            }
+            return response()->json(['intent' => $intent->id, 'status' => $intent->status, 'client_secret' => $intent->status === 'requires_action' ? $intent->client_secret : null]);
         } catch (DisplayException $e) {
-            return response()->json(['message' => $e->getMessage()], 409);
+            return response()->json(['message' => $e->getMessage(), 'intent' => $intent->id ?? null,
+                'declined' => $e instanceof \Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException], 409);
         } catch (RequestException | ConnectionException $e) {
             return response()->json(['message' => 'Stripe is unavailable. We will check this payment automatically.'], 503);
         }
@@ -232,7 +247,10 @@ trait Checkout
                 if ($agreement) $params['payment_method'] = $agreement->external_reference;
                 $intent = $this->confirmAttempt($invoice, $id, $params, $agreement, expectedAmount: $amount);
             }
-            if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
+            if ($intent->status === 'succeeded') {
+                $this->recordIntentPayment($intent, 'succeeded');
+                $this->saveConsentedMethod($intent);
+            }
             if (in_array($intent->status, ['requires_payment_method', 'canceled'], true)) throw new DisplayException('This payment was not completed. Choose another payment method on the invoice.');
             if ($intent->status === 'requires_action') throw new DisplayException('This payment still needs authentication. Open the invoice to finish it.');
             return redirect()->to(route('invoices.show', $invoice) . '?checkPayment=true');
@@ -304,9 +322,7 @@ trait Checkout
             };
             $amount = $status === 'succeeded' ? $intent->amount_received : $intent->amount;
             $transaction = ExtensionHelper::{$helper}($invoice, 'AeStripe', $this->fromMinorUnits($amount, $intent->currency), null, $intent->id);
-            if (in_array($status, ['succeeded', 'processing'], true)) {
-                $this->recordTransactionMethod($transaction, $intent, $status === 'succeeded');
-            }
+            $this->recordTransactionMethod($transaction, $intent, $status === 'succeeded', $status === 'failed');
             if ($status === 'succeeded') {
                 $attempt = $this->readPaymentAttempt($user, $invoice);
                 if (($attempt['intent'] ?? null) === $intent->id) {
@@ -322,10 +338,6 @@ trait Checkout
                     $this->writePaymentAttempt($user, $invoice,
                         array_replace($attempt, ['agreement_id' => null, 'confirmation' => null, 'retry' => $status === 'processing', 'funds_pending' => $status === 'processing' || ($intent->amount_received ?? 0) > 0]));
                 }
-            }
-            if ($status === 'failed') {
-                // The locked success guard above preserves labels on settled payments.
-                DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $transaction->id)->delete();
             }
         });
     }
@@ -387,6 +399,20 @@ trait Checkout
         });
     }
 
+    // Save the consented method as soon as Stripe confirms. The payment_intent.succeeded webhook
+    // saves it again (idempotent) if this fails or the customer leaves before the response.
+    private function saveConsentedMethod($intent): void
+    {
+        try {
+            $this->savePaidMethod($intent);
+        } catch (DisplayException $e) {
+            \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'reason' => $e->getMessage()]);
+        } catch (\Throwable $e) {
+            if ($e instanceof \Symfony\Component\HttpKernel\Exception\HttpExceptionInterface) throw $e;
+            \Illuminate\Support\Facades\Log::warning('AeStripe saved method deferred to webhook', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'error' => get_class($e)]);
+        }
+    }
+
     private function savePaidMethod($intent)
     {
         if (($intent->metadata->ae_stripe_gateway ?? null) !== '1'
@@ -442,7 +468,7 @@ trait Checkout
             $duplicate = null;
             if ($deduplicate) {
                 try {
-                    $duplicate = $this->duplicateCard($user, $method, $gateway, $agreement);
+                    $duplicate = $this->duplicateCard($user, $method, $gateway, $agreement, updateExpiry: true);
                 } catch (RequestException $e) {
                     if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') throw $e;
                     // A missing comparison card cannot prevent saving the verified incoming method.
@@ -451,7 +477,7 @@ trait Checkout
             }
             if ($duplicate) {
                 [$kept] = $duplicate;
-                $this->rememberDuplicate($user, $method, $kept);
+                $this->rememberDuplicate($user, $method, $kept, updateExpiry: true);
                 return [...$duplicate, $agreement?->id];
             }
             if (!$this->methodCustomerMatches($user, $method, current: true)) return false;
@@ -470,6 +496,11 @@ trait Checkout
             }
             if ($agreement->trashed()) {
                 throw new DisplayException('This payment method was removed. Add a new payment method.');
+            }
+            if ($deduplicate && ($method->type ?? null) === 'card'
+                && substr((string) $agreement->expiry, 0, 10) !== $data['expiry']) {
+                $user->properties()->updateOrCreate(
+                    ['key' => 'ae_stripe_card_update_' . $method->id], ['value' => $method->id]);
             }
             $agreement->update(['name' => $data['name'], 'type' => $data['type'], 'expiry' => $data['expiry']]);
             // Explicit checkout opt-in or account setup authorizes future redisplay.

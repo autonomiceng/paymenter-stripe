@@ -1,20 +1,27 @@
 <form id="payment-form" class="mt-2">
     <div id="error-message" role="alert" class="text-red-600 dark:text-red-400"></div>
-    <div id="express-checkout" class="mb-4" hidden>
-        <div id="express-checkout-element"></div>
-    </div>
     <div id="payment-element">
 
     </div>
-    <label class="mt-4 block">
+    <label class="mt-4 flex items-center gap-2">
         <input type="checkbox" id="save-card" @checked(in_array($intent->status, ['requires_action', 'requires_confirmation'], true) && ($intent->metadata->ae_stripe_consent ?? null) === '1') disabled />
-        Save this card or Link for future payments
+        Save this card for next time
     </label>
-    <p class="text-sm">Saving does not turn on Auto Pay.</p>
     <button id="submit" disabled
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
-        Pay
+        {{ __('Pay :amount', ['amount' => $paymentAmount]) }}
     </button>
+    <button id="refresh-payment" type="button" hidden class="mt-4 underline w-full">
+        {{ __('Refresh payment form') }}
+    </button>
+    {{-- Link is offered below Pay, small enough that Pay stays the main button. --}}
+    <div id="express-checkout" hidden>
+        <div class="mt-4 flex items-center justify-between gap-3">
+            <span class="text-sm">Or pay with Link</span>
+            {{-- An inline width: a theme built before this release has no w-40 class. At 160px Stripe shows the Link mark alone. --}}
+            <div id="express-checkout-element" class="shrink-0" style="width: 160px"></div>
+        </div>
+    </div>
 </form>
 @script
 <script>
@@ -61,7 +68,8 @@ async function initializePaymentForm() {
                 mode: 'payment',
                 amount: @js($intent->amount),
                 currency: @js(strtolower($intent->currency)),
-                excludedPaymentMethodTypes: ['blik', 'acss_debit', 'customer_balance'],
+                // Card and Link only: the methods Auto Pay and saved payments can charge later.
+                paymentMethodTypes: ['card', 'link'],
                 paymentMethodCreation: 'manual',
                 appearance: stripeAppearance(form),
             };
@@ -71,6 +79,7 @@ async function initializePaymentForm() {
 
             const resuming = @js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true));
             const savedConsent = @js(($intent->metadata->ae_stripe_consent ?? null) === '1');
+            let intentId = @js($intent->id);
             // The server still checks the invoice balance before confirming.
             const {elements, paymentElement, expressCheckout, mountExpress} = createStripeElements(stripe, options, {
                 linkDisplay: @js($linkDisplay),
@@ -83,6 +92,16 @@ async function initializePaymentForm() {
             let canSave = resuming && savedConsent;
             let linkAvailable = false;
             let loading = false;
+            let refreshRequired = false;
+            const refreshPayment = document.getElementById('refresh-payment');
+            refreshPayment.addEventListener('click', () => window.location.reload());
+            function clearDeclinedPayment() {
+                paymentElement.clear();
+                if (resuming) {
+                    refreshRequired = true;
+                    refreshPayment.hidden = false;
+                }
+            }
             const saveCard = document.getElementById('save-card');
             function updateSaveCard() {
                 saveCard.disabled = resuming || loading || !(canSave || linkAvailable);
@@ -95,7 +114,8 @@ async function initializePaymentForm() {
             }
             // https://docs.stripe.com/js/element/events/on_change?type=paymentElement
             paymentElement.on('change', (event) => {
-                if (!loading) clearMessage();
+                // clear() also reports an empty form after submission has finished.
+                if (!loading && event.empty !== true) clearMessage();
                 canSave = resuming ? savedConsent : ['card', 'link'].includes(event.value?.type);
                 updateSaveCard();
             });
@@ -110,7 +130,7 @@ async function initializePaymentForm() {
             expressCheckout?.on('confirm', (event) => confirmPayment(event));
 
             async function confirmPayment(expressEvent = null) {
-                if (!ready || loading) {
+                if (!ready || loading || refreshRequired) {
                     expressEvent?.paymentFailed({reason: 'fail'});
                     return;
                 }
@@ -139,11 +159,18 @@ async function initializePaymentForm() {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
                                 'X-CSRF-TOKEN': @js(csrf_token())},
-                            body: JSON.stringify({intent: @js($intent->id), confirmation_token: token,
+                            body: JSON.stringify({intent: intentId, confirmation_token: token,
                                 amount: @js($intent->amount), save}),
                         });
                         const result = await response.json();
-                        if (!response.ok) { failPayment(result.message || 'Could not confirm your payment. Refresh the invoice for its status.'); return; }
+                        if (result.intent) intentId = result.intent;
+                        if (!response.ok) {
+                            // A declined card number stays out of the form, so the customer types a different card.
+                            if (result.declined) clearDeclinedPayment();
+                            failPayment(refreshRequired ? 'This payment was declined. Refresh the payment form to try another card.'
+                                : result.message || 'Could not confirm your payment. Refresh the invoice for its status.');
+                            return;
+                        }
                         if (result.status === 'requires_action') {
                             const next = await stripe.handleNextAction({clientSecret: result.client_secret});
                             if (next.error) throw next.error;
@@ -154,12 +181,16 @@ async function initializePaymentForm() {
                             window.location.assign(@js(route('invoices.show', $invoice) . '?checkPayment=true'));
                             return;
                         }
-                        failPayment('This payment was declined. Choose another payment method.');
+                        clearDeclinedPayment();
+                        failPayment(refreshRequired ? 'This payment was declined. Refresh the payment form to try another card.'
+                            : 'This payment was declined. Try a different card or payment method.');
                         return;
                     }
                     failPayment('Payment still needs authentication. Refresh the invoice to continue.');
                 } catch (error) {
-                    failPayment(['card_error', 'validation_error'].includes(error?.type) && error.message
+                    if (resuming && error?.type === 'card_error') clearDeclinedPayment();
+                    failPayment(refreshRequired ? 'This payment was declined. Refresh the payment form to try another card.'
+                        : ['card_error', 'validation_error'].includes(error?.type) && error.message
                         ? error.message : 'Could not check the payment. Refresh the invoice for its status.');
                 } finally {
                     setLoading(false);
@@ -172,25 +203,28 @@ async function initializePaymentForm() {
                 const message = document.createElement('p');
                 message.className = 'mb-2';
                 message.textContent = messageText;
-                document.getElementById('error-message').replaceChildren(message);
+                const alert = document.getElementById('error-message');
+                alert.replaceChildren(message);
+                alert.scrollIntoView({block: 'nearest', behavior: 'instant'});
             }
 
             function clearMessage() {
+                if (refreshRequired) return;
                 document.getElementById('error-message').replaceChildren();
             }
 
             // Show a spinner on payment submission
             function setLoading(isLoading) {
                 loading = isLoading;
-                document.getElementById("payment-element").inert = isLoading;
-                document.getElementById('express-checkout').inert = isLoading;
+                document.getElementById("payment-element").inert = isLoading || refreshRequired;
+                document.getElementById('express-checkout').inert = isLoading || refreshRequired;
                 updateSaveCard();
                 if (isLoading) {
                     // Disable the button and show a spinner
                     document.querySelector("#submit").disabled = true;
                     document.querySelector("#submit").classList.add("hidden");
                 } else {
-                    document.querySelector("#submit").disabled = !ready;
+                    document.querySelector("#submit").disabled = !ready || refreshRequired;
                     document.querySelector("#submit").classList.remove("hidden");
                 }
             }

@@ -89,7 +89,7 @@ use Paymenter\Extensions\Gateways\AeStripe\ConvertFromStripeSavedCommand;
                 && User::$row->props->values['ae_stripe_checkout_12'] === $before['properties'][0]['value'],
                 'Duplicate handling preserves converted checkout retries and service preferences for ' . $case);
             if ($case === 'unbound') {
-                check($result['message'] === 'This card is already saved.' && $incoming['deleted_at'] !== null
+                check($result['message'] === 'This card is already saved. We updated it.' && $incoming['deleted_at'] !== null
                     && $methods['pm_converted_new']->customer === null && $methods['pm_converted_old']->allow_redisplay === 'always',
                     'Legacy setup redirect resumes webhook dedupe of converted cards and preserves consent');
                 $receipt = json_decode(User::$row->props->values['ae_stripe_duplicate_pm_converted_new']);

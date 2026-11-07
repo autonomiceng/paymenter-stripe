@@ -156,7 +156,7 @@ if (in_array($scenario, ['all', 'finalization-boundaries'])) {
     ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
     $gateway->setupAgreement(new Request(['setup_intent' => 'seti_races']));
     $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_races']));
-    check($result['message'] === 'This card is already saved.', 'Setup retries a successfully removed imported duplicate');
+    check($result['message'] === 'This card is already saved. We updated it.', 'Setup retries a successfully removed imported duplicate');
     echo "PASS: finalization-boundaries\n";
 }
 
