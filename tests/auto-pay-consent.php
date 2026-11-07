@@ -181,6 +181,7 @@ $gateway->saveAutoPayDefault(new Request($choice));
 Http::$handler = function ($verb, $path) { if ($verb === 'get') return ['customer' => null]; throw new RuntimeException('Unexpected request'); };
 check($gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements['pm_default'])) === true
     && $current->billing_agreement_id === null && !isset($user->props->values[$property]), 'Removing the account card turns Auto Pay off');
+check($gateway->autoPayCard($user) === null, 'Removing the chosen card clears its saved preference');
 Http::$handler = null;
 
 // Hosting dates follow the real native cron setting. A pending invoice is not a new automatic debit.

@@ -137,6 +137,10 @@ trait AutoPay
         if (is_array($record) && ($record['agreement_id'] ?? null) === $agreementId) {
             $user->properties()->where('key', self::AUTO_PAY_PROPERTY)->delete();
         }
+        $choice = $user->properties()->where('key', self::AUTO_PAY_CARD)->first()?->value;
+        if ($choice && (json_decode($choice, true)['agreement_id'] ?? null) === $agreementId) {
+            $user->properties()->where('key', self::AUTO_PAY_CARD)->delete();
+        }
         foreach ($this->autoPayServices($user) as $service) {
             if ($service->billing_agreement_id == $agreementId) $service->update(['billing_agreement_id' => null]);
         }
