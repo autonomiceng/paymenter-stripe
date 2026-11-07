@@ -113,9 +113,8 @@ trait CheckoutIntent
                 $this->replacePaymentAttempt($invoice, $attempt);
                 continue;
             }
-            if ($this->paymentAttemptFailed($attempt, $intent)) {
-                if (!$elements) return $intent; // Recovery must report the refusal, never replace its debit instruction.
-            }
+            // Recovery reports refusal; only explicit checkout can retire the old debit instruction.
+            if (!$elements && $this->paymentAttemptFailed($attempt, $intent)) return $intent;
             $usesElements = $this->isElementsAttempt($attempt, $intent);
             $legacyAutomatic = ($intent->confirmation_method ?? 'automatic') !== 'manual' && !$usesElements;
             $changeFlow = $usesElements && !$elements && isset($data['agreement_id'])
@@ -422,7 +421,7 @@ trait CheckoutIntent
             return $attempt;
         });
         $expectedAmount = $attempt['accepted_amount'] ?? $expectedAmount;
-        $expectedCurrency = $attempt['confirmation']['currency'];
+        $expectedCurrency = $attempt['confirmation']['currency'] ?? $attempt['params']['currency'] ?? null;
         if (!empty($attempt['automatic_renewal'])) {
             $params = $attempt['confirmation']['params'];
             $expectedAmount = $attempt['confirmation']['amount'];

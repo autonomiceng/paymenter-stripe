@@ -352,7 +352,7 @@ try {
     }
     // A resumed manual intent has no new token. After a proven decline the customer must
     // refresh into a new checkout before a different card can be submitted.
-    for (const decline of ['response', 'status']) {
+    for (const decline of ['response', 'status', 'sdk-error']) {
         const page = activePage = await browser.newPage();
         page.setDefaultTimeout(5000);
         await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
@@ -376,7 +376,8 @@ try {
                     return {on(name, fn) {handlers[name] = fn;}, mount() {handlers.ready();},
                         clear() {handlers.change?.({empty: true});}, destroy() {}};
                 }}),
-                async handleNextAction() {actions++; return {};},
+                async handleNextAction() {actions++; return decline === 'sdk-error'
+                    ? {error: {type: 'card_error', message: 'Authentication declined.'}} : {};},
                 async createConfirmationToken() {tokens++; return {confirmationToken: {id: 'ctoken_new'}};},
             });
         }, decline);
@@ -384,7 +385,7 @@ try {
         await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
         assert.equal(await page.locator('#save-card').isChecked(), true, 'Resume keeps the original save consent');
         await page.locator('#submit').click();
-        await page.waitForFunction(() => requests.length === 2 && !document.querySelector('#submit').classList.contains('hidden'));
+        await page.waitForFunction(() => requests.length >= 1 && !document.querySelector('#submit').classList.contains('hidden'));
         assert.equal(await page.locator('#submit').isDisabled(), true,
             'A declined resumed payment cannot submit another card in tokenless mode');
         assert.match(await page.locator('[role=alert]').textContent(), /[Rr]efresh/);
@@ -394,9 +395,10 @@ try {
             handlers.change({empty: false, value: {type: 'card'}});
             document.querySelector('form').dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
         });
-        assert.equal(await page.evaluate(() => requests.length), 2, 'A second card cannot send another tokenless request');
+        const requestCount = decline === 'sdk-error' ? 1 : 2;
+        assert.equal(await page.evaluate(() => requests.length), requestCount, 'A second card cannot send another tokenless request');
         assert.equal(await page.evaluate(() => tokens), 0);
-        assert.deepEqual(await page.evaluate(() => requests), [0, 1].map(() => ({
+        assert.deepEqual(await page.evaluate(() => requests), Array.from({length: requestCount}, () => ({
             intent: 'fixture-intent', confirmation_token: null, amount: 2000, save: true,
         })), 'Authentication keeps the resumed intent, amount and consent');
         await page.route('https://example.com/resume', route => route.fulfill({contentType: 'text/html', body: 'Fresh payment checkout'}));

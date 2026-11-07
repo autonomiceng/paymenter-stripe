@@ -188,7 +188,9 @@ async function initializePaymentForm() {
                     }
                     failPayment('Payment still needs authentication. Refresh the invoice to continue.');
                 } catch (error) {
-                    failPayment(['card_error', 'validation_error'].includes(error?.type) && error.message
+                    if (resuming && error?.type === 'card_error') clearDeclinedPayment();
+                    failPayment(refreshRequired ? 'This payment was declined. Refresh the payment form to try another card.'
+                        : ['card_error', 'validation_error'].includes(error?.type) && error.message
                         ? error.message : 'Could not check the payment. Refresh the invoice for its status.');
                 } finally {
                     setLoading(false);

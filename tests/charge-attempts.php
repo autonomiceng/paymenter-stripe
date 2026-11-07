@@ -128,7 +128,7 @@ use Illuminate\Support\Facades\{DB, Http};
                     'A resumed payment displays its exact amount and currency despite a stale caller invoice');
             });
         }
-        foreach (['unconfirmed', 'failed', 'canceled', 'processing', 'partial', 'unread', 'unknown'] as $outcome) {
+        foreach (['unconfirmed', 'failed', 'canceled', 'processing', 'partial', 'unread', 'cancel-unread', 'unknown'] as $outcome) {
             $run('one-time-after-off-'.$outcome, function ($invoice, $stripe) use ($gateway, $outcome) {
                 foreach (ExtensionHelper::$agreements as &$row) $row['gateway_id'] = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
                 unset($row);
@@ -144,6 +144,9 @@ use Illuminate\Support\Facades\{DB, Http};
                 if ($outcome === 'partial') $old->amount_received = 100;
                 if ($outcome === 'unread') $stripe->failure = function ($verb, $path) {
                     if ($verb === 'get' && $path === '/payment_intents/pi_test1') throw new ConnectionException('Unknown payment outcome');
+                };
+                if ($outcome === 'cancel-unread') $stripe->failure = function ($verb, $path) {
+                    if (str_ends_with($path, '/cancel')) throw new ConnectionException('Cancellation outcome unknown');
                 };
                 $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
                 check($gateway->autoPayDefault(User::$row) === null, 'Off revokes the old account instruction');
@@ -165,9 +168,27 @@ use Illuminate\Support\Facades\{DB, Http};
                 } else {
                     check(count($stripe->intents) === 1 && $old->status !== 'canceled',
                         'Processing, partial and unknown outcomes cannot be replaced by one-time checkout');
+                    $held = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                    check(($held['auto_pay_agreement'] ?? null) === 4 && ($held['accepted_amount'] ?? null) === 2000
+                        && ($held['accepted_currency'] ?? null) === 'usd', 'Uncertain outcomes retain the old payment constraints');
                 }
             });
         }
+        $run('revoked-native-confirmation', function ($invoice, $stripe) use ($gateway) {
+            foreach (ExtensionHelper::$agreements as &$row) $row['gateway_id'] = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+            unset($row);
+            User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode([
+                'version' => $gateway::AUTO_PAY_CONSENT, 'user_id' => 7, 'accepted_at' => time(), 'agreement_id' => 4,
+            ]);
+            $stripe->status = 'requires_action';
+            paymentStops(fn () => $gateway->chargeAutoPayAccepted($invoice, 20, new BillingAgreement));
+            $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+            $stripe->intents['pi_test1']->status = 'requires_confirmation';
+            $result = $gateway->confirmPayment(new Request(['intent' => 'pi_test1', 'amount' => 2000, 'save' => false]));
+            check($result['status'] === 409 && str_contains($result['data']['message'], 'Auto Pay card changed')
+                && count($stripe->confirms) === 1 && !$stripe->charges,
+                'Allowing one-time inspection never permits confirmation against revoked account authority');
+        });
         $run('accepted-currency', function ($invoice, $stripe) use ($gateway) {
             $accepted = clone $invoice;
             $invoice->currency_code = 'eur';
@@ -175,13 +196,14 @@ use Illuminate\Support\Facades\{DB, Http};
             check(str_contains($message, 'changed') && !$stripe->intents && !$stripe->confirms && !$stripe->charges,
                 'An accepted USD quote cannot create or confirm EUR under the invoice lock');
         });
-        foreach (['recover', 'expired', 'canceled', 'invalid-params'] as $replacement) {
+        foreach (['recover', 'expired', 'canceled', 'invalid-params', 'legacy-currency'] as $replacement) {
             foreach (['eur', 'jpy'] as $currency) {
                 $run('accepted-currency-'.$replacement.'-'.$currency, function ($invoice, $stripe) use ($gateway, $replacement, $currency) {
                     $stripe->loseCreate = true;
                     paymentStops(fn () => $gateway->chargeAccepted($invoice, 20, new BillingAgreement));
                     $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
                     check(($attempt['accepted_currency'] ?? null) === 'usd', 'Accepted currency commits before creation');
+                    if ($replacement === 'legacy-currency') unset($attempt['accepted_currency']);
                     if ($replacement === 'expired') $attempt['created'] = time() - 24 * 3600;
                     if ($replacement === 'canceled') $stripe->intents['pi_test1']->status = 'canceled';
                     if ($replacement === 'invalid-params') $attempt['params']['automatic_payment_methods'] = ['enabled' => 'true'];
