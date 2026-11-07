@@ -6,7 +6,7 @@ use App\Exceptions\DisplayException;
 use App\Models\{BillingAgreement, Invoice, InvoiceTransaction, User};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Support\Facades\DB;
-use Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException;
+use Paymenter\Extensions\Gateways\AeStripe\{PaymentDeclinedException, PaymentPendingException};
 
 trait CheckoutIntent
 {
@@ -466,8 +466,10 @@ trait CheckoutIntent
                         $fresh = $this->request('get', '/payment_intents/' . $intentId);
                         if (($fresh->amount_received ?? 0) === 0 && in_array($fresh->status, ['requires_payment_method', 'requires_confirmation', 'canceled'], true)) {
                             $this->writePaymentAttempt($user, $current, array_replace($stored, ['retry' => false, 'confirmation' => null, 'agreement_id' => null]));
-                            if ($fresh->status === 'requires_payment_method' && ($e->response->status() === 402 || !empty($fresh->last_payment_error))) $this->recordIntentPayment($fresh, 'failed');
-                            return new DisplayException($this->paymentRefusalReason($e, $current, $fresh->last_payment_error->code ?? null));
+                            $declined = $fresh->status === 'requires_payment_method' && ($e->response->status() === 402 || !empty($fresh->last_payment_error));
+                            if ($declined) $this->recordIntentPayment($fresh, 'failed');
+                            $reason = $this->paymentRefusalReason($e, $current, $fresh->last_payment_error->code ?? null);
+                            return $declined ? new PaymentDeclinedException($reason) : new DisplayException($reason);
                         }
                         return $fresh;
                     } catch (RequestException | ConnectionException $readError) { return $readError; }
@@ -498,7 +500,7 @@ trait CheckoutIntent
         if ($result instanceof DisplayException) throw $result;
         if ($result->status === 'requires_payment_method' && !empty($result->last_payment_error)) {
             $this->recordIntentPayment($result, 'failed');
-            throw new DisplayException($this->paymentFailureReason($result->last_payment_error->code ?? null));
+            throw new PaymentDeclinedException($this->paymentFailureReason($result->last_payment_error->code ?? null));
         }
         return $result;
     }
@@ -519,7 +521,7 @@ trait CheckoutIntent
     {
         return match ($code) {
             'amount_too_small' => "This balance is below Stripe's minimum. Use account credit or contact support to pay it.",
-            'card_declined' => 'This card was declined. Choose another payment method.',
+            'card_declined' => 'Your bank declined this card. Try a different card, or contact your bank.',
             'expired_card' => 'This card has expired. Choose another payment method.',
             'resource_missing' => 'The saved payment details are no longer available. Choose another payment method.',
             default => 'Stripe refused this payment. Choose another payment method or contact support.',

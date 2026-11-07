@@ -197,7 +197,8 @@ trait Checkout
             }
             return response()->json(['intent' => $intent->id, 'status' => $intent->status, 'client_secret' => $intent->status === 'requires_action' ? $intent->client_secret : null]);
         } catch (DisplayException $e) {
-            return response()->json(['message' => $e->getMessage(), 'intent' => $intent->id ?? null], 409);
+            return response()->json(['message' => $e->getMessage(), 'intent' => $intent->id ?? null,
+                'declined' => $e instanceof \Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException], 409);
         } catch (RequestException | ConnectionException $e) {
             return response()->json(['message' => 'Stripe is unavailable. We will check this payment automatically.'], 503);
         }

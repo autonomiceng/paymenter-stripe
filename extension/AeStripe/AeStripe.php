@@ -52,6 +52,7 @@ require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
 require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
 require_once __DIR__ . '/Concerns/CheckoutIntent.php';
 require_once __DIR__ . '/PaymentPendingException.php';
+require_once __DIR__ . '/PaymentDeclinedException.php';
 require_once __DIR__ . '/Concerns/ChargeRecovery.php';
 require_once __DIR__ . '/Concerns/RenewalRetry.php';
 require_once __DIR__ . '/Concerns/InvoicePayments.php';
@@ -861,7 +862,7 @@ class AeStripe extends Gateway
             }
             if (in_array($intent->status, ['processing', 'requires_capture'], true)) $this->paymentPending();
             if ($intent->status === 'requires_action') throw new DisplayException('This payment needs authentication. Use the one-time payment option to finish it.');
-            throw new DisplayException('This card was declined. Choose another payment method.');
+            throw new DisplayException('Your bank declined this card. Try a different card, or contact your bank.');
         } catch (\PDOException | \Illuminate\Database\QueryException $e) {
             // Before reservation there is no durable retry: let core surface that failure.
             // Afterwards even a lost DB connection may follow a landed Stripe confirm.

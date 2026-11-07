@@ -144,7 +144,12 @@ async function initializePaymentForm() {
                         });
                         const result = await response.json();
                         if (result.intent) intentId = result.intent;
-                        if (!response.ok) { failPayment(result.message || 'Could not confirm your payment. Refresh the invoice for its status.'); return; }
+                        if (!response.ok) {
+                            // A declined card number stays out of the form, so the customer types a different card.
+                            if (result.declined) paymentElement.clear();
+                            failPayment(result.message || 'Could not confirm your payment. Refresh the invoice for its status.');
+                            return;
+                        }
                         if (result.status === 'requires_action') {
                             const next = await stripe.handleNextAction({clientSecret: result.client_secret});
                             if (next.error) throw next.error;
@@ -155,7 +160,8 @@ async function initializePaymentForm() {
                             window.location.assign(@js(route('invoices.show', $invoice) . '?checkPayment=true'));
                             return;
                         }
-                        failPayment('This payment was declined. Choose another payment method.');
+                        paymentElement.clear();
+                        failPayment('This payment was declined. Try a different card or payment method.');
                         return;
                     }
                     failPayment('Payment still needs authentication. Refresh the invoice to continue.');
