@@ -81,6 +81,17 @@ check(str_contains($setupView, '}, existingScript ? 5000 : 30000)')
     && str_contains($setupView, 'clearTimeout(timeout)'), 'Setup allows fresh requests thirty seconds, bounds reused waits at five seconds and clears the timer');
 check(str_contains($setupView, 'if (!existingScript) script.remove();'), 'Setup removes failed scripts only when it owns them');
 $recordConsentCall = 'await fetch(config.consentUrl';
+$consentPosition = strpos($setupView, 'id="setup-consent"');
+$expressPosition = strpos($setupView, 'id="express-checkout"');
+$paymentPosition = strpos($setupView, 'id="payment-element"');
+check($consentPosition !== false && $expressPosition !== false && $paymentPosition !== false
+    && $consentPosition < $expressPosition && $consentPosition < $paymentPosition,
+    'Setup presents the required consent before customers can open Link or enter a card');
+check(preg_match('/id="express-checkout"[^>]*\binert\b/', $setupView) === 1
+    && preg_match('/id="payment-element"[^>]*\binert\b/', $setupView) === 1
+    && str_contains($setupView, 'container.inert = isLoading || !ready || !consent.checked;')
+    && str_contains($setupView, 'expressContainer.inert = container.inert;'),
+    'Setup keeps both Stripe entry points inactive until the existing consent is accepted');
 $confirmSetupCall = 'await stripe.confirmSetup(';
 $recordsConsentBeforeConfirmation = static function ($view) use ($recordConsentCall, $confirmSetupCall) {
     $consentPosition = strpos($view, $recordConsentCall);

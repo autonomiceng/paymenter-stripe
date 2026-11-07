@@ -7,16 +7,16 @@
     businessName: @js($businessName)
 })">
     <div id="error-message" role="alert" class="text-red-600 dark:text-red-400"></div>
-    <div id="express-checkout" class="mb-4" hidden wire:ignore>
-        <div id="express-checkout-element"></div>
-    </div>
-    <div id="payment-element" wire:ignore></div>
     <label class="mt-4 block">
         <input type="checkbox" id="setup-consent" required disabled />
         I agree to save this payment method for future charges, including renewals.
         @if(config('settings.tos'))<a href="{{ config('settings.tos') }}" target="_blank" rel="noopener" class="underline">Terms</a>@endif
     </label>
     <p class="text-sm">Auto Pay can charge when you are away. Saving does not turn on Auto Pay.</p>
+    <div id="express-checkout" class="mb-4" hidden inert wire:ignore>
+        <div id="express-checkout-element"></div>
+    </div>
+    <div id="payment-element" inert wire:ignore></div>
     <button id="submit" disabled
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
         Save payment method
@@ -108,8 +108,8 @@ Alpine.data('aeStripeSetup', (config) => {
                 loading = isLoading;
                 if (disposed) return;
                 consent.disabled = isLoading || !ready;
-                container.inert = isLoading;
-                expressContainer.inert = isLoading;
+                container.inert = isLoading || !ready || !consent.checked;
+                expressContainer.inert = container.inert;
                 submit.disabled = isLoading || !ready || !consent.checked;
                 submit.classList.toggle('hidden', isLoading);
             }

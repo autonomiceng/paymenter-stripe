@@ -1,24 +1,26 @@
 # Duplicate saved cards
 
-Account setup compares Stripe card fingerprint, expiry month and expiry year within
-one Paymenter user, Stripe customer and AE Stripe gateway. It keeps the oldest
-matching active agreement. Missing fingerprints do not match. Service bindings and
-Auto Pay are unchanged. A duplicate already bound to a service stays saved and is
+Account setup compares Stripe card fingerprints within one Paymenter user, Stripe
+customer and AE Stripe gateway. It keeps the oldest matching active agreement and
+updates its Stripe and local expiry from the confirmed card. Missing fingerprints
+do not match. Service bindings and Auto Pay are unchanged. A duplicate already bound to a service stays saved and is
 logged. Other method types and their mandates are unchanged.
 
 Explicit setup consent permits `allow_redisplay=always` on the retained card. A
 private user property records the duplicate and retained references before detach,
-so setup retries can recognize an already detached duplicate. Removing the retained
-agreement still prevents reuse. The setup redirect returns one native notification:
-“This card is already saved.”
+so setup retries can recognize an already detached duplicate. The latest confirmed
+save is recorded for the retained card, so an older unfinished save cannot undo it.
+Removing the retained agreement still prevents reuse. The setup redirect returns one native notification:
+“This card is already saved. We updated it.”
 
 From the Paymenter root, review existing duplicates with
 `php artisan ae-stripe:deduplicate-cards`. It only reads Stripe and lists local
-agreement IDs. `php artisan ae-stripe:deduplicate-cards --apply` detaches and
-soft-deletes only duplicates with no service binding. It preserves the broadest
+agreement IDs, matching both fingerprint and expiry.
+`php artisan ae-stripe:deduplicate-cards --apply` detaches and soft-deletes only duplicates with no service binding. It preserves the broadest
 existing redisplay setting and rechecks ownership and bindings before removal.
 Failed agreements are reported for manual review while the remaining rows continue.
 If any agreements are skipped, the command reports the count and exits nonzero.
+Stripe supports changing the retained card’s [expiry fields](https://docs.stripe.com/api/payment_methods/update?api-version=2025-07-30.basil&query=card).
 Use a sandbox first. No cleanup has been run against a live installation.
 
 Invoice payment labels such as `Visa **** 4242` are stored in the extension-owned

@@ -463,7 +463,7 @@ trait Checkout
             $duplicate = null;
             if ($deduplicate) {
                 try {
-                    $duplicate = $this->duplicateCard($user, $method, $gateway, $agreement);
+                    $duplicate = $this->duplicateCard($user, $method, $gateway, $agreement, updateExpiry: true);
                 } catch (RequestException $e) {
                     if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') throw $e;
                     // A missing comparison card cannot prevent saving the verified incoming method.
@@ -472,7 +472,7 @@ trait Checkout
             }
             if ($duplicate) {
                 [$kept] = $duplicate;
-                $this->rememberDuplicate($user, $method, $kept);
+                $this->rememberDuplicate($user, $method, $kept, updateExpiry: true);
                 return [...$duplicate, $agreement?->id];
             }
             if (!$this->methodCustomerMatches($user, $method, current: true)) return false;
@@ -491,6 +491,11 @@ trait Checkout
             }
             if ($agreement->trashed()) {
                 throw new DisplayException('This payment method was removed. Add a new payment method.');
+            }
+            if ($deduplicate && ($method->type ?? null) === 'card'
+                && substr((string) $agreement->expiry, 0, 10) !== $data['expiry']) {
+                $user->properties()->updateOrCreate(
+                    ['key' => 'ae_stripe_card_update_' . $method->id], ['value' => $method->id]);
             }
             $agreement->update(['name' => $data['name'], 'type' => $data['type'], 'expiry' => $data['expiry']]);
             // Explicit checkout opt-in or account setup authorizes future redisplay.

@@ -91,7 +91,7 @@ foreach (['setup', 'cleanup', 'server failure', 'receipt'] as $case) {
             check(!array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach')),
                 'A missing retained receipt method never authorizes a detach');
         } else {
-            check($result['message'] === 'This card is already saved.' && !isset(ExtensionHelper::$agreements['pm_new'])
+            check($result['message'] === 'This card is already saved. We updated it.' && !isset(ExtensionHelper::$agreements['pm_new'])
                 && $methods['pm_new']->customer === null, 'Setup finds a later duplicate after a missing older candidate');
             check(ExtensionHelper::$agreements['pm_kept']['deleted_at'] === null && $methods['pm_kept']->customer === 'cus_owner',
                 'Setup retains the later matching agreement');

@@ -35,12 +35,12 @@ $row = fn ($id, $pm, $extra = []) => $extra + ['id' => $id, 'external_reference'
     'name' => 'Visa **** 4242', 'type' => 'visa', 'expiry' => '2030-05-31', 'deleted_at' => null];
 ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
 $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check($result['message'] === 'This card is already saved.' && count(ExtensionHelper::$agreements) === 1,
+check($result['message'] === 'This card is already saved. We updated it.' && count(ExtensionHelper::$agreements) === 1,
     'A confirmed duplicate setup retains one saved card and shows one notice');
 check($methods['pm_new']->customer === null && $methods['pm_old']->allow_redisplay === 'always',
     'Duplicate setup detaches the new method and broadens redisplay on the retained method');
 $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check($result['message'] === 'This card is already saved.' && count(ExtensionHelper::$agreements) === 1,
+check($result['message'] === 'This card is already saved. We updated it.' && count(ExtensionHelper::$agreements) === 1,
     'Webhook or redirect retries recognize the detached duplicate without another agreement');
 BillingAgreement::$snapshot = null;
 
@@ -81,14 +81,12 @@ check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods[
     && DB::$tables['services'] === $serviceBefore, 'Cleanup preserves bound duplicates and every service preference');
 
 DB::$tables['services'] = [];
-foreach (['fingerprint', 'month', 'year', 'missing fingerprint', 'other user', 'other gateway', 'removed', 'other customer'] as $case) {
+foreach (['fingerprint', 'missing fingerprint', 'other user', 'other gateway', 'removed', 'other customer'] as $case) {
     $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
     $user->props->values = [];
     $old = $row(19, 'pm_old');
     switch ($case) {
         case 'fingerprint': $methods['pm_new']->card->fingerprint = 'fp_other'; break;
-        case 'month': $methods['pm_new']->card->exp_month = 6; break;
-        case 'year': $methods['pm_new']->card->exp_year = 2031; break;
         case 'missing fingerprint': unset($methods['pm_new']->card->fingerprint); break;
         case 'other user': $old['user_id'] = 99; break;
         case 'other gateway': $old['gateway_id'] = 1; break;
@@ -123,7 +121,7 @@ try {
     check(count(ExtensionHelper::$agreements) === 1, 'Uncertain detach never creates another saved agreement');
 }
 $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check($result['message'] === 'This card is already saved.' && DB::$tables['services'] === $serviceBefore,
+check($result['message'] === 'This card is already saved. We updated it.' && DB::$tables['services'] === $serviceBefore,
     'Retry after a lost detach response preserves the retained agreement and its service settings');
 Http::$handler = $handler;
 

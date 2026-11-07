@@ -279,6 +279,7 @@ require __DIR__ . '/schema-scheduler.php';
 require __DIR__ . '/transaction-method.php';
 require __DIR__ . '/native-upgrade.php';
 require __DIR__ . '/agreement-persistence.php';
+require __DIR__ . '/card-expiry.php';
 require __DIR__ . '/card-dedupe.php';
 require __DIR__ . '/card-dedupe-races.php';
 require __DIR__ . '/converted-card-dedupe.php';

@@ -713,7 +713,7 @@ class AeStripe extends Gateway
 
         return redirect()->route('account.payment-methods')->with('notification', [
             'type' => 'success',
-            'message' => $saved === 'duplicate' ? 'This card is already saved.' : 'Payment method added successfully.',
+            'message' => $saved === 'duplicate' ? 'This card is already saved. We updated it.' : 'Payment method added successfully.',
         ]);
     }
 
