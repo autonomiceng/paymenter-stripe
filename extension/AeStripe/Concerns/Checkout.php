@@ -401,10 +401,10 @@ trait Checkout
         try {
             $this->savePaidMethod($intent);
         } catch (DisplayException $e) {
-            \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['payment_intent_id' => $intent->id ?? null, 'reason' => $e->getMessage()]);
+            \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'reason' => $e->getMessage()]);
         } catch (\Throwable $e) {
             if ($e instanceof \Symfony\Component\HttpKernel\Exception\HttpExceptionInterface) throw $e;
-            \Illuminate\Support\Facades\Log::warning('AeStripe saved method deferred to webhook', ['payment_intent_id' => $intent->id ?? null, 'error' => get_class($e)]);
+            \Illuminate\Support\Facades\Log::warning('AeStripe saved method deferred to webhook', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'error' => get_class($e)]);
         }
     }
 
