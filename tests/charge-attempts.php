@@ -108,6 +108,15 @@ use Illuminate\Support\Facades\{DB, Http};
     };
     try {
         require __DIR__ . '/renewal-retries.php';
+        $run('elements-replacement-currency', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $stripe->intents['pi_test1']->status = 'canceled';
+            ExtensionHelper::$payments['920:pi_test1'] = ['status' => 'failed', 'amount' => 20];
+            $invoice->currency_code = 'eur';
+            $result = $gateway->confirmPayment(new Request(['intent' => 'pi_test1', 'confirmation_token' => 'ctoken_new', 'amount' => 2000]));
+            check($result['status'] === 409 && str_contains($result['data']['message'], 'changed') && !$stripe->confirms && !$stripe->charges,
+                'An open USD Elements form cannot confirm a replacement in EUR at the same minor-unit amount');
+        });
         foreach (['usd' => '20.00 USD', 'jpy' => '20 JPY', 'ugx' => '20 UGX', 'isk' => '20 ISK'] as $currency => $label) {
             $run('displayed-resume-'.$currency, function ($invoice, $stripe) use ($gateway, $currency, $label) {
                 $invoice->currency_code = $currency;

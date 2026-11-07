@@ -167,6 +167,7 @@ trait Checkout
             $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
             abort_unless(Auth::id() == $invoice->user_id && $customer && $intent->customer === $customer
                 && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 403);
+            $acceptedCurrency = strtolower($intent->currency);
             // The open Elements form can submit a new token after a definite decline. The
             // retired intent identifies the invoice, while checkoutIntent serializes its replacement.
             if ($request->input('confirmation_token') && in_array($intent->status, ['requires_payment_method', 'canceled'], true)
@@ -191,7 +192,7 @@ trait Checkout
             }
             // Automatic authentication completes in Stripe.js. Only native manual payments reconfirm.
             if ($request->input('confirmation_token') || $intent->status === 'requires_confirmation' && ($intent->confirmation_method ?? null) === 'manual') {
-                $intent = $this->confirmAttempt($invoice, $intent->id, $params, $agreement, expectedAmount: (int) $request->input('amount'));
+                $intent = $this->confirmAttempt($invoice, $intent->id, $params, $agreement, expectedAmount: (int) $request->input('amount'), expectedCurrency: $acceptedCurrency);
             }
             if ($intent->status === 'succeeded') {
                 $this->recordIntentPayment($intent, 'succeeded');

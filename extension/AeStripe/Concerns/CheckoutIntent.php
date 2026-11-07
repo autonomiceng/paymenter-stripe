@@ -185,6 +185,10 @@ trait CheckoutIntent
             foreach (['accepted_amount', 'accepted_currency', 'auto_pay_agreement'] as $key) {
                 if (array_key_exists($key, $data)) $context[$key] = $data[$key];
             }
+            // Older accepted quotes already froze their currency in the creation parameters.
+            if (isset($context['accepted_amount'], $attempt['params']['currency'])) {
+                $context['accepted_currency'] ??= strtolower($attempt['params']['currency']);
+            }
             if (!($elements && $attempt) && isset($context['accepted_currency']) && strtolower($current->currency_code) !== $context['accepted_currency']) {
                 throw new DisplayException('The amount due changed. Refresh the invoice before paying.');
             }
@@ -393,19 +397,21 @@ trait CheckoutIntent
         return false;
     }
 
-    private function confirmAttempt($invoice, string $intentId, array $params, ?BillingAgreement $agreement = null, ?int $expectedAmount = null)
+    private function confirmAttempt($invoice, string $intentId, array $params, ?BillingAgreement $agreement = null, ?int $expectedAmount = null, ?string $expectedCurrency = null)
     {
         // Persist the confirmation identity before HTTP. The second transaction keeps credits,
         // card removal and other callers out until Stripe responds (or the request times out).
-        $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($intentId, $params, $agreement, $expectedAmount) {
+        $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($intentId, $params, $agreement, $expectedAmount, $expectedCurrency) {
             $attempt = $this->readPaymentAttempt($user, $current);
             if (($attempt['intent'] ?? null) !== $intentId) $this->paymentPending('Payment changed. Refresh the invoice to check its status.');
             $expectedAmount = $attempt['accepted_amount'] ?? $expectedAmount;
+            $expectedCurrency = $attempt['accepted_currency'] ?? $expectedCurrency
+                ?? $attempt['confirmation']['currency'] ?? $attempt['params']['currency'] ?? null;
             if (!empty($attempt['automatic_renewal'])) {
                 if (($attempt['renewal']['state'] ?? null) !== 'active') throw new DisplayException('Auto Pay stopped for this renewal. Open the invoice to pay the amount due.');
                 if (!empty($attempt['confirmation'])) return $attempt; // Resume the claimed instruction, never replace its identity.
             }
-            $attempt['confirmation'] = ['key' => 'confirm_' . bin2hex(random_bytes(16)), 'params' => $params, 'agreement' => $agreement?->id, 'amount' => $expectedAmount, 'previous_charge' => $attempt['latest_charge'] ?? null];
+            $attempt['confirmation'] = ['key' => 'confirm_' . bin2hex(random_bytes(16)), 'params' => $params, 'agreement' => $agreement?->id, 'amount' => $expectedAmount, 'currency' => $expectedCurrency, 'previous_charge' => $attempt['latest_charge'] ?? null];
             unset($attempt['agreement_pending']); // The confirmation now owns this instruction.
             $attempt['retry'] = true;
             $attempt['failure_reason'] = null;
@@ -416,12 +422,13 @@ trait CheckoutIntent
             return $attempt;
         });
         $expectedAmount = $attempt['accepted_amount'] ?? $expectedAmount;
+        $expectedCurrency = $attempt['confirmation']['currency'];
         if (!empty($attempt['automatic_renewal'])) {
             $params = $attempt['confirmation']['params'];
             $expectedAmount = $attempt['confirmation']['amount'];
         }
         $writeStarted = false;
-        $result = $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intentId, $params, $agreement, $expectedAmount, &$writeStarted) {
+        $result = $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intentId, $params, $agreement, $expectedAmount, $expectedCurrency, &$writeStarted) {
             $stored = $this->readPaymentAttempt($user, $current);
             if (($stored['confirmation']['key'] ?? null) !== $attempt['confirmation']['key']) return null;
             try {
@@ -437,7 +444,7 @@ trait CheckoutIntent
                 }
                 $amount = $this->paymentBalance($current);
                 if ($current->status !== 'pending' || $amount <= 0) return new DisplayException('This invoice has no payment due. Refresh the invoice.');
-                if (isset($stored['accepted_currency']) && strtolower($current->currency_code) !== $stored['accepted_currency']
+                if ($expectedCurrency !== null && strtolower($current->currency_code) !== strtolower($expectedCurrency)
                     || strtolower($intent->currency) !== strtolower($current->currency_code) || $expectedAmount !== null && $amount !== $expectedAmount) {
                     return new DisplayException('The amount due changed. Refresh the invoice before paying.');
                 }
@@ -497,7 +504,7 @@ trait CheckoutIntent
             // token must not be replayed; Stripe already holds the authenticated payment method.
             $resumeParams = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id]), 'use_stripe_sdk' => 'true'];
             if ($agreement) $resumeParams['payment_method'] = $agreement->external_reference;
-            $resume = ['key' => $attempt['confirmation']['key'], 'params' => $resumeParams, 'agreement' => $agreement?->id, 'amount' => $expectedAmount ?? $result->amount];
+            $resume = ['key' => $attempt['confirmation']['key'], 'params' => $resumeParams, 'agreement' => $agreement?->id, 'amount' => $expectedAmount ?? $result->amount, 'currency' => $expectedCurrency ?? $result->currency];
         }
         $this->storePaymentAttempt($invoice, $attempt, ['retry' => !($result instanceof DisplayException)
             && in_array($result->status, ['succeeded', 'processing', 'requires_capture', 'requires_action'], true), 'confirmation' => $resume, 'agreement_id' => null, 'funds_pending' => !($result instanceof DisplayException)
