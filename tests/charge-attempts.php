@@ -550,6 +550,65 @@ use Illuminate\Support\Facades\{DB, Http};
                 && (ExtensionHelper::$payments['920:pi_test1']['amount'] ?? null) === 20.0,
                 'Recovery still records an already sent payment after Auto Pay is disabled and the balance changes');
         });
+        foreach (['card-off', 'card-switched', 'amount', 'declined', 'recovery-card', 'recovery-amount', 'retired', 'decline-unread'] as $refusal) {
+            foreach (in_array($refusal, ['retired', 'decline-unread'], true) ? ['elements'] : ['elements', 'saved', 'accepted'] as $next) {
+                $run('accepted-refusal-'.$refusal.'-'.$next, function ($invoice, $stripe) use ($gateway, $refusal, $next) {
+                    foreach (ExtensionHelper::$agreements as &$row) $row['gateway_id'] = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+                    unset($row);
+                    User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode([
+                        'version' => $gateway::AUTO_PAY_CONSENT, 'user_id' => 7, 'accepted_at' => time(), 'agreement_id' => 4,
+                    ]);
+                    $change = function () use ($invoice, $refusal) {
+                        if (in_array($refusal, ['amount', 'recovery-amount'], true)) $invoice->total = 25;
+                        elseif ($refusal === 'card-switched') User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode([
+                            'version' => 'auto_pay_account_v1', 'user_id' => 7, 'accepted_at' => time(), 'agreement_id' => 5,
+                        ]);
+                        else unset(User::$row->props->values['ae_stripe_auto_pay_default']);
+                    };
+                    if (str_starts_with($refusal, 'recovery-') || $refusal === 'retired') $stripe->loseCreate = true;
+                    elseif (in_array($refusal, ['declined', 'decline-unread'], true)) {
+                        $stripe->loseConfirm = $refusal === 'decline-unread';
+                        $stripe->status = 'requires_payment_method';
+                        $stripe->beforeConfirm = function ($intent) { $intent->last_payment_error = (object) ['code' => 'card_declined']; };
+                    } else $stripe->beforeCreate = $change;
+                    paymentStops(fn () => $gateway->chargeAutoPayAccepted($invoice, 20, new BillingAgreement));
+                    $stripe->beforeCreate = $stripe->beforeConfirm = null;
+                    if (str_starts_with($refusal, 'recovery-')) $change();
+                    if ($refusal === 'declined') unset(User::$row->props->values['ae_stripe_auto_pay_default']);
+                    $retiring = in_array($refusal, ['retired', 'decline-unread'], true);
+                    if ($retiring) $invoice->total = 25;
+                    else $gateway->retryChargeAttempts();
+                    $confirms = count($stripe->confirms);
+                    if (!$retiring) $gateway->retryChargeAttempts();
+                    check(!$stripe->charges && count($stripe->confirms) === $confirms, 'A refused offer cannot debit through recovery before a fresh payment');
+                    if ($refusal === 'card-off') {
+                        // An earlier build retained these fields after clearing the refused instruction.
+                        $stored = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                        $stored['accepted_amount'] = 2000; $stored['auto_pay_agreement'] = 4;
+                        User::$row->props->values['ae_stripe_checkout_920'] = json_encode($stored);
+                    }
+                    $stripe->status = 'succeeded';
+                    try {
+                        if ($next === 'elements') {
+                            $view = $gateway->pay($invoice, $invoice->total);
+                            $response = $gateway->confirmPayment(new Request(['intent' => $view['data']['intent']->id,
+                                'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => (int) ($invoice->total * 100)]));
+                            check(($response['data']['status'] ?? null) === 'succeeded', 'Fresh Pay now confirms the newly accepted total: '.json_encode($response));
+                        } else {
+                            $agreement = new BillingAgreement(['id' => 5, 'external_reference' => 'pm_other']);
+                            check(($next === 'accepted' ? $gateway->chargeAccepted($invoice, $invoice->total, $agreement)
+                                : $gateway->charge($invoice, $invoice->total, $agreement)) === true, 'Fresh saved-card payment succeeds after offer refusal');
+                        }
+                    } catch (\App\Exceptions\DisplayException $e) {
+                        check(false, 'A '.$refusal.' refusal must permit a fresh '.$next.' payment: '.$e->getMessage());
+                    }
+                    $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+                    check(count($stripe->charges) === 1 && $stripe->charges[0][1] === (int) ($invoice->total * 100)
+                        && count($stripe->confirms) === $confirms + 1,
+                        'Only the fresh payment charges, once, at its current total after '.$refusal.' refusal');
+                });
+            }
+        }
         $run('charge-accepted-amount', function ($invoice, $stripe) use ($gateway) {
             // The customer accepted 20.00, then the invoice was raised before the charge reached the payment lock.
             $invoice->total = 25;

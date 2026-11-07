@@ -107,10 +107,15 @@ trait CheckoutIntent
                     if ($transaction->transaction_id === $intent->id) { $this->recordIntentPayment($intent, 'failed'); break; }
                 }
             }
-            if ($intent->status === 'canceled') { $this->replacePaymentAttempt($invoice, $attempt); continue; }
+            if ($intent->status === 'canceled') {
+                // A new checkout can take over only after Stripe proves the earlier payment canceled without funds.
+                if ($elements) unset($data['agreement_id'], $data['accepted_amount'], $data['auto_pay_agreement']);
+                $this->replacePaymentAttempt($invoice, $attempt);
+                continue;
+            }
             if ($this->paymentAttemptFailed($attempt, $intent)) {
                 if (!$elements) return $intent; // Recovery must report the refusal, never replace its debit instruction.
-                unset($data['agreement_id']);
+                unset($data['agreement_id'], $data['accepted_amount'], $data['auto_pay_agreement']);
             }
             $usesElements = $this->isElementsAttempt($attempt, $intent);
             $legacyAutomatic = ($intent->confirmation_method ?? 'automatic') !== 'manual' && !$usesElements;
@@ -321,11 +326,21 @@ trait CheckoutIntent
     private function readPaymentAttempt($user, $invoice): ?array
     {
         $stored = $user->properties()->where('key', 'ae_stripe_checkout_' . $invoice->id)->lockForUpdate()->first()?->value;
-        return $stored ? json_decode($stored, true, flags: JSON_THROW_ON_ERROR) : null;
+        return $stored ? $this->clearFinishedPaymentConstraints(json_decode($stored, true, flags: JSON_THROW_ON_ERROR)) : null;
+    }
+
+    private function clearFinishedPaymentConstraints(array $attempt): array
+    {
+        // An ended instruction cannot constrain a later Pay. Unknown confirmations and funds keep their constraints.
+        if (empty($attempt['agreement_id']) && empty($attempt['confirmation']) && empty($attempt['funds_pending']) && empty($attempt['state'])) {
+            unset($attempt['accepted_amount'], $attempt['auto_pay_agreement']);
+        }
+        return $attempt;
     }
 
     private function writePaymentAttempt($user, $invoice, array $attempt): void
     {
+        $attempt = $this->clearFinishedPaymentConstraints($attempt);
         if (empty($attempt['agreement_id'])) unset($attempt['agreement_pending']);
         $user->properties()->updateOrCreate(['key' => 'ae_stripe_checkout_' . $invoice->id], ['value' => json_encode($attempt, JSON_THROW_ON_ERROR)]);
     }
