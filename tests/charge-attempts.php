@@ -115,6 +115,33 @@ use Illuminate\Support\Facades\{DB, Http};
     };
     try {
         require __DIR__ . '/renewal-retries.php';
+        foreach (['requires_payment_method', 'requires_action', 'processing', 'partial'] as $state) {
+            $run('new-card-old-form-'.$state, function ($invoice, $stripe) use ($gateway, $state) {
+                $old = $gateway->pay($invoice, 20)['data']['intent'];
+                $stripe->intents[$old->id]->payment_method_types = ['card', 'klarna', 'link', 'cashapp'];
+                $stripe->intents[$old->id]->status = $state === 'partial' ? 'requires_payment_method' : $state;
+                if ($state === 'partial') $stripe->intents[$old->id]->amount_received = 100;
+                $result = null;
+                try { $result = $gateway->pay($invoice, 20); }
+                catch (\App\Exceptions\DisplayException $e) {
+                    if (in_array($state, ['requires_payment_method', 'requires_action'], true)) throw $e;
+                }
+                if (in_array($state, ['requires_payment_method', 'requires_action'], true)) {
+                    check($stripe->intents[$old->id]->status === 'canceled' && $result['data']['intent']->id !== $old->id,
+                        'Opening an old mismatched form cancels the known unfunded intent and prepares card and Link');
+                } else check(count($stripe->intents) === 1 && $stripe->intents[$old->id]->status !== 'canceled',
+                    'A method-set change cannot replace processing or partially received funds');
+                check(!$stripe->confirms && !$stripe->charges, 'Changing the form never starts a debit');
+            });
+        }
+        $run('new-card-old-tab', function ($invoice, $stripe) use ($gateway) {
+            $intent = $gateway->pay($invoice, 20)['data']['intent'];
+            $stripe->intents[$intent->id]->payment_method_types = ['card', 'klarna', 'link', 'cashapp'];
+            $result = $gateway->confirmPayment(new Request(['intent' => $intent->id, 'amount' => 2000,
+                'confirmation_token' => 'ctoken_old', 'save' => false]));
+            check($result['status'] === 409 && str_contains($result['data']['message'], 'form changed')
+                && !$stripe->confirms && !$stripe->charges, 'An already open mismatched form is refused before any debit');
+        });
         foreach ([false, true] as $save) {
             $run('new-card-confirm-'.($save ? 'save' : 'once'), function ($invoice, $stripe) use ($gateway, $save) {
                 $invoice->total = 10.99;
