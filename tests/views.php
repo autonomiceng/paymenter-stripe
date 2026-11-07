@@ -140,7 +140,7 @@ $payView = file_get_contents($views . 'pay.blade.php');
 check(str_contains($payView, "paymentMethodTypes: ['card', 'link'],") && !str_contains($payView, 'excludedPaymentMethodTypes'),
     'The pay form offers only card and Link');
 foreach (['pay' => $payView, 'billing-agreement' => $setupView] as $name => $view) {
-    check(strpos($view, 'id="express-checkout"') > strpos($view, 'id="submit"') && str_contains($view, 'class="w-40 shrink-0"'),
+    check(strpos($view, 'id="express-checkout"') > strpos($view, 'id="submit"') && str_contains($view, '<div id="express-checkout-element" class="shrink-0" style="width: 160px"></div>'),
         "$name: Link is a small button below the main button");
 }
 check(str_contains($elementsView, "layout: 'tabs',") && str_contains($elementsView, 'buttonHeight: 40,'),

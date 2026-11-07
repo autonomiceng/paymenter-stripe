@@ -15,7 +15,8 @@
     <div id="express-checkout" hidden>
         <div class="mt-4 flex items-center justify-between gap-3">
             <span class="text-sm">Or pay with Link</span>
-            <div id="express-checkout-element" class="w-40 shrink-0"></div>
+            {{-- An inline width: a theme built before this release has no w-40 class. At 160px Stripe shows the Link mark alone. --}}
+            <div id="express-checkout-element" class="shrink-0" style="width: 160px"></div>
         </div>
     </div>
 </form>
