@@ -80,6 +80,50 @@ $gateway->deduplicateCards(true, fn ($line) => null);
 check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner'
     && DB::$tables['services'] === $serviceBefore, 'Cleanup preserves bound duplicates and every service preference');
 
+// The account card can have no services, including duplicates saved before expiry matching changed.
+$accountProperty = 'ae_stripe_auto_pay_default';
+$accountChoice = json_encode(['version' => AeStripe::AUTO_PAY_CONSENT, 'user_id' => 7,
+    'accepted_at' => 1700000000, 'agreement_id' => 20], JSON_THROW_ON_ERROR);
+$accountGateway = new AeStripe(['stripe_secret_key' => 'fake-secret', 'stripe_webhook_secret' => 'whsec_test']);
+foreach (['return', 'webhook', 'selected before detach', 'cleanup'] as $entry) {
+    $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new', month: $entry === 'cleanup' ? 5 : 6)];
+    ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'),
+        'pm_new' => $row(20, 'pm_new', ['expiry' => $entry === 'cleanup' ? '2030-05-31' : '2030-06-30'])];
+    DB::$tables['services'] = [];
+    $tablesBefore = DB::$tables;
+    $user->props->values = $entry === 'selected before detach' ? [] : [$accountProperty => $accountChoice];
+    $selectedBetweenPhases = false;
+    if ($entry === 'selected before detach') {
+        DB::$afterTransaction = function () use ($user, $accountProperty, $accountChoice, &$selectedBetweenPhases) {
+            check(!DB::$userLocked, 'The account choice commits after the first duplicate transaction');
+            $user->props->values[$accountProperty] = $accountChoice;
+            $selectedBetweenPhases = true;
+        };
+    }
+    $start = count(Http::$calls);
+    for ($attempt = 0; $attempt < 2; $attempt++) {
+        if ($entry === 'webhook') {
+            check($accountGateway->webhook(eventRequest($setup, type: 'setup_intent.succeeded'))['status'] === 200,
+                'Delayed setup success is acknowledged for the account card');
+        } elseif ($entry === 'cleanup') {
+            check($accountGateway->deduplicateCards(true, fn ($line) => null) === 0, 'Cleanup preserves the account card without an error');
+        } else {
+            $accountGateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
+        }
+        check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner',
+            "$entry keeps the newer account Auto Pay agreement attached and active");
+        check($accountGateway->autoPayDefault($user)['agreement_id'] === 20
+            && $user->props->values[$accountProperty] === $accountChoice,
+            "$entry preserves the exact account choice and Auto Pay still resolves");
+    }
+    check(count(ExtensionHelper::$agreements) === 2 && DB::$tables === $tablesBefore,
+        "$entry preserves both existing agreements, service settings and charge history");
+    check(!array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach')),
+        "$entry sends no detach for the account card");
+    if ($entry === 'selected before detach') check($selectedBetweenPhases, 'The pre-detach recheck scenario ran');
+}
+$user->props->values = [];
+
 DB::$tables['services'] = [];
 foreach (['fingerprint', 'missing fingerprint', 'other user', 'other gateway', 'removed', 'other customer'] as $case) {
     $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];

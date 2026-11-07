@@ -44,7 +44,7 @@ trait CardDuplicates
             }
             $remote = $this->request('get', '/payment_methods/' . $kept->external_reference);
             if (($remote->customer ?? null) !== $customer || $this->cardIdentity($remote, includeExpiry: !$updateExpiry) !== $identity) return null;
-            return $this->duplicateIsBound($incoming, $report) ? null : [$kept, $remote];
+            return $this->duplicateIsBound($user, $incoming, $report) ? null : [$kept, $remote];
         }
         if (($method->customer ?? null) !== $customer) return null;
         $agreements = BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->get();
@@ -61,16 +61,22 @@ trait CardDuplicates
                 continue;
             }
             if (($remote->customer ?? null) !== $customer || $this->cardIdentity($remote, includeExpiry: !$updateExpiry) !== $identity) continue;
-            return $this->duplicateIsBound($incoming, $report) ? null : [$kept, $remote];
+            return $this->duplicateIsBound($user, $incoming, $report) ? null : [$kept, $remote];
         }
         return null;
     }
 
-    private function duplicateIsBound($incoming, ?callable $report): bool
+    private function duplicateIsBound($user, $incoming, ?callable $report): bool
     {
-        if (!$incoming || !$incoming->services()->lockForUpdate()->first()) return false;
-        Log::info('AeStripe duplicate card kept: agreement is bound to a service', ['agreement_id' => $incoming->id]);
-        if ($report) $report('Saved card #' . $incoming->id . ' kept: the duplicate is linked to a service.');
+        if (!$incoming) return false;
+        if ($incoming->services()->lockForUpdate()->first()) {
+            Log::info('AeStripe duplicate card kept: agreement is bound to a service', ['agreement_id' => $incoming->id]);
+            if ($report) $report('Saved card #' . $incoming->id . ' kept: the duplicate is linked to a service.');
+            return true;
+        }
+        if (($this->autoPayDefault($user, lock: true)['agreement_id'] ?? null) != $incoming->id) return false;
+        Log::info('AeStripe duplicate card kept: agreement is the account Auto Pay card', ['agreement_id' => $incoming->id]);
+        if ($report) $report('Saved card #' . $incoming->id . ' kept: the duplicate is the account Auto Pay card.');
         return true;
     }
 
