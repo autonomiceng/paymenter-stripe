@@ -56,6 +56,20 @@ foreach (['user_id' => 8, 'gateway_id' => $gatewayId + 1, 'deleted_at' => '2026-
     ExtensionHelper::$agreements['pm_default'][$field] = $saved;
 }
 Service::$row = $existing;
+// Bundled Stripe retains ownership until adoption, including existing service links.
+$existing->billing_agreement_id = 55;
+Gateway::$bundled = true; Gateway::$bundledEnabled = true;
+$beforeProperties = $user->props->values;
+rejects(fn () => $gateway->saveAutoPayDefault(new Request($choice)), 'HTTP 409');
+check($existing->billing_agreement_id === 55 && $user->props->values === $beforeProperties,
+    'Refused enrollment leaves existing gateway links, preferences and consent unchanged');
+$gateway->saveAutoPayDefault(new Request(['agreement_id' => 91]));
+check($gateway->autoPayCard($user) === 91 && $existing->billing_agreement_id === 55,
+    'A preference-only save remains usable during gateway coexistence');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+check($existing->billing_agreement_id === null && $gateway->autoPayDefault($user) === null,
+    'Off remains usable while bundled Stripe owns collection');
+Gateway::$bundled = false; Gateway::$bundledEnabled = false;
 $gateway->saveAutoPayDefault(new Request($choice));
 $record = $gateway->autoPayDefault($user);
 check($record['version'] === AeStripe::AUTO_PAY_CONSENT && $record['user_id'] === 7

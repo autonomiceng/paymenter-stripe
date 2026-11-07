@@ -65,7 +65,7 @@ trait AutoPay
             'consent' => 'accepted_if:enabled,true',
             'version' => 'required_if:enabled,true|string',
         ]);
-        abort_unless(!$request->boolean('enabled') || $this->gatewayEnabled(), 409);
+        abort_unless(!$request->boolean('enabled') || $this->gatewayEnabled() && $this->bundledInactive(), 409);
         return DB::transaction(function () use ($request) {
             $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
             // A picker change alone saves a preference, never enables or disables any service.
