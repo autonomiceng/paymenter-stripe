@@ -361,7 +361,8 @@ use Illuminate\Support\Facades\{DB, Http};
         $run('manual-elements-tab', function ($invoice, $stripe) use ($gateway) {
             $intent = invoke($gateway, 'checkoutIntent', $invoice, invoke($gateway, 'checkoutPaymentData', $invoice, 2000, 'cus_owner'));
             $response = $gateway->confirmPayment(new Request(['intent' => $intent->id, 'save' => false, 'confirmation_token' => 'ctoken_oldtab', 'amount' => 2000]));
-            check($response['status'] === 409 && str_contains($response['data']['message'], 'form changed') && !$stripe->confirms,
+            check($response['status'] === 409 && str_contains($response['data']['message'], 'form changed') && !$stripe->confirms
+                && $response['data']['declined'] === false,
                 'An older manual checkout tab must refresh before it can send an Elements token');
         });
         $run('elements-repeat-decline', function ($invoice, $stripe) use ($gateway) {
@@ -375,6 +376,8 @@ use Illuminate\Support\Facades\{DB, Http};
                 $response = $gateway->confirmPayment(new Request(['intent' => $original, 'save' => false,
                     'confirmation_token' => $token, 'amount' => 2000]));
                 check($response['status'] === 409, 'A declined payment returns a customer error');
+                check($response['data']['message'] === 'Your bank declined this card. Try a different card, or contact your bank.' && $response['data']['declined'] === true,
+                    'A decline says the bank declined the card and tells the form to clear the declined card');
                 check(count(ExtensionHelper::$payments) === $index + 1, 'Each submit from the same open form records its own decline');
             }
             foreach ($stripe->intents as $failed) {
@@ -925,7 +928,7 @@ use Illuminate\Support\Facades\{DB, Http};
         });
         $run('confirm-refusal', function ($invoice, $stripe) use ($gateway) {
             $stripe->failure = function ($verb, $path) { if (str_ends_with($path, '/confirm')) throw new RequestException(402, ['error' => ['code' => 'card_declined']]); };
-            check(paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)) === 'This card was declined. Choose another payment method.', 'Definite 402 without an intent gives the real refusal');
+            check(paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)) === 'Your bank declined this card. Try a different card, or contact your bank.', 'Definite 402 without an intent gives the real refusal');
             $stripe->failure = null;
             check($gateway->charge($invoice, 20, new BillingAgreement(['id' => 5, 'external_reference' => 'pm_other'])) === true && count($stripe->intents) === 1,
                 'A different card can pay the refused intent without a permanent hold');

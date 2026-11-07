@@ -50,10 +50,12 @@ try {
             window.expressThrows = expressThrows;
             window.failure = 'network';
             window.confirms = 0;
+            window.clears = 0;
             window.elementCalls = [];
             window.elementHandlers = {};
             window.fetch = async () => {
                 if (failure === 'network') throw new TypeError('Failed to fetch');
+                if (failure === 'server-decline') return { ok: false, async json() { return {message: 'Server decline wording.', intent: 'fixture-intent', declined: true}; } };
                 return { ok: failure !== 'consent', async json() { return {message: 'Could not record payment preferences. Refresh the invoice.', status: 'requires_action', client_secret: 'fixture-secret'}; } };
             };
             window.$wire = { on() {} };
@@ -76,7 +78,7 @@ try {
                             type === 'payment' ? 'Card form' : 'Pay with Link';
                         // No available methods also models Link being disabled on the account.
                         handlers.ready?.({availablePaymentMethods: expressThrows === 'unavailable' ? null : {link: true}});
-                    }, destroy() {} };
+                    }, clear() { if (type === 'payment') clears++; }, destroy() {} };
                 } }; },
                 async createConfirmationToken({elements}) {
                     if (elements !== elementsInstance) throw new Error('Token must use the mounted Elements instance');
@@ -152,15 +154,18 @@ try {
             assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${name}: above-card always mounts the card form`);
         }
         const fallback = name === 'pay' ? 'Could not check the payment. Refresh the invoice for its status.' : 'Could not save your payment method. Try again.';
-        for (const failure of ['network', 'confirmation', ...(name === 'pay' ? ['updates'] : []), 'consent', 'decline']) {
+        for (const failure of ['network', 'confirmation', ...(name === 'pay' ? ['updates', 'server-decline'] : []), 'consent', 'decline']) {
             await page.evaluate(value => { window.failure = value; }, failure);
             const before = await page.evaluate(() => confirms);
+            const clearsBefore = await page.evaluate(() => clears);
             await page.locator('#submit').click();
-            const expected = failure === 'decline' ? 'Your card was declined.' : failure === 'consent'
+            const expected = failure === 'decline' ? 'Your card was declined.' : failure === 'server-decline' ? 'Server decline wording.' : failure === 'consent'
                 ? (name === 'pay' ? 'Could not record payment preferences. Refresh the invoice.' : 'Could not record your agreement. Try again.') : fallback;
             await page.waitForFunction(() => document.querySelector('[role=alert]').textContent.length > 0);
             assert.equal(await page.locator('[role=alert]').textContent(), expected, `${name}: ${failure}`);
             assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: retry stays available after ${failure}`);
+            // Only a decline of the entered details clears them, so the customer types a different card.
+            assert.equal(await page.evaluate(() => clears) - clearsBefore, failure === 'server-decline' ? 1 : 0, `${name}: ${failure} clears the card form only after a decline`);
             if (['network', 'consent', 'updates'].includes(failure)) assert.equal(await page.evaluate(() => confirms), before, 'Failed preparation cannot confirm');
         }
         if (name === 'billing-agreement' && linkDisplay === 'above_card' && !expressThrows) {
