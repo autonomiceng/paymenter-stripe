@@ -79,11 +79,10 @@ parameters before HTTP and never confirms or supplies a card. Elements attempts 
 automatic confirmation; native saved-method and bank-debit attempts use manual confirmation.
 The rendered checkout never includes the PaymentIntent client secret. Only a locked confirm
 result requiring authentication returns it. Opening checkout only prepares the form. Elements uses deferred `mode: payment` with the intent's integer amount and lowercase currency,
-plus manual payment-method creation. BLIK and ACSS are excluded because this integration path does not support them; this form also excludes customer balance.
+plus manual payment-method creation. It offers only card and Link (`paymentMethodTypes`).
 Ilya checked creation in Stripe test mode on 2026-10-30 at 12:00 PM PT (2025-07-30.basil): manual confirmation alone returned 200; adding automatic_payment_methods returned 400.
 The live pass on 2026-10-30 then proved Elements tokens are rejected on manual intents.
 Elements now uses the documented automatic flow; its real Stripe acceptance must be checked again.
-Klarna, Cash App and bank methods remain available under the same exclusions.
 Payment Elements keep Link and its default-on sign-up box (see [Auto Pay](auto-pay.md#stripe-link));
 automated card tests untick `linkOptIn` in the Stripe frame.
 Submission sends a ConfirmationToken to the authenticated,
@@ -178,7 +177,7 @@ compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
   account setup redisplay. Test card, wallet and Link with saving checked/clear.
 - First verify ConfirmationTokens with deferred Elements (`mode`, amount, currency), Customer Sessions and automatic confirmation
   on pinned Basil, including card, Link, SEPA/ACH mandates, declines, 3DS and bank redirects.
-  Check the client exclusions for ACSS, BLIK and customer balance; verify available methods before release.
+  Check that the pay form and account setup offer only card and Link before release.
   Check the bank/3DS error page and its invoice link. Check clearing method-specific future usage with `''` and preserving consent after authentication.
 - Run concurrent success deliveries/setup redirects against the real database;
   assert one agreement/transaction, preserved success after late failed/processing

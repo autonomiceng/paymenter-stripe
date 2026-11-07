@@ -1,8 +1,5 @@
 <form id="payment-form" class="mt-2">
     <div id="error-message" role="alert" class="text-red-600 dark:text-red-400"></div>
-    <div id="express-checkout" class="mb-4" hidden>
-        <div id="express-checkout-element"></div>
-    </div>
     <div id="payment-element">
 
     </div>
@@ -14,6 +11,13 @@
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
         {{ __('Pay :amount', ['amount' => $invoice->formattedRemaining]) }}
     </button>
+    {{-- Link is offered below Pay, small enough that Pay stays the main button. --}}
+    <div id="express-checkout" hidden>
+        <div class="mt-4 flex items-center justify-between gap-3">
+            <span class="text-sm">Or pay with Link</span>
+            <div id="express-checkout-element" class="w-40 shrink-0"></div>
+        </div>
+    </div>
 </form>
 @script
 <script>
@@ -60,7 +64,8 @@ async function initializePaymentForm() {
                 mode: 'payment',
                 amount: @js($intent->amount),
                 currency: @js(strtolower($intent->currency)),
-                excludedPaymentMethodTypes: ['blik', 'acss_debit', 'customer_balance'],
+                // Card and Link only: the methods Auto Pay and saved payments can charge later.
+                paymentMethodTypes: ['card', 'link'],
                 paymentMethodCreation: 'manual',
                 appearance: stripeAppearance(form),
             };
