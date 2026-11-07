@@ -84,7 +84,7 @@ $methodIntent->id = 'pi_failedlabel';
 $methodIntent->latest_charge = 'py_fixture';
 $before = count(Http::$calls);
 $gateway->webhook(eventRequest($methodIntent, type: 'payment_intent.payment_failed'));
-check(count(Http::$calls) === $before && !isset(DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_failedlabel')]), 'Failed payment captures nothing');
+check(count(Http::$calls) === $before + 1 && DB::$tables['ae_stripe_transaction_methods'][crc32('12:pi_failedlabel')]['label'] === 'Visa **** 4242', 'Failed payment retrieves and retains its card');
 // A PaymentIntent can fail and then reuse its transaction for another card.
 $retryIntent = clone $methodIntent;
 $retryIntent->id = 'pi_labelretry';
@@ -94,7 +94,7 @@ $gateway->webhook(eventRequest($retryIntent, type: 'payment_intent.processing'))
 check(DB::$tables['ae_stripe_transaction_methods'][$retryId]['label'] === 'Visa **** 4242', 'Processing records the first attempt card');
 $gateway->webhook(eventRequest($retryIntent, type: 'payment_intent.payment_failed'));
 $gateway->webhook(eventRequest($retryIntent, type: 'payment_intent.payment_failed'));
-check(!isset(DB::$tables['ae_stripe_transaction_methods'][$retryId]), 'Failure and its replay clear the failed attempt label');
+check(DB::$tables['ae_stripe_transaction_methods'][$retryId]['label'] === 'Visa **** 4242' && isset(DB::$tables['ae_stripe_transaction_methods'][$retryId]['failure_reason']), 'Failure and its replay retain the failed card and reason');
 $retryIntent->latest_charge = 'ch_retrycard';
 Http::$handler = function ($verb, $path) {
     check($verb === 'get' && $path === '/charges/ch_retrycard' && !DB::$locked, 'Retry retrieves its new charge before locking');
