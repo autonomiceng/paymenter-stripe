@@ -44,6 +44,8 @@ submission clears it. The save control is available only when the Element
 reports a card or Link selection; changing to another method clears the opt-in. Stripe's own saving control is disabled to keep this one
 consent path. Successful opted-in card/Link payments create/update one native
 agreement per user, gateway and payment-method ID, serialized by user-row lock.
+The agreement is saved when the payment confirms or returns from the bank; the
+`payment_intent.succeeded` webhook saves it again if that step failed.
 Account payment-method setup also authorizes saving and redisplay. Customer setup
 and checkout never assign an agreement to services or enable Auto Pay.
 

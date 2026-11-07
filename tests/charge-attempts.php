@@ -33,7 +33,8 @@ use Illuminate\Support\Facades\{DB, Http};
                         'customer' => $data['customer'], 'client_secret' => 'fixture-secret', 'metadata' => (object) $data['metadata']];
                 }
                 if ($path === '/setup_intents/seti_display') return $this->setups['seti_display'];
-                if (str_starts_with($path, '/payment_methods/')) return (object) ['id' => substr($path, 17), 'customer' => 'cus_owner', 'type' => 'card'];
+                if (str_starts_with($path, '/payment_methods/')) return (object) ['id' => substr($path, 17), 'customer' => 'cus_owner', 'type' => 'card',
+                    'card' => (object) ['brand' => 'visa', 'last4' => '4242', 'exp_month' => 4, 'exp_year' => 2030]];
                 if ($path === '/payment_intents/search') return (object) ['data' => [], 'has_more' => false];
                 if ($this->failure) ($this->failure)($verb, $path, $data);
                 if (str_starts_with($path, '/charges/ch_')) return (object) ['id' => substr($path, 9)];
@@ -73,6 +74,9 @@ use Illuminate\Support\Facades\{DB, Http};
                     if (!in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) throw new RequestException(400, ['error' => ['code' => 'payment_intent_unexpected_state']]);
                     if ($this->beforeConfirm) ($this->beforeConfirm)($intent, $data);
                     $this->confirms[] = [$key, $data, $intent->amount];
+                    // A token confirmation attaches the token's new method and the request's per-method options.
+                    if (isset($data['confirmation_token'])) $intent->payment_method = 'pm_paid';
+                    if (isset($data['payment_method_options'])) $intent->payment_method_options = json_decode(json_encode($data['payment_method_options']));
                     $this->settle($intent, $data);
                     $this->cache[$key] = clone $intent;
                     if ($this->loseConfirm) { $this->loseConfirm = false; throw new ConnectionException('Lost confirm'); }
@@ -928,6 +932,13 @@ use Illuminate\Support\Facades\{DB, Http};
             };
             $response = $gateway->confirmPayment(new Request(['intent' => 'pi_test1', 'save' => true, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
             check($response['data']['status'] === 'succeeded' && $response['data']['client_secret'] === null && count($stripe->charges) === 1, 'Checkout token confirms once with explicit saving consent and no client secret on success');
+            // Demo r28: paying with "Save this card for next time" saved nothing when the webhook did not save it.
+            check((ExtensionHelper::$agreements['pm_paid']['name'] ?? null) === 'Visa **** 4242', 'Paying with Save ticked saves the card at once, without waiting for the webhook');
+        });
+        $run('checkout-no-save', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $response = $gateway->confirmPayment(new Request(['intent' => 'pi_test1', 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
+            check($response['data']['status'] === 'succeeded' && !isset(ExtensionHelper::$agreements['pm_paid']), 'Paying without Save ticked saves no card');
         });
         $run('bank-verification', function ($invoice, $stripe) use ($gateway) {
             $stripe->status = 'requires_action'; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));

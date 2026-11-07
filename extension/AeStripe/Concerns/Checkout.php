@@ -184,7 +184,10 @@ trait Checkout
             if ($request->input('confirmation_token') || $intent->status === 'requires_confirmation' && ($intent->confirmation_method ?? null) === 'manual') {
                 $intent = $this->confirmAttempt($invoice, $intent->id, $params, $agreement, expectedAmount: (int) $request->input('amount'));
             }
-            if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
+            if ($intent->status === 'succeeded') {
+                $this->recordIntentPayment($intent, 'succeeded');
+                $this->saveConsentedMethod($intent);
+            }
             return response()->json(['status' => $intent->status, 'client_secret' => $intent->status === 'requires_action' ? $intent->client_secret : null]);
         } catch (DisplayException $e) {
             return response()->json(['message' => $e->getMessage()], 409);
@@ -233,7 +236,10 @@ trait Checkout
                 if ($agreement) $params['payment_method'] = $agreement->external_reference;
                 $intent = $this->confirmAttempt($invoice, $id, $params, $agreement, expectedAmount: $amount);
             }
-            if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
+            if ($intent->status === 'succeeded') {
+                $this->recordIntentPayment($intent, 'succeeded');
+                $this->saveConsentedMethod($intent);
+            }
             if (in_array($intent->status, ['requires_payment_method', 'canceled'], true)) throw new DisplayException('This payment was not completed. Choose another payment method on the invoice.');
             if ($intent->status === 'requires_action') throw new DisplayException('This payment still needs authentication. Open the invoice to finish it.');
             return redirect()->to(route('invoices.show', $invoice) . '?checkPayment=true');
@@ -386,6 +392,20 @@ trait Checkout
                 $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($alert, JSON_THROW_ON_ERROR)]);
             });
         });
+    }
+
+    // Save the consented method as soon as Stripe confirms. The payment_intent.succeeded webhook
+    // saves it again (idempotent) if this fails or the customer leaves before the response.
+    private function saveConsentedMethod($intent): void
+    {
+        try {
+            $this->savePaidMethod($intent);
+        } catch (DisplayException $e) {
+            \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['payment_intent_id' => $intent->id ?? null, 'reason' => $e->getMessage()]);
+        } catch (\Throwable $e) {
+            if ($e instanceof \Symfony\Component\HttpKernel\Exception\HttpExceptionInterface) throw $e;
+            \Illuminate\Support\Facades\Log::warning('AeStripe saved method deferred to webhook', ['payment_intent_id' => $intent->id ?? null, 'error' => get_class($e)]);
+        }
     }
 
     private function savePaidMethod($intent)
