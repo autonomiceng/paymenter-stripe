@@ -662,21 +662,23 @@ class AeStripe extends Gateway
             if (!$current) return false;
             $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail();
             if ($current->id != $billingAgreement->id || $current->user_id != $user->id || $current->gateway_id != $gateway->id) return false;
-            if ($current->trashed()) return true;
+            // Native removal follows every true result, so Auto Pay stops using this card first.
+            $removed = function () use ($user, $current) { $this->autoPayCardRemoved($user, (int) $current->id); return true; };
+            if ($current->trashed()) return $removed();
             try {
                 $method = $this->request('get', '/payment_methods/' . $current->external_reference);
             } catch (Exception $e) {
                 \Illuminate\Support\Facades\Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
-                return true;
+                return $removed();
             }
-            if (($method->customer ?? null) === null) return true;
+            if (($method->customer ?? null) === null) return $removed();
             if (!$this->methodCustomerMatches($user, $method, current: true)) return false;
             try {
                 $this->request('post', '/payment_methods/' . $current->external_reference . '/detach');
             } catch (Exception $e) {
                 // Native cancellation still removes the local agreement after a Stripe failure.
             }
-            return true;
+            return $removed();
         });
     }
 

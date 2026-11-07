@@ -20,7 +20,7 @@ SetupIntent's user, customer, purpose and unfinished status, then records
 Legacy forms without a version retain `off_session_v1`; a v1 authentication resume
 keeps its original metadata. Both versions save only a payment method. Neither can
 enroll services through a webhook or redirect. Existing agreements stay unchanged.
-The separate account default requires fresh `auto_pay_new_services_v2` consent;
+The separate account switch requires fresh `auto_pay_account_v1` consent;
 see [Auto Pay integration](auto-pay.md) for the theme calls and dates.
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.

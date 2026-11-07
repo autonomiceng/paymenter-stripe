@@ -8,7 +8,8 @@ use Illuminate\Support\Facades\{Auth, DB};
 
 trait AutoPay
 {
-    public const AUTO_PAY_CONSENT = 'auto_pay_new_services_v2';
+    // Account scope: every recurring service, current and new. Older new-services-only consent does not carry over.
+    public const AUTO_PAY_CONSENT = 'auto_pay_account_v1';
     private const AUTO_PAY_PROPERTY = 'ae_stripe_auto_pay_default';
 
     /** A saved card or v1 consent alone never grants this scope. */
@@ -27,7 +28,11 @@ trait AutoPay
         return $agreement ? $record : null;
     }
 
-    /** Authenticated account preference, independent of paying any invoice. Off needs no consent. */
+    /**
+     * Authenticated account switch, independent of paying any invoice. Off needs no consent. On links every recurring
+     * service to the chosen card; off unlinks them all. Open invoices are never charged by this: native renewal charges
+     * happen only when an invoice is issued. Stripe subscriptions keep their own billing.
+     */
     public function saveAutoPayDefault(Request $request)
     {
         $request->validate([
@@ -41,6 +46,9 @@ trait AutoPay
             $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
             if (!$request->boolean('enabled')) {
                 $user->properties()->where('key', self::AUTO_PAY_PROPERTY)->delete();
+                foreach ($this->autoPayServices($user) as $service) {
+                    if ($service->billing_agreement_id) $service->update(['billing_agreement_id' => null]);
+                }
                 return response()->json(['ok' => true, 'enabled' => false]);
             }
             abort_unless($request->boolean('consent') && $request->input('version') === self::AUTO_PAY_CONSENT, 422);
@@ -51,11 +59,40 @@ trait AutoPay
             $record = ['version' => self::AUTO_PAY_CONSENT, 'user_id' => (int) $user->id,
                 'accepted_at' => time(), 'agreement_id' => (int) $agreement->id];
             $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_PROPERTY], ['value' => json_encode($record, JSON_THROW_ON_ERROR)]);
-            return response()->json(['ok' => true, 'enabled' => true]);
+            $services = 0;
+            foreach ($this->autoPayServices($user) as $service) {
+                if (($service->plan?->type ?? null) !== 'recurring' || $service->status === Service::STATUS_CANCELLED) continue;
+                if ($service->billing_agreement_id != $agreement->id) $service->update(['billing_agreement_id' => (int) $agreement->id]);
+                $services++;
+            }
+            return response()->json(['ok' => true, 'enabled' => true, 'services' => $services]);
         });
     }
 
-    /** Called synchronously by Service Created only. Never backfill or reapply on Updated. */
+    /** The user's services under lock, without Stripe subscriptions. Callers hold the user row lock. */
+    private function autoPayServices(User $user): array
+    {
+        $services = [];
+        foreach (Service::where('user_id', $user->id)->lockForUpdate()->get() as $service) {
+            if ($service->user_id == $user->id && !$service->subscription_id) $services[] = $service;
+        }
+        return $services;
+    }
+
+    /** A removed card turns account Auto Pay off when it was the account card, and unlinks the services it paid. */
+    private function autoPayCardRemoved(User $user, int $agreementId): void
+    {
+        $value = $user->properties()->where('key', self::AUTO_PAY_PROPERTY)->first()?->value;
+        $record = $value ? json_decode($value, true) : null;
+        if (is_array($record) && ($record['agreement_id'] ?? null) === $agreementId) {
+            $user->properties()->where('key', self::AUTO_PAY_PROPERTY)->delete();
+        }
+        foreach ($this->autoPayServices($user) as $service) {
+            if ($service->billing_agreement_id == $agreementId) $service->update(['billing_agreement_id' => null]);
+        }
+    }
+
+    /** Called synchronously by Service Created only; turning the switch on links existing services. Never reapply on Updated. */
     private function applyNewServiceAutoPay(Service $service): void
     {
         if (!$this->gatewayEnabled() || !$this->bundledInactive()) return;

@@ -1,42 +1,44 @@
 # Auto Pay integration
 
-Saving a payment method and enabling Auto Pay are separate actions. Auto Pay belongs
-to an account default for **new services**, or to an individual service. Paying an
-invoice never grants invoice-wide Auto Pay. Customer and staff views use the same words.
+Saving a payment method and enabling Auto Pay are separate actions. Auto Pay is one
+account switch: on, every recurring service, current and new, renews with the account
+card; off, none do. Paying an invoice never turns it on. Customer and staff views use
+the same words.
 
-## Account default (theme integration)
+## Account switch (theme integration)
 
 Resolve AE Stripe through `ExtensionHelper::getExtension('gateway', 'AeStripe')`.
 Read `autoPayDefault($user)`: null means Off; otherwise `agreement_id` identifies the
-selected native BillingAgreement. Do not choose a first card or derive consent from
-boolean properties or old Stripe metadata.
+account card, a native BillingAgreement. Do not derive consent from boolean properties
+or old Stripe metadata.
 
-Show an Off switch for Auto Pay that names the card it charges and when: “Renewals are
-charged to <card> when each invoice is issued.” Explain: “Applies to new orders. Current
-services keep their own setting.” Turning the switch on is the consent; keep the configured
-Terms link in its help. With one owned saved method the switch uses it; with more, the
-customer picks one first and nothing is preselected. Future services have no exact calendar until provisioned; show their invoice and
-charge dates on the service page once scheduled. Never substitute their expiry date.
+Show an Off switch for Auto Pay. Turning it on is the consent: confirm what it covers in
+one line, for example “Renewals for all 3 services charge Visa **** 4242.”, and keep the
+configured Terms link in its help. With one owned saved method the switch uses it; with
+more, the customer picks one first and nothing is preselected. Open invoices are not
+charged by turning it on; offer Pay now for those.
 
 POST JSON to `route('extensions.gateways.ae-stripe.auto-pay-default')` with the normal
 session, Accept application/json and X-CSRF-TOKEN:
 
 ```json
-{"enabled":true,"agreement_id":123,"consent":true,"version":"auto_pay_new_services_v2"}
+{"enabled":true,"agreement_id":123,"consent":true,"version":"auto_pay_account_v1"}
 ```
 
-`agreement_id` is the native numeric ID, not the Stripe reference or ULID. The new
-scope requires fresh authenticated acceptance even for an existing saved card. Off:
-`{"enabled":false}`. A 200 returns `ok` and `enabled`; preserve the control on errors.
-Apply this account choice after a newly saved agreement appears in the native list,
-not to an unfinished SetupIntent. No default is inferred from setup completion.
+`agreement_id` is the native numeric ID, not the Stripe reference or ULID. The account
+scope requires fresh authenticated acceptance even for an existing saved card; the older
+new-services-only `auto_pay_new_services_v2` record reads as Off. Off: `{"enabled":false}`.
+A 200 returns `ok`, `enabled` and, when on, `services` (how many were linked); preserve the
+control on errors. No default is inferred from setup completion.
 
 The property `ae_stripe_auto_pay_default` records version, user ID, server acceptance
-time and agreement ID. Native Service Created applies it under user/service locks
-and current reads, only for recurring services without a selected agreement or
-subscription. Service Updated never reapplies it. No existing service backfill,
-card changes, new charge or consent migration occurs. A removed agreement makes the
-default ineffective; the next opt-in must select an active owned AE Stripe agreement.
+time and agreement ID. On links every recurring, uncancelled service of the user to the
+card, under the user lock; off unlinks every service. Stripe subscriptions keep their own
+billing either way. Native Service Created applies the record to new recurring services
+without a selected agreement or subscription; Service Updated never reapplies it.
+Linking charges nothing: native renewal charges happen when an invoice is issued, so open
+invoices stay for the customer to pay. Removing the account card deletes the record and
+unlinks the services it paid for, so Auto Pay reads Off.
 
 ## Dates for every service opt-in
 

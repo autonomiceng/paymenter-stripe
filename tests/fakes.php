@@ -65,6 +65,7 @@ namespace App\Models {
         public function first() { return $this->value; }
         public function exists() { return (bool) $this->value; }
         public function firstOrFail() { return $this->value ?? throw new \RuntimeException('Missing row'); }
+        public function get() { return $this->value ? [$this->value] : []; }
         public function where($key, $value) { return $this; }
         public function lockForUpdate() { if ($this->model === Service::class && ($hook = \Illuminate\Support\Facades\DB::$beforeServiceLock)) $hook(); if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $before = \App\Helpers\ExtensionHelper::$payments; $hook(); foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) if (($before[$key] ?? null) !== $row) \Illuminate\Support\Facades\DB::$concurrentPayments[$key] = $row; } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
     }
