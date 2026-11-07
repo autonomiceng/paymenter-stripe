@@ -32,9 +32,10 @@ trait AutoPay
     /** The customer's saved choice, independent of charging consent. Older enabled accounts keep their card. */
     public function autoPayCard(User $user): ?int
     {
+        if ($default = $this->autoPayDefault($user)) return $default['agreement_id'];
         $value = $user->properties()->where('key', self::AUTO_PAY_CARD)->first()?->value;
         $record = $value ? json_decode($value, true) : null;
-        if (!is_array($record)) return $this->autoPayDefault($user)['agreement_id'] ?? null;
+        if (!is_array($record)) return null;
         if (($record['user_id'] ?? null) != $user->id || !is_int($record['agreement_id'] ?? null)) return null;
         $gateway = Gateway::where('extension', 'AeStripe')->first();
         return $gateway && BillingAgreement::where('id', $record['agreement_id'])->where('user_id', $user->id)
@@ -57,14 +58,23 @@ trait AutoPay
     public function saveAutoPayDefault(Request $request)
     {
         $request->validate([
-            'enabled' => 'required|boolean',
-            'agreement_id' => 'required_if:enabled,true|integer|min:1',
+            'enabled' => 'sometimes|boolean',
+            'agreement_id' => 'required_without:enabled|required_if:enabled,true|integer|min:1',
             'consent' => 'accepted_if:enabled,true',
             'version' => 'required_if:enabled,true|string',
         ]);
         abort_unless(!$request->boolean('enabled') || $this->gatewayEnabled(), 409);
         return DB::transaction(function () use ($request) {
             $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
+            // A picker change alone saves a preference, never enables or disables any service.
+            if ($request->input('enabled') === null) {
+                $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
+                $agreement = BillingAgreement::where('id', $request->input('agreement_id'))
+                    ->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
+                abort_unless($agreement, 403);
+                $this->rememberAutoPayCard($user, (int) $agreement->id);
+                return response()->json(['ok' => true]);
+            }
             if (!$request->boolean('enabled')) {
                 $card = $this->autoPayDefault($user, lock: true)['agreement_id'] ?? null;
                 if ($card) $this->rememberAutoPayCard($user, $card);

@@ -67,6 +67,30 @@ check($gateway->autoPayDefault($user) === null, 'Off still revokes account charg
 check($gateway->autoPayCard($user) === 91, 'Off keeps the explicitly chosen Auto Pay card for the next visit');
 $gateway->saveAutoPayDefault(new Request($choice));
 check($gateway->autoPayCard($user) === 91, 'Off then On keeps the same card');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+ExtensionHelper::$agreements['pm_selected'] = ['id' => 92, 'user_id' => 7, 'gateway_id' => $gatewayId,
+    'external_reference' => 'pm_selected', 'deleted_at' => null];
+$gateway->saveAutoPayDefault(new Request(['agreement_id' => 92]));
+check($gateway->autoPayCard($user) === 92 && $gateway->autoPayDefault($user) === null
+    && $existing->billing_agreement_id === null, 'Choosing an Auto Pay card while Off persists without enabling charges');
+// Saving another method must not take over the chosen card.
+ExtensionHelper::$agreements['pm_added'] = ['id' => 93, 'user_id' => 7, 'gateway_id' => $gatewayId,
+    'external_reference' => 'pm_added', 'deleted_at' => null];
+check($gateway->autoPayCard($user) === 92, 'A newly saved card cannot replace the explicit choice');
+foreach (['user_id' => 8, 'gateway_id' => $gatewayId + 1, 'deleted_at' => '2026-11-07'] as $field => $value) {
+    $saved = ExtensionHelper::$agreements['pm_added'][$field];
+    ExtensionHelper::$agreements['pm_added'][$field] = $value;
+    rejects(fn () => $gateway->saveAutoPayDefault(new Request(['agreement_id' => 93])), 'HTTP 403');
+    check($gateway->autoPayCard($user) === 92, 'A refused selection preserves the current choice');
+    ExtensionHelper::$agreements['pm_added'][$field] = $saved;
+}
+$gateway->saveAutoPayDefault(new Request($choice));
+$gateway->saveAutoPayDefault(new Request(['agreement_id' => 92]));
+check($gateway->autoPayDefault($user)['agreement_id'] === 91 && $existing->billing_agreement_id === 91,
+    'A card preference alone cannot change existing charging consent');
+unset(ExtensionHelper::$agreements['pm_selected'], ExtensionHelper::$agreements['pm_added']);
+$gateway->saveAutoPayDefault(new Request($choice));
+
 
 foreach (['subscription_id' => 'sub_existing', 'status' => Service::STATUS_CANCELLED, 'user_id' => 8] as $field => $value) {
     $kept = $existing->$field; $existing->$field = $value; $existing->billing_agreement_id = null;
