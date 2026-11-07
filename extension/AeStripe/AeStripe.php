@@ -261,7 +261,7 @@ class AeStripe extends Gateway
                 'name' => 'stripe_link_display',
                 'label' => 'Link at checkout',
                 'type' => 'select',
-                'options' => ['above_card' => 'Link button above card', 'inside_card' => 'Inside card form',
+                'options' => ['above_card' => 'Small Link button below the form', 'inside_card' => 'Inside card form',
                     'stripe_default' => 'Stripe default'],
                 'default' => 'above_card',
                 'hint' => fn () => new \Illuminate\Support\HtmlString('<span tabindex="0" title="Choose where Link appears. Stripe default also prefills the customer email.">?</span>'),
@@ -647,6 +647,8 @@ class AeStripe extends Gateway
             ],
             'usage' => 'off_session',
             'customer' => $customer->id,
+            // Auto Pay charges a saved card or Link later, so the form offers only those.
+            'payment_method_types' => ['card', 'link'],
         ]);
 
         // Return the client secret to the frontend to complete the setup

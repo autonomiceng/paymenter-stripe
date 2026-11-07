@@ -38,6 +38,13 @@ trait SetupIntent
                 && ($intent->metadata->is_billing_agreement ?? null) === '1'
                 && ($intent->metadata->ae_stripe_gateway ?? null) === '1', 409);
             abort_unless(in_array($intent->status, ['requires_payment_method', 'requires_confirmation', 'requires_action'], true), 409);
+            if (isset($data['payment_method_types'], $intent->payment_method_types)
+                && !self::sameMethodTypes($intent->payment_method_types, $data['payment_method_types'])) {
+                // An unfinished intent from an earlier release offers other methods. Replace it with the current set.
+                $this->request('post', '/setup_intents/' . $intent->id . '/cancel');
+                $attempt = $reserve($attempt['key']);
+                continue;
+            }
             return $intent;
         }
         // Commit the retry key before HTTP. An ambiguous response must never create a second intent.
@@ -50,5 +57,12 @@ trait SetupIntent
             $owner->properties()->updateOrCreate(['key' => $property], ['value' => json_encode($attempt + ['intent' => $intent->id], JSON_THROW_ON_ERROR)]);
         });
         return $intent;
+    }
+
+    private static function sameMethodTypes(array $current, array $wanted): bool
+    {
+        sort($current);
+        sort($wanted);
+        return $current === $wanted;
     }
 }

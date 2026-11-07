@@ -159,4 +159,27 @@ Auth::$id = 99;
 $before = count(Http::$calls);
 rejects(fn () => $setupGateway->createBillingAgreement($setupUser), 'HTTP 403');
 check(count(Http::$calls) === $before, 'Foreign user cannot retrieve or create a setup');
+Auth::$id = $setupUser->id;
+// Auto Pay charges a saved card or Link later; the form offers no other method, and an older open intent is replaced.
+unset($setupUser->props->values[$property]);
+$createdTypes = [];
+$cancelledSetups = [];
+Http::$handler = function ($verb, $path, $data) use ($normalHandler, &$createdTypes, &$cancelledSetups, &$remoteSetups) {
+    if ($verb === 'post' && $path === '/setup_intents') $createdTypes[] = $data['payment_method_types'] ?? null;
+    if ($verb === 'post' && preg_match('#^/setup_intents/(seti_[a-z_0-9]+)/cancel$#', $path, $match)) {
+        $cancelledSetups[] = $match[1];
+        $remoteSetups[$match[1]]->status = 'canceled';
+        return $remoteSetups[$match[1]];
+    }
+    return $normalHandler($verb, $path, $data);
+};
+$cardAndLink = $setupGateway->createBillingAgreement($setupUser)['data']['intent'];
+check($createdTypes === [['card', 'link']], 'Account setup offers only card and Link');
+$remoteSetups[$cardAndLink->id]->payment_method_types = ['link', 'card'];
+check($setupGateway->createBillingAgreement($setupUser)['data']['intent']->id === $cardAndLink->id && $cancelledSetups === [],
+    'An open card and Link intent is reused in any order');
+$remoteSetups[$cardAndLink->id]->payment_method_types = ['card', 'klarna', 'link'];
+$replaced = $setupGateway->createBillingAgreement($setupUser)['data']['intent'];
+check($cancelledSetups === [$cardAndLink->id] && $replaced->id !== $cardAndLink->id && count($createdTypes) === 2,
+    'An open intent offering other methods is cancelled and replaced');
 [User::$row, Gateway::$enabled, Auth::$id, Http::$handler] = $savedSetupState;

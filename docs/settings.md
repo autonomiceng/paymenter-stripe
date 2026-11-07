@@ -28,14 +28,19 @@ All paths start with `/v1`. Read uses `GET`; write uses `POST` unless marked `DE
 | Payment methods | `/payment_methods/{id}` | `/payment_methods/{id}`, `/payment_methods/{id}/detach` |
 | Refunds | `/refunds` | `/refunds` |
 | Products | `/products/search` | `/products` |
-| SetupIntents | `/setup_intents/{id}` | `/setup_intents`, `/setup_intents/{id}` |
+| SetupIntents | `/setup_intents/{id}` | `/setup_intents`, `/setup_intents/{id}`, `/setup_intents/{id}/cancel` |
 | Subscription items | None | `/subscription_items/{id}` |
 | Subscription schedules | `/subscription_schedules/{id}` | `/subscription_schedules`, `/subscription_schedules/{id}`, `/subscription_schedules/{id}/release` |
 | Subscriptions | `/subscriptions/{id}` | `/subscriptions/{id}`, `DELETE /subscriptions/{id}` |
 | Webhook endpoints | `/webhook_endpoints` | `/webhook_endpoints`, `DELETE /webhook_endpoints/{id}` |
 
-The Payment Element offers a new card, wallets and Link. It does not list saved methods again:
-Paymenter's invoice page lists them beside it.
+The Payment Element and account setup offer only a new card and Link, the methods saved payments
+and Auto Pay can charge later. Link must stay on in the Stripe Dashboard (it is on by default).
+With **Link at checkout** set to the small button, Link sits below the form's main button and shows
+only its mark, so the main button stays the obvious action. Account setup shows one consent text:
+Stripe's card terms are hidden because the form's own required checkbox covers saving. An unfinished
+account SetupIntent from an earlier release that offers other methods is cancelled and replaced when
+the form opens. The Payment Element does not list saved methods again: Paymenter's invoice page lists them beside it.
 It and the Link button name the business from Paymenter's **Company Name** setting; when that
 is empty, Stripe uses the Stripe account's name.
 The **Save this card for next time** checkbox (it also covers Link) starts unchecked; checking it sets

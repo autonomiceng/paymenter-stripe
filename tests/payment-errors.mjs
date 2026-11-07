@@ -117,16 +117,17 @@ try {
             assert.equal(options.amount, 2000);
             assert.equal(options.currency, 'usd');
             assert.equal(options.clientSecret, undefined);
-            assert.deepEqual(options.excludedPaymentMethodTypes, ['blik', 'acss_debit', 'customer_balance']);
+            assert.deepEqual(options.paymentMethodTypes, ['card', 'link'], 'The pay form offers only card and Link');
+            assert.equal(options.excludedPaymentMethodTypes, undefined);
             const calls = await page.evaluate(() => elementCalls);
             const payment = calls.find(call => call.type === 'payment').options;
             assert.equal(payment.defaultValues.billingDetails.email, linkDisplay === 'stripe_default' ? 'Fixture' : undefined,
                 `${linkDisplay}: only Stripe default prefills email`);
-            assert.equal(payment.layout.type, 'accordion');
-            assert.equal(payment.layout.defaultCollapsed, false);
+            assert.equal(payment.layout, 'tabs');
+            assert.equal(payment.terms, undefined, 'The pay form keeps Stripe card terms');
             assert.deepEqual(calls.filter(call => call.type === 'expressCheckout').map(call => call.options),
                 linkDisplay === 'above_card' ? [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
-                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, ...(businessName ? {business: {name: businessName}} : {})}] : [],
+                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, buttonHeight: 40, ...(businessName ? {business: {name: businessName}} : {})}] : [],
                 `${linkDisplay}: only the above-card choice mounts Link-only Express Checkout`);
         } else {
             await page.evaluate(async ({linkDisplay, businessName}) => {
@@ -134,17 +135,24 @@ try {
                 component.$el = document.querySelector('form');
                 await component.init();
             }, {linkDisplay, businessName});
-            assert.equal(await page.locator('#submit').isEnabled(), false, 'Setup requires explicit consent');
+            assert.equal(await page.locator('#submit').isEnabled(), true, 'Save stays live so it can say why it waits');
+            await page.locator('#submit').click();
+            assert.equal(await page.locator('[role=alert]').textContent(), 'Tick the box to save this card.');
+            assert.equal(await page.evaluate(() => document.activeElement?.id), 'setup-consent', 'The reason moves focus to the box');
+            assert.equal(await page.evaluate(() => confirms), 0, 'Save without the tick confirms nothing');
+            assert.equal(await page.locator('#payment-element').evaluate(element => element.inert), false, 'Card fields are live before the tick');
+            assert.equal(await page.locator('#express-checkout').evaluate(element => element.inert), true, 'Link waits for the tick');
             const options = await page.evaluate(() => elementOptions);
             assert.equal(options.clientSecret, 'fixture-secret', 'Setup keeps the existing SetupIntent flow');
             assert.equal(options.mode, undefined);
             const calls = await page.evaluate(() => elementCalls);
             assert.equal(calls.find(call => call.type === 'payment').options.defaultValues.billingDetails.email,
                 linkDisplay === 'stripe_default' ? 'Fixture' : undefined, `${linkDisplay}: setup only prefills email for Stripe default`);
-            assert.equal(calls.find(call => call.type === 'payment').options.layout.defaultCollapsed, false);
+            assert.equal(calls.find(call => call.type === 'payment').options.layout, 'tabs');
+            assert.deepEqual(calls.find(call => call.type === 'payment').options.terms, {card: 'never'}, 'Setup shows its own consent only');
             assert.deepEqual(calls.filter(call => call.type === 'expressCheckout').map(call => call.options),
                 linkDisplay === 'above_card' ? [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
-                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, ...(businessName ? {business: {name: businessName}} : {})}] : []);
+                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, buttonHeight: 40, ...(businessName ? {business: {name: businessName}} : {})}] : []);
             if (expressThrows) assert.equal(await page.locator('#setup-consent').isEnabled(), true, 'Card setup stays ready when Express fails');
             await page.locator('#setup-consent').check();
         }
@@ -194,8 +202,8 @@ try {
         }
         if (name === 'billing-agreement' && linkDisplay === 'above_card' && !expressThrows) {
             assert.equal(await page.locator('#express-checkout').isVisible(), true);
-            assert.equal(await page.evaluate(() => document.querySelector('#express-checkout').compareDocumentPosition(
-                document.querySelector('#payment-element')) & Node.DOCUMENT_POSITION_FOLLOWING), 4);
+            assert.equal(await page.evaluate(() => document.querySelector('#submit').compareDocumentPosition(
+                document.querySelector('#express-checkout')) & Node.DOCUMENT_POSITION_FOLLOWING), 4, 'Link sits below Save');
             await page.evaluate(() => {
                 window.setupRequests = [];
                 window.linkFailures = [];
@@ -209,7 +217,7 @@ try {
             const before = await page.evaluate(() => confirms);
             const confirmLink = () => page.evaluate(() => elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)}));
             await confirmLink();
-            assert.equal(await page.locator('[role=alert]').textContent(), 'Agree to future charges before saving your payment method.');
+            assert.equal(await page.locator('[role=alert]').textContent(), 'Tick the box to save with Link.');
             assert.equal(await page.evaluate(() => confirms), before);
             assert.deepEqual(await page.evaluate(() => setupRequests), [], 'Unchecked consent never reaches the server');
             await page.locator('#setup-consent').check();
@@ -260,9 +268,9 @@ try {
             if (linkDisplay === 'above_card' && !expressThrows) {
                 assert.equal(await page.evaluate(() => typeof elementHandlers.expressCheckout.confirm), 'function',
                     'Link Express Checkout has a confirm handler');
-                assert.equal(await page.locator('#express-checkout').isVisible(), true, 'Available Link appears above the card form');
-                assert.equal(await page.evaluate(() => document.querySelector('#express-checkout').compareDocumentPosition(
-                    document.querySelector('#payment-element')) & Node.DOCUMENT_POSITION_FOLLOWING), 4);
+                assert.equal(await page.locator('#express-checkout').isVisible(), true, 'Available Link appears below Pay');
+                assert.equal(await page.evaluate(() => document.querySelector('#submit').compareDocumentPosition(
+                    document.querySelector('#express-checkout')) & Node.DOCUMENT_POSITION_FOLLOWING), 4);
                 await page.evaluate(() => {
                     window.failure = 'action-success';
                     window.linkRequests = [];

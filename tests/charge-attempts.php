@@ -321,7 +321,7 @@ use Illuminate\Support\Facades\{DB, Http};
             $setting = $settings['stripe_link_display'] ?? [];
             check(($setting['label'] ?? null) === 'Link at checkout' && ($setting['type'] ?? null) === 'select',
                 'The gateway offers one Link at checkout selector');
-            check(($setting['options'] ?? null) === ['above_card' => 'Link button above card',
+            check(($setting['options'] ?? null) === ['above_card' => 'Small Link button below the form',
                 'inside_card' => 'Inside card form', 'stripe_default' => 'Stripe default']
                 && ($setting['default'] ?? null) === 'above_card' && isset($setting['hint']),
                 'Link display has three plain choices, hover help and the above-card default');
