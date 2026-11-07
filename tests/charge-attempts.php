@@ -108,6 +108,43 @@ use Illuminate\Support\Facades\{DB, Http};
     };
     try {
         require __DIR__ . '/renewal-retries.php';
+        foreach (['unconfirmed', 'failed', 'canceled', 'processing', 'partial', 'unread', 'unknown'] as $outcome) {
+            $run('one-time-after-off-'.$outcome, function ($invoice, $stripe) use ($gateway, $outcome) {
+                User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode([
+                    'version' => $gateway::AUTO_PAY_CONSENT, 'user_id' => 7, 'accepted_at' => time(), 'agreement_id' => 4,
+                ]);
+                $stripe->loseCreate = true;
+                paymentStops(fn () => $gateway->chargeAutoPayAccepted($invoice, 20, new BillingAgreement));
+                $old = $stripe->intents['pi_test1'];
+                if ($outcome === 'failed') $old->last_payment_error = (object) ['code' => 'card_declined'];
+                if (in_array($outcome, ['canceled', 'processing', 'unknown'], true)) $old->status = $outcome;
+                if ($outcome === 'partial') $old->amount_received = 100;
+                if ($outcome === 'unread') $stripe->failure = function ($verb, $path) {
+                    if ($verb === 'get' && $path === '/payment_intents/pi_test1') throw new ConnectionException('Unknown payment outcome');
+                };
+                $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+                check($gateway->autoPayDefault(User::$row) === null, 'Off revokes the old account instruction');
+                $view = null;
+                try { $view = $gateway->pay($invoice, 20); }
+                catch (\App\Exceptions\DisplayException $e) {
+                    if (in_array($outcome, ['unconfirmed', 'failed', 'canceled'], true)) throw $e;
+                }
+                check(!$stripe->confirms && !$stripe->charges, 'Opening one-time Pay cannot confirm the revoked instruction');
+                if (in_array($outcome, ['unconfirmed', 'failed', 'canceled'], true)) {
+                    check($old->status === 'canceled' && $view['data']['intent']->id === 'pi_test2',
+                        'One-time checkout retires a known unfunded reservation after Off');
+                    $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                    check(!isset($attempt['auto_pay_agreement'], $attempt['accepted_amount'], $attempt['accepted_currency']),
+                        'Only proven cancellation releases the old quote and Auto Pay constraints');
+                    $result = $gateway->confirmPayment(new Request(['intent' => 'pi_test2', 'confirmation_token' => 'ctoken_new', 'amount' => 2000]));
+                    check(($result['data']['status'] ?? null) === 'succeeded' && count($stripe->charges) === 1,
+                        'The customer can pay once with a new card after disabling Auto Pay');
+                } else {
+                    check(count($stripe->intents) === 1 && $old->status !== 'canceled',
+                        'Processing, partial and unknown outcomes cannot be replaced by one-time checkout');
+                }
+            });
+        }
         $run('accepted-currency', function ($invoice, $stripe) use ($gateway) {
             $accepted = clone $invoice;
             $invoice->currency_code = 'eur';

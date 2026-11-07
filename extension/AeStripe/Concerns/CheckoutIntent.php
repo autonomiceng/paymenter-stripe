@@ -109,20 +109,21 @@ trait CheckoutIntent
             }
             if ($intent->status === 'canceled') {
                 // A new checkout can take over only after Stripe proves the earlier payment canceled without funds.
-                if ($elements) unset($data['agreement_id'], $data['accepted_amount'], $data['auto_pay_agreement']);
+                if ($elements) unset($data['agreement_id'], $data['accepted_amount'], $data['accepted_currency'], $data['auto_pay_agreement']);
                 $this->replacePaymentAttempt($invoice, $attempt);
                 continue;
             }
             if ($this->paymentAttemptFailed($attempt, $intent)) {
                 if (!$elements) return $intent; // Recovery must report the refusal, never replace its debit instruction.
-                unset($data['agreement_id'], $data['accepted_amount'], $data['auto_pay_agreement']);
             }
             $usesElements = $this->isElementsAttempt($attempt, $intent);
             $legacyAutomatic = ($intent->confirmation_method ?? 'automatic') !== 'manual' && !$usesElements;
             $changeFlow = $usesElements && !$elements && isset($data['agreement_id'])
                 || $elements && !$usesElements && $intent->status === 'requires_payment_method';
+            $revokedAutoPay = $elements && isset($attempt['auto_pay_agreement'])
+                && (int) ($this->autoPayDefault($invoice->user)['agreement_id'] ?? 0) !== $attempt['auto_pay_agreement'];
             $failedElements = $usesElements && $intent->status === 'requires_payment_method' && !empty($intent->last_payment_error);
-            if ($legacyAutomatic || $changeFlow || $failedElements
+            if ($legacyAutomatic || $changeFlow || $failedElements || $revokedAutoPay
                 || strtolower($intent->currency) !== strtolower($invoice->currency_code)
                 || $intent->customer !== $invoice->user->properties()->where('key', 'stripe_id')->first()?->value) {
                 // Retire legacy tabs, failed Elements authentication and changes between native Pay and Elements.
@@ -184,10 +185,10 @@ trait CheckoutIntent
             foreach (['accepted_amount', 'accepted_currency', 'auto_pay_agreement'] as $key) {
                 if (array_key_exists($key, $data)) $context[$key] = $data[$key];
             }
-            if (isset($context['accepted_currency']) && strtolower($current->currency_code) !== $context['accepted_currency']) {
+            if (!($elements && $attempt) && isset($context['accepted_currency']) && strtolower($current->currency_code) !== $context['accepted_currency']) {
                 throw new DisplayException('The amount due changed. Refresh the invoice before paying.');
             }
-            if (isset($context['auto_pay_agreement']) && empty($attempt['confirmation']) && empty($attempt['funds_pending'])
+            if (!($elements && $attempt) && isset($context['auto_pay_agreement']) && empty($attempt['confirmation']) && empty($attempt['funds_pending'])
                 && (int) ($this->autoPayDefault($user, true)['agreement_id'] ?? 0) !== $context['auto_pay_agreement']) {
                 throw new DisplayException('The Auto Pay card changed. Refresh Payment methods before paying.');
             }
@@ -336,7 +337,7 @@ trait CheckoutIntent
     {
         // An ended instruction cannot constrain a later Pay. Unknown confirmations and funds keep their constraints.
         if (empty($attempt['agreement_id']) && empty($attempt['confirmation']) && empty($attempt['funds_pending']) && empty($attempt['state'])) {
-            unset($attempt['accepted_amount'], $attempt['auto_pay_agreement']);
+            unset($attempt['accepted_amount'], $attempt['accepted_currency'], $attempt['auto_pay_agreement']);
         }
         return $attempt;
     }
