@@ -474,6 +474,14 @@ use Illuminate\Support\Facades\{DB, Http};
             $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
             check($attempt['retry'] && !empty($attempt['agreement_id']) && !ExtensionHelper::$payments, 'An unknown post-refusal read retains recovery and cannot record failure');
         });
+        $run('charge-accepted-amount', function ($invoice, $stripe) use ($gateway) {
+            // The customer accepted 20.00, then the invoice was raised before the charge reached the payment lock.
+            $invoice->total = 25;
+            check(paymentStops(fn () => $gateway->chargeAccepted($invoice, 20, new BillingAgreement)) === 'The amount due changed. Refresh the invoice before paying.'
+                && $stripe->confirms === [] && $stripe->charges === [] && !ExtensionHelper::$payments, 'An accepted-amount charge refuses a balance other than the amount the customer accepted');
+            $invoice->total = 20;
+            check($gateway->chargeAccepted($invoice, 20, new BillingAgreement) === true && array_column($stripe->charges, 1) === [2000], 'The accepted amount still charges once');
+        });
         $run('recovery-decline-body', function ($invoice, $stripe) use ($gateway) {
             $stripe->beforeConfirm = fn () => throw new ConnectionException('Confirm not sent');
             paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)); $stripe->beforeConfirm = null;

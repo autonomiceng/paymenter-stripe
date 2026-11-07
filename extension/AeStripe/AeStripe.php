@@ -811,7 +811,16 @@ class AeStripe extends Gateway
 
     }
 
-    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement)
+    /**
+     * A customer's saved-method payment of the amount they accepted. Unlike charge(), which always confirms today's
+     * balance, confirmation refuses a different balance under the payment lock, so a raised invoice is never charged.
+     */
+    public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $billingAgreement)
+    {
+        return $this->charge($invoice, $amount, $billingAgreement, $this->toMinorUnits($amount, $invoice->currency_code));
+    }
+
+    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement, ?int $acceptedAmount = null)
     {
         $this->paymentRetryReserved = false;
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
@@ -829,7 +838,7 @@ class AeStripe extends Gateway
             if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
                 $intent = $this->confirmAttempt($invoice, $intent->id, [
                     'payment_method' => $billingAgreement->external_reference, 'off_session' => 'true',
-                ], $billingAgreement);
+                ], $billingAgreement, $acceptedAmount);
             }
             if ($intent->status === 'succeeded') {
                 try { $this->recordIntentPayment($intent, 'succeeded'); }
