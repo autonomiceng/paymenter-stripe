@@ -23,7 +23,7 @@ use Illuminate\Support\Facades\{DB, Http};
             public array $intents = [], $setups = [], $cache = [], $charges = [], $confirms = [], $refunds = [];
             public $beforeCreate, $beforeConfirm, $failure;
             public string $status = 'succeeded';
-            public bool $loseCreate = false, $loseConfirm = false, $dropCreate = false;
+            public bool $loseCreate = false, $loseConfirm = false, $dropCreate = false, $strictElements = false;
             public function request($verb, $path, $data) {
                 if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
                 if ($path === '/customer_sessions') return ['client_secret' => 'cuss_test'];
@@ -54,6 +54,7 @@ use Illuminate\Support\Facades\{DB, Http};
                     $intent = (object) ['id' => $id, 'status' => 'requires_payment_method', 'amount_received' => 0,
                         'client_secret' => $id . '_secret', 'confirmation_method' => $data['confirmation_method'] ?? 'automatic',
                         'amount' => $data['amount'], 'currency' => $data['currency'], 'customer' => $data['customer'],
+                        'payment_method_types' => $data['payment_method_types'] ?? ['card', 'klarna', 'link', 'cashapp'],
                         'metadata' => (object) $data['metadata']];
                     $this->intents[$id] = $intent;
                     if (!empty($data['confirm'])) $this->settle($intent, $data);
@@ -71,6 +72,12 @@ use Illuminate\Support\Facades\{DB, Http};
                 if (($match[2] ?? '') === '/confirm') {
                     // Observed on Stripe TEST / 2025-07-30.basil in the live pass; this is only a regression fixture.
                     if (isset($data['confirmation_token']) && $intent->confirmation_method === 'manual') throw new RequestException(400, ['error' => ['param' => 'confirmation_method', 'message' => 'Payment details were collected through Stripe Elements and cannot be confirmed with a Payment Intent configured with manual confirmation_method.']]);
+                    // Deferred Elements collected card and Link only. The real r30f intents instead
+                    // had card/Klarna/Link/Cash App; validate the provider boundary rather than accepting any token.
+                    if ($this->strictElements && isset($data['confirmation_token']) && $intent->payment_method_types !== ['card', 'link']) {
+                        throw new RequestException(400, ['error' => ['type' => 'invalid_request_error',
+                            'param' => 'payment_method_types', 'message' => 'Deferred Elements and PaymentIntent payment method types do not match.']]);
+                    }
                     if (!in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) throw new RequestException(400, ['error' => ['code' => 'payment_intent_unexpected_state']]);
                     if ($this->beforeConfirm) ($this->beforeConfirm)($intent, $data);
                     $this->confirms[] = [$key, $data, $intent->amount];
@@ -108,6 +115,24 @@ use Illuminate\Support\Facades\{DB, Http};
     };
     try {
         require __DIR__ . '/renewal-retries.php';
+        foreach ([false, true] as $save) {
+            $run('new-card-confirm-'.($save ? 'save' : 'once'), function ($invoice, $stripe) use ($gateway, $save) {
+                $invoice->total = 10.99;
+                $stripe->strictElements = true;
+                $intent = $gateway->pay($invoice, 10.99)['data']['intent'];
+                $result = $gateway->confirmPayment(new Request(['intent' => $intent->id, 'amount' => 1099,
+                    'confirmation_token' => 'ctoken_card', 'save' => $save]));
+                check($result['status'] === 200 && ($result['data']['status'] ?? null) === 'succeeded',
+                    'A new-card invoice payment confirms instead of the generic 409: '.json_encode($result));
+                check(count($stripe->charges) === 1 && $stripe->charges[0][1] === 1099
+                    && (ExtensionHelper::$payments['920:'.$intent->id]['status'] ?? null) === 'succeeded',
+                    'The accepted 10.99 is charged and recorded once');
+                $method = $stripe->intents[$intent->id]->payment_method_options;
+                check($method->card->setup_future_usage === ($save ? 'off_session' : '')
+                    && $method->link->setup_future_usage === ($save ? 'off_session' : ''),
+                    'Confirmation keeps the explicit saving choice for card and Link');
+            });
+        }
         $run('elements-replacement-currency', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20);
             $stripe->intents['pi_test1']->status = 'canceled';

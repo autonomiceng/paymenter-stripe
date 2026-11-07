@@ -285,10 +285,9 @@ trait CheckoutIntent
         $params = $this->checkoutPaymentData($invoice, $amount, $data['customer']);
         // Stripe rejects automatic_payment_methods together with confirmation_method.
         // Keep checkoutPaymentData unchanged for legacy digest reconstruction.
-        if (!$elements) {
-            unset($params['automatic_payment_methods']);
-            $params['confirmation_method'] = 'manual';
-        }
+        unset($params['automatic_payment_methods']);
+        if ($elements) $params['payment_method_types'] = ['card', 'link'];
+        else $params['confirmation_method'] = 'manual';
         $key = 'checkout_' . bin2hex(random_bytes(16));
         $params['metadata']['ae_stripe_attempt'] = $key;
         return ['version' => 2, 'key' => $key, 'created' => time(), 'params' => $params, 'elements' => $elements];
