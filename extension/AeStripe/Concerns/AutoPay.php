@@ -11,6 +11,7 @@ trait AutoPay
     // Account scope: every recurring service, current and new. Older new-services-only consent does not carry over.
     public const AUTO_PAY_CONSENT = 'auto_pay_account_v1';
     private const AUTO_PAY_PROPERTY = 'ae_stripe_auto_pay_default';
+    private const AUTO_PAY_CARD = 'ae_stripe_auto_pay_card';
 
     /** A saved card or v1 consent alone never grants this scope. */
     public function autoPayDefault(User $user, bool $lock = false): ?array
@@ -26,6 +27,25 @@ trait AutoPay
             ->where('user_id', $user->id)->where('gateway_id', $gateway->id) : null;
         $agreement = $query ? ($lock ? $query->lockForUpdate() : $query)->first() : null;
         return $agreement ? $record : null;
+    }
+
+    /** The customer's saved choice, independent of charging consent. Older enabled accounts keep their card. */
+    public function autoPayCard(User $user): ?int
+    {
+        $value = $user->properties()->where('key', self::AUTO_PAY_CARD)->first()?->value;
+        $record = $value ? json_decode($value, true) : null;
+        if (!is_array($record)) return $this->autoPayDefault($user)['agreement_id'] ?? null;
+        if (($record['user_id'] ?? null) != $user->id || !is_int($record['agreement_id'] ?? null)) return null;
+        $gateway = Gateway::where('extension', 'AeStripe')->first();
+        return $gateway && BillingAgreement::where('id', $record['agreement_id'])->where('user_id', $user->id)
+            ->where('gateway_id', $gateway->id)->first() ? $record['agreement_id'] : null;
+    }
+
+    private function rememberAutoPayCard(User $user, int $agreementId): void
+    {
+        $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_CARD], ['value' => json_encode([
+            'user_id' => (int) $user->id, 'agreement_id' => $agreementId,
+        ], JSON_THROW_ON_ERROR)]);
     }
 
     /**
@@ -46,6 +66,8 @@ trait AutoPay
         return DB::transaction(function () use ($request) {
             $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
             if (!$request->boolean('enabled')) {
+                $card = $this->autoPayDefault($user, lock: true)['agreement_id'] ?? null;
+                if ($card) $this->rememberAutoPayCard($user, $card);
                 $this->stopWaitingRenewals($user);
                 $user->properties()->where('key', self::AUTO_PAY_PROPERTY)->delete();
                 foreach ($this->autoPayServices($user) as $service) {
@@ -59,6 +81,7 @@ trait AutoPay
                 ->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
             abort_unless($agreement, 403);
             $this->stopWaitingRenewals($user);
+            $this->rememberAutoPayCard($user, (int) $agreement->id);
             $record = ['version' => self::AUTO_PAY_CONSENT, 'user_id' => (int) $user->id,
                 'accepted_at' => time(), 'agreement_id' => (int) $agreement->id];
             $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_PROPERTY], ['value' => json_encode($record, JSON_THROW_ON_ERROR)]);

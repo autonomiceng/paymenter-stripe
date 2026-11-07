@@ -61,6 +61,13 @@ $record = $gateway->autoPayDefault($user);
 check($record['version'] === AeStripe::AUTO_PAY_CONSENT && $record['user_id'] === 7
     && $record['agreement_id'] === 91 && is_int($record['accepted_at']), 'New account scope records authenticated consent, time and exact agreement');
 check($existing->billing_agreement_id === 91, 'Account switch links current recurring services to the chosen card');
+// Off revokes charging consent without discarding the customer's card choice.
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+check($gateway->autoPayDefault($user) === null, 'Off still revokes account charging consent');
+check($gateway->autoPayCard($user) === 91, 'Off keeps the explicitly chosen Auto Pay card for the next visit');
+$gateway->saveAutoPayDefault(new Request($choice));
+check($gateway->autoPayCard($user) === 91, 'Off then On keeps the same card');
+
 foreach (['subscription_id' => 'sub_existing', 'status' => Service::STATUS_CANCELLED, 'user_id' => 8] as $field => $value) {
     $kept = $existing->$field; $existing->$field = $value; $existing->billing_agreement_id = null;
     $gateway->saveAutoPayDefault(new Request($choice));
