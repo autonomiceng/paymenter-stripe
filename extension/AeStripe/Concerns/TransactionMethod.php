@@ -18,7 +18,11 @@ trait TransactionMethod
             || ($status === 'succeeded' && !in_array($invoice->status, ['pending', 'paid'], true))
             || InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) return $intent;
         $existing = InvoiceTransaction::where('transaction_id', $intent->id)->first();
-        // A failed attempt may clear this label before success acquires its locks.
+        // Failure can be recorded from confirmation while its locks are already held.
+        // The error's embedded method is enough there; optional reads must not extend the lock.
+        if ($status === 'failed' && (DB::transactionLevel() > 0 || $existing
+            && DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $existing->id)->first()?->failure_reason)) return $intent;
+        // A failed attempt may replace this label before success acquires its locks.
         if ($status === 'processing' && $existing && DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $existing->id)->exists()) return $intent;
         if (is_string($charge) && preg_match('/^(?:ch|py)_[a-zA-Z0-9]+$/D', $charge)) {
             try {
@@ -36,6 +40,7 @@ trait TransactionMethod
     private function recordTransactionMethod($transaction, $intent, bool $succeeded, bool $failed = false): void
     {
         $table = DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $transaction->id);
+        if ($failed && $table->first()?->failure_reason) return;
         // The locked success guard permits only the first successful settlement here.
         if ($succeeded || $failed) $table->delete();
         elseif ($table->exists()) return;

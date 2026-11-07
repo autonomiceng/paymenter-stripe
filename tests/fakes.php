@@ -571,6 +571,7 @@ namespace {
         private $id;
         public function where($key, $value) { $this->id = $value; return $this; }
         public function exists() { return isset(\Illuminate\Support\Facades\DB::$tables['ae_stripe_transaction_methods'][$this->id]); }
+        public function first() { $row = \Illuminate\Support\Facades\DB::$tables['ae_stripe_transaction_methods'][$this->id] ?? null; return $row ? (object) ($row + ['failure_reason' => null]) : null; }
         public function delete() {
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Method deletion requires settlement locks');
             unset(\Illuminate\Support\Facades\DB::$tables['ae_stripe_transaction_methods'][$this->id]);
