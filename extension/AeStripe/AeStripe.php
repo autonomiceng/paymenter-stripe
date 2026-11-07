@@ -52,6 +52,7 @@ require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
 require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
 require_once __DIR__ . '/Concerns/CheckoutIntent.php';
 require_once __DIR__ . '/PaymentPendingException.php';
+require_once __DIR__ . '/PaymentDeclinedException.php';
 require_once __DIR__ . '/Concerns/ChargeRecovery.php';
 require_once __DIR__ . '/Concerns/RenewalRetry.php';
 require_once __DIR__ . '/Concerns/InvoicePayments.php';
@@ -253,7 +254,7 @@ class AeStripe extends Gateway
                 'name' => 'stripe_create_customers',
                 'label' => 'Send address and phone to Stripe',
                 'type' => 'checkbox',
-                'description' => 'Include address, phone and company details for Stripe Tax and addresses on Stripe receipts.',
+                'description' => 'Copy the customer\'s address, phone and company to Stripe when their Stripe customer is first created. Used on Stripe receipts. Later profile changes are not sent.',
                 'required' => false,
             ],
             [
@@ -662,21 +663,23 @@ class AeStripe extends Gateway
             if (!$current) return false;
             $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail();
             if ($current->id != $billingAgreement->id || $current->user_id != $user->id || $current->gateway_id != $gateway->id) return false;
-            if ($current->trashed()) return true;
+            // Native removal follows every true result, so Auto Pay stops using this card first.
+            $removed = function () use ($user, $current) { $this->autoPayCardRemoved($user, (int) $current->id); return true; };
+            if ($current->trashed()) return $removed();
             try {
                 $method = $this->request('get', '/payment_methods/' . $current->external_reference);
             } catch (Exception $e) {
                 \Illuminate\Support\Facades\Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
-                return true;
+                return $removed();
             }
-            if (($method->customer ?? null) === null) return true;
+            if (($method->customer ?? null) === null) return $removed();
             if (!$this->methodCustomerMatches($user, $method, current: true)) return false;
             try {
                 $this->request('post', '/payment_methods/' . $current->external_reference . '/detach');
             } catch (Exception $e) {
                 // Native cancellation still removes the local agreement after a Stripe failure.
             }
-            return true;
+            return $removed();
         });
     }
 
@@ -711,7 +714,7 @@ class AeStripe extends Gateway
 
         return redirect()->route('account.payment-methods')->with('notification', [
             'type' => 'success',
-            'message' => $saved === 'duplicate' ? 'This card is already saved.' : 'Payment method added successfully.',
+            'message' => $saved === 'duplicate' ? 'This card is already saved. We updated it.' : 'Payment method added successfully.',
         ]);
     }
 
@@ -809,7 +812,22 @@ class AeStripe extends Gateway
 
     }
 
-    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement)
+    /**
+     * A customer's saved-method payment of the amount they accepted. Unlike charge(), which always confirms today's
+     * balance, confirmation refuses a different balance under the payment lock, so a raised invoice is never charged.
+     */
+    public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $billingAgreement, bool $requireAutoPay = false)
+    {
+        return $this->charge($invoice, $amount, $billingAgreement, $this->toMinorUnits($amount, $invoice->currency_code), $requireAutoPay);
+    }
+
+    /** Pay the open-invoice offer only while its accepted card is still the account Auto Pay card. */
+    public function chargeAutoPayAccepted(Invoice $invoice, $amount, BillingAgreement $billingAgreement)
+    {
+        return $this->chargeAccepted($invoice, $amount, $billingAgreement, true);
+    }
+
+    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement, ?int $acceptedAmount = null, bool $requireAutoPay = false)
     {
         $this->paymentRetryReserved = false;
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
@@ -819,6 +837,8 @@ class AeStripe extends Gateway
         try {
             $data = $this->checkoutPaymentData($invoice, $this->toMinorUnits($amount, $invoice->currency_code), $customer)
                 + ['agreement_id' => $billingAgreement->id, 'renewal_start' => app()->runningInConsole()];
+            if ($acceptedAmount !== null) $data['accepted_amount'] = $acceptedAmount;
+            if ($requireAutoPay) $data['auto_pay_agreement'] = (int) $billingAgreement->id;
             if (!$this->gatewayEnabled()) {
                 $this->reservePaymentAttempt($invoice, $data);
                 $this->paymentPending('Payments are paused. We will check this payment when payments resume.');
@@ -827,7 +847,7 @@ class AeStripe extends Gateway
             if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
                 $intent = $this->confirmAttempt($invoice, $intent->id, [
                     'payment_method' => $billingAgreement->external_reference, 'off_session' => 'true',
-                ], $billingAgreement);
+                ], $billingAgreement, $acceptedAmount);
             }
             if ($intent->status === 'succeeded') {
                 try { $this->recordIntentPayment($intent, 'succeeded'); }
@@ -842,7 +862,7 @@ class AeStripe extends Gateway
             }
             if (in_array($intent->status, ['processing', 'requires_capture'], true)) $this->paymentPending();
             if ($intent->status === 'requires_action') throw new DisplayException('This payment needs authentication. Use the one-time payment option to finish it.');
-            throw new DisplayException('This card was declined. Choose another payment method.');
+            throw new DisplayException('Your bank declined this card. Try a different card, or contact your bank.');
         } catch (\PDOException | \Illuminate\Database\QueryException $e) {
             // Before reservation there is no durable retry: let core surface that failure.
             // Afterwards even a lost DB connection may follow a landed Stripe confirm.

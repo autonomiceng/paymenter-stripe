@@ -301,11 +301,11 @@ try {
                 'service-cancelled' => $service->cancellation = (object) [],
                 'new-calendar' => $service->expires_at = new DateTimeImmutable('2026-12-07'),
             };
-            User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode(['version' => 'auto_pay_new_services_v2',
+            User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode(['version' => \Paymenter\Extensions\Gateways\AeStripe\AeStripe::AUTO_PAY_CONSENT,
                 'user_id' => 7, 'accepted_at' => time(), 'agreement_id' => 4]);
             $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
             unset($GLOBALS['fakeToday']);
-            check(count($stripe->confirms) === 1, 'Renewal retry stops on ' . $stop . ' despite a new-service account default');
+            check(count($stripe->confirms) === 1, 'Renewal retry stops on ' . $stop . ' despite an account default');
         });
     }
     $run('renewal-reservation-crash-optout', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal) {

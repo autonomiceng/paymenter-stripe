@@ -6,14 +6,13 @@
     <div id="payment-element">
 
     </div>
-    <label class="mt-4 block">
+    <label class="mt-4 flex items-center gap-2">
         <input type="checkbox" id="save-card" @checked(in_array($intent->status, ['requires_action', 'requires_confirmation'], true) && ($intent->metadata->ae_stripe_consent ?? null) === '1') disabled />
-        Save this card or Link for future payments
+        Save this card for next time
     </label>
-    <p class="text-sm">Saving does not turn on Auto Pay.</p>
     <button id="submit" disabled
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
-        Pay
+        {{ __('Pay :amount', ['amount' => $invoice->formattedRemaining]) }}
     </button>
 </form>
 @script
@@ -71,6 +70,7 @@ async function initializePaymentForm() {
 
             const resuming = @js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true));
             const savedConsent = @js(($intent->metadata->ae_stripe_consent ?? null) === '1');
+            let intentId = @js($intent->id);
             // The server still checks the invoice balance before confirming.
             const {elements, paymentElement, expressCheckout, mountExpress} = createStripeElements(stripe, options, {
                 linkDisplay: @js($linkDisplay),
@@ -95,7 +95,8 @@ async function initializePaymentForm() {
             }
             // https://docs.stripe.com/js/element/events/on_change?type=paymentElement
             paymentElement.on('change', (event) => {
-                if (!loading) clearMessage();
+                // clear() also reports an empty form after submission has finished.
+                if (!loading && event.empty !== true) clearMessage();
                 canSave = resuming ? savedConsent : ['card', 'link'].includes(event.value?.type);
                 updateSaveCard();
             });
@@ -139,11 +140,17 @@ async function initializePaymentForm() {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
                                 'X-CSRF-TOKEN': @js(csrf_token())},
-                            body: JSON.stringify({intent: @js($intent->id), confirmation_token: token,
+                            body: JSON.stringify({intent: intentId, confirmation_token: token,
                                 amount: @js($intent->amount), save}),
                         });
                         const result = await response.json();
-                        if (!response.ok) { failPayment(result.message || 'Could not confirm your payment. Refresh the invoice for its status.'); return; }
+                        if (result.intent) intentId = result.intent;
+                        if (!response.ok) {
+                            // A declined card number stays out of the form, so the customer types a different card.
+                            if (result.declined) paymentElement.clear();
+                            failPayment(result.message || 'Could not confirm your payment. Refresh the invoice for its status.');
+                            return;
+                        }
                         if (result.status === 'requires_action') {
                             const next = await stripe.handleNextAction({clientSecret: result.client_secret});
                             if (next.error) throw next.error;
@@ -154,7 +161,8 @@ async function initializePaymentForm() {
                             window.location.assign(@js(route('invoices.show', $invoice) . '?checkPayment=true'));
                             return;
                         }
-                        failPayment('This payment was declined. Choose another payment method.');
+                        paymentElement.clear();
+                        failPayment('This payment was declined. Try a different card or payment method.');
                         return;
                     }
                     failPayment('Payment still needs authentication. Refresh the invoice to continue.');
@@ -172,7 +180,9 @@ async function initializePaymentForm() {
                 const message = document.createElement('p');
                 message.className = 'mb-2';
                 message.textContent = messageText;
-                document.getElementById('error-message').replaceChildren(message);
+                const alert = document.getElementById('error-message');
+                alert.replaceChildren(message);
+                alert.scrollIntoView({block: 'nearest', behavior: 'instant'});
             }
 
             function clearMessage() {

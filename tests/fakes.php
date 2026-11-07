@@ -65,6 +65,7 @@ namespace App\Models {
         public function first() { return $this->value; }
         public function exists() { return (bool) $this->value; }
         public function firstOrFail() { return $this->value ?? throw new \RuntimeException('Missing row'); }
+        public function get() { return $this->value ? [$this->value] : []; }
         public function where($key, $value) { return $this; }
         public function lockForUpdate() { if ($this->model === Service::class && ($hook = \Illuminate\Support\Facades\DB::$beforeServiceLock)) $hook(); if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $before = \App\Helpers\ExtensionHelper::$payments; $hook(); foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) if (($before[$key] ?? null) !== $row) \Illuminate\Support\Facades\DB::$concurrentPayments[$key] = $row; } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
     }
@@ -104,7 +105,12 @@ namespace App\Models {
         public static $beforeWrite = null;
         public array $values = [];
         public function __construct(public string $customer) {}
-        public function where($key, $value) {
+        public function where($key, $value, $like = null) {
+            if ($value === 'like') { // Prefix scans only, as AutoPay uses them.
+                $rows = [];
+                foreach ($this->values as $name => $stored) if (str_starts_with($name, rtrim($like, '%'))) $rows[] = (object) ['key' => $name, 'value' => $stored];
+                return new class($rows) { public function __construct(private $rows) {} public function lockForUpdate() { return $this; } public function get() { return $this->rows; } };
+            }
             $stored = $value === 'stripe_id' ? $this->customer : ($this->values[$value] ?? null);
             return new class($stored ? (object) ['value' => $stored] : null, $this, $value) extends Query {
                 public function __construct($stored, private Properties $properties, private string $key) { parent::__construct($stored); }
@@ -565,6 +571,7 @@ namespace {
         private $id;
         public function where($key, $value) { $this->id = $value; return $this; }
         public function exists() { return isset(\Illuminate\Support\Facades\DB::$tables['ae_stripe_transaction_methods'][$this->id]); }
+        public function first() { $row = \Illuminate\Support\Facades\DB::$tables['ae_stripe_transaction_methods'][$this->id] ?? null; return $row ? (object) ($row + ['failure_reason' => null]) : null; }
         public function delete() {
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Method deletion requires settlement locks');
             unset(\Illuminate\Support\Facades\DB::$tables['ae_stripe_transaction_methods'][$this->id]);

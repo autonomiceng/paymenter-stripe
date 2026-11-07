@@ -34,19 +34,22 @@ All paths start with `/v1`. Read uses `GET`; write uses `POST` unless marked `DE
 | Subscriptions | `/subscriptions/{id}` | `/subscriptions/{id}`, `DELETE /subscriptions/{id}` |
 | Webhook endpoints | `/webhook_endpoints` | `/webhook_endpoints`, `DELETE /webhook_endpoints/{id}` |
 
-The Payment Element displays Stripe-eligible saved cards, wallets and Link.
+The Payment Element offers a new card, wallets and Link. It does not list saved methods again:
+Paymenter's invoice page lists them beside it.
 It and the Link button name the business from Paymenter's **Company Name** setting; when that
 is empty, Stripe uses the Stripe account's name.
-The **Save this card or Link for future payments** checkbox starts unchecked; checking it sets
+The **Save this card for next time** checkbox (it also covers Link) starts unchecked; checking it sets
 `setup_future_usage=off_session` only after the owner submits consent. Unchecked
 submission clears it. The save control is available only when the Element
 reports a card or Link selection; changing to another method clears the opt-in. Stripe's own saving control is disabled to keep this one
 consent path. Successful opted-in card/Link payments create/update one native
 agreement per user, gateway and payment-method ID, serialized by user-row lock.
+The agreement is saved when the payment confirms or returns from the bank; the
+`payment_intent.succeeded` webhook saves it again if that step failed.
 Account payment-method setup also authorizes saving and redisplay. Customer setup
 and checkout never assign an agreement to services or enable Auto Pay.
 
-Only methods Stripe permits to redisplay appear. This fork sets
+Checkout redisplay is off. Where a method is redisplayed, only methods Stripe permits appear. This fork sets
 `allow_redisplay=always` after explicit checkout consent or account setup. Legacy
 methods with unspecified consent may remain hidden: customers should reauthorize
 in **Account > Payment methods**. The optional [migration redisplay step](migrating-from-bundled.md)

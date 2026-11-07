@@ -20,7 +20,9 @@ SetupIntent's user, customer, purpose and unfinished status, then records
 Legacy forms without a version retain `off_session_v1`; a v1 authentication resume
 keeps its original metadata. Both versions save only a payment method. Neither can
 enroll services through a webhook or redirect. Existing agreements stay unchanged.
-The separate account default requires fresh `auto_pay_new_services_v2` consent;
+The consent checkbox appears before the Stripe controls. Both the Payment Element
+and Link stay inactive until it is accepted, so Link cannot open and then fail on
+the page’s unchecked consent. The separate account switch requires fresh `auto_pay_account_v1` consent;
 see [Auto Pay integration](auto-pay.md) for the theme calls and dates.
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.
@@ -182,7 +184,8 @@ compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
   assert one agreement/transaction, preserved success after late failed/processing
   events, no automatic service assignment from saving a method, and unchanged existing Auto Pay.
 - With fresh account-default consent, create a recurring service and verify it inherits
-  the chosen card. Turning the default off must leave existing services unchanged.
+  the chosen card. Turning it off must unlink every service, including ones linked before
+  the account switch, and stop any waiting renewal retry.
 - Reject bad/stale signatures; disable the fork and confirm 503/no effects.
   Rehearse migration and legacy subscription billing/cancellation end to end.
 

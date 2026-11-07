@@ -35,12 +35,12 @@ $row = fn ($id, $pm, $extra = []) => $extra + ['id' => $id, 'external_reference'
     'name' => 'Visa **** 4242', 'type' => 'visa', 'expiry' => '2030-05-31', 'deleted_at' => null];
 ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
 $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check($result['message'] === 'This card is already saved.' && count(ExtensionHelper::$agreements) === 1,
+check($result['message'] === 'This card is already saved. We updated it.' && count(ExtensionHelper::$agreements) === 1,
     'A confirmed duplicate setup retains one saved card and shows one notice');
 check($methods['pm_new']->customer === null && $methods['pm_old']->allow_redisplay === 'always',
     'Duplicate setup detaches the new method and broadens redisplay on the retained method');
 $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check($result['message'] === 'This card is already saved.' && count(ExtensionHelper::$agreements) === 1,
+check($result['message'] === 'This card is already saved. We updated it.' && count(ExtensionHelper::$agreements) === 1,
     'Webhook or redirect retries recognize the detached duplicate without another agreement');
 BillingAgreement::$snapshot = null;
 
@@ -80,15 +80,60 @@ $gateway->deduplicateCards(true, fn ($line) => null);
 check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner'
     && DB::$tables['services'] === $serviceBefore, 'Cleanup preserves bound duplicates and every service preference');
 
+// The account card can have no services, including duplicates saved before expiry matching changed.
+foreach (['on', 'off'] as $state) {
+$accountProperty = $state === 'on' ? 'ae_stripe_auto_pay_default' : 'ae_stripe_auto_pay_card';
+$accountChoice = json_encode(['version' => AeStripe::AUTO_PAY_CONSENT, 'user_id' => 7,
+    'accepted_at' => 1700000000, 'agreement_id' => 20], JSON_THROW_ON_ERROR);
+$accountGateway = new AeStripe(['stripe_secret_key' => 'fake-secret', 'stripe_webhook_secret' => 'whsec_test']);
+foreach (['return', 'webhook', 'selected before detach', 'cleanup'] as $entry) {
+    $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new', month: $entry === 'cleanup' ? 5 : 6)];
+    ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'),
+        'pm_new' => $row(20, 'pm_new', ['expiry' => $entry === 'cleanup' ? '2030-05-31' : '2030-06-30'])];
+    DB::$tables['services'] = [];
+    $tablesBefore = DB::$tables;
+    $user->props->values = $entry === 'selected before detach' ? [] : [$accountProperty => $accountChoice];
+    $selectedBetweenPhases = false;
+    if ($entry === 'selected before detach') {
+        DB::$afterTransaction = function () use ($user, $accountProperty, $accountChoice, &$selectedBetweenPhases) {
+            check(!DB::$userLocked, 'The account choice commits after the first duplicate transaction');
+            $user->props->values[$accountProperty] = $accountChoice;
+            $selectedBetweenPhases = true;
+        };
+    }
+    $start = count(Http::$calls);
+    for ($attempt = 0; $attempt < 2; $attempt++) {
+        if ($entry === 'webhook') {
+            check($accountGateway->webhook(eventRequest($setup, type: 'setup_intent.succeeded'))['status'] === 200,
+                'Delayed setup success is acknowledged for the account card');
+        } elseif ($entry === 'cleanup') {
+            check($accountGateway->deduplicateCards(true, fn ($line) => null) === 0, 'Cleanup preserves the account card without an error');
+        } else {
+            $accountGateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
+        }
+        check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner',
+            "$entry keeps the newer account Auto Pay agreement attached and active");
+        check($accountGateway->autoPayCard($user) === 20
+            && ($accountGateway->autoPayDefault($user) !== null) === ($state === 'on')
+            && $user->props->values[$accountProperty] === $accountChoice,
+            "$entry preserves the exact account choice and Auto Pay still resolves");
+    }
+    check(count(ExtensionHelper::$agreements) === 2 && DB::$tables === $tablesBefore,
+        "$entry preserves both existing agreements, service settings and charge history");
+    check(!array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach')),
+        "$entry sends no detach for the account card");
+    if ($entry === 'selected before detach') check($selectedBetweenPhases, 'The pre-detach recheck scenario ran');
+}
+}
+$user->props->values = [];
+
 DB::$tables['services'] = [];
-foreach (['fingerprint', 'month', 'year', 'missing fingerprint', 'other user', 'other gateway', 'removed', 'other customer'] as $case) {
+foreach (['fingerprint', 'missing fingerprint', 'other user', 'other gateway', 'removed', 'other customer'] as $case) {
     $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
     $user->props->values = [];
     $old = $row(19, 'pm_old');
     switch ($case) {
         case 'fingerprint': $methods['pm_new']->card->fingerprint = 'fp_other'; break;
-        case 'month': $methods['pm_new']->card->exp_month = 6; break;
-        case 'year': $methods['pm_new']->card->exp_year = 2031; break;
         case 'missing fingerprint': unset($methods['pm_new']->card->fingerprint); break;
         case 'other user': $old['user_id'] = 99; break;
         case 'other gateway': $old['gateway_id'] = 1; break;
@@ -123,7 +168,7 @@ try {
     check(count(ExtensionHelper::$agreements) === 1, 'Uncertain detach never creates another saved agreement');
 }
 $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check($result['message'] === 'This card is already saved.' && DB::$tables['services'] === $serviceBefore,
+check($result['message'] === 'This card is already saved. We updated it.' && DB::$tables['services'] === $serviceBefore,
     'Retry after a lost detach response preserves the retained agreement and its service settings');
 Http::$handler = $handler;
 
