@@ -11,6 +11,9 @@
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
         {{ __('Pay :amount', ['amount' => $paymentAmount]) }}
     </button>
+    <button id="refresh-payment" type="button" hidden class="mt-4 underline w-full">
+        {{ __('Refresh payment form') }}
+    </button>
     {{-- Link is offered below Pay, small enough that Pay stays the main button. --}}
     <div id="express-checkout" hidden>
         <div class="mt-4 flex items-center justify-between gap-3">
@@ -89,6 +92,16 @@ async function initializePaymentForm() {
             let canSave = resuming && savedConsent;
             let linkAvailable = false;
             let loading = false;
+            let refreshRequired = false;
+            const refreshPayment = document.getElementById('refresh-payment');
+            refreshPayment.addEventListener('click', () => window.location.reload());
+            function clearDeclinedPayment() {
+                paymentElement.clear();
+                if (resuming) {
+                    refreshRequired = true;
+                    refreshPayment.hidden = false;
+                }
+            }
             const saveCard = document.getElementById('save-card');
             function updateSaveCard() {
                 saveCard.disabled = resuming || loading || !(canSave || linkAvailable);
@@ -117,7 +130,7 @@ async function initializePaymentForm() {
             expressCheckout?.on('confirm', (event) => confirmPayment(event));
 
             async function confirmPayment(expressEvent = null) {
-                if (!ready || loading) {
+                if (!ready || loading || refreshRequired) {
                     expressEvent?.paymentFailed({reason: 'fail'});
                     return;
                 }
@@ -153,8 +166,9 @@ async function initializePaymentForm() {
                         if (result.intent) intentId = result.intent;
                         if (!response.ok) {
                             // A declined card number stays out of the form, so the customer types a different card.
-                            if (result.declined) paymentElement.clear();
-                            failPayment(result.message || 'Could not confirm your payment. Refresh the invoice for its status.');
+                            if (result.declined) clearDeclinedPayment();
+                            failPayment(refreshRequired ? 'This payment was declined. Refresh the payment form to try another card.'
+                                : result.message || 'Could not confirm your payment. Refresh the invoice for its status.');
                             return;
                         }
                         if (result.status === 'requires_action') {
@@ -167,8 +181,9 @@ async function initializePaymentForm() {
                             window.location.assign(@js(route('invoices.show', $invoice) . '?checkPayment=true'));
                             return;
                         }
-                        paymentElement.clear();
-                        failPayment('This payment was declined. Try a different card or payment method.');
+                        clearDeclinedPayment();
+                        failPayment(refreshRequired ? 'This payment was declined. Refresh the payment form to try another card.'
+                            : 'This payment was declined. Try a different card or payment method.');
                         return;
                     }
                     failPayment('Payment still needs authentication. Refresh the invoice to continue.');
@@ -192,21 +207,22 @@ async function initializePaymentForm() {
             }
 
             function clearMessage() {
+                if (refreshRequired) return;
                 document.getElementById('error-message').replaceChildren();
             }
 
             // Show a spinner on payment submission
             function setLoading(isLoading) {
                 loading = isLoading;
-                document.getElementById("payment-element").inert = isLoading;
-                document.getElementById('express-checkout').inert = isLoading;
+                document.getElementById("payment-element").inert = isLoading || refreshRequired;
+                document.getElementById('express-checkout').inert = isLoading || refreshRequired;
                 updateSaveCard();
                 if (isLoading) {
                     // Disable the button and show a spinner
                     document.querySelector("#submit").disabled = true;
                     document.querySelector("#submit").classList.add("hidden");
                 } else {
-                    document.querySelector("#submit").disabled = !ready;
+                    document.querySelector("#submit").disabled = !ready || refreshRequired;
                     document.querySelector("#submit").classList.remove("hidden");
                 }
             }
