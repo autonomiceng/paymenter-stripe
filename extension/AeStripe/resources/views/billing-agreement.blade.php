@@ -1,5 +1,4 @@
-{{-- novalidate: the form says why Save waits in its own message, not in a browser bubble. --}}
-<form id="payment-form" class="mt-2" novalidate x-data="aeStripeSetup({
+<form id="payment-form" class="mt-2" x-data="aeStripeSetup({
     publishableKey: @js($stripePublishableKey), clientSecret: @js($intent->client_secret),
     linkDisplay: @js($linkDisplay), intent: @js($intent->id), consentUrl: @js(route('extensions.gateways.ae-stripe.setup-consent')),
     returnUrl: @js(route('extensions.gateways.ae-stripe.setup-agreement')), csrf: @js(csrf_token()),
@@ -7,27 +6,30 @@
     email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }},
     businessName: @js($businessName)
 })">
-    {{-- The card fields come first; the consent sits just above Save, and Link waits below until it is ticked. --}}
-    <div id="payment-element" inert wire:ignore></div>
-    <label class="mt-4 flex items-start gap-2" id="setup-consent-label">
-        <input type="checkbox" id="setup-consent" class="mt-1 shrink-0" required disabled aria-describedby="setup-consent-note" />
-        <span>I agree to save this payment method for future charges, including renewals.
-            @if(config('settings.tos'))<a href="{{ config('settings.tos') }}" target="_blank" rel="noopener" class="underline">Terms</a>@endif
-            <span id="setup-consent-note" class="mt-1 block text-sm opacity-75">Auto Pay can charge when you are away. Saving does not turn on Auto Pay.</span>
-        </span>
-    </label>
+    {{-- One line, shown before either choice, says what saving agrees to. Choosing Link or Save card is the agreement. --}}
+    <p id="setup-terms">By saving with Link or a card, you agree to save it for future charges, including renewals.
+        @if(config('settings.tos'))<a href="{{ config('settings.tos') }}" target="_blank" rel="noopener" class="underline">Terms</a>@endif
+        <span id="setup-consent-note" class="mt-1 block text-sm opacity-75">Auto Pay can charge when you are away. Saving does not turn on Auto Pay.</span>
+    </p>
+    {{-- Link uses what the customer saved there; the wrapper keeps it above the card fields if a theme reorders the form. --}}
+    <div id="setup-link">
+        <div id="express-checkout" hidden inert wire:ignore>
+            <div class="mt-4 flex items-center justify-between gap-3">
+                <span>Use your Link wallet</span>
+                {{-- An inline width: a theme built before this release has no w-40 class. At 160px Stripe shows the Link mark alone. --}}
+                <div id="express-checkout-element" class="shrink-0" style="width: 160px"></div>
+            </div>
+            <div class="mt-4 flex items-center gap-3 text-sm opacity-75" aria-hidden="true">
+                <span style="flex: 1; border-top: 1px solid currentColor; opacity: 0.4"></span>or add a card<span style="flex: 1; border-top: 1px solid currentColor; opacity: 0.4"></span>
+            </div>
+        </div>
+    </div>
+    <div id="payment-element" class="mt-4" inert wire:ignore></div>
     <div id="error-message" role="alert" class="text-red-600 dark:text-red-400"></div>
     <button id="submit" disabled
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
         Save card
     </button>
-    <div id="express-checkout" hidden inert wire:ignore>
-        <div class="mt-4 flex items-center justify-between gap-3">
-            <span class="text-sm">Or save with Link</span>
-            {{-- An inline width: a theme built before this release has no w-40 class. At 160px Stripe shows the Link mark alone. --}}
-            <div id="express-checkout-element" class="shrink-0" style="width: 160px"></div>
-        </div>
-    </div>
 </form>
 @script
 <script>
@@ -91,7 +93,6 @@ Alpine.data('aeStripeSetup', (config) => {
     return {
         async init() {
             const form = this.$el;
-            const consent = form.querySelector('#setup-consent');
             const submit = form.querySelector('#submit');
             const message = form.querySelector('#error-message');
             const container = form.querySelector('#payment-element');
@@ -111,14 +112,12 @@ Alpine.data('aeStripeSetup', (config) => {
                 paymentElement = null;
                 stopThemeSync = () => {};
             };
-            // Card fields and Save stay live, so Save can say why it waits. Link confirms at once, so it waits for the tick.
+            // Both choices open together once Stripe is ready, and lock together while one saves.
             function setLoading(isLoading) {
                 loading = isLoading;
                 if (disposed) return;
-                consent.disabled = isLoading || !ready;
                 container.inert = isLoading || !ready;
-                expressContainer.inert = container.inert || !consent.checked;
-                expressContainer.style.opacity = expressContainer.inert ? '0.5' : '';
+                expressContainer.inert = container.inert;
                 submit.disabled = isLoading || !ready;
                 submit.classList.toggle('hidden', isLoading);
             }
@@ -141,20 +140,6 @@ Alpine.data('aeStripeSetup', (config) => {
                 paymentElement = created.paymentElement;
                 expressCheckout = created.expressCheckout;
                 stopThemeSync = syncStripeTheme(form, elements);
-                consent.addEventListener('change', () => {
-                    if (loading) return;
-                    if (consent.checked) message.replaceChildren();
-                    setLoading(false);
-                }, {signal: controller.signal});
-                // An inert Link button passes its click to the form; say why it waits.
-                form.addEventListener('click', (event) => {
-                    if (loading || !ready || consent.checked || expressContainer.hidden) return;
-                    const box = expressContainer.getBoundingClientRect();
-                    if (event.clientX >= box.left && event.clientX <= box.right && event.clientY >= box.top && event.clientY <= box.bottom) {
-                        showMessage('Tick the box to save with Link.');
-                        consent.focus();
-                    }
-                }, {signal: controller.signal});
                 paymentElement.on('change', () => { if (!loading) message.replaceChildren(); });
                 form.addEventListener('submit', (event) => {
                     event.preventDefault();
@@ -170,18 +155,14 @@ Alpine.data('aeStripeSetup', (config) => {
                         showMessage(value);
                         expressEvent?.paymentFailed({reason: 'fail'});
                     }
-                    if (!consent.checked) {
-                        failSetup(expressEvent ? 'Tick the box to save with Link.' : 'Tick the box to save this card.');
-                        consent.focus();
-                        return;
-                    }
                     message.replaceChildren();
                     setLoading(true);
                     try {
                         const result = await fetch(config.consentUrl, {
                             method: 'POST', signal: controller.signal,
                             headers: {'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': config.csrf},
-                            body: JSON.stringify({intent: config.intent, consent: consent.checked, version: 'off_session_v2'}),
+                            // The customer chose Link or Save card under the agreement line, so the choice is the consent.
+                            body: JSON.stringify({intent: config.intent, consent: true, version: 'off_session_v2'}),
                         });
                         if (!result.ok) {
                             failSetup('Could not record your agreement. Try again.');

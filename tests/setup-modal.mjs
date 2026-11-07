@@ -12,6 +12,7 @@ const livewire = readFileSync(process.env.LIVEWIRE_SCRIPT, 'utf8');
 const root = fileURLToPath(new URL('../', import.meta.url));
 const theme = readFileSync(`${root}extension/AeStripe/resources/views/stripe-theme.blade.php`, 'utf8');
 let view = readFileSync(`${root}extension/AeStripe/resources/views/billing-agreement.blade.php`, 'utf8')
+    .replace(/\{\{--[\s\S]*?--\}\}/g, '')
     .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
     .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(`${root}extension/AeStripe/resources/views/stripe-elements.blade.php`, 'utf8'))
     .replace('@js($linkDisplay)', "'above_card'")
@@ -126,7 +127,7 @@ try {
             throw new Error(`cycle ${cycle}: missing Stripe form; browser errors: ${JSON.stringify(errors)}`, { cause: error });
         }
         assert.equal(await page.getByRole('textbox', { name: 'Card number' }).count(), 1, `cycle ${cycle}: exactly one form`);
-        await page.locator('#setup-consent').check();
+        assert.equal(await page.getByRole('button', { name: 'Save card' }).isEnabled(), true, `cycle ${cycle}: Save card works with no box to tick`);
         if (cycle === 1) {
             await page.evaluate(() => { probe.failConsent = true; });
             await page.getByRole('button', { name: 'Save card' }).click();
@@ -173,7 +174,7 @@ try {
     releaseStripe();
     holdStripe = false;
     await page.getByRole('textbox', { name: 'Card number' }).waitFor();
-    assert.equal(await page.getByRole('checkbox', { name: /I agree/ }).isEnabled(), true, 'The delayed fresh load enables consent');
+    assert.equal(await page.getByRole('button', { name: 'Save card' }).isEnabled(), true, 'The delayed fresh load enables Save card');
     assert.equal(await page.evaluate(() => probe.scripts), 1, 'The delayed fresh load succeeds without another request');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('dialog').waitFor({ state: 'detached' });

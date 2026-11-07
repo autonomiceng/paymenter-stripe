@@ -11,8 +11,8 @@ python3 tools/build_release.py --output dist/AeStripe.zip
 
 Upgrade through the native admin upload over an installed copy; root PHP files must declare only classes for Paymenter 1.5.9 `getExtensionType()`.
 
-Account setup displays an unchecked opt-in: “I agree to save this payment method
-for future charges, including renewals.” The configured Terms link stays beside it.
+Account setup shows one consent line above both choices: “By saving with Link or a
+card, you agree to save it for future charges, including renewals.” The configured Terms link stays beside it.
 It explains that Auto Pay can charge when the customer is away and saving does
 not enable it. The authenticated CSRF-protected setup-consent endpoint checks the
 SetupIntent's user, customer, purpose and unfinished status, then records
@@ -20,9 +20,9 @@ SetupIntent's user, customer, purpose and unfinished status, then records
 Legacy forms without a version retain `off_session_v1`; a v1 authentication resume
 keeps its original metadata. Both versions save only a payment method. Neither can
 enroll services through a webhook or redirect. Existing agreements stay unchanged.
-The consent checkbox appears before the Stripe controls. Both the Payment Element
-and Link stay inactive until it is accepted, so Link cannot open and then fail on
-the page’s unchecked consent. The separate account switch requires fresh `auto_pay_account_v1` consent;
+The line appears before the Stripe controls, so the customer reads it before
+choosing. Choosing Link or Save card is the agreement: the form records consent
+before it confirms, and no choice waits on a box or fails for a missing tick. The separate account switch requires fresh `auto_pay_account_v1` consent;
 see [Auto Pay integration](auto-pay.md) for the theme calls and dates.
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.
@@ -175,7 +175,7 @@ compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
   duplicate subscription listeners even when bundled Stripe is disabled.
 - Check CustomerSession feature names on pinned Basil, restricted-key access,
   `customerSessionClientSecret`, saved-card selection and Link email display.
-- Verify setup cannot save without the opt-in, recorded terms/user/time survive
+- Verify setup cannot save without recorded consent, recorded terms/user/time survive
   redirect and webhook retries, and setup errors permit retry.
 - Verify own-customer isolation, legacy unspecified-redisplay exclusions and
   account setup redisplay. Test card, wallet and Link with saving checked/clear.
