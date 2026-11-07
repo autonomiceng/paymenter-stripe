@@ -1,4 +1,5 @@
-<form id="payment-form" class="mt-2" x-data="aeStripeSetup({
+{{-- novalidate: the form says why Save waits in its own message, not in a browser bubble. --}}
+<form id="payment-form" class="mt-2" novalidate x-data="aeStripeSetup({
     publishableKey: @js($stripePublishableKey), clientSecret: @js($intent->client_secret),
     linkDisplay: @js($linkDisplay), intent: @js($intent->id), consentUrl: @js(route('extensions.gateways.ae-stripe.setup-consent')),
     returnUrl: @js(route('extensions.gateways.ae-stripe.setup-agreement')), csrf: @js(csrf_token()),

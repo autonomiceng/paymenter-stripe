@@ -98,6 +98,8 @@ check(preg_match('/id="express-checkout"[^>]*\binert\b/', $setupView) === 1
     'Setup keeps Link inactive until consent, while the card fields and Save stay live');
 check(preg_match("/if \(!consent\.checked\) \{\s+failSetup\(expressEvent \? 'Tick the box to save with Link\.' : 'Tick the box to save this card\.'\);\s+consent\.focus\(\);\s+return;\s+\}\s+message\.replaceChildren\(\);\s+setLoading\(true\);/", $setupView) === 1,
     'Save without the tick says why next to the box and moves focus to it, before any request');
+check(str_contains($setupView, '<form id="payment-form" class="mt-2" novalidate '),
+    'The browser does not stop Save with its own bubble, so the form can say why in its message');
 check(str_contains($setupView, "showMessage('Tick the box to save with Link.');"), 'A click on the waiting Link button says why it waits');
 check(str_contains($setupView, 'Save card') && !str_contains($setupView, 'Save payment method'), 'Setup button names what it saves');
 check(str_contains($setupView, 'ownTerms: true,') && str_contains($elementsView, "if (ownTerms) paymentOptions.terms = {card: 'never'};"),
