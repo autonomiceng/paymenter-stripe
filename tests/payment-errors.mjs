@@ -61,7 +61,8 @@ try {
             window.$wire = { on() {} };
             window.Alpine = { data: (_, factory) => { window.setupFactory = factory; } };
             window.Stripe = () => ({
-                elements: (options) => { window.elementOptions = options; return window.elementsInstance = { update() {}, async submit() {
+                elements: (options) => { window.elementOptions = options; let updated; return window.elementsInstance = {
+                    on(name, fn) {if (name === 'update-end') updated = fn;}, update() {updated?.();}, async submit() {
                     if (failure === 'updates') return { error: { type: 'api_connection_error' } };
                     return {};
                 }, async fetchUpdates() {
@@ -371,7 +372,7 @@ try {
                     : {status: 'requires_payment_method'}; }};
             };
             window.Stripe = () => ({
-                elements: () => ({update() {}, async submit() {return {};}, create(type) {
+                elements: () => ({on() {}, update() {}, async submit() {return {};}, create(type) {
                     if (type !== 'payment') throw new Error('A resumed payment cannot offer Express Checkout');
                     return {on(name, fn) {handlers[name] = fn;}, mount() {handlers.ready();},
                         clear() {handlers.change?.({empty: true});}, destroy() {}};
@@ -426,7 +427,10 @@ try {
             window.Stripe = () => ({
                 elements: options => {
                     window.currentOptions = {...options};
-                    return {async update(changes) {Object.assign(currentOptions, changes);}, async submit() {return {};},
+                    return {on(name, fn) {handlers[name] = fn;}, update(changes) {
+                        // Stripe.js v3 returns void; the options reach the iframe later.
+                        setTimeout(() => {Object.assign(currentOptions, changes); handlers['update-end']?.();}, 20);
+                    }, async submit() {return {};},
                         create(type) {
                             const events = handlers[type] = {};
                             return {on(name, fn) {events[name] = fn;}, mount() {events.ready?.({availablePaymentMethods: {link: true}});},

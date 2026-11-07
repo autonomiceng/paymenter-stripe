@@ -79,7 +79,10 @@ parameters before HTTP and never confirms or supplies a card. Elements attempts 
 automatic confirmation; native saved-method and bank-debit attempts use manual confirmation.
 The rendered checkout never includes the PaymentIntent client secret. Only a locked confirm
 result requiring authentication returns it. Opening checkout only prepares the form. Elements uses deferred `mode: payment` with the intent's integer amount and lowercase currency,
-plus manual payment-method creation. It offers only card and Link (`paymentMethodTypes`).
+plus manual payment-method creation. It offers only card and Link (`paymentMethodTypes`),
+and new Elements intents explicitly use the same `payment_method_types`.
+Opening checkout retires an older mismatched form only after confirmed cancellation without funds;
+an already open mismatched form cannot confirm a token. Processing and partial payments stay protected.
 Ilya checked creation in Stripe test mode on 2026-10-30 at 12:00 PM PT (2025-07-30.basil): manual confirmation alone returned 200; adding automatic_payment_methods returned 400.
 The live pass on 2026-10-30 then proved Elements tokens are rejected on manual intents.
 Elements now uses the documented automatic flow; its real Stripe acceptance must be checked again.
@@ -199,11 +202,14 @@ mismatches are logged and acknowledged after settlement. Transient request and l
 persistence failures remain retryable; retries preserve one payment and one agreement.
 Verify Customer Session failure and recovery in the sandbox as well as normal redisplay.
 
-Checkout's opt-in covers card and Link only. Consent sets (or clears with `''`)
-`payment_method_options.card.setup_future_usage` and the matching Link option,
-and clears top-level future usage left by earlier versions. Saving requires
+Checkout's opt-in covers card and Link only. New-card token collection and confirmation
+use matching card and Link `setup_future_usage`: `off_session` when checked, `none` otherwise.
+Token collection waits for Stripe.js v3's `update-end` before submitting the updated Elements.
+The consent endpoint clears method-specific values with `''`; confirmation clears top-level
+future usage left by earlier versions. Saving requires
 consent metadata and `off_session` for the actual method type. Bank debits are not saved by this checkout opt-in.
-Verify both method-specific options against pinned Basil before release.
+Offline regressions cover $10.99 with saving on/off and a bank decline with a visible, clickable
+Refresh payment form action. Both method-specific options still need a live pinned-Basil check.
 
 A successful checkout or bound subscription charge on an already paid invoice is
 recorded in full. Each validated excess reserves one row in the extension-owned

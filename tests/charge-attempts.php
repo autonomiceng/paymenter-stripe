@@ -72,8 +72,8 @@ use Illuminate\Support\Facades\{DB, Http};
                 if (($match[2] ?? '') === '/confirm') {
                     // Observed on Stripe TEST / 2025-07-30.basil in the live pass; this is only a regression fixture.
                     if (isset($data['confirmation_token']) && $intent->confirmation_method === 'manual') throw new RequestException(400, ['error' => ['param' => 'confirmation_method', 'message' => 'Payment details were collected through Stripe Elements and cannot be confirmed with a Payment Intent configured with manual confirmation_method.']]);
-                    // Deferred Elements collected card and Link only. The real r30f intents instead
-                    // had card/Klarna/Link/Cash App; validate the provider boundary rather than accepting any token.
+                    // Model the mismatched configuration recovered from r30f, where Elements collected
+                    // card/Link but the intent had card/Klarna/Link/Cash App. The original 400 body was not retained.
                     if ($this->strictElements && isset($data['confirmation_token']) && $intent->payment_method_types !== ['card', 'link']) {
                         throw new RequestException(400, ['error' => ['type' => 'invalid_request_error',
                             'param' => 'payment_method_types', 'message' => 'Deferred Elements and PaymentIntent payment method types do not match.']]);

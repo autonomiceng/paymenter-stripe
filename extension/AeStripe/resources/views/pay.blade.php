@@ -89,6 +89,12 @@ async function initializePaymentForm() {
                 allowExpress: !resuming,
                 onLinkAvailability: updateLinkAvailability,
             });
+            let finishOptionsUpdate = null;
+            elements.on('update-end', () => {
+                const finish = finishOptionsUpdate;
+                finishOptionsUpdate = null;
+                finish?.();
+            });
             let canSave = resuming && savedConsent;
             let linkAvailable = false;
             let loading = false;
@@ -147,10 +153,14 @@ async function initializePaymentForm() {
                     let token = null;
                     if (!resuming) {
                         // Deferred Elements and confirmation must agree on the customer's saving choice.
-                        await elements.update({paymentMethodOptions: {
-                            card: {setup_future_usage: save ? 'off_session' : 'none'},
-                            link: {setup_future_usage: save ? 'off_session' : 'none'},
-                        }});
+                        // Stripe.js v3 returns void; update-end confirms the iframe has applied it.
+                        await new Promise((resolve) => {
+                            finishOptionsUpdate = resolve;
+                            elements.update({paymentMethodOptions: {
+                                card: {setup_future_usage: save ? 'off_session' : 'none'},
+                                link: {setup_future_usage: save ? 'off_session' : 'none'},
+                            }});
+                        });
                         const submitted = await elements.submit();
                         if (submitted.error) throw submitted.error;
                         const created = await stripe.createConfirmationToken({elements});
