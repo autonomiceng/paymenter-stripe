@@ -30,16 +30,18 @@ trait AutoPay
     }
 
     /** The customer's saved choice, independent of charging consent. Older enabled accounts keep their card. */
-    public function autoPayCard(User $user): ?int
+    public function autoPayCard(User $user, bool $lock = false): ?int
     {
-        if ($default = $this->autoPayDefault($user)) return $default['agreement_id'];
-        $value = $user->properties()->where('key', self::AUTO_PAY_CARD)->first()?->value;
+        if ($default = $this->autoPayDefault($user, $lock)) return $default['agreement_id'];
+        $property = $user->properties()->where('key', self::AUTO_PAY_CARD);
+        $value = ($lock ? $property->lockForUpdate() : $property)->first()?->value;
         $record = $value ? json_decode($value, true) : null;
         if (!is_array($record)) return null;
         if (($record['user_id'] ?? null) != $user->id || !is_int($record['agreement_id'] ?? null)) return null;
         $gateway = Gateway::where('extension', 'AeStripe')->first();
-        return $gateway && BillingAgreement::where('id', $record['agreement_id'])->where('user_id', $user->id)
-            ->where('gateway_id', $gateway->id)->first() ? $record['agreement_id'] : null;
+        $query = $gateway ? BillingAgreement::where('id', $record['agreement_id'])->where('user_id', $user->id)
+            ->where('gateway_id', $gateway->id) : null;
+        return $query && ($lock ? $query->lockForUpdate() : $query)->first() ? $record['agreement_id'] : null;
     }
 
     private function rememberAutoPayCard(User $user, int $agreementId): void

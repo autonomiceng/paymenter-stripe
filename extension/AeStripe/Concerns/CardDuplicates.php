@@ -74,7 +74,7 @@ trait CardDuplicates
             if ($report) $report('Saved card #' . $incoming->id . ' kept: the duplicate is linked to a service.');
             return true;
         }
-        if (($this->autoPayDefault($user, lock: true)['agreement_id'] ?? null) != $incoming->id) return false;
+        if ($this->autoPayCard($user, lock: true) != $incoming->id) return false;
         Log::info('AeStripe duplicate card kept: agreement is the account Auto Pay card', ['agreement_id' => $incoming->id]);
         if ($report) $report('Saved card #' . $incoming->id . ' kept: the duplicate is the account Auto Pay card.');
         return true;

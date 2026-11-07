@@ -81,7 +81,8 @@ check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods[
     && DB::$tables['services'] === $serviceBefore, 'Cleanup preserves bound duplicates and every service preference');
 
 // The account card can have no services, including duplicates saved before expiry matching changed.
-$accountProperty = 'ae_stripe_auto_pay_default';
+foreach (['on', 'off'] as $state) {
+$accountProperty = $state === 'on' ? 'ae_stripe_auto_pay_default' : 'ae_stripe_auto_pay_card';
 $accountChoice = json_encode(['version' => AeStripe::AUTO_PAY_CONSENT, 'user_id' => 7,
     'accepted_at' => 1700000000, 'agreement_id' => 20], JSON_THROW_ON_ERROR);
 $accountGateway = new AeStripe(['stripe_secret_key' => 'fake-secret', 'stripe_webhook_secret' => 'whsec_test']);
@@ -112,7 +113,8 @@ foreach (['return', 'webhook', 'selected before detach', 'cleanup'] as $entry) {
         }
         check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner',
             "$entry keeps the newer account Auto Pay agreement attached and active");
-        check($accountGateway->autoPayDefault($user)['agreement_id'] === 20
+        check($accountGateway->autoPayCard($user) === 20
+            && ($accountGateway->autoPayDefault($user) !== null) === ($state === 'on')
             && $user->props->values[$accountProperty] === $accountChoice,
             "$entry preserves the exact account choice and Auto Pay still resolves");
     }
@@ -121,6 +123,7 @@ foreach (['return', 'webhook', 'selected before detach', 'cleanup'] as $entry) {
     check(!array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach')),
         "$entry sends no detach for the account card");
     if ($entry === 'selected before detach') check($selectedBetweenPhases, 'The pre-detach recheck scenario ran');
+}
 }
 $user->props->values = [];
 
