@@ -9,13 +9,15 @@ the same words.
 
 Resolve AE Stripe through `ExtensionHelper::getExtension('gateway', 'AeStripe')`.
 Read `autoPayDefault($user)`: null means Off; otherwise `agreement_id` identifies the
-account card, a native BillingAgreement. Do not derive consent from boolean properties
-or old Stripe metadata.
+account card, a native BillingAgreement. Read `autoPayCard($user)` for the chosen numeric
+agreement ID while Off as well as On. This preference grants no charging consent.
+Do not derive consent from boolean properties or old Stripe metadata.
 
 Show an Off switch for Auto Pay. Turning it on is the consent: confirm what it covers in
 one line, for example “Renewals for all 3 services charge Visa **** 4242.”, and keep the
 configured Terms link in its help. With one owned saved method the switch uses it; with
-more, the customer picks one first and nothing is preselected. Open invoices are not
+more, retain their saved choice. With no choice yet, use the oldest saved method so
+adding a new card or Link cannot silently replace the displayed card. Open invoices are not
 charged by turning it on; offer Pay now for those.
 
 To pay an open invoice the customer accepted with a saved method, call
@@ -41,18 +43,23 @@ session, Accept application/json and X-CSRF-TOKEN:
 `agreement_id` is the native numeric ID, not the Stripe reference or ULID. The account
 scope requires fresh authenticated acceptance even for an existing saved card; the older
 new-services-only `auto_pay_new_services_v2` record grants nothing new. Off: `{"enabled":false}`.
-A 200 returns `ok`, `enabled` and, when on, `services` (how many were linked); preserve the
+To save only the card preference, post `{"agreement_id":123}` without `enabled`.
+This checks ownership and saves the choice without changing any account or service
+charging consent. On always requires the full fresh consent request above.
+A 200 returns `ok`; switch requests also return `enabled` and, when on,
+`services` (how many were linked). Preserve the
 control on errors. No default is inferred from setup completion.
 
 The property `ae_stripe_auto_pay_default` records version, user ID, server acceptance
 time and agreement ID. On links every recurring, uncancelled service of the user to the
-card, under the user lock; off unlinks every service. Stripe subscriptions keep their own
+card, under the user lock; off unlinks every service and keeps the card choice in
+`ae_stripe_auto_pay_card`, separately from charging consent. Stripe subscriptions keep their own
 billing either way. Native Service Created applies the record to new recurring services
 without a selected agreement or subscription; Service Updated never reapplies it.
 Linking charges nothing: native renewal charges happen when an invoice is issued, so open
 invoices stay for the customer to pay. On and Off both stop a renewal retry waiting on an
 open invoice, so the confirm can say open invoices are not charged. Removing the account card
-deletes the record and unlinks the services it paid for, so Auto Pay reads Off.
+deletes its consent and card choice and unlinks the services it paid for, so Auto Pay reads Off.
 
 Services linked one at a time before the account switch keep their card and still renew
 with it, with or without a record. Show the switch as On while any service is linked, naming

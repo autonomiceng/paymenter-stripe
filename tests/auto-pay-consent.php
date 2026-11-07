@@ -91,7 +91,6 @@ check($gateway->autoPayDefault($user)['agreement_id'] === 91 && $existing->billi
 unset(ExtensionHelper::$agreements['pm_selected'], ExtensionHelper::$agreements['pm_added']);
 $gateway->saveAutoPayDefault(new Request($choice));
 
-
 foreach (['subscription_id' => 'sub_existing', 'status' => Service::STATUS_CANCELLED, 'user_id' => 8] as $field => $value) {
     $kept = $existing->$field; $existing->$field = $value; $existing->billing_agreement_id = null;
     $gateway->saveAutoPayDefault(new Request($choice));
