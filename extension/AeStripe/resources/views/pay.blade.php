@@ -97,9 +97,9 @@ async function initializePaymentForm() {
             refreshPayment.addEventListener('click', () => window.location.reload());
             function clearDeclinedPayment() {
                 paymentElement.clear();
+                refreshPayment.hidden = false;
                 if (resuming) {
                     refreshRequired = true;
-                    refreshPayment.hidden = false;
                 }
             }
             const saveCard = document.getElementById('save-card');
@@ -146,6 +146,11 @@ async function initializePaymentForm() {
                 try {
                     let token = null;
                     if (!resuming) {
+                        // Deferred Elements and confirmation must agree on the customer's saving choice.
+                        await elements.update({paymentMethodOptions: {
+                            card: {setup_future_usage: save ? 'off_session' : 'none'},
+                            link: {setup_future_usage: save ? 'off_session' : 'none'},
+                        }});
                         const submitted = await elements.submit();
                         if (submitted.error) throw submitted.error;
                         const created = await stripe.createConfirmationToken({elements});

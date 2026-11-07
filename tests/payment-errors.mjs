@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const views = new URL('../extension/AeStripe/resources/views/', import.meta.url);
 const theme = readFileSync(new URL('stripe-theme.blade.php', views), 'utf8');
-function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hosting', resuming = false, savedConsent = false) {
+function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hosting', resuming = false, savedConsent = false, amount = 2000) {
     let source = readFileSync(new URL(`${name}.blade.php`, views), 'utf8')
         .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
         .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(new URL('stripe-elements.blade.php', views), 'utf8'))
@@ -22,7 +22,7 @@ function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hostin
         .replace('@js($linkDisplay)', JSON.stringify(linkDisplay))
         .replace('@js($businessName)', JSON.stringify(businessName))
         .replace("@js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true))", JSON.stringify(resuming))
-        .replaceAll('@js($intent->amount)', '2000').replace("@js(strtolower($intent->currency))", "'usd'")
+        .replaceAll('@js($intent->amount)', JSON.stringify(amount)).replace("@js(strtolower($intent->currency))", "'usd'")
         .replace("@js(($intent->metadata->ae_stripe_consent ?? null) === '1')", JSON.stringify(savedConsent))
         .replace(/@checked\([^\n]+? disabled/, resuming && savedConsent ? 'checked disabled' : 'disabled')
         .replace(/\{\{[^\n]+?\}\}/g, "'Fixture'")
@@ -404,6 +404,66 @@ try {
         await page.route('https://example.com/resume', route => route.fulfill({contentType: 'text/html', body: 'Fresh payment checkout'}));
         await page.locator('#refresh-payment').click();
         await page.getByText('Fresh payment checkout').waitFor();
+        await page.close();
+    }
+    for (const scenario of ['decline', 'save-card', 'once-card', 'save-link', 'once-link']) {
+        const page = activePage = await browser.newPage({viewport: {width: 390, height: 844}});
+        const sent = [];
+        page.setDefaultTimeout(5000);
+        await page.exposeFunction('captureNewCard', request => sent.push(request));
+        await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
+        await page.route('https://example.com/new-card', route => route.fulfill({contentType: 'text/html', body: '<html><body></body></html>'}));
+        await page.route('https://example.com/return', route => route.fulfill({contentType: 'text/html', body: 'Payment received'}));
+        await page.goto('https://example.com/new-card');
+        await page.evaluate(scenario => {
+            window.handlers = {}; window.$wire = {on() {}};
+            window.fetch = async (_, options) => {
+                await captureNewCard({body: JSON.parse(options.body), tokenOptions});
+                return {ok: scenario !== 'decline', async json() { return scenario === 'decline'
+                    ? {declined: true, message: 'Your bank declined this card. Try a different card, or contact your bank.'}
+                    : {status: 'succeeded'}; }};
+            };
+            window.Stripe = () => ({
+                elements: options => {
+                    window.currentOptions = {...options};
+                    return {async update(changes) {Object.assign(currentOptions, changes);}, async submit() {return {};},
+                        create(type) {
+                            const events = handlers[type] = {};
+                            return {on(name, fn) {events[name] = fn;}, mount() {events.ready?.({availablePaymentMethods: {link: true}});},
+                                clear() {events.change?.({empty: true});}, destroy() {}};
+                        }};
+                },
+                async createConfirmationToken() {
+                    window.tokenOptions = JSON.parse(JSON.stringify(currentOptions));
+                    return {confirmationToken: {id: 'ctoken_newcard'}};
+                },
+            });
+        }, scenario);
+        await page.setContent(render('pay', 'above_card', 'Fixture Hosting', false, false, 1099));
+        await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
+        await page.evaluate(() => handlers.payment.change({empty: false, value: {type: 'card'}}));
+        await page.locator('#save-card').setChecked(scenario.startsWith('save'));
+        if (scenario.endsWith('link')) {
+            await page.evaluate(() => handlers.expressCheckout.confirm({paymentFailed() {}}));
+        } else await page.locator('#submit').click();
+        if (scenario === 'decline') {
+            await page.waitForFunction(() => document.querySelector('[role=alert]').textContent.includes('Your bank declined'));
+            assert.equal(await page.locator('#refresh-payment').isVisible(), true,
+                'A fresh-card bank decline offers Refresh payment form');
+        } else await page.getByText('Payment received', {exact: true}).waitFor();
+        assert.equal(sent.length, 1, 'One submit sends one confirmation');
+        const save = scenario.startsWith('save');
+        assert.deepEqual(sent[0].body, {intent: 'fixture-intent', confirmation_token: 'ctoken_newcard', amount: 1099, save});
+        assert.deepEqual(sent[0].tokenOptions.paymentMethodTypes, ['card', 'link']);
+        assert.deepEqual(sent[0].tokenOptions.paymentMethodOptions, {
+            card: {setup_future_usage: save ? 'off_session' : 'none'},
+            link: {setup_future_usage: save ? 'off_session' : 'none'},
+        }, 'The token collects the same saving options the server will confirm');
+        if (scenario === 'decline') {
+            await page.route('https://example.com/new-card', route => route.fulfill({contentType: 'text/html', body: 'Fresh payment checkout'}));
+            await page.locator('#refresh-payment').click();
+            await page.getByText('Fresh payment checkout', {exact: true}).waitFor();
+        }
         await page.close();
     }
     console.log('Pay and setup network failures, retry and card declines passed.');

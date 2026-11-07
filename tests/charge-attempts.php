@@ -134,6 +134,21 @@ use Illuminate\Support\Facades\{DB, Http};
                 check(!$stripe->confirms && !$stripe->charges, 'Changing the form never starts a debit');
             });
         }
+        $run('new-card-decline', function ($invoice, $stripe) use ($gateway) {
+            $stripe->strictElements = true;
+            $intent = $gateway->pay($invoice, 20)['data']['intent'];
+            $stripe->beforeConfirm = function ($current) {
+                $current->last_payment_error = (object) ['code' => 'card_declined', 'decline_code' => 'generic_decline'];
+                $current->latest_charge = 'ch_declined';
+                throw new RequestException(402, ['error' => ['type' => 'card_error', 'code' => 'card_declined']]);
+            };
+            $result = $gateway->confirmPayment(new Request(['intent' => $intent->id, 'amount' => 2000,
+                'confirmation_token' => 'ctoken_declined', 'save' => false]));
+            check($result['status'] === 409 && $result['data']['declined'] === true
+                && $result['data']['message'] === 'Your bank declined this card. Try a different card, or contact your bank.'
+                && (ExtensionHelper::$payments['920:'.$intent->id]['status'] ?? null) === 'failed' && !$stripe->charges,
+                'A new-card refusal reaches the bank decline path and records failure instead of a generic integration 409');
+        });
         $run('new-card-old-tab', function ($invoice, $stripe) use ($gateway) {
             $intent = $gateway->pay($invoice, 20)['data']['intent'];
             $stripe->intents[$intent->id]->payment_method_types = ['card', 'klarna', 'link', 'cashapp'];
@@ -155,8 +170,8 @@ use Illuminate\Support\Facades\{DB, Http};
                     && (ExtensionHelper::$payments['920:'.$intent->id]['status'] ?? null) === 'succeeded',
                     'The accepted 10.99 is charged and recorded once');
                 $method = $stripe->intents[$intent->id]->payment_method_options;
-                check($method->card->setup_future_usage === ($save ? 'off_session' : '')
-                    && $method->link->setup_future_usage === ($save ? 'off_session' : ''),
+                check($method->card->setup_future_usage === ($save ? 'off_session' : 'none')
+                    && $method->link->setup_future_usage === ($save ? 'off_session' : 'none'),
                     'Confirmation keeps the explicit saving choice for card and Link');
             });
         }
