@@ -160,14 +160,20 @@ trait AutoPay
     private function applyNewServiceAutoPay(Service $service): void
     {
         if (!$this->gatewayEnabled() || !$this->bundledInactive()) return;
-        DB::transaction(function () use ($service) {
+        $owner = User::where('id', $service->user_id)->firstOrFail();
+        if (!$this->autoPayDefault($owner)) return;
+        $this->withSavedMethodBindingLock((int) $owner->id, fn () => DB::transaction(function () use ($service) {
             $user = User::where('id', $service->user_id)->lockForUpdate()->firstOrFail();
             $current = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
             if ($current->user_id != $user->id || $current->billing_agreement_id || $current->subscription_id
                 || ($current->plan?->type ?? null) !== 'recurring' || $current->status === Service::STATUS_CANCELLED) return;
             $record = $this->autoPayDefault($user, lock: true);
-            if ($record) $current->update(['billing_agreement_id' => $record['agreement_id']]);
-        });
+            if ($record) {
+                $agreement = BillingAgreement::where('id', $record['agreement_id'])->where('user_id', $user->id)->lockForUpdate()->firstOrFail();
+                $this->assertSavedMethodBindable($user, $agreement);
+                $current->update(['billing_agreement_id' => $record['agreement_id']]);
+            }
+        }));
     }
 
     /** Local read-only dates for account, service and invoice opt-ins. No provider calls. */

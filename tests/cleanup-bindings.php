@@ -39,9 +39,11 @@ Http::$handler = function ($verb, $path, $data) use (&$methods, &$entered, &$bin
 if (in_array($case, ['account-during', 'reserved-account'], true)) {
     $attempt = function () use ($gateway, $choice, $user) {
         $before = $user->props->values;
-        $response = $gateway->saveAutoPayDefault(new Request($choice));
+        foreach ([$choice, ['agreement_id' => 20]] as $selection) {
+        $response = $gateway->saveAutoPayDefault(new Request($selection));
         check(($response['status'] ?? null) === 409 && str_contains($response['data']['message'] ?? '', 'Try again'), 'A competing account binding receives a clear retry response');
         check($user->props->values === $before, 'A refused account binding changes no choice or consent');
+        }
     };
     if ($case === 'reserved-account') {
         $user->props->values['ae_stripe_duplicate_pm_new'] = json_encode(['customer' => 'cus_owner', 'gateway' => 2, 'kept' => 'pm_old']);
@@ -50,16 +52,18 @@ if (in_array($case, ['account-during', 'reserved-account'], true)) {
         $bind = $attempt;
         check($gateway->deduplicateCards(true, fn ($line) => null) === 0 && $entered, 'Cleanup completes while a concurrent account binding is refused');
     }
-} elseif (in_array($case, ['repair-account', 'repair-service', 'lost-detach', 'unreconciled', 'survivor-change'], true)) {
+} elseif (in_array($case, ['repair-account', 'repair-service', 'lost-detach', 'unreconciled', 'survivor-change', 'missing-identity', 'missing-customer'], true)) {
     $bind = function () use ($case, $user, $record, &$methods) {
         if ($case !== 'repair-service') foreach (['ae_stripe_auto_pay_default', 'ae_stripe_auto_pay_card'] as $key) $user->props->values[$key] = json_encode($record);
         DB::$tables['services'] = [['id' => 41, 'user_id' => $case === 'unreconciled' ? 99 : 7, 'billing_agreement_id' => 20, 'auto_pay' => true]];
         if ($case === 'survivor-change') $methods['pm_old']->card->fingerprint = 'fp_other';
-        if ($case === 'lost-detach') throw new ConnectionException('Synthetic lost detach response');
+        if ($case === 'missing-identity') unset($methods['pm_new']->card->fingerprint);
+        if ($case === 'missing-customer') $user->props->customer = '';
+        if (in_array($case, ['lost-detach', 'missing-identity', 'missing-customer'], true)) throw new ConnectionException('Synthetic lost detach response');
     };
     $lines = [];
     $result = $gateway->deduplicateCards(true, function ($line) use (&$lines) { $lines[] = $line; });
-    if (in_array($case, ['unreconciled', 'survivor-change'], true)) {
+    if (in_array($case, ['unreconciled', 'survivor-change', 'missing-identity', 'missing-customer'], true)) {
         check($result > 0 && $entered, 'Unsafe post-detach reconciliation reports a failure');
         $lines = [];
         check($gateway->deduplicateCards(true, function ($line) use (&$lines) { $lines[] = $line; }) > 0, 'Rerun cannot silently keep an unreconciled detached agreement');
@@ -76,6 +80,23 @@ if (in_array($case, ['account-during', 'reserved-account'], true)) {
         }
         check($gateway->deduplicateCards(true, fn ($line) => null) === 0, 'Completed reconciliation remains idempotent');
     }
+} elseif ($case === 'inherit-during') {
+    $user->props->values['ae_stripe_auto_pay_default'] = json_encode(array_replace($record, ['agreement_id' => 19]));
+    $service = Service::$row = new Service;
+    $service->subscription_id = null; $service->plan->type = 'recurring';
+    $bind = function () use ($gateway, $service) {
+        try { invoke($gateway, 'applyNewServiceAutoPay', $service); throw new RuntimeException('Expected inheritance contention'); }
+        catch (\Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException $e) { check(str_contains($e->getMessage(), 'Try again'), 'Service inheritance uses the shared binding lock'); }
+        check($service->billing_agreement_id === null, 'Contended inheritance does not choose a card');
+    };
+    check($gateway->deduplicateCards(true, fn ($line) => null) === 0 && $entered, 'Cleanup can finish while new-service inheritance is refused');
+    invoke($gateway, 'applyNewServiceAutoPay', $service);
+    check($service->billing_agreement_id === 19, 'Retry inherits the exact existing account choice after cleanup');
+} elseif ($case === 'turn-off') {
+    $user->props->values['ae_stripe_auto_pay_default'] = json_encode(array_replace($record, ['agreement_id' => 19]));
+    $bind = fn () => $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+    check($gateway->deduplicateCards(true, fn ($line) => null) === 0 && $entered, 'Turning Auto Pay off stays available during cleanup');
+    check($gateway->autoPayDefault($user) === null && $gateway->autoPayCard($user) === 19, 'Cleanup preserves Off and its exact chosen survivor');
 } elseif ($case === 're-add') {
     $handler = Http::$handler;
     Http::$handler = function ($verb, $path, $data) use ($handler) {

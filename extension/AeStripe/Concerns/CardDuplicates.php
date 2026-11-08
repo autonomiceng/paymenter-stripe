@@ -62,7 +62,12 @@ trait CardDuplicates
     private function cleanupCandidate($user, $gateway, $incoming, array $snapshot): ?array
     {
         $method = $this->request('get', '/payment_methods/' . $incoming->external_reference);
-        if (($method->id ?? null) !== $incoming->external_reference || !($identity = $this->cardIdentity($method))) return null;
+        if (($method->id ?? null) !== $incoming->external_reference || !($identity = $this->cardIdentity($method))) {
+            if (isset($snapshot['properties']['ae_stripe_duplicate_' . $incoming->external_reference]) || ($method->customer ?? null) === null) {
+                throw new DisplayException('Reserved saved card could not be reconciled. Review it manually.');
+            }
+            return null;
+        }
         if (($method->customer ?? null) !== null && $method->customer !== $snapshot['customer']) {
             if (isset($snapshot['properties']['ae_stripe_duplicate_' . $method->id])) throw new DisplayException('Reserved saved card could not be reconciled. Review it manually.');
             return null;
@@ -98,7 +103,11 @@ trait CardDuplicates
         $snapshot = DB::transaction(fn () => $this->cleanupSnapshot($user, $gateway));
         $incoming = null;
         foreach ($snapshot['rows'] as $current) if ($current->id == $row->id && $current->external_reference === $row->external_reference) $incoming = $current;
-        if (!$incoming || !$snapshot['customer']) return;
+        if (!$incoming) return;
+        if (!$snapshot['customer']) {
+            if (isset($snapshot['properties']['ae_stripe_duplicate_' . $incoming->external_reference])) throw new DisplayException('Reserved saved card could not be reconciled. Review it manually.');
+            return;
+        }
         $candidate = $this->cleanupCandidate($user, $gateway, $incoming, $snapshot);
         if (!$candidate) return;
         [$method, $kept, $remote] = $candidate;

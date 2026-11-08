@@ -458,3 +458,16 @@ local removal pending for retry. No schema or extension version change is requir
 Checkout first saves and duplicate saves retain the same success notice shape as Add card. The notice
 is stored for that user and invoice until the native invoice component delivers it, including after
 intervening session requests. Other invoices cannot consume it, and refreshing does not deliver it twice.
+
+Account card selection, the Auto Pay switch, new-service inheritance, and the native service/invoice
+recurring-default actions use the same shared per-user lock as cleanup. Binding a reserved or removing
+reference returns a retry message before any preference or consent changes. Turning Auto Pay off remains
+available. Cleanup verifies the survivor again after detachment, then moves remaining owned service and
+account links to that same-card survivor under the owner lock, preserving consent and other settings.
+Interrupted detached plans resume reconciliation even when bound; unresolved ownership, customer or
+identity conflicts remain reported with a nonzero exit on every rerun, including a read-only dry run.
+
+Removal marks a reference in progress before HTTP and permanently removed only after its detach is
+confirmed. A fresh Add card save of the same physical card may create a new provider reference while a
+failed removal is pending, without reusing or refreshing its uncertain references. Retrying Remove still
+verifies all matching copies, including the newly saved one. Confirmed removed references remain removed.

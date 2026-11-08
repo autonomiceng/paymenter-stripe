@@ -317,7 +317,7 @@ foreach (['pending', 'removed-replay', 'version', 'cleanup-replay', 'cleanup-rem
 foreach (['http', 'contention', 'notice-first', 'post-state', 'retry', 'recovery', 'state-customer', 'state-owner', 'state-gateway', 'state-id', 'state-expiry', 'state-receipt', 'state-service', 'state-account', 'removal-customer', 'removal-owner', 'removal-gateway', 'removal-id'] as $cleanupCase) {
     (function () use ($cleanupCase) { require __DIR__ . '/cleanup-http.php'; })();
 }
-foreach (['account-during', 'reserved-account', 'repair-account', 'repair-service', 'lost-detach', 'unreconciled', 'survivor-change', 're-add'] as $bindingCase) {
+foreach (['account-during', 'reserved-account', 'repair-account', 'repair-service', 'lost-detach', 'unreconciled', 'survivor-change', 'missing-identity', 'missing-customer', 'turn-off', 'inherit-during', 're-add'] as $bindingCase) {
     (function () use ($bindingCase) { require __DIR__ . '/cleanup-bindings.php'; })();
 }
 echo "PASS: $count offline assertions\n";
