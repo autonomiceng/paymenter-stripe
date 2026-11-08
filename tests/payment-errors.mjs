@@ -558,8 +558,7 @@ try {
         assert.equal(await page.locator('#submit').isVisible(), true, `${choice}: ${updateFailure} restores Pay`);
         assert.match(await page.locator('[role=alert]').textContent(), /Could not check the payment/);
         assert.deepEqual(await page.evaluate(() => [submits, tokens, requests]), [0, 0, 0], `${choice}: unresolved options cannot reach payment`);
-        if (choice === 'Link') assert.deepEqual(await page.evaluate(() => linkFailures), [{reason: 'fail'}]);
-        await page.evaluate(() => {elementsInstance.update = () => elementHandlers['unused']?.();});
+        if (choice === 'Link') assert.deepEqual(await page.evaluate(() => linkFailures), Array.from({length: updateFailure === 'missing-event' ? 2 : 1}, () => ({reason: 'fail'})), 'Overlapping Link and unresolved options each dismiss their own payment UI');
         await page.close();
     }
     console.log('Pay and setup network failures, retry and card declines passed.');
