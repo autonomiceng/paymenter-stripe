@@ -19,7 +19,8 @@ foreach ([true, false] as $save) {
         'metadata' => ['ae_stripe_consent' => $save ? '1' : '0',
             'ae_stripe_consent_at' => $save ? end(Http::$calls)[2]['metadata']['ae_stripe_consent_at'] : ''],
     ], $save ? 'Saving sets card and Link usage and clears legacy usage' : 'Clearing removes legacy, card and Link usage');
-    check(!$save || ctype_digit(end(Http::$calls)[2]['metadata']['ae_stripe_consent_at']), 'Saving records the server acceptance time');
+    $consentAt = end(Http::$calls)[2]['metadata']['ae_stripe_consent_at'];
+    check(!$save || (is_string($consentAt) && preg_match('/\A[0-9]+\z/', $consentAt) === 1), 'Saving records the server acceptance time');
 }
 $optIntent->status = 'requires_action';
 $optIntent->metadata->ae_stripe_consent = '1';
