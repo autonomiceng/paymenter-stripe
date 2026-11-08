@@ -4,6 +4,7 @@ namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Models\User;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Http\Client\RequestException;
 
 trait SetupIntent
 {
@@ -41,7 +42,16 @@ trait SetupIntent
             if (isset($data['payment_method_types'], $intent->payment_method_types)
                 && !self::sameMethodTypes($intent->payment_method_types, $data['payment_method_types'])) {
                 // An unfinished intent from an earlier release offers other methods. Replace it with the current set.
-                $this->request('post', '/setup_intents/' . $intent->id . '/cancel');
+                try {
+                    $canceled = $this->request('post', '/setup_intents/' . $intent->id . '/cancel');
+                } catch (RequestException $error) {
+                    if ($error->response->json('error.code') !== 'setup_intent_unexpected_state') throw $error;
+                    // Another request may have completed or canceled this intent after our lookup.
+                    $canceled = $this->request('get', '/setup_intents/' . $intent->id);
+                    if (!in_array($canceled->status, ['succeeded', 'canceled'], true)) throw $error;
+                }
+                abort_unless(($canceled->id ?? null) === $intent->id
+                    && in_array($canceled->status, ['succeeded', 'canceled'], true), 409);
                 $attempt = $reserve($attempt['key']);
                 continue;
             }
