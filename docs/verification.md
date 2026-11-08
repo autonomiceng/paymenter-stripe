@@ -178,14 +178,14 @@ compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
   duplicate subscription listeners even when bundled Stripe is disabled.
 - Check CustomerSession feature names on pinned Basil, restricted-key access,
   `customerSessionClientSecret`, saved-card selection and Link email display.
-- Verify setup cannot save without recorded consent, recorded terms/user/time survive
-  redirect and webhook retries, and setup errors permit retry.
+- Verify setup cannot save without recorded consent, the consent POST completes before `confirmSetup`, and its `off_session_v2` terms, authenticated user ID and acceptance time survive
+  redirect and webhook retries. Refused consent must prevent both Link and card confirmation at phone and desktop widths and permit retry.
 - Verify own-customer isolation, legacy unspecified-redisplay exclusions and
   account setup redisplay. Test card, wallet and Link with saving checked/clear.
 - First verify ConfirmationTokens with deferred Elements (`mode`, amount, currency), Customer Sessions and automatic confirmation
   on pinned Basil, including card, Link, SEPA/ACH mandates, declines, 3DS and bank redirects.
   Check that the pay form and account setup offer only card and Link before release.
-  Check the bank/3DS error page and its invoice link. Check clearing method-specific future usage with `''` and preserving consent after authentication.
+  Check the bank/3DS error page and its invoice link. Check method-specific `setup_future_usage=none` when unchecked and preservation of consent after authentication.
 - Run concurrent success deliveries/setup redirects against the real database;
   assert one agreement/transaction, preserved success after late failed/processing
   events, no automatic service assignment from saving a method, and unchanged existing Auto Pay.
@@ -205,7 +205,7 @@ Verify Customer Session failure and recovery in the sandbox as well as normal re
 Checkout's opt-in covers card and Link only. New-card token collection and confirmation
 use matching card and Link `setup_future_usage`: `off_session` when checked, `none` otherwise.
 Token collection waits for Stripe.js v3's `update-end` before submitting the updated Elements.
-The consent endpoint clears method-specific values with `''`; confirmation clears top-level
+The consent endpoint sets method-specific values to `none` when unchecked; confirmation clears top-level
 future usage left by earlier versions. Saving requires
 consent metadata and `off_session` for the actual method type. Bank debits are not saved by this checkout opt-in.
 Offline regressions cover $10.99 with saving on/off and a bank decline with a visible, clickable

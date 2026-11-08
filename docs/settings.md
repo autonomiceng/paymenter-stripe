@@ -52,7 +52,7 @@ consent path. Successful opted-in card/Link payments create/update one native
 agreement per user, gateway and payment-method ID, serialized by user-row lock.
 The agreement is saved when the payment confirms or returns from the bank; the
 `payment_intent.succeeded` webhook saves it again if that step failed.
-Account payment-method setup also authorizes saving and redisplay. Customer setup
+Choosing Link or Save card in account setup records `off_session_v2` agreement to saving and redisplay before confirming the SetupIntent. Customer setup
 and checkout never assign an agreement to services or enable Auto Pay.
 
 Checkout redisplay is off. Where a method is redisplayed, only methods Stripe permits appear. This fork sets
