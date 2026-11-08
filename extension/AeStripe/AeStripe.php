@@ -136,6 +136,7 @@ class AeStripe extends Gateway
                 $artisan->resolve(ConvertFromStripeSavedCommand::class);
             });
         }
+        if (function_exists('Livewire\\on')) app(\Livewire\EventBus::class)->before('dehydrate', fn ($component) => $this->deliverSavedMethodNotice($component));
         require __DIR__ . '/routes.php';
         // Register webhook route
         View::addNamespace('gateways.ae-stripe', __DIR__ . '/resources/views');

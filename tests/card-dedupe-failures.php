@@ -187,7 +187,7 @@ ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_failed' => $
 Http::$handler = fn () => throw new RequestException(503);
 Gateway::$rows = ['AeStripe' => [new \App\Models\Extension(['id' => 2, 'settings' => ['stripe_secret_key' => 'fake-secret']])]];
 $command = new DeduplicateCardsCommand;
-check($command->handle() === 1 && in_array('2 saved card(s) skipped. Review them manually.', $command->output),
+check($command->handle() === 1 && in_array('2 saved card(s) skipped. See the per-card reasons above.', $command->output),
     'Cleanup reports the total when more than one agreement is skipped');
 Gateway::$rows = null;
 

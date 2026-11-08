@@ -77,6 +77,14 @@ trait SavedMethods
     private function removeSavedMethodCopies(BillingAgreement $agreement): bool
     {
         $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
+        $journalKey = 'ae_stripe_removal_' . $agreement->external_reference;
+        $owner = User::where('id', $agreement->user_id)->firstOrFail();
+        $previous = json_decode($owner->properties()->where('key', $journalKey)->first()?->value ?? 'null', true);
+        if (($previous['gateway_id'] ?? null) == $gateway->id && ($previous['user_id'] ?? null) == $owner->id
+            && ($previous['customer'] ?? null) !== $owner->properties()->where('key', 'stripe_id')->first()?->value) {
+            DB::transaction(fn () => $this->reconcileRemoval($owner, $gateway, $journalKey, $previous, $agreement->external_reference));
+            return false;
+        }
         $snapshot = DB::transaction(function () use ($agreement, $gateway) {
             $user = User::where('id', $agreement->user_id)->lockForUpdate()->firstOrFail();
             $current = BillingAgreement::withTrashed()->where('external_reference', $agreement->external_reference)->lockForUpdate()->first();
@@ -120,7 +128,7 @@ trait SavedMethods
                         && $this->savedMethodIdentity($remote) === $identity) $copies[$incoming] = $remote;
                 }
             }
-            $valid = DB::transaction(function () use ($user, $gateway, $customer, $copies, $matched) {
+            $journal = DB::transaction(function () use ($user, $gateway, $customer, $copies, $matched, $journalKey, $identity) {
                 User::where('id', $user->id)->lockForUpdate()->firstOrFail();
                 if ($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value !== $customer) return false;
                 foreach ($copies as $reference => $remote) {
@@ -131,46 +139,42 @@ trait SavedMethods
                     $row = BillingAgreement::withTrashed()->where('external_reference', $match->external_reference)->lockForUpdate()->first();
                     if (!$row || $row->id != $match->id) return false;
                 }
-                return true;
+                $old = json_decode($user->properties()->where('key', $journalKey)->lockForUpdate()->first()?->value ?? 'null', true);
+                $journal = ['user_id' => $user->id, 'gateway_id' => $gateway->id, 'customer' => $customer,
+                    'identity' => $identity, 'copies' => [], 'detached' => []];
+                if (($old['customer'] ?? null) === $customer && ($old['gateway_id'] ?? null) == $gateway->id) {
+                    $journal['copies'] = $old['copies'];
+                    $journal['detached'] = $old['detached'];
+                }
+                foreach ($copies as $reference => $remote) {
+                    $journal['copies'][$reference] = null;
+                    foreach ($matched as $match) if ($match->external_reference === $reference) $journal['copies'][$reference] = $match->id;
+                    // A removal in progress cannot be undone by a delayed or differently sourced save.
+                    $index = $this->savedMethodIndex($user, $reference, $customer, $gateway);
+                    $user->properties()->updateOrCreate(['key' => 'ae_stripe_method_' . $reference], ['value' => json_encode(
+                        array_replace($index, ['customer' => $customer, 'gateway_id' => $gateway->id, 'identity' => $identity, 'removed' => true]), JSON_THROW_ON_ERROR)]);
+                }
+                $user->properties()->updateOrCreate(['key' => $journalKey], ['value' => json_encode($journal, JSON_THROW_ON_ERROR)]);
+                return $journal;
             });
-            if (!$valid) return false;
+            if (!$journal) return false;
             // Detach the visible method last. If any copy fails, keep the local rows and retry the same removal.
             $visible = $copies[$current->external_reference];
             unset($copies[$current->external_reference]);
             $copies[$current->external_reference] = $visible;
             foreach ($copies as $reference => $remote) {
                 if (($remote->customer ?? null) === $customer) $this->request('post', '/payment_methods/' . $reference . '/detach');
+                $journal['detached'][$reference] = true;
+                DB::transaction(function () use ($user, $journalKey, $journal) {
+                    User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+                    $user->properties()->updateOrCreate(['key' => $journalKey], ['value' => json_encode($journal, JSON_THROW_ON_ERROR)]);
+                });
             }
         } catch (ConnectionException | RequestException $e) {
             Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
             return false;
         }
-        $removed = DB::transaction(function () use ($user, $gateway, $customer, $matched, $current, $copies, $identity) {
-            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-            if ($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value !== $customer) return false;
-            foreach ($matched as $match) {
-                $row = BillingAgreement::withTrashed()->where('external_reference', $match->external_reference)->lockForUpdate()->first();
-                if (!$row || $row->id != $match->id || $row->user_id != $user->id || $row->gateway_id != $gateway->id) return false;
-            }
-            foreach ($matched as $match) {
-                $this->autoPayCardRemoved($user, (int) $match->id);
-                // Core deletes only the clicked agreement after this call returns true.
-                if ($match->id != $current->id && !$match->trashed()) $match->delete();
-            }
-            foreach ($copies as $reference => $remote) {
-                $index = $this->savedMethodIndex($user, $reference, $customer, $gateway);
-                $user->properties()->updateOrCreate(['key' => 'ae_stripe_method_' . $reference], ['value' => json_encode(
-                    array_replace($index, ['customer' => $customer, 'gateway_id' => $gateway->id, 'identity' => $identity, 'removed' => true]), JSON_THROW_ON_ERROR)]);
-            }
-            foreach ($user->properties()->where('key', 'like', 'ae_stripe_saved_%')->lockForUpdate()->get() as $property) {
-                $receipt = json_decode($property->value, true);
-                if (($receipt['consent']['user_id'] ?? null) != $user->id
-                    || (!array_key_exists($receipt['incoming'] ?? '', $copies) && !array_key_exists($receipt['reference'] ?? '', $copies))) continue;
-                $receipt['removed'] = true;
-                $user->properties()->updateOrCreate(['key' => $property->key], ['value' => json_encode($receipt, JSON_THROW_ON_ERROR)]);
-            }
-            return true;
-        });
+        $removed = DB::transaction(fn () => $this->reconcileRemoval($user, $gateway, $journalKey, $journal, $current->external_reference));
         if ($removed && !$method && $identity === null) {
             $notice = ['type' => 'warning', 'message' => 'This payment method was already gone. We removed its saved entry, but could not verify or remove other copies.'];
             \Illuminate\Support\Facades\Session::flash('notification', $notice);
@@ -182,6 +186,39 @@ trait SavedMethods
             });
         }
         return $removed;
+    }
+
+    // The journal records the original authorization and proven provider outcomes, independently of stripe_id changes.
+    private function reconcileRemoval($user, $gateway, string $key, array $journal, string $clicked): bool
+    {
+        User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+        $valid = $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value === $journal['customer'];
+        $owned = [];
+        foreach ($journal['copies'] as $reference => $id) {
+            if ($id === null) continue;
+            $row = BillingAgreement::withTrashed()->where('external_reference', $reference)->lockForUpdate()->first();
+            if (!$row || $row->id != $id || $row->user_id != $user->id || $row->gateway_id != $gateway->id) {
+                $valid = false;
+                continue;
+            }
+            $owned[$reference] = $row;
+        }
+        foreach ($owned as $reference => $row) {
+            if (!isset($journal['detached'][$reference])) continue;
+            $this->autoPayCardRemoved($user, (int) $row->id);
+            // Leave core its normal clicked-row deletion only when final validation succeeds.
+            if (($reference !== $clicked || !$valid) && !$row->trashed()) $row->delete();
+        }
+        foreach ($user->properties()->where('key', 'like', 'ae_stripe_saved_%')->lockForUpdate()->get() as $property) {
+            $receipt = json_decode($property->value, true);
+            if (($receipt['consent']['user_id'] ?? null) != $user->id
+                || (!isset($journal['detached'][$receipt['incoming'] ?? '']) && !isset($journal['detached'][$receipt['reference'] ?? '']))) continue;
+            $receipt['removed'] = true;
+            $user->properties()->updateOrCreate(['key' => $property->key], ['value' => json_encode($receipt, JSON_THROW_ON_ERROR)]);
+        }
+        $journal['complete'] = count($journal['copies']) === count($journal['detached']);
+        $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($journal, JSON_THROW_ON_ERROR)]);
+        return $valid && $journal['complete'];
     }
 
     private function persistAgreement($user, $method, array $consent = [])

@@ -488,7 +488,7 @@ namespace Illuminate\Support\Facades {
     class View { public static function addNamespace($name, $path) {} }
     class Event { public static $listeners = []; public static function listen($type, $callback) { self::$listeners[$type] = $callback; } }
     class Auth { public static $id = 7; public static function id() { return self::$id; } public static function user() { return self::$id ? \App\Models\User::$row : null; } }
-    class Session { public static array $flashes = []; public static function flash($key, $value) { self::$flashes[$key] = $value; } }
+    class Session { public static array $values = []; public static function put($key, $value) { self::$values[$key] = $value; } public static function get($key) { return self::$values[$key] ?? null; } public static function forget($key) { unset(self::$values[$key], self::$flashes[$key]); } public static array $flashes = []; public static function flash($key, $value) { self::$flashes[$key] = $value; } }
     class Cache {
         public static array $locks = [];
         public static $beforeBlock = null;

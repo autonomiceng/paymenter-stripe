@@ -61,6 +61,11 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
     };
 };
 
+if (getenv('PAY_CLEANUP_CASE')) {
+    require __DIR__ . '/cleanup-http.php';
+    return;
+}
+
 if (getenv('PAY_FOLLOWUP_CASE')) {
     require __DIR__ . '/saved-method-followups.php';
     return;
@@ -299,5 +304,8 @@ require __DIR__ . '/card-dedupe-failures.php';
 require __DIR__ . '/card-dedupe-candidates.php';
 foreach (['pending', 'removed-replay', 'version', 'cleanup-replay', 'cleanup-removal', 'missing', 'warning', 'index', 'cleanup-lock', 'cleanup-setup', 'cleanup-checkout', 'cache', 'link', 'terms', 'notices'] as $followupCase) {
     (function () use ($followupCase) { require __DIR__ . '/saved-method-followups.php'; })();
+}
+foreach (['http', 'contention', 'notice-first', 'state-customer', 'state-owner', 'state-gateway', 'state-id', 'state-expiry', 'state-receipt', 'state-service', 'state-account', 'removal-customer', 'removal-owner', 'removal-gateway', 'removal-id'] as $cleanupCase) {
+    (function () use ($cleanupCase) { require __DIR__ . '/cleanup-http.php'; })();
 }
 echo "PASS: $count offline assertions\n";
