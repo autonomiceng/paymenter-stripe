@@ -144,8 +144,8 @@ trait Checkout
         $this->request('post', '/payment_intents/' . $intent->id, [
             'setup_future_usage' => '',
             'payment_method_options' => [
-                'card' => ['setup_future_usage' => $save ? 'off_session' : ''],
-                'link' => ['setup_future_usage' => $save ? 'off_session' : ''],
+                'card' => ['setup_future_usage' => $save ? 'off_session' : 'none'],
+                'link' => ['setup_future_usage' => $save ? 'off_session' : 'none'],
             ],
             'metadata' => ['ae_stripe_consent' => $save ? '1' : '0'],
         ]);

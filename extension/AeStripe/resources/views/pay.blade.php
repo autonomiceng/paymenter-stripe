@@ -90,11 +90,7 @@ async function initializePaymentForm() {
                 onLinkAvailability: updateLinkAvailability,
             });
             let finishOptionsUpdate = null;
-            elements.on('update-end', () => {
-                const finish = finishOptionsUpdate;
-                finishOptionsUpdate = null;
-                finish?.();
-            });
+            elements.on('update-end', () => finishOptionsUpdate?.());
             let canSave = resuming && savedConsent;
             let linkAvailable = false;
             let loading = false;
@@ -154,12 +150,21 @@ async function initializePaymentForm() {
                     if (!resuming) {
                         // Deferred Elements and confirmation must agree on the customer's saving choice.
                         // Stripe.js v3 returns void; update-end confirms the iframe has applied it.
-                        await new Promise((resolve) => {
-                            finishOptionsUpdate = resolve;
-                            elements.update({paymentMethodOptions: {
-                                card: {setup_future_usage: save ? 'off_session' : 'none'},
-                                link: {setup_future_usage: save ? 'off_session' : 'none'},
-                            }});
+                        await new Promise((resolve, reject) => {
+                            const finish = (error = null) => {
+                                if (finishOptionsUpdate !== finish) return;
+                                finishOptionsUpdate = null;
+                                clearTimeout(timer);
+                                error ? reject(error) : resolve();
+                            };
+                            const timer = setTimeout(() => finish(new Error('Payment options did not update.')), 5000);
+                            finishOptionsUpdate = finish;
+                            try {
+                                elements.update({paymentMethodOptions: {
+                                    card: {setup_future_usage: save ? 'off_session' : 'none'},
+                                    link: {setup_future_usage: save ? 'off_session' : 'none'},
+                                }});
+                            } catch (error) { finish(error); }
                         });
                         const submitted = await elements.submit();
                         if (submitted.error) throw submitted.error;
