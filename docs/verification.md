@@ -502,10 +502,22 @@ confirmations stop scheduled recovery after 20 attempts. A later successful webh
 a retained confirmation. Access errors, rate limits, connection, unreadable responses and local failures only back off;
 they never consume the confirmation attempt budget. A succeeded intent whose notice completion is
 still pending also keeps its budget. Only missing, mismatched or non-succeeded intent outcomes
-consume attempts. Exhaustion logs the invoice and intent once, with a reminder to check Stripe
-account access. Access errors, rate limits and outages stop each recovery pass.
+consume attempts. A payment-method 404 during saving is ambiguous and keeps the succeeded intent's
+budget; a definite removed-method receipt still refuses replay. A true intent `resource_missing`
+waits a day and uses the intent budget. Exhaustion distinguishes a missing intent from an intent
+that did not succeed or match. Earlier access warnings include a sample invoice/intent and stage,
+aggregated per configured key and reason to at most once an hour, without keys or response bodies.
+401/403, rate limits, server and connection outages stop each recovery pass; per-row 400/402/409
+and saving-stage 404 back off while allowing unrelated rows to proceed. Non-consuming failures
+grow an independent bounded backoff and never create a terminal state.
 Notice-only maintenance failures do not fail settlement or unrelated inheritance.
 The invoice keeps a notice-specific poll until completion/refusal/expiry, including after payment polling stops. Confirmations for intents older than 30 days are not recreated.
+The original tab explains delayed saving once and reduces its notice poll to once a minute.
+Failed notices stop polling but can deliver a later webhook success on an explicit refresh.
+Recovery and retention skip missing users before limiting a batch and rotate by property ID in
+shared cache. Young and future-due records need no owner lock or metadata rewrite. Retention
+uses property timestamps for malformed dates; an entirely unknown age starts one safe retention
+period. Exact row identity and value are rechecked under the owner lock before any mutation.
 Legacy notices keep their original delivery state; new confirmations use a separate intent-bound token.
 These changes use existing properties and require no schema or extension version change.
 
@@ -522,3 +534,5 @@ Owner/selection changes revoke old pending setup before the service SQL. An encl
 transaction rolls both changes back together. An autocommit interruption after SQL cannot revive
 old consent on an ownership round trip; an autocommit write that fails after revocation conservatively
 requires fresh setup. Staff opt-out rechecks the current gateway under the owner/service locks.
+Cancellation locks user, service and pending property in that order. A missed conditional
+deletion refuses the ownership write and asks for a refresh instead of retaining old work.

@@ -150,10 +150,16 @@ class AeStripe extends Gateway
                 \Livewire\store($component)->set('aeStripePendingState', $memo['aeStripePendingState'] ?? null);
                 \Livewire\store($component)->set('aeStripeSavedNotice', $memo['aeStripeSavedNotice'] ?? null);
                 \Livewire\store($component)->set('aeStripeNoticeDone', $memo['aeStripeNoticeDone'] ?? false);
+                \Livewire\store($component)->set('aeStripeNoticeDelay', $memo['aeStripeNoticeDelay'] ?? false);
             });
             app(\Livewire\EventBus::class)->on('render', function ($component) {
                 return function ($html, $replaceHtml) use ($component) {
-                    if ($this->savedNoticeNeedsPolling($component)) $replaceHtml(preg_replace('/(<[^>]+>)/', '$1<span hidden data-ae-stripe-notice-poll wire:poll.5s="$refresh"></span>', $html, 1));
+                    if ($interval = $this->savedNoticePollInterval($component)) {
+                        // Skip non-element prefixes and respect quoted '>' inside the actual root tag.
+                        $root = '/\A(?:\s|<!--.*?-->|<\?.*?\?>|<!DOCTYPE[^>]*>)*<[a-zA-Z][a-zA-Z0-9:-]*(?:[^>"\']|"[^"]*"|\'[^\']*\')*>/s';
+                        $patched = preg_replace_callback($root, fn ($match) => $match[0] . '<span hidden data-ae-stripe-notice-poll wire:key="ae-stripe-notice-poll-' . $interval . '" wire:poll.' . $interval . 's="$refresh"></span>', $html, 1);
+                        if (is_string($patched)) $replaceHtml($patched);
+                    }
                 };
             });
             app(\Livewire\EventBus::class)->before('dehydrate', function ($component, $context) {

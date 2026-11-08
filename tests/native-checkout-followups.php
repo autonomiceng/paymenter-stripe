@@ -17,7 +17,7 @@ $create = fn ($extra = []) => Service::create($extra + ['user_id' => $user->id, 
     'price' => 20, 'currency_code' => 'USD', 'quantity' => 1, 'status' => 'active']);
 $delivered = fn ($page) => array_values(array_filter($page->effects['dispatches'] ?? [], fn ($e) => $e['name'] === 'notify'));
 $pending = fn ($service) => $service->properties()->where('key', 'ae_stripe_auto_pay_pending')->exists();
-if (str_starts_with($case, 'followup-')) { require __DIR__ . '/native-pending-followups.php'; return; }
+if (str_starts_with($case, 'followup-') || str_starts_with($case, 'final-')) { require __DIR__ . '/native-pending-followups.php'; return; }
 if (str_starts_with($case, 'polish-')) { require __DIR__ . '/native-pending-polish.php'; return; }
 if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
     $setDefault();
