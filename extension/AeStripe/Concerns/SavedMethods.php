@@ -177,7 +177,7 @@ trait SavedMethods
                     // A removal in progress cannot be undone by a delayed or differently sourced save.
                     $index = $this->savedMethodIndex($user, $reference, $customer, $gateway);
                     $user->properties()->updateOrCreate(['key' => 'ae_stripe_method_' . $reference], ['value' => json_encode(
-                        array_replace($index, ['customer' => $customer, 'gateway_id' => $gateway->id, 'identity' => $identity, 'removed' => true]), JSON_THROW_ON_ERROR)]);
+                        array_replace($index, ['customer' => $customer, 'gateway_id' => $gateway->id, 'identity' => $identity, 'removing' => $journalKey]), JSON_THROW_ON_ERROR)]);
                 }
                 $user->properties()->updateOrCreate(['key' => $journalKey], ['value' => json_encode($journal, JSON_THROW_ON_ERROR)]);
                 return $journal;
@@ -190,8 +190,12 @@ trait SavedMethods
             foreach ($copies as $reference => $remote) {
                 if (($remote->customer ?? null) === $customer) $this->request('post', '/payment_methods/' . $reference . '/detach');
                 $journal['detached'][$reference] = true;
-                DB::transaction(function () use ($user, $journalKey, $journal) {
+                DB::transaction(function () use ($user, $gateway, $customer, $reference, $journalKey, $journal) {
                     User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+                    $index = $this->savedMethodIndex($user, $reference, $customer, $gateway);
+                    unset($index['removing']);
+                    $index['removed'] = true;
+                    $user->properties()->updateOrCreate(['key' => 'ae_stripe_method_' . $reference], ['value' => json_encode($index, JSON_THROW_ON_ERROR)]);
                     $user->properties()->updateOrCreate(['key' => $journalKey], ['value' => json_encode($journal, JSON_THROW_ON_ERROR)]);
                 });
             }
@@ -295,6 +299,9 @@ trait SavedMethods
         if ($this->savedMethodIndex($user, $incomingId, $customer, $gateway)['removed'] ?? false) {
             throw new DisplayException('This payment method was removed. Add a new payment method.');
         }
+        if (isset($this->savedMethodIndex($user, $incomingId, $customer, $gateway)['removing'])) {
+            throw new SavedMethodRetryException('This payment method is being removed. Try again with a new payment method.');
+        }
         $method = $this->request('get', '/payment_methods/' . $incomingId);
         if (($method->customer ?? null) === null) {
             // An unfinished return from the previous release may refer to a duplicate it already detached.
@@ -319,6 +326,8 @@ trait SavedMethods
             if (($method->type ?? null) === 'link' && $row->type !== 'link') continue;
             // Local card types are display brands. Verify the actual Stripe identity for every brand.
             $known = json_decode($user->properties()->where('key', 'ae_stripe_method_' . $row->external_reference)->first()?->value ?? 'null', true);
+            // A fresh provider reference can replace a failed removal without reusing its uncertain copies.
+            if (($known['customer'] ?? null) === $customer && ($known['gateway_id'] ?? null) == $gateway->id && isset($known['removing'])) continue;
             if ($identity !== null && ($known['customer'] ?? null) === $customer && ($known['gateway_id'] ?? null) == $gateway->id
                 && ($known['identity'] ?? null) !== null && $known['identity'] !== $identity) continue;
             if ($row->external_reference !== $incomingId && $identity !== null) {
@@ -385,6 +394,7 @@ trait SavedMethods
             if (!$incoming || array_key_exists($incoming, $targets) || isset($localReferences[$incoming])
                 || ($stored['removed'] ?? false) || ($stored['consent']['user_id'] ?? null) != $user->id) continue;
             $known = $this->savedMethodIndex($user, $incoming, $customer, $gateway);
+            if (isset($known['removing'])) continue;
             if (isset($known['identity']) && $known['identity'] !== $identity) continue;
             $remote = $this->readSavedMethod($incoming);
             if (($remote->id ?? null) === $incoming && ($remote->customer ?? null) === $customer

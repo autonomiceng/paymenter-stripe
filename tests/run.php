@@ -1,6 +1,6 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-if (getenv('PAY_CLEANUP_CASE') === 'notice-native') {
+if (getenv('PAY_CLEANUP_CASE') === 'notice-native' || getenv('PAY_BINDING_CASE') === 'native') {
     require __DIR__ . '/native-saved-notices.php';
     return;
 }
@@ -64,6 +64,11 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
         default => throw new RuntimeException('Unexpected HTTP request: ' . $path),
     };
 };
+
+if (getenv('PAY_BINDING_CASE')) {
+    require __DIR__ . '/cleanup-bindings.php';
+    return;
+}
 
 if (getenv('PAY_CLEANUP_CASE')) {
     require __DIR__ . '/cleanup-http.php';
@@ -311,5 +316,8 @@ foreach (['pending', 'removed-replay', 'version', 'cleanup-replay', 'cleanup-rem
 }
 foreach (['http', 'contention', 'notice-first', 'post-state', 'retry', 'recovery', 'state-customer', 'state-owner', 'state-gateway', 'state-id', 'state-expiry', 'state-receipt', 'state-service', 'state-account', 'removal-customer', 'removal-owner', 'removal-gateway', 'removal-id'] as $cleanupCase) {
     (function () use ($cleanupCase) { require __DIR__ . '/cleanup-http.php'; })();
+}
+foreach (['account-during', 'reserved-account', 'repair-account', 'repair-service', 'lost-detach', 'unreconciled', 'survivor-change', 're-add'] as $bindingCase) {
+    (function () use ($bindingCase) { require __DIR__ . '/cleanup-bindings.php'; })();
 }
 echo "PASS: $count offline assertions\n";

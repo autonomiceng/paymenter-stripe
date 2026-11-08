@@ -215,9 +215,16 @@ namespace App\Models {
                 ? [new Extension(['id' => $bundled ? 1 : 2, 'extension' => $value, 'enabled' => $bundled ? self::$bundledEnabled : self::$enabled])] : []);
         }
     }
+    class NativeServiceRow extends \stdClass {
+        public function __construct(array $row) { foreach ($row as $key => $value) $this->$key = $value; }
+        public function update(array $values) {
+            foreach (\Illuminate\Support\Facades\DB::$tables['services'] as &$row) if ($row['id'] == $this->id) $row = array_replace($row, $values);
+            foreach ($values as $key => $value) $this->$key = $value;
+        }
+    }
     class NativeModelQuery implements \IteratorAggregate {
         public function __construct(private array $rows) {}
-        public static function table($table) { return new self(array_map(fn ($r) => (object) $r, \Illuminate\Support\Facades\DB::$tables[$table] ?? [])); }
+        public static function table($table) { return new self(array_map(fn ($r) => $table === 'services' ? new NativeServiceRow($r) : (object) $r, \Illuminate\Support\Facades\DB::$tables[$table] ?? [])); }
         public function where($key, $value) { $this->rows = array_filter($this->rows, fn ($r) => ($r->$key ?? null) == $value); return $this; }
         public function whereIn($key, $values) { $this->rows = array_filter($this->rows, fn ($r) => in_array($r->$key ?? null, (array) $values)); return $this; }
         public function whereNull($key) { return $this->where($key, null); }
