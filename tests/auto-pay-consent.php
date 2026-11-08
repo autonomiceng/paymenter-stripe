@@ -191,7 +191,7 @@ check($enrolled->billing_agreement_id === 91 && count(ExtensionHelper::$agreemen
 check(count(Http::$calls) === $beforeCalls, 'Account consent and new-service assignment need no Stripe calls');
 // Removing the account card turns Auto Pay off and unlinks what it paid for.
 $gateway->saveAutoPayDefault(new Request($choice));
-Http::$handler = function ($verb, $path) { if ($verb === 'get') return ['customer' => null]; throw new RuntimeException('Unexpected request'); };
+Http::$handler = function ($verb, $path) { if ($verb === 'get') return ['id' => 'pm_default', 'customer' => null]; throw new RuntimeException('Unexpected request'); };
 check($gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements['pm_default'])) === true
     && $current->billing_agreement_id === null && !isset($user->props->values[$property]), 'Removing the account card turns Auto Pay off');
 check($gateway->autoPayCard($user) === null, 'Removing the chosen card clears its saved preference');
