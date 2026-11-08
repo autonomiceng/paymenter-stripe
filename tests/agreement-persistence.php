@@ -53,6 +53,7 @@ $agreementRow = ['id' => 19, 'external_reference' => $agreementMethod->id, 'user
 $scenario = getenv('AGREEMENT_SCENARIO') ?: 'all';
 if (in_array($scenario, ['all', 'sequential'])) {
     ExtensionHelper::$agreements = [];
+    $user->props->values = [];
     $gateway->setupAgreement(new Request(['setup_intent' => $agreementSetup->id]));
     ExtensionHelper::$agreements[$agreementMethod->id]['deleted_at'] = '2026-10-23 11:18:14';
     $result = $gateway->setupAgreement(new Request(['setup_intent' => $agreementSetup->id]));
@@ -88,6 +89,7 @@ if ($scenario === 'all') {
     foreach ($entries as $entry => $call) {
         foreach ([null, []] as $snapshot) {
             ExtensionHelper::$agreements = [];
+    $user->props->values = [];
             BillingAgreement::$snapshot = $snapshot;
             $call();
             $first = ExtensionHelper::$agreements;
@@ -135,6 +137,7 @@ if ($scenario === 'all') {
         $field = match ($race) { 'other user' => 'user_id', 'other gateway' => 'gateway_id', 'removed' => 'deleted_at', default => 'user_id' };
         $committed = array_replace($agreementRow, [$field => $value]);
         ExtensionHelper::$agreements = [];
+    $user->props->values = [];
         BillingAgreement::$snapshot = [];
         BillingAgreement::$beforeInsert = function () use ($agreementMethod, $committed) {
             // Commit by a native writer between the guard and the insert.
@@ -149,6 +152,7 @@ if ($scenario === 'all') {
     BillingAgreement::$snapshot = null;
     foreach (['redirect', 'setup webhook', 'payment webhook'] as $entry) {
         ExtensionHelper::$agreements = [];
+    $user->props->values = [];
         $unrelated = new \Illuminate\Database\UniqueConstraintViolationException('Duplicate ulid');
         BillingAgreement::$beforeInsert = fn () => throw $unrelated;
         try {
@@ -167,6 +171,7 @@ if ($scenario === 'all') {
         check(ExtensionHelper::$agreements === [], "$entry rolls back interrupted persistence");
         $entries[$entry]();
         check(count(ExtensionHelper::$agreements) === 1, "$entry recovers on retry");
+        $user->props->values = array_filter($user->props->values, fn ($key) => !str_starts_with($key, 'ae_stripe_saved_'), ARRAY_FILTER_USE_KEY);
         $handler = Http::$handler;
         Http::$handler = function ($verb, $path, $data) use ($handler) {
             if ($verb === 'post') throw new \Illuminate\Http\Client\ConnectionException('Synthetic connection failure');

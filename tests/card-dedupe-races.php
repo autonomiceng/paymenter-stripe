@@ -40,144 +40,71 @@ $handler = function ($verb, $path, $data) use (&$methods, $setup) {
     throw new RuntimeException('Unexpected race request: ' . $path);
 };
 Http::$handler = $handler;
-$scenario = getenv('DEDUPE_RACE') ?: 'all';
-if (in_array($scenario, ['all', 'retained-removed'])) {
-    ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
-    DB::$afterTransaction = function () { ExtensionHelper::$agreements['pm_old']['deleted_at'] = '2026-10-23 13:00:00'; };
-    $gateway->setupAgreement(new Request(['setup_intent' => 'seti_races']));
-    check($methods['pm_new']->customer === 'cus_owner' && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
-        'Setup preserves the incoming saved card when the retained agreement is removed before finalization');
-    echo "PASS: retained-removed\n";
-}
-if (in_array($scenario, ['all', 'detach-failure'])) {
+// A removed comparison agreement cannot be written through a stale plan.
+ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
+DB::$afterTransaction = function () { ExtensionHelper::$agreements['pm_old']['deleted_at'] = '2026-10-23 13:00:00'; };
+$result = $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
+check($result['type'] === 'danger' && $result['message'] === 'Saved payment methods changed. Try again.', 'A changed agreement set shows a retry notice');
+$gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
+check($methods['pm_new']->customer === 'cus_owner' && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
+    'Retry preserves the current agreement and provider reference');
+
+// A second save cannot interleave provider writes while the first holds the save lock.
+$user->props->values = [];
+ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
+$methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
+$entered = false;
+Http::$handler = function ($verb, $path, $data) use ($handler, $gateway, &$entered) {
+    if ($verb === 'post' && !$entered) {
+        $entered = true;
+        $before = count(Http::$calls);
+        try { invoke($gateway, 'persistAgreement', User::$row, (object) ['id' => 'pm_new']); throw new RuntimeException('Expected lock contention'); }
+        catch (\Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException $e) { check(str_contains($e->getMessage(), 'in progress'), 'Concurrent saving stays retryable'); }
+        check(count(Http::$calls) === $before, 'Lock contention never starts provider work');
+    }
+    return $handler($verb, $path, $data);
+};
+$gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
+check($entered && $methods['pm_old']->allow_redisplay === 'always', 'The serialized save completes its redisplay consent');
+Http::$handler = $handler;
+
+foreach (['incoming user', 'incoming gateway', 'incoming removed', 'incoming bound', 'retained user', 'retained gateway', 'method customer'] as $case) {
     $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
     $user->props->values = [];
-    ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
-    Http::$handler = function ($verb, $path, $data) use ($handler) {
-        if (str_ends_with($path, '/detach')) throw new \Illuminate\Http\Client\ConnectionException('Synthetic detach failure');
-        return $handler($verb, $path, $data);
-    };
-    try {
-        $gateway->setupAgreement(new Request(['setup_intent' => 'seti_races']));
-        throw new RuntimeException('Detach failure must remain retryable');
-    } catch (\Illuminate\Http\Client\ConnectionException $e) {
-        check($methods['pm_new']->customer === 'cus_owner' && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
-            'Setup keeps the incoming agreement when detach fails before any remote effect');
-        check(isset($user->props->values['ae_stripe_duplicate_pm_new']), 'Detach failure retains the committed retry receipt');
-    }
-    Http::$handler = $handler;
-    echo "PASS: detach-failure\n";
-}
-
-// Pause an unlocked consent request while cleanup reads the previous Stripe value.
-// Requests holding the user lock finish first; cleanup then runs after commit.
-foreach (['setup', 'checkout'] as $entry) {
-    if (!in_array($scenario, ['all', 'redisplay-' . $entry])) continue;
-    $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
-    $methods['pm_new']->allow_redisplay = 'limited';
-    $user->props->values = [];
-    ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
-    $pendingAlways = false;
-    $cleanup = fn () => $gateway->deduplicateCards(true, fn ($line) => null);
-    Http::$handler = function ($verb, $path, $data) use ($handler, &$methods, &$pendingAlways, $cleanup, $user) {
-        if ($verb === 'post' && $path === '/payment_methods/pm_old' && $data['allow_redisplay'] === 'always') {
-            if (DB::$userLocked) {
-                DB::$afterTransaction = $cleanup;
-                return $handler($verb, $path, $data);
-            }
-            $pendingAlways = true;
-            $cleanup();
-            $pendingAlways = false;
-            return $methods['pm_old'];
-        }
-        if ($verb === 'get' && $path === '/payment_methods/pm_old' && $pendingAlways
-            && isset($user->props->values['ae_stripe_duplicate_pm_new'])) {
-            $stale = clone $methods['pm_old'];
-            $handler('post', $path, ['allow_redisplay' => 'always']);
-            return $stale;
-        }
-        return $handler($verb, $path, $data);
-    };
-    if ($entry === 'setup') {
-        $setup->payment_method = 'pm_old';
-        $gateway->setupAgreement(new Request(['setup_intent' => 'seti_races']));
-        $setup->payment_method = 'pm_new';
-    } else {
-        $paid = (object) ['id' => 'pi_races', 'status' => 'succeeded', 'customer' => 'cus_owner', 'currency' => 'usd',
-            'amount' => 2000, 'amount_received' => 2000, 'payment_method' => 'pm_old',
-            'payment_method_options' => (object) ['card' => (object) ['setup_future_usage' => 'off_session']],
-            'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1']];
-        $body = json_encode(['type' => 'payment_intent.succeeded', 'data' => ['object' => $paid]]);
-        $time = time();
-        $webhook = new AeStripe(['stripe_secret_key' => 'fake-secret', 'stripe_webhook_secret' => 'whsec_test']);
-        $webhook->webhook(new Request(body: $body,
-            signature: 't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.' . $body, 'whsec_test')));
-    }
-    check($methods['pm_old']->allow_redisplay === 'always', "$entry consent survives cleanup's interleaved retained read and update");
-    Http::$handler = $handler;
-    echo "PASS: redisplay-$entry\n";
-}
-
-if (in_array($scenario, ['all', 'cancel-stale'])) {
-    $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
-    $stale = new BillingAgreement($row(19, 'pm_old'));
-    ExtensionHelper::$agreements = ['pm_old' => array_replace($row(19, 'pm_old'), ['user_id' => 99])];
-    $gateway->cancelBillingAgreement($stale);
-    check($methods['pm_old']->customer === 'cus_owner', 'Cancellation revalidates agreement ownership before detaching');
-    echo "PASS: cancel-stale\n";
-}
-
-if (in_array($scenario, ['all', 'finalization-boundaries'])) {
-    foreach (['incoming user', 'incoming gateway', 'incoming removed', 'incoming bound', 'retained user', 'retained gateway', 'method customer'] as $case) {
-        $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
-        $user->props->values = [];
-        DB::$tables['services'] = [];
-        ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
-        DB::$afterTransaction = function () use ($case, &$methods) {
-            switch ($case) {
-                case 'incoming user': ExtensionHelper::$agreements['pm_new']['user_id'] = 99; break;
-                case 'incoming gateway': ExtensionHelper::$agreements['pm_new']['gateway_id'] = 1; break;
-                case 'incoming removed': ExtensionHelper::$agreements['pm_new']['deleted_at'] = '2026-10-23'; break;
-                case 'incoming bound': DB::$tables['services'] = [['id' => 41, 'billing_agreement_id' => 20]]; break;
-                case 'retained user': ExtensionHelper::$agreements['pm_old']['user_id'] = 99; break;
-                case 'retained gateway': ExtensionHelper::$agreements['pm_old']['gateway_id'] = 1; break;
-                case 'method customer': $methods['pm_new']->customer = 'cus_other'; break;
-            }
-        };
-        $start = count(Http::$calls);
-        try { $gateway->setupAgreement(new Request(['setup_intent' => 'seti_races'])); }
-        catch (RuntimeException $e) { if ($case !== 'method customer' || $e->getMessage() !== 'HTTP 409') throw $e; }
-        check(!array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach')),
-            "Setup revalidates $case through finalization");
-    }
     DB::$tables['services'] = [];
-    $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
-    $user->props->values = [];
     ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
-    $gateway->setupAgreement(new Request(['setup_intent' => 'seti_races']));
-    $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_races']));
-    check($result['message'] === 'This card is already saved. We updated it.', 'Setup retries a successfully removed imported duplicate');
-    echo "PASS: finalization-boundaries\n";
+    $injected = null;
+    DB::$afterTransaction = function () use ($case, &$methods, &$injected) {
+        switch ($case) {
+            case 'incoming user': ExtensionHelper::$agreements['pm_new']['user_id'] = 99; break;
+            case 'incoming gateway': ExtensionHelper::$agreements['pm_new']['gateway_id'] = 1; break;
+            case 'incoming removed': ExtensionHelper::$agreements['pm_new']['deleted_at'] = '2026-10-23'; break;
+            case 'incoming bound': DB::$tables['services'] = [['id' => 41, 'billing_agreement_id' => 20]]; break;
+            case 'retained user': ExtensionHelper::$agreements['pm_old']['user_id'] = 99; break;
+            case 'retained gateway': ExtensionHelper::$agreements['pm_old']['gateway_id'] = 1; break;
+            case 'method customer': $methods['pm_new']->customer = 'cus_other'; break;
+        }
+        $injected = ExtensionHelper::$agreements;
+    };
+    $start = count(Http::$calls);
+    $refused = false;
+    try { $result = $gateway->setupAgreement(new Request(['setup_intent' => $setup->id])); $refused = ($result['type'] ?? null) === 'danger'; }
+    catch (RuntimeException $e) {
+        check($e->getMessage() === 'HTTP 409', 'Only an expected HTTP 409 may escape the concurrent save');
+        $refused = true;
+    }
+    check($injected !== null, "The concurrent change is injected for $case");
+    check($refused || ExtensionHelper::$agreements === $injected, "Setup refuses or preserves the injected agreements after $case");
+    if ($case !== 'incoming bound') check($refused, "Setup refuses the unsafe concurrent change after $case");
+    check(!array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach')),
+        "Setup preserves provider references after $case");
+    if ($case === 'incoming bound') check(DB::$tables['services'][0]['billing_agreement_id'] === 20, 'A concurrent service choice is retained');
 }
 
-if (in_array($scenario, ['all', 'save-boundaries'])) {
-    $methods = ['pm_new' => $card('pm_new')];
-    ExtensionHelper::$agreements = [];
-    $user->props->values = [];
-    DB::$beforeUserLock = function () use (&$methods) { $methods['pm_new']->customer = 'cus_other'; };
-    try { $gateway->setupAgreement(new Request(['setup_intent' => 'seti_races'])); }
-    catch (RuntimeException $e) { if ($e->getMessage() !== 'HTTP 409') throw $e; }
-    DB::$beforeUserLock = null;
-    check(!isset(ExtensionHelper::$agreements['pm_new']), 'Saving refreshes method ownership after acquiring the user lock');
-    Http::$handler = function ($verb, $path, $data) use ($handler, $setup) {
-        if ($path === '/customers/cus_owner') {
-            check(DB::$userLocked, 'Customer lookup and replacement use the agreement owner lock');
-            return ['id' => 'cus_owner'];
-        }
-        if ($path === '/setup_intents') return $setup;
-        return $handler($verb, $path, $data);
-    };
-    $gateway->createBillingAgreement($user);
-    Http::$handler = $handler;
-    echo "PASS: save-boundaries\n";
-}
+$methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
+$stale = new BillingAgreement($row(19, 'pm_old'));
+ExtensionHelper::$agreements = ['pm_old' => array_replace($row(19, 'pm_old'), ['user_id' => 99])];
+$gateway->cancelBillingAgreement($stale);
+check($methods['pm_old']->customer === 'cus_owner', 'Cancellation revalidates agreement ownership before detaching');
+DB::$tables['services'] = [];
+echo "PASS: saved method ownership, concurrent changes and serialized provider writes\n";

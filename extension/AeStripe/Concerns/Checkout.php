@@ -13,7 +13,6 @@ use App\Models\InvoiceTransaction;
 use App\Models\Notification;
 use App\Models\User;
 use Illuminate\Http\Request;
-use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 
@@ -147,7 +146,8 @@ trait Checkout
                 'card' => ['setup_future_usage' => $save ? 'off_session' : 'none'],
                 'link' => ['setup_future_usage' => $save ? 'off_session' : 'none'],
             ],
-            'metadata' => ['ae_stripe_consent' => $save ? '1' : '0'],
+            'metadata' => ['ae_stripe_consent' => $save ? '1' : '0',
+                'ae_stripe_consent_at' => $save ? (string) time() : ''],
         ]);
 
         return response()->json(['ok' => true]);
@@ -183,7 +183,8 @@ trait Checkout
                 $params += ['confirmation_token' => $request->input('confirmation_token'), 'setup_future_usage' => '',
                     'payment_method_options' => ['card' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : 'none'],
                         'link' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : 'none']],
-                    'metadata' => ['ae_stripe_consent' => $request->boolean('save') ? '1' : '0']];
+                    'metadata' => ['ae_stripe_consent' => $request->boolean('save') ? '1' : '0',
+                        'ae_stripe_consent_at' => $request->boolean('save') ? (string) time() : '']];
             } else {
                 abort_unless(in_array($intent->status, ['requires_action', 'requires_confirmation', 'processing', 'succeeded'], true), 409);
                 abort_unless($request->boolean('save') === (($intent->metadata->ae_stripe_consent ?? null) === '1'), 409);
@@ -404,7 +405,10 @@ trait Checkout
     private function saveConsentedMethod($intent): void
     {
         try {
-            $this->savePaidMethod($intent);
+            $saved = $this->savePaidMethod($intent);
+            if (is_array($saved)) \Illuminate\Support\Facades\Session::flash('ae_stripe_saved_notice', [
+                'type' => 'success', 'message' => $saved['message'],
+            ]);
         } catch (DisplayException $e) {
             \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'reason' => $e->getMessage()]);
         } catch (\Throwable $e) {
@@ -430,7 +434,8 @@ trait Checkout
             return; // The checkout opt-in authorizes saving a card or Link only.
         }
         if (($intent->payment_method_options->{$method->type}->setup_future_usage ?? null) !== 'off_session') return;
-        $this->persistAgreement($invoice->user, $method);
+        return $this->persistAgreement($invoice->user, $method, ['source' => $intent->id,
+            'version' => 'off_session_v1', 'accepted_at' => (int) ($intent->metadata->ae_stripe_consent_at ?? $intent->created ?? time()), 'user_id' => $invoice->user_id]);
     }
 
     private function methodCustomerMatches($user, $method, bool $current = false): bool
@@ -444,73 +449,4 @@ trait Checkout
         return true;
     }
 
-    private function persistAgreement($user, $method, bool $deduplicate = false)
-    {
-        if (empty($method->id)) return false;
-        // Native external_reference is globally unique, including soft-deleted rows.
-        $duplicate = DB::transaction(function () use ($user, $method, $deduplicate) {
-            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-            $method = $this->request('get', '/payment_methods/' . $method->id);
-            $receipt = $deduplicate ? $this->duplicateReceipt($user, $method) : null;
-            if (!(($method->customer ?? null) === null && $receipt)
-                && !$this->methodCustomerMatches($user, $method, current: true)) return false;
-            $data = $this->getPaymentDetails($method);
-            $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
-            // Locking reads see concurrent commits even under REPEATABLE READ.
-            $find = fn () => BillingAgreement::withTrashed()->where('external_reference', $method->id)->lockForUpdate()->first();
-            $agreement = $find();
-            if ($agreement && ($agreement->user_id != $user->id || $agreement->gateway_id != $gateway->id)) {
-                throw new DisplayException('This payment method can\'t be used on this account. Add a new payment method.');
-            }
-            if ($agreement?->trashed() && !$receipt) {
-                throw new DisplayException('This payment method was removed. Add a new payment method.');
-            }
-            $duplicate = null;
-            if ($deduplicate) {
-                try {
-                    $duplicate = $this->duplicateCard($user, $method, $gateway, $agreement, updateExpiry: true);
-                } catch (RequestException $e) {
-                    if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') throw $e;
-                    // A missing comparison card cannot prevent saving the verified incoming method.
-                    \Illuminate\Support\Facades\Log::warning('ae_stripe_duplicate_candidate_missing', ['error' => get_class($e)]);
-                }
-            }
-            if ($duplicate) {
-                [$kept] = $duplicate;
-                $this->rememberDuplicate($user, $method, $kept, updateExpiry: true);
-                return [...$duplicate, $agreement?->id];
-            }
-            if (!$this->methodCustomerMatches($user, $method, current: true)) return false;
-            if (!$agreement) {
-                try {
-                    $agreement = ExtensionHelper::makeBillingAgreement($user, 'AeStripe', $data['name'],
-                        $method->id, $data['type'], $data['expiry']);
-                } catch (UniqueConstraintViolationException $e) {
-                    // Another writer may not take our user lock. Recheck its committed row.
-                    $agreement = $find();
-                    if (!$agreement) throw $e;
-                }
-            }
-            if ($agreement->user_id != $user->id || $agreement->gateway_id != $gateway->id) {
-                throw new DisplayException('This payment method can\'t be used on this account. Add a new payment method.');
-            }
-            if ($agreement->trashed()) {
-                throw new DisplayException('This payment method was removed. Add a new payment method.');
-            }
-            if ($deduplicate && ($method->type ?? null) === 'card'
-                && substr((string) $agreement->expiry, 0, 10) !== $data['expiry']) {
-                $user->properties()->updateOrCreate(
-                    ['key' => 'ae_stripe_card_update_' . $method->id], ['value' => $method->id]);
-            }
-            $agreement->update(['name' => $data['name'], 'type' => $data['type'], 'expiry' => $data['expiry']]);
-            // Explicit checkout opt-in or account setup authorizes future redisplay.
-            $this->request('post', '/payment_methods/' . $method->id, ['allow_redisplay' => 'always']);
-        });
-        if ($duplicate === false) return false;
-        if ($duplicate) {
-            if ($this->finalizeDuplicate($user, $method, consented: true, incomingId: $duplicate[2])) return 'duplicate';
-            return $this->persistAgreement($user, $method);
-        }
-        return true; // Never assign a service billing_agreement_id or enable Auto Pay.
-    }
 }

@@ -16,8 +16,11 @@ foreach ([true, false] as $save) {
         'setup_future_usage' => '',
         'payment_method_options' => ['card' => ['setup_future_usage' => $save ? 'off_session' : 'none'],
             'link' => ['setup_future_usage' => $save ? 'off_session' : 'none']],
-        'metadata' => ['ae_stripe_consent' => $save ? '1' : '0'],
+        'metadata' => ['ae_stripe_consent' => $save ? '1' : '0',
+            'ae_stripe_consent_at' => $save ? end(Http::$calls)[2]['metadata']['ae_stripe_consent_at'] : ''],
     ], $save ? 'Saving sets card and Link usage and clears legacy usage' : 'Clearing removes legacy, card and Link usage');
+    $consentAt = end(Http::$calls)[2]['metadata']['ae_stripe_consent_at'];
+    check(!$save || (is_string($consentAt) && preg_match('/\A[0-9]+\z/', $consentAt) === 1), 'Saving records the server acceptance time');
 }
 $optIntent->status = 'requires_action';
 $optIntent->metadata->ae_stripe_consent = '1';
@@ -31,6 +34,7 @@ $optIntent->payment_method_options = (object) [
     'link' => (object) ['setup_future_usage' => 'off_session'],
 ];
 foreach (['sepa_debit', 'us_bank_account', 'card', 'link'] as $type) {
+    $optIntent->id = 'pi_options_' . $type;
     $optMethod = (object) ['id' => 'pm_options_' . $type, 'type' => $type, 'customer' => 'cus_owner',
         'card' => (object) ['brand' => 'visa', 'last4' => '4242', 'exp_year' => 2030, 'exp_month' => 5], 'link' => (object) []];
     Http::$handler = fn () => $optMethod;

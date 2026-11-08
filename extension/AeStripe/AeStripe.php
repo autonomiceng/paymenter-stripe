@@ -47,6 +47,8 @@ require_once __DIR__ . '/Concerns/StripeMetadata.php';
 require_once __DIR__ . '/Concerns/Signature.php';
 require_once __DIR__ . '/Concerns/Checkout.php';
 require_once __DIR__ . '/Concerns/CardDuplicates.php';
+require_once __DIR__ . '/Concerns/SavedMethods.php';
+require_once __DIR__ . '/SavedMethodRetryException.php';
 require_once __DIR__ . '/Concerns/Amounts.php';
 require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
 require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
@@ -75,7 +77,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, Concerns\SavedMethods, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -659,30 +661,13 @@ class AeStripe extends Gateway
 
     public function cancelBillingAgreement(BillingAgreement $billingAgreement): bool
     {
-        return \Illuminate\Support\Facades\DB::transaction(function () use ($billingAgreement) {
-            $user = User::where('id', $billingAgreement->user_id)->lockForUpdate()->firstOrFail();
-            $current = BillingAgreement::withTrashed()->where('external_reference', $billingAgreement->external_reference)->lockForUpdate()->first();
-            if (!$current) return false;
-            $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail();
-            if ($current->id != $billingAgreement->id || $current->user_id != $user->id || $current->gateway_id != $gateway->id) return false;
-            // Native removal follows every true result, so Auto Pay stops using this card first.
-            $removed = function () use ($user, $current) { $this->autoPayCardRemoved($user, (int) $current->id); return true; };
-            if ($current->trashed()) return $removed();
-            try {
-                $method = $this->request('get', '/payment_methods/' . $current->external_reference);
-            } catch (Exception $e) {
-                \Illuminate\Support\Facades\Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
-                return $removed();
-            }
-            if (($method->customer ?? null) === null) return $removed();
-            if (!$this->methodCustomerMatches($user, $method, current: true)) return false;
-            try {
-                $this->request('post', '/payment_methods/' . $current->external_reference . '/detach');
-            } catch (Exception $e) {
-                // Native cancellation still removes the local agreement after a Stripe failure.
-            }
-            return $removed();
-        });
+        $lock = \Illuminate\Support\Facades\Cache::lock('ae-stripe-save-method-' . $billingAgreement->user_id, 600);
+        if (!$lock->get()) return false;
+        try {
+            return $this->removeSavedMethodCopies($billingAgreement);
+        } finally {
+            $lock->release();
+        }
     }
 
     public function setupAgreement(Request $request)
@@ -708,15 +693,18 @@ class AeStripe extends Gateway
         try {
             $saved = $this->setupBillingAgreement($setupIntent);
             abort_unless($saved, 409);
-        } catch (DisplayException $e) {
+        } catch (DisplayException | SavedMethodRetryException $e) {
             return redirect()->route('account.payment-methods')->with('notification', [
                 'type' => 'danger', 'message' => $e->getMessage(),
             ]);
         }
 
+        if (is_array($saved)) return redirect()->route('account.payment-methods')->with('ae_stripe_saved_notice', [
+            'type' => 'success', 'message' => $saved['message'],
+        ]);
         return redirect()->route('account.payment-methods')->with('notification', [
             'type' => 'success',
-            'message' => $saved === 'duplicate' ? 'This card is already saved. We updated it.' : 'Payment method added successfully.',
+            'message' => 'Payment method added successfully.',
         ]);
     }
 
@@ -739,7 +727,9 @@ class AeStripe extends Gateway
         // Get the actual payment method that will be used for future charges
         $actualPaymentMethod = $this->getActualPaymentMethod($setupIntent);
 
-        return $this->persistAgreement($user, $actualPaymentMethod, deduplicate: true);
+        return $this->persistAgreement($user, $actualPaymentMethod, ['source' => $setupIntent->id,
+            'version' => $setupIntent->metadata->ae_stripe_setup_consent,
+            'accepted_at' => (int) $setupIntent->metadata->ae_stripe_setup_consent_at, 'user_id' => $user->id]);
     }
 
     private function getActualPaymentMethod($setupIntent)

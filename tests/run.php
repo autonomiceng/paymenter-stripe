@@ -61,6 +61,12 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
     };
 };
 
+if (getenv('PAY_DEDUPE_CASE')) {
+    require __DIR__ . '/saved-method-dedupe.php';
+    echo "PASS: $count saved method assertions\n";
+    return;
+}
+
 if (in_array('--payment-fees', $argv, true)) {
     require __DIR__ . '/fee-recovery.php';
     require __DIR__ . '/fee-recovery-review.php';
@@ -160,7 +166,7 @@ check(ExtensionHelper::$payments['12:pi_test']['status'] === 'succeeded', 'Delay
 check(ExtensionHelper::$agreements['pm_test']['name'] === 'Visa **** 4242', 'Card label preserved');
 check(ExtensionHelper::$agreements['pm_test']['gateway'] === 'AeStripe', 'Independent native gateway');
 check(ExtensionHelper::$agreements['pm_test']['expiry'] === '2030-05-31', 'Card expiry preserved');
-check(end(Http::$calls)[2] === ['allow_redisplay' => 'always'], 'Redisplay opt-in reaches Stripe');
+check((bool) array_filter(Http::$calls, fn ($call) => $call[0] === 'post' && $call[1] === '/payment_methods/pm_test' && $call[2] === ['allow_redisplay' => 'always']), 'Redisplay opt-in reaches Stripe');
 $method->customer = 'cus_other';
 $warningCount = count(Log::$warnings);
 $callCount = count(Http::$calls);
@@ -189,7 +195,7 @@ $gateway->webhook(eventRequest($setup, type: 'setup_intent.succeeded'));
 $gateway->setupAgreement(new Request(['setup_intent' => 'seti_test']));
 check(count(ExtensionHelper::$agreements) === 2, 'Setup webhook plus redirect retry creates one agreement');
 check(ExtensionHelper::$agreements['pm_link']['name'] === 'Link · s***@example.com', 'Native setup labels Link truthfully');
-check(end(Http::$calls)[2] === ['allow_redisplay' => 'always'], 'Account setup grants redisplay after authorization');
+check((bool) array_filter(Http::$calls, fn ($call) => $call[0] === 'post' && $call[1] === '/payment_methods/pm_link' && $call[2] === ['allow_redisplay' => 'always']), 'Account setup grants redisplay after authorization');
 Auth::$id = 99;
 rejects(fn () => $gateway->setupAgreement(new Request(['setup_intent' => 'seti_test'])), 'HTTP 403');
 Auth::$id = 7;
@@ -279,6 +285,7 @@ require __DIR__ . '/schema-scheduler.php';
 require __DIR__ . '/transaction-method.php';
 require __DIR__ . '/native-upgrade.php';
 require __DIR__ . '/agreement-persistence.php';
+require __DIR__ . '/saved-method-dedupe.php';
 require __DIR__ . '/card-expiry.php';
 require __DIR__ . '/card-dedupe.php';
 require __DIR__ . '/card-dedupe-races.php';

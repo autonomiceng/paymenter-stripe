@@ -422,3 +422,20 @@ from Stripe, since Stripe's list API cannot recover it. No endpoint is deleted.
 Cutover still follows the paused-writer and missed-event reconciliation steps in
 [migration](migrating-from-bundled.md); this does not redirect the bundled core route
 or enable a disabled endpoint.
+
+Saving a card reuses the newest local agreement with the same Stripe fingerprint. Link saves match the full
+Stripe Link account email, ignoring case; billing email and masked labels never identify an account. Existing
+duplicates and attached Stripe methods remain intact for provider references and Auto Pay. Every verified copy
+receives the expiry and consent refresh, including verified receipt-only incoming copies that provider
+subscriptions may still charge. Card matching uses the provider fingerprint for every brand. Each copy has
+its own newer-consent check. A native cache lock
+serializes saves, while provider reads and writes run outside the database owner lock. Consent source receipts
+retain acceptance time and prevent a retried save from replacing a later expiry. The theme groups verified
+identities for display and keeps the original selected agreement IDs. Offline fakes do not prove distributed
+cache behavior or real database concurrency; check those in the test-mode sandbox before release.
+
+Repeated Add card returns wait up to five seconds for the saved receipt, then reuse its result. A longer wait
+shows a retry notice. Removal verifies and detaches every matching local method and its receipt-linked incoming
+copies outside the owner lock. A confirmed missing candidate is skipped; a confirmed missing clicked method
+proceeds with its own local removal without touching other copies. Other provider failures stop native local
+removal so it can finish on retry.
