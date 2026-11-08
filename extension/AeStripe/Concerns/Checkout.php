@@ -407,15 +407,16 @@ trait Checkout
 
     private function savePaidMethod($intent)
     {
-        try {
-            $saved = $this->savePaidMethodDetails($intent);
-            if ($saved === true || is_array($saved)) $this->completeSavedMethodNotices($intent, $saved);
-            else $this->discardSavedMethodNotices($intent);
-            return $saved;
-        } catch (DisplayException $e) {
-            $this->discardSavedMethodNotices($intent);
+        try { $saved = $this->savePaidMethodDetails($intent); }
+        catch (DisplayException $e) {
+            try { $this->discardSavedMethodNotices($intent); } catch (\Throwable $ignored) { $this->noticeWarning('AeStripe notice cleanup will retry'); }
             throw $e;
         }
+        try {
+            if ($saved === true || is_array($saved)) $this->completeSavedMethodNotices($intent, $saved);
+            else $this->discardSavedMethodNotices($intent);
+        } catch (\Throwable $e) { $this->noticeWarning('AeStripe saved method notice will retry'); }
+        return $saved;
     }
 
     private function savePaidMethodDetails($intent)

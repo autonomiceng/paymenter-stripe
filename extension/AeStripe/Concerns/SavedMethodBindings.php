@@ -6,6 +6,8 @@ use App\Models\{BillingAgreement, Gateway, Invoice, Service, User};
 use Illuminate\Support\Facades\{Auth, DB};
 use Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException;
 
+require_once __DIR__ . '/../SavedMethodBusyException.php';
+
 trait SavedMethodBindings
 {
     private const BINDING_RETRY = 'Saved payment methods are being updated. Try again in a moment.';
@@ -13,7 +15,7 @@ trait SavedMethodBindings
     private function withSavedMethodBindingLock(int $userId, callable $change)
     {
         $lock = $this->savedMethodLock($userId);
-        if (!$lock->get()) throw new SavedMethodRetryException(self::BINDING_RETRY);
+        if (!$lock->get()) throw new \Paymenter\Extensions\Gateways\AeStripe\SavedMethodBusyException(self::BINDING_RETRY);
         try { return $change(); } finally { $lock->release(); }
     }
 
@@ -51,6 +53,8 @@ trait SavedMethodBindings
                         User::where('id', $record->user_id)->lockForUpdate()->firstOrFail();
                         $service = Service::where('id', $record->id)->where('user_id', $record->user_id)->lockForUpdate()->firstOrFail();
                         abort_if((bool) $service->subscription_id, 409, 'This service uses its Stripe subscription billing method.');
+                        $current = $service->billingAgreement;
+                        abort_if($current && $current->gateway?->extension !== 'AeStripe', 409, 'The payment method changed. Refresh this service and try again.');
                         $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
                         $service->update(['billing_agreement_id' => null]);
                     });

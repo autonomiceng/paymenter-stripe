@@ -82,11 +82,14 @@ if (str_starts_with($case, 'polish-staff')) {
     $value = json_decode($service->properties()->where('key', 'ae_stripe_auto_pay_pending')->firstOrFail()->value, true);
     $assert($value === $newRecord && $service->fresh()->billing_agreement_id === null, 'Old after-commit callback cannot bind or delete the new owner pending request.');
 } elseif (str_starts_with($case, 'polish-paused-')) {
+    $nearCap = $record + ['retry' => ['attempts' => 9, 'state' => 'pending']];
+    $service->properties()->where('key', 'ae_stripe_auto_pay_pending')->update(['value' => json_encode($nearCap)]);
+    $beforePause = $service->properties()->where('key', 'ae_stripe_auto_pay_pending')->first()->value;
     $bundled = null;
     if (str_contains($case, 'disabled')) $native->update(['enabled' => false]);
     else $bundled = App\Models\Gateway::create(['name' => 'Stripe', 'extension' => 'Stripe', 'type' => 'gateway', 'enabled' => true]);
     $gateway->retryAutoPayInheritance(); $gateway->retryAutoPayInheritance();
-    $assert($pending($service), 'Operational pause preserves pending setup across retries.');
+    $assert($pending($service) && $service->properties()->where('key', 'ae_stripe_auto_pay_pending')->first()->value === $beforePause, 'Operational pause preserves the exact near-cap retry budget.');
     $invalidate = preg_match('/-(off|removed|subscription|owner)$/', $case, $match) ? $match[1] : null;
     if ($invalidate === 'off') $gateway->saveAutoPayDefault(Illuminate\Http\Request::create('/', 'POST', ['enabled' => false]));
     elseif ($invalidate === 'removed') $old->delete();
@@ -97,13 +100,29 @@ if (str_starts_with($case, 'polish-staff')) {
         $assert(!$pending($service), 'Revocation and invalid eligibility are cancelled even during operational pause.');
     }
     if ($bundled) $bundled->update(['enabled' => false]); else $native->update(['enabled' => true]);
+    if (str_ends_with($case, '-failure')) {
+        $reservation = $user->properties()->create(['key' => 'ae_stripe_duplicate_pm_old', 'value' => json_encode(['customer' => 'cus_fixture', 'gateway' => $native->id, 'kept' => 'pm_other'])]);
+        $gateway->retryAutoPayInheritance();
+        $retry = json_decode($service->properties()->where('key', 'ae_stripe_auto_pay_pending')->first()->value, true)['retry'];
+        $assert($retry === ['attempts' => 10, 'state' => 'stopped'], 'First genuine failure after resume consumes exactly the remaining attempt.');
+        $reservation->delete(); $gateway->retryAutoPayInheritance();
+        $assert($service->fresh()->billing_agreement_id === null, 'A stopped request is not automatically revived.');
+        $gateway->saveAutoPayDefault(Illuminate\Http\Request::create('/', 'POST', ['enabled' => true, 'agreement_id' => $old->id, 'consent' => true, 'version' => $gateway::AUTO_PAY_CONSENT]));
+        $assert(!$pending($service) && $service->fresh()->billing_agreement_id === $old->id, 'Explicit account On replaces stopped work.');
+        echo "PASS: $checks pending polish checks ($case, $theme)\n"; return;
+    }
     $gateway->retryAutoPayInheritance();
     $assert(!$pending($service) && $service->fresh()->billing_agreement_id === ($invalidate ? null : $old->id), 'Resume revalidates and completes pending setup.');
 } elseif ($case === 'polish-exhausted') {
     $stoppedLogs = 0; Illuminate\Support\Facades\Log::listen(function ($event) use (&$stoppedLogs) { if ($event->message === 'ae_stripe_auto_pay_binding_stopped') ++$stoppedLogs; });
-    $lock->get();
-    try { for ($i = 0; $i < 15; ++$i) $gateway->retryAutoPayInheritance(); } finally { $lock->release(); }
-    $gateway->retryAutoPayInheritance();
+    $reservation = $user->properties()->create(['key' => 'ae_stripe_duplicate_pm_old', 'value' => json_encode(['customer' => 'cus_fixture', 'gateway' => $native->id, 'kept' => 'pm_other'])]);
+    for ($i = 1; $i <= 10; ++$i) {
+        $gateway->retryAutoPayInheritance();
+        $retry = json_decode($service->properties()->where('key', 'ae_stripe_auto_pay_pending')->first()->value, true)['retry'];
+        $assert($retry === ['attempts' => $i, 'state' => $i < 10 ? 'pending' : 'stopped'], 'Genuine failure has the exact ninth/tenth boundary.');
+    }
+    $reservation->delete();
+    for ($i = 0; $i < 15; ++$i) $gateway->retryAutoPayInheritance();
     $assert($service->fresh()->billing_agreement_id === null, 'Exhausted setup stops automatic retries after the lock clears.');
     $assert($stoppedLogs === 1, 'Only exhaustion logs once; repeated retries do not log forever.');
     $page = Livewire::test(App\Livewire\Services\Show::class, ['service' => $service->fresh()]);
@@ -148,8 +167,25 @@ if (str_starts_with($case, 'polish-staff')) {
         $assert($pending($second), 'Both invoice services have pending setup.');
     }
     foreach ([App\Livewire\Services\Show::class => ['service' => $service->fresh()], App\Livewire\Invoices\Show::class => ['invoice' => $invoice->fresh()]] as $class => $parameters) {
+        if ($case === 'polish-poll-many') {
+            foreach ([$service, $second] as $fixture) {
+                $fixture->refresh()->update(['billing_agreement_id' => null]);
+                $lock->get();
+                try { (new ReflectionMethod($gateway, 'applyNewServiceAutoPay'))->invoke($gateway, $fixture->fresh()); } finally { $lock->release(); }
+                $assert($pending($fixture), 'Each page scenario starts with both independent pending services.');
+            }
+        }
         $page = Livewire::test($class, $parameters);
         $assert(count($delivered($page)) === 1, 'First page load explains pending setup.');
+        if ($case === 'polish-poll-many' && $class === App\Livewire\Invoices\Show::class) {
+            $second->properties()->where('key', 'ae_stripe_auto_pay_pending')->update(['value' => json_encode($record + ['retry' => ['attempts' => 10, 'state' => 'stopped']])]);
+            $page->call('$refresh');
+            $assert(count($delivered($page)) === 1 && str_contains($delivered($page)[0]['params'][0]['message'], 'could not'), 'Only the second service changing to stopped takes precedence.');
+            $page->call('$refresh'); $assert(!$delivered($page), 'Stopped aggregate state is explained once.');
+            $second->properties()->where('key', 'ae_stripe_auto_pay_pending')->update(['value' => json_encode($record)]);
+            $page->call('$refresh'); $assert(count($delivered($page)) === 1, 'Changing only the second service back to pending updates the invoice.');
+            $page->call('$refresh');
+        }
         $page->call('$refresh');
         $assert(!$delivered($page), 'Identical polling does not repeat pending setup warning.');
         $native->update(['enabled' => false]); $page->call('$refresh');

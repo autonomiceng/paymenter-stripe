@@ -3,7 +3,7 @@
 // Optional native integration against a cached Paymenter release; only an in-memory fixture is booted.
 $successful = false;
 register_shutdown_function(static function () use (&$successful) { if (!$successful) exit(1); });
-$release = getenv('PAYMENTER_TEST_APP');
+$release = getenv('PAY_NATIVE_PINNED_APP') ?: getenv('PAYMENTER_TEST_APP');
 if (!$release || !is_file($release . '/vendor/autoload.php')) throw new RuntimeException('A cached Paymenter test release is required.');
 $root = sys_get_temp_dir() . '/ae-stripe-notices-' . bin2hex(random_bytes(6));
 mkdir($root, 0700);
@@ -12,6 +12,7 @@ foreach (['app', 'config', 'database', 'routes', 'vendor', 'resources', 'public'
 foreach (['bootstrap/app.php', 'bootstrap/providers.php', 'composer.json'] as $path) copy($release . '/' . $path, $root . '/' . $path);
 symlink($release . '/themes/default', $root . '/themes/default');
 $themeRoot = getenv('PAY_NOTICE_THEME');
+if ($themeRoot && !is_file($themeRoot . '/views/invoices/show.blade.php')) throw new RuntimeException('Selected native theme is unavailable.');
 $theme = $themeRoot ? 'beco' : 'default';
 if ($themeRoot) symlink($themeRoot, $root . '/themes/beco');
 foreach (['APP_ENV' => 'testing', 'APP_KEY' => 'base64:' . base64_encode(str_repeat('t', 32)), 'APP_URL' => 'http://stripe-tests.invalid',

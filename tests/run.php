@@ -1,5 +1,6 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
+if (getenv('PAY_PENDING_MATRIX')) { require __DIR__ . '/native-pending-matrix.php'; return; }
 if (getenv('PAY_CLEANUP_CASE') === 'notice-native' || getenv('PAY_BINDING_CASE') === 'native' || getenv('PAY_CHECKOUT_NATIVE')) {
     require __DIR__ . '/native-saved-notices.php';
     return;
@@ -339,4 +340,5 @@ foreach (['pending-survivor', 'removed-survivor', 'reserved-survivor', 'bound-re
 foreach (['account-during', 'reserved-account', 'repair-account', 'repair-service', 'lost-detach', 'unreconciled', 'survivor-change', 'missing-identity', 'missing-customer', 'turn-off', 'inherit-during', 're-add'] as $bindingCase) {
     (function () use ($bindingCase) { require __DIR__ . '/cleanup-bindings.php'; })();
 }
+require __DIR__ . '/native-ci-selection.php';
 echo "PASS: $count offline assertions\n";

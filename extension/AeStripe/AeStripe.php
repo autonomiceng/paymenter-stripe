@@ -48,8 +48,8 @@ require_once __DIR__ . '/Concerns/Signature.php';
 require_once __DIR__ . '/Concerns/Checkout.php';
 require_once __DIR__ . '/Concerns/CardDuplicates.php';
 require_once __DIR__ . '/Concerns/SavedMethods.php';
-require_once __DIR__ . '/Concerns/SavedMethodBindings.php';
 require_once __DIR__ . '/SavedMethodRetryException.php';
+require_once __DIR__ . '/Concerns/SavedMethodBindings.php';
 require_once __DIR__ . '/Concerns/Amounts.php';
 require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
 require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
@@ -149,6 +149,12 @@ class AeStripe extends Gateway
             app(\Livewire\EventBus::class)->before('hydrate', function ($component, $memo) {
                 \Livewire\store($component)->set('aeStripePendingState', $memo['aeStripePendingState'] ?? null);
                 \Livewire\store($component)->set('aeStripeSavedNotice', $memo['aeStripeSavedNotice'] ?? null);
+                \Livewire\store($component)->set('aeStripeNoticeDone', $memo['aeStripeNoticeDone'] ?? false);
+            });
+            app(\Livewire\EventBus::class)->on('render', function ($component) {
+                return function ($html, $replaceHtml) use ($component) {
+                    if ($this->savedNoticeNeedsPolling($component)) $replaceHtml(preg_replace('/(<[^>]+>)/', '$1<span hidden data-ae-stripe-notice-poll wire:poll.5s="$refresh"></span>', $html, 1));
+                };
             });
             app(\Livewire\EventBus::class)->before('dehydrate', function ($component, $context) {
                 $this->deliverSavedMethodNotice($component, $context);
@@ -169,7 +175,7 @@ class AeStripe extends Gateway
                 catch (\Throwable $e) { \Illuminate\Support\Facades\Log::warning('AeStripe invoice cancellation will retry', ['invoice_id' => $event->invoice->id]); }
             });
         });
-        Service::updated(fn ($service) => $this->invalidatePendingAutoPay($service));
+        Service::updating(fn ($service) => $this->invalidatePendingAutoPay($service));
         Event::listen(\App\Events\Service\Created::class, fn ($event) => $this->applyNewServiceAutoPay($event->service));
         // Core boots disabled gateways too. Let the bundled listener own legacy subscriptions.
         if (!$this->bundledInactive(requireAbsent: true)) {

@@ -486,8 +486,8 @@ Revocation, removal, reassignment, explicit service opt-out or a newer selection
 Stripe subscriptions retain their own billing method and reject local-only service card changes. Invoice defaults skip
 subscription services while ordinary invoice payment continues. No schema or extension version change is required.
 
-Pending Auto Pay retains valid work while AE Stripe is paused or bundled Stripe is active. Ten failed
-binding attempts stop automatic setup and explain manual service selection or invoice payment. Explicit
+Pending Auto Pay retains valid work while AE Stripe is paused or bundled Stripe is active. Ten genuine failed
+binding attempts (excluding ordinary shared-lock contention) stop automatic setup and explain manual service selection or invoice payment. Explicit
 account Off, customer clear, staff opt-out, a changed service selection and each ownership transfer cancel
 pending work immediately. The native staff Billing Agreement field offers Turn off Auto Pay because an
 already empty field cannot record a deliberate None selection separately from an unrelated save.
@@ -496,7 +496,25 @@ Pending warnings appear once per page and state, including a pause or exhausted 
 Checkout confirmation records include the payment intent and original tab token before saving starts.
 A successful webhook or the scheduled recovery completes a deferred confirmation, and the original
 invoice can receive it on a later poll. Refused saving produces no success. Reusing a token for another
-intent allocates a distinct stable token. Consumed notices are pruned after 30 days; the existing saved
-method receipt preserves delivery history. Confirmations for intents older than 30 days are not recreated.
+intent allocates a distinct stable token. Abandoned pending, ready and consumed notices expire after 30 days; existing saved
+method receipts preserve delivery history. Missing intents back off independently, and irrecoverable
+confirmations stop scheduled recovery after 20 attempts. A later successful webhook can still finish
+a retained confirmation. Access errors, rate limits and outages stop each recovery pass.
+Notice-only maintenance failures do not fail settlement or unrelated inheritance.
+The invoice keeps a notice-specific poll until completion/refusal/expiry, including after payment polling stops. Confirmations for intents older than 30 days are not recreated.
 Legacy notices keep their original delivery state; new confirmations use a separate intent-bound token.
 These changes use existing properties and require no schema or extension version change.
+
+Native pending integration is provisioned in public CI from Paymenter 1.5.9 commit
+`ee729f7d99ac18942625b79f3f93d8d8b21255e8` with its locked Composer dependencies, PHP 8.4.27
+and SQLite. Run `PAYMENTER_TEST_APP=/path/to/release PAY_PENDING_MATRIX=1 php tests/run.php`
+to select the same isolated cases locally. `PAYMENTER_TEST_PHP` can select a local PHP wrapper.
+Missing dependencies or an explicitly selected missing theme fail. The public job uses only the
+public default theme, synthetic credentials and fake HTTP with stray requests forbidden. An
+authorized private integration run can additionally set `PAY_NOTICE_THEME` to its pinned theme;
+private theme source and credentials never enter the public workflow.
+
+Owner/selection changes revoke old pending setup before the service SQL. An enclosing native
+transaction rolls both changes back together. An autocommit interruption after SQL cannot revive
+old consent on an ownership round trip; an autocommit write that fails after revocation conservatively
+requires fresh setup. Staff opt-out rechecks the current gateway under the owner/service locks.
