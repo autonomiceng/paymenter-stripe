@@ -1303,6 +1303,19 @@ use Illuminate\Support\Facades\{DB, Http};
             // Demo r28: paying with "Save this card for next time" saved nothing when the webhook did not save it.
             check((ExtensionHelper::$agreements['pm_paid']['name'] ?? null) === 'Visa **** 4242', 'Paying with Save ticked saves the card at once, without waiting for the webhook');
         });
+        $run('checkout-notice-return', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20); $stripe->status = 'requires_action';
+            $token = str_repeat('c', 32);
+            $response = $gateway->confirmPayment(new Request(['intent' => 'pi_test1', 'save' => true,
+                'confirmation_token' => 'ctoken_test', 'amount' => 2000, 'saved_notice' => $token]));
+            check(($response['data']['saved_notice'] ?? null) === $token, 'Authentication keeps the checkout notice token');
+            $intent = $stripe->intents['pi_test1']; $intent->status = 'succeeded'; $intent->amount_received = $intent->amount;
+            $destination = $gateway->finishPayment(new Request(['payment_intent' => $intent->id,
+                'payment_intent_client_secret' => $intent->client_secret, 'saved_notice' => $token]));
+            check(is_string($destination) && str_contains($destination, 'saved_notice=' . $token), 'The authenticated bank return preserves the checkout-tab notice destination');
+            $notice = json_decode(User::$row->props->values['ae_stripe_notice_' . hash('sha256', $token)] ?? 'null', true);
+            check(($notice['invoice_id'] ?? null) === 920 && !($notice['consumed'] ?? true), 'Bank return stores a claimable notice for the paid invoice');
+        });
         $run('checkout-no-save', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20);
             $response = $gateway->confirmPayment(new Request(['intent' => 'pi_test1', 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));

@@ -108,7 +108,7 @@ if (in_array('--receipt-returns', $argv, true)) {
     return;
 }
 
-if (in_array('--charge-attempts', $argv, true)) {
+if (in_array('--charge-attempts', $argv, true) || getenv('PAY_BANK_NOTICE')) {
     require __DIR__ . '/charge-attempts.php';
     echo "PASS: $count charge attempt assertions\n";
     return;
