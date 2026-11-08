@@ -16,12 +16,16 @@ Removing the retained agreement still prevents reuse. The setup redirect returns
 From the Paymenter root, review existing duplicates with
 `php artisan ae-stripe:deduplicate-cards`. It only reads Stripe and lists local
 agreement IDs, matching both fingerprint and expiry.
-`php artisan ae-stripe:deduplicate-cards --apply` detaches and soft-deletes only duplicates with no service binding. It preserves the broadest
-existing redisplay setting and rechecks ownership and bindings before removal.
+`php artisan ae-stripe:deduplicate-cards --apply` detaches fresh duplicates only when they have no service or account Auto Pay binding.
+When resuming a verified already-detached duplicate, it moves remaining owned bindings to the same-card survivor before removing the entry.
+It preserves the broadest existing redisplay setting and rechecks ownership and bindings before removal.
 Cleanup makes provider calls outside database transactions and rechecks exact local state before writes.
 Failed agreements are reported while the remaining rows continue. Busy shared locks and changed plans
 are identified as retryable; other failures retain the manual-review message.
 If any agreements are skipped, the command reports the count and exits nonzero.
+Cards being removed or reserved for another cleanup cannot be survivors. Unresolved bound reservations also exit nonzero.
+If the survivor was removed but its original card is still attached to the same customer, apply cancels that unused reservation
+without detaching the original. Already-detached cards without a verified survivor remain reported for reconciliation.
 Stripe supports changing the retained card’s [expiry fields](https://docs.stripe.com/api/payment_methods/update?api-version=2025-07-30.basil&query=card).
 Use a sandbox first. No cleanup has been run against a live installation.
 

@@ -110,7 +110,7 @@ if ($case === 'http') {
         return $handler($verb, $path, $data);
     };
     $remove = fn () => $gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements['pm_new']));
-    check(!$remove() && ExtensionHelper::$agreements['pm_old']['deleted_at'] === null, 'Partial failure preserves local rows for retry');
+    check(!$remove() && ExtensionHelper::$agreements['pm_old']['deleted_at'] !== null && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null, 'Partial failure reconciles detached copies and preserves the live clicked row for retry');
     try { invoke($gateway, 'persistAgreement', $user, $methods['pm_alias'], ['source' => 'seti_late', 'user_id' => 7]); throw new RuntimeException('Expected removal refusal'); }
     catch (App\Exceptions\DisplayException $e) { check(str_contains($e->getMessage(), 'removed'), 'An interrupted removal cannot be undone by a delayed save'); }
     Http::$handler = function ($verb, $path, $data) use ($handler) {
@@ -180,14 +180,16 @@ if ($case === 'http') {
     $intent = (object) ['id' => 'pi_first', 'customer' => 'cus_owner', 'payment_method' => 'pm_new',
         'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1'],
         'payment_method_options' => (object) ['card' => (object) ['setup_future_usage' => 'off_session']]];
-    invoke($gateway, 'saveConsentedMethod', $intent);
-    $actual = Session::$values['ae_stripe_saved_notice_12']['notice'] ?? Session::$flashes['notification'] ?? null;
+    $noticeToken = invoke($gateway, 'saveConsentedMethod', $intent);
+    $checkoutNotice = json_decode($user->props->values['ae_stripe_notice_' . hash('sha256', (string) $noticeToken)] ?? 'null', true)['notice'] ?? Session::$values['ae_stripe_saved_notice_12']['notice'] ?? null;
+    $actual = $checkoutNotice ?? Session::$flashes['notification'] ?? null;
     check($actual === $expected, 'Independent first saves through Add card and checkout deliver the same notice');
     foreach (['no-consent', 'wrong-customer'] as $refusal) {
         Session::$flashes = Session::$values = [];
         if ($refusal === 'no-consent') $intent->metadata->ae_stripe_consent = '0';
         else { $intent->metadata->ae_stripe_consent = '1'; $methods['pm_new']->customer = 'cus_other'; }
-        invoke($gateway, 'saveConsentedMethod', $intent);
+        $noticeToken = invoke($gateway, 'saveConsentedMethod', $intent);
+    $checkoutNotice = json_decode($user->props->values['ae_stripe_notice_' . hash('sha256', (string) $noticeToken)] ?? 'null', true)['notice'] ?? Session::$values['ae_stripe_saved_notice_12']['notice'] ?? null;
         check(Session::$flashes === [] && Session::$values === [], 'A false/null save does not publish a success notice');
     }
 }

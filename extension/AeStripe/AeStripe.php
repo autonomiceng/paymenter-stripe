@@ -64,6 +64,7 @@ require_once __DIR__ . '/Concerns/ReversalReview.php';
 require_once __DIR__ . '/Concerns/WebhookContinuity.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
 require_once __DIR__ . '/Concerns/AutoPay.php';
+require_once __DIR__ . '/Concerns/AutoPayInheritance.php';
 require_once __DIR__ . '/Concerns/SetupIntent.php';
 require_once __DIR__ . '/Concerns/Webhooks.php';
 require_once __DIR__ . '/Concerns/PaymentFees.php';
@@ -78,7 +79,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, Concerns\SavedMethods, Concerns\SavedMethodBindings, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\AutoPayInheritance, Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, Concerns\SavedMethods, Concerns\SavedMethodBindings, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -120,6 +121,8 @@ class AeStripe extends Gateway
     public function boot()
     {
         if (app()->runningInConsole()) {
+            app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryAutoPayInheritance())
+                ->name('ae-stripe:auto-pay-inheritance')->everyMinute()->onOneServer()->withoutOverlapping(5));
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryChargeAttempts())
                 ->name('ae-stripe:charge-attempts')->everyFiveMinutes()->onOneServer()->withoutOverlapping(60));
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryReceiptReturns())
@@ -138,7 +141,10 @@ class AeStripe extends Gateway
             });
         }
         if (function_exists('Livewire\\on')) {
-            app(\Livewire\EventBus::class)->before('dehydrate', fn ($component) => $this->deliverSavedMethodNotice($component));
+            app(\Livewire\EventBus::class)->before('dehydrate', function ($component) {
+                $this->deliverSavedMethodNotice($component);
+                $this->deliverAutoPayPendingNotice($component);
+            });
             app(\Livewire\EventBus::class)->before('call', function ($component, $method, $params, $context, $returnEarly) {
                 $this->bindNativeSavedMethod($component, $method, $returnEarly);
             });

@@ -1,8 +1,12 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-if (getenv('PAY_CLEANUP_CASE') === 'notice-native' || getenv('PAY_BINDING_CASE') === 'native') {
+if (getenv('PAY_CLEANUP_CASE') === 'notice-native' || getenv('PAY_BINDING_CASE') === 'native' || getenv('PAY_CHECKOUT_NATIVE')) {
     require __DIR__ . '/native-saved-notices.php';
     return;
+}
+if (getenv('PAY_CHECKOUT_BROWSER')) {
+    $run = proc_open([getenv('PAYMENTER_TEST_NODE') ?: 'node', __DIR__ . '/payment-errors.mjs', 'pay'], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
+    exit(proc_close($run));
 }
 require __DIR__ . '/fakes.php';
 require __DIR__ . '/../extension/AeStripe/AeStripe.php';
@@ -65,6 +69,11 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
     };
 };
 
+if (getenv('PAY_CHECKOUT_CASE')) {
+    require __DIR__ . '/checkout-followups.php';
+    return;
+}
+
 if (getenv('PAY_BINDING_CASE')) {
     require __DIR__ . '/cleanup-bindings.php';
     return;
@@ -99,7 +108,7 @@ if (in_array('--receipt-returns', $argv, true)) {
     return;
 }
 
-if (in_array('--charge-attempts', $argv, true)) {
+if (in_array('--charge-attempts', $argv, true) || getenv('PAY_BANK_NOTICE')) {
     require __DIR__ . '/charge-attempts.php';
     echo "PASS: $count charge attempt assertions\n";
     return;
@@ -316,6 +325,9 @@ foreach (['pending', 'removed-replay', 'version', 'cleanup-replay', 'cleanup-rem
 }
 foreach (['http', 'contention', 'notice-first', 'post-state', 'retry', 'recovery', 'state-customer', 'state-owner', 'state-gateway', 'state-id', 'state-expiry', 'state-receipt', 'state-service', 'state-account', 'removal-customer', 'removal-owner', 'removal-gateway', 'removal-id'] as $cleanupCase) {
     (function () use ($cleanupCase) { require __DIR__ . '/cleanup-http.php'; })();
+}
+foreach (['pending-survivor', 'removed-survivor', 'reserved-survivor', 'bound-reservation', 'bound-reservation-late', 'orphan-reservation', 'removal-partial', 'removal-owner', 'removal-gateway', 'removal-id', 'removal-missing', 'save-reserved', 'save-reserved-new', 'save-reserved-expiry', 'save-replay', 'notice-during-cleanup', 'legacy-reserved-survivor', 'removing-message'] as $checkoutCase) {
+    (function () use ($checkoutCase) { require __DIR__ . '/checkout-followups.php'; })();
 }
 foreach (['account-during', 'reserved-account', 'repair-account', 'repair-service', 'lost-detach', 'unreconciled', 'survivor-change', 'missing-identity', 'missing-customer', 'turn-off', 'inherit-during', 're-add'] as $bindingCase) {
     (function () use ($bindingCase) { require __DIR__ . '/cleanup-bindings.php'; })();

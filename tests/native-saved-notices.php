@@ -88,6 +88,11 @@ Illuminate\Support\Facades\Http::fake(function ($request) use (&$methods, $setup
     }
     throw new RuntimeException('Unexpected native fixture request.');
 });
+if (getenv('PAY_CHECKOUT_NATIVE')) {
+    require __DIR__ . '/native-checkout-followups.php';
+    $successful = true;
+    return;
+}
 if (getenv('PAY_BINDING_CASE') === 'native') {
     require __DIR__ . '/native-cleanup-bindings.php';
     $successful = true;
@@ -112,15 +117,15 @@ foreach (['first', 'duplicate'] as $case) {
     $intent = json_decode(json_encode(['id' => 'pi_notice_' . $case, 'status' => 'succeeded', 'customer' => 'cus_fixture', 'payment_method' => 'pm_new',
         'payment_method_options' => ['card' => ['setup_future_usage' => 'off_session']],
         'metadata' => ['invoice_id' => $invoice->id, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1', 'ae_stripe_consent_at' => '1794071700']]));
-    (new ReflectionMethod($gateway, 'saveConsentedMethod'))->invoke($gateway, $intent);
+    $noticeToken = (new ReflectionMethod($gateway, 'saveConsentedMethod'))->invoke($gateway, $intent);
     // Finish the JSON response and one unrelated session request before loading the destination.
     session()->save(); session()->start(); session()->save(); session()->start();
     $unrelated = Livewire\Livewire::test(App\Livewire\Invoices\Show::class, ['invoice' => $other->fresh()]);
     $assert(!$delivered($unrelated), 'Another invoice cannot consume the pending save notice.');
-    $page = Livewire\Livewire::test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
+    $page = Livewire\Livewire::withQueryParams(['saved_notice' => $noticeToken])->test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
     $assert(($delivered($page)[0]['params'][0] ?? null) == $expected, 'The destination invoice delivers the saved-card notice after intervening requests.');
     $assert(str_contains($page->html(), 'invoice'), 'The actual invoice view renders with notice delivery.');
-    $page = Livewire\Livewire::test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
+    $page = Livewire\Livewire::withQueryParams(['saved_notice' => $noticeToken])->test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
     $assert(!$delivered($page), 'Refreshing the invoice does not deliver the notice twice.');
 }
 $successful = true;

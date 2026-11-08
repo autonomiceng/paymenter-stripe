@@ -174,7 +174,7 @@ if (in_array($case, ['pending', 'removed-replay'], true)) {
     ExtensionHelper::$agreements['pm_new'] = array_replace($row(20, 'pm_new'), ['type' => 'link']);
     $save('pm_alias');
     $fail = ['post', '/payment_methods/pm_alias/detach'];
-    check(!$remove('pm_new') && ExtensionHelper::$agreements['pm_old']['deleted_at'] === null, 'Failed Link removal retains local agreements for retry');
+    check(!$remove('pm_new') && ExtensionHelper::$agreements['pm_old']['deleted_at'] !== null && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null, 'Failed Link removal reconciles detached copies and retains its live clicked row for retry');
     $fail = null;
     check($remove('pm_new'), 'Link copy removal succeeds on retry');
     check($methods['pm_old']->customer === null && $methods['pm_new']->customer === null && $methods['pm_alias']->customer === null,
@@ -190,10 +190,11 @@ if (in_array($case, ['pending', 'removed-replay'], true)) {
     $intent = (object) ['id' => 'pi_followup', 'customer' => 'cus_owner', 'payment_method' => 'pm_new', 'status' => 'succeeded',
         'payment_method_options' => (object) ['card' => (object) ['setup_future_usage' => 'off_session']],
         'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1', 'ae_stripe_consent_at' => '1794071700']];
-    invoke($gateway, 'saveConsentedMethod', $intent);
-    check((Session::$values['ae_stripe_saved_notice_12']['notice']['type'] ?? null) === 'success'
-        && str_contains(Session::$values['ae_stripe_saved_notice_12']['notice']['message'] ?? '', 'already saved'), 'Checkout reuse notice uses the native notification handler');
-    $expected = Session::$values['ae_stripe_saved_notice_12']['notice'];
+    $noticeToken = invoke($gateway, 'saveConsentedMethod', $intent);
+    $checkoutNotice = json_decode($user->props->values['ae_stripe_notice_' . hash('sha256', (string) $noticeToken)] ?? 'null', true)['notice'] ?? Session::$values['ae_stripe_saved_notice_12']['notice'] ?? null;
+    check(($checkoutNotice['type'] ?? null) === 'success'
+        && str_contains($checkoutNotice['message'] ?? '', 'already saved'), 'Checkout reuse notice uses the native notification handler');
+    $expected = $checkoutNotice;
     $setup = (object) ['id' => 'seti_followup', 'status' => 'succeeded', 'customer' => 'cus_owner', 'payment_method' => 'pm_new', 'latest_attempt' => null,
         'metadata' => (object) ['user_id' => '7', 'is_billing_agreement' => '1', 'ae_stripe_setup_consent' => 'off_session_v2',
             'ae_stripe_setup_consent_user' => '7', 'ae_stripe_setup_consent_at' => '1794071700']];

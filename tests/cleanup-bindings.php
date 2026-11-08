@@ -85,12 +85,12 @@ if (in_array($case, ['account-during', 'reserved-account'], true)) {
     $service = Service::$row = new Service;
     $service->subscription_id = null; $service->plan->type = 'recurring';
     $bind = function () use ($gateway, $service) {
-        try { invoke($gateway, 'applyNewServiceAutoPay', $service); throw new RuntimeException('Expected inheritance contention'); }
-        catch (\Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException $e) { check(str_contains($e->getMessage(), 'Try again'), 'Service inheritance uses the shared binding lock'); }
+        invoke($gateway, 'applyNewServiceAutoPay', $service);
+        check(isset($service->properties->values['ae_stripe_auto_pay_pending']), 'Service inheritance retains pending work during lock contention');
         check($service->billing_agreement_id === null, 'Contended inheritance does not choose a card');
     };
     check($gateway->deduplicateCards(true, fn ($line) => null) === 0 && $entered, 'Cleanup can finish while new-service inheritance is refused');
-    invoke($gateway, 'applyNewServiceAutoPay', $service);
+    invoke($gateway, 'finishAutoPayInheritance', 7, $service->id);
     check($service->billing_agreement_id === 19, 'Retry inherits the exact existing account choice after cleanup');
 } elseif ($case === 'turn-off') {
     $user->props->values['ae_stripe_auto_pay_default'] = json_encode(array_replace($record, ['agreement_id' => 19]));

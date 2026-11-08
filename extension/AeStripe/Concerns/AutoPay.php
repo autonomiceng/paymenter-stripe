@@ -84,6 +84,7 @@ trait AutoPay
                 $this->stopWaitingRenewals($user);
                 $user->properties()->where('key', self::AUTO_PAY_PROPERTY)->delete();
                 foreach ($this->autoPayServices($user) as $service) {
+                    $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
                     if ($service->billing_agreement_id) $service->update(['billing_agreement_id' => null]);
                 }
                 return response()->json(['ok' => true, 'enabled' => false]);
@@ -103,6 +104,7 @@ trait AutoPay
             foreach ($this->autoPayServices($user) as $service) {
                 if (($service->plan?->type ?? null) !== 'recurring' || $service->status === Service::STATUS_CANCELLED) continue;
                 if ($service->billing_agreement_id != $agreement->id) $service->update(['billing_agreement_id' => (int) $agreement->id]);
+                $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
                 $services++;
             }
             return response()->json(['ok' => true, 'enabled' => true, 'services' => $services]);
@@ -154,26 +156,6 @@ trait AutoPay
         foreach ($this->autoPayServices($user) as $service) {
             if ($service->billing_agreement_id == $agreementId) $service->update(['billing_agreement_id' => null]);
         }
-    }
-
-    /** Called synchronously by Service Created only; turning the switch on links existing services. Never reapply on Updated. */
-    private function applyNewServiceAutoPay(Service $service): void
-    {
-        if (!$this->gatewayEnabled() || !$this->bundledInactive()) return;
-        $owner = User::where('id', $service->user_id)->firstOrFail();
-        if (!$this->autoPayDefault($owner)) return;
-        $this->withSavedMethodBindingLock((int) $owner->id, fn () => DB::transaction(function () use ($service) {
-            $user = User::where('id', $service->user_id)->lockForUpdate()->firstOrFail();
-            $current = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
-            if ($current->user_id != $user->id || $current->billing_agreement_id || $current->subscription_id
-                || ($current->plan?->type ?? null) !== 'recurring' || $current->status === Service::STATUS_CANCELLED) return;
-            $record = $this->autoPayDefault($user, lock: true);
-            if ($record) {
-                $agreement = BillingAgreement::where('id', $record['agreement_id'])->where('user_id', $user->id)->lockForUpdate()->firstOrFail();
-                $this->assertSavedMethodBindable($user, $agreement);
-                $current->update(['billing_agreement_id' => $record['agreement_id']]);
-            }
-        }));
     }
 
     /** Local read-only dates for account, service and invoice opt-ins. No provider calls. */
