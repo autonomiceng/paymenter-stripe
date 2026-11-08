@@ -71,7 +71,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 #[ExtensionMeta(
     name: 'AE Stripe',
     description: 'Stripe payments with saved cards.',
-    version: '0.1.1',
+    version: '0.1.2',
     author: 'Autonomic Engineering',
     icon: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cmVjdCB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgZmlsbD0iIzUzM0FGRCIvPjxwYXRoIGQ9Ik0xMjAgMzkyTDM5MiAzMzRWMTEyTDEyMCAxNz hWMzk yWiIgZmlsbD0iI2ZmZiIvPjwvc3ZnPg=='
 )]

@@ -297,7 +297,7 @@ require __DIR__ . '/card-dedupe-races.php';
 require __DIR__ . '/converted-card-dedupe.php';
 require __DIR__ . '/card-dedupe-failures.php';
 require __DIR__ . '/card-dedupe-candidates.php';
-foreach (['pending', 'cleanup-replay', 'cleanup-removal', 'missing', 'warning', 'index', 'cleanup-lock', 'cache', 'link', 'terms', 'notices'] as $followupCase) {
+foreach (['pending', 'removed-replay', 'version', 'cleanup-replay', 'cleanup-removal', 'missing', 'warning', 'index', 'cleanup-lock', 'cache', 'link', 'terms', 'notices'] as $followupCase) {
     (function () use ($followupCase) { require __DIR__ . '/saved-method-followups.php'; })();
 }
 echo "PASS: $count offline assertions\n";

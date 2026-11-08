@@ -3,8 +3,10 @@
 use App\Helpers\ExtensionHelper;
 use App\Models\{BillingAgreement, Gateway, Invoice, Properties, User};
 use Illuminate\Http\Client\RequestException;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\{Cache, DB, Http, Session};
 use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
+global $count;
 
 $user = User::$row = new User(new Properties('cus_owner'));
 Invoice::$row = new Invoice($user);
@@ -38,12 +40,12 @@ $save = fn ($id = 'pm_new', $source = 'seti_followup') => invoke($gateway, 'pers
     ['source' => $source, 'user_id' => 7, 'accepted_at' => 1794071700]);
 $remove = fn ($id = 'pm_old') => $gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements[$id]));
 $case = $followupCase ?? getenv('PAY_FOLLOWUP_CASE');
-if ($case === 'pending') {
+if (in_array($case, ['pending', 'removed-replay'], true)) {
     $fail = ['post', '/payment_methods/pm_new'];
     try { $save(); throw new RuntimeException('Expected pending save'); } catch (RequestException $e) {}
     $fail = null;
     check($remove(), 'Removing an agreement with an unfinished incoming save succeeds');
-    check($methods['pm_new']->customer === null, 'Removal detaches matching pending-receipt incoming methods');
+    if ($case === 'pending') check($methods['pm_new']->customer === null, 'Removal detaches matching pending-receipt incoming methods');
     (new BillingAgreement(ExtensionHelper::$agreements['pm_old']))->delete();
     // The same saved source must remain removed even if a later operation reattaches the provider method.
     $methods['pm_new']->customer = 'cus_owner';
@@ -51,6 +53,8 @@ if ($case === 'pending') {
     try { $save(); throw new RuntimeException('A removed save receipt must refuse replay'); }
     catch (\App\Exceptions\DisplayException $e) { check(str_contains($e->getMessage(), 'removed'), 'Removed pending sources refuse replay'); }
     check(ExtensionHelper::$agreements === $before, 'A removed receipt cannot recreate an agreement');
+    try { $save('pm_new', 'seti_other'); throw new RuntimeException('A new source must not restore a removed reference'); }
+    catch (\App\Exceptions\DisplayException $e) { check(str_contains($e->getMessage(), 'removed'), 'New sources cannot restore removed provider references'); }
 } elseif (in_array($case, ['cleanup-replay', 'cleanup-removal'], true)) {
     ExtensionHelper::$agreements['pm_new'] = $row(20, 'pm_new');
     $save('pm_alias'); // This completed receipt points at the newer local agreement, pm_new.
@@ -122,16 +126,20 @@ if ($case === 'pending') {
     foreach (['pm_other' => 'other@example.com', 'pm_unknown' => null] as $id => $email) {
         $methods[$id] = (object) ['id' => $id, 'type' => 'link', 'customer' => 'cus_owner', 'link' => (object) ['email' => $email]];
     }
+    foreach (['pm_other' => 21, 'pm_unknown' => 22] as $id => $number) ExtensionHelper::$agreements[$id] = array_replace($row($number, $id), ['type' => 'link']);
     ExtensionHelper::$agreements['pm_old']['type'] = 'link';
     ExtensionHelper::$agreements['pm_new'] = array_replace($row(20, 'pm_new'), ['type' => 'link']);
     $save('pm_alias');
-    $fail = ['post', '/payment_methods/pm_old/detach'];
+    $fail = ['post', '/payment_methods/pm_alias/detach'];
     check(!$remove('pm_new') && ExtensionHelper::$agreements['pm_old']['deleted_at'] === null, 'Failed Link removal retains local agreements for retry');
     $fail = null;
     check($remove('pm_new'), 'Link copy removal succeeds on retry');
     check($methods['pm_old']->customer === null && $methods['pm_new']->customer === null && $methods['pm_alias']->customer === null,
         'Link removal detaches both local and receipt-only matching account copies');
     check($methods['pm_other']->customer === 'cus_owner' && $methods['pm_unknown']->customer === 'cus_owner', 'Different or unknown Link accounts are untouched');
+} elseif ($case === 'version') {
+    $meta = (new ReflectionClass(AeStripe::class))->getAttributes(\App\Attributes\ExtensionMeta::class)[0]->getArguments();
+    check(version_compare($meta['version'], '0.1.1', '>'), 'A schema-changing update advertises a newer extension version');
 } elseif ($case === 'terms') {
     $view = file_get_contents(__DIR__ . '/../extension/AeStripe/resources/views/billing-agreement.blade.php');
     check(str_contains($view, '>Terms of Service</a>'), 'The Add card agreement names Terms of Service');
@@ -142,5 +150,12 @@ if ($case === 'pending') {
     invoke($gateway, 'saveConsentedMethod', $intent);
     check((Session::$flashes['notification']['type'] ?? null) === 'success'
         && str_contains(Session::$flashes['notification']['message'] ?? '', 'already saved'), 'Checkout reuse notice uses the native notification handler');
+    $expected = Session::$flashes['notification'];
+    $setup = (object) ['id' => 'seti_followup', 'status' => 'succeeded', 'customer' => 'cus_owner', 'payment_method' => 'pm_new', 'latest_attempt' => null,
+        'metadata' => (object) ['user_id' => '7', 'is_billing_agreement' => '1', 'ae_stripe_setup_consent' => 'off_session_v2',
+            'ae_stripe_setup_consent_user' => '7', 'ae_stripe_setup_consent_at' => '1794071700']];
+    $handler = Http::$handler;
+    Http::$handler = fn ($verb, $path, $data) => $path === '/setup_intents/seti_followup' ? $setup : $handler($verb, $path, $data);
+    check($gateway->setupAgreement(new Request(['setup_intent' => 'seti_followup'])) === $expected, 'Add card uses the same native notification shape as checkout');
 }
 echo "PASS: $case, $count followup assertions\n";

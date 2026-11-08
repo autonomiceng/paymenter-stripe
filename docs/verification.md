@@ -428,14 +428,20 @@ Stripe Link account email, ignoring case; billing email and masked labels never 
 duplicates and attached Stripe methods remain intact for provider references and Auto Pay. Every verified copy
 receives the expiry and consent refresh, including verified receipt-only incoming copies that provider
 subscriptions may still charge. Card matching uses the provider fingerprint for every brand. Each copy has
-its own newer-consent check. A native cache lock
-serializes saves, while provider reads and writes run outside the database owner lock. Consent source receipts
+its own newer-consent check. A shared native cache lock
+serializes saves, removal and duplicate cleanup, while provider reads and writes run outside the database owner lock. Consent source receipts
 retain acceptance time and prevent a retried save from replacing a later expiry. The theme groups verified
 identities for display and keeps the original selected agreement IDs. Offline fakes do not prove distributed
-cache behavior or real database concurrency; check those in the test-mode sandbox before release.
+cache behavior or real database concurrency; check those in the test-mode sandbox before release. All workers must use the same database, Redis, Memcached
+or DynamoDB cache store and lock namespace. Array, file, null, failover and other stores are refused for saved-method
+changes; configure a central store (including its required lock table for database caching).
 
 Repeated Add card returns wait up to five seconds for the saved receipt, then reuse its result. A longer wait
 shows a retry notice. Removal verifies and detaches every matching local method and its receipt-linked incoming
 copies outside the owner lock. A confirmed missing candidate is skipped; a confirmed missing clicked method
-proceeds with its own local removal without touching other copies. Other provider failures stop native local
+uses its server-verified identity index to find remaining copies. Without that identity it removes only its own
+local entry and warns that other copies could not be verified. Pending and completed save receipts are marked
+removed so a delayed setup or payment webhook cannot restore them. Cleanup redirects completed receipts to the
+verified surviving agreement, including retries after a detach. Unrelated receipt-only methods with a verified
+different identity are skipped before Stripe reads; unknown identities are still verified remotely. Other provider failures stop native local
 removal so it can finish on retry.

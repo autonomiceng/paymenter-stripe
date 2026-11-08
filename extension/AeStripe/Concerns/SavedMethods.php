@@ -69,7 +69,9 @@ trait SavedMethods
     private function savedMethodIndex($user, string $reference, $customer, $gateway): array
     {
         $index = json_decode($user->properties()->where('key', 'ae_stripe_method_' . $reference)->first()?->value ?? 'null', true);
-        return ($index['customer'] ?? null) === $customer && ($index['gateway_id'] ?? null) == $gateway->id ? $index : [];
+        if (($index['customer'] ?? null) !== $customer || ($index['gateway_id'] ?? null) != $gateway->id) return [];
+        if (isset($index['identity']) && (!is_string($index['identity']) || !preg_match('/\A[0-9a-f]{64}\z/', $index['identity']))) unset($index['identity']);
+        return $index;
     }
 
     private function removeSavedMethodCopies(BillingAgreement $agreement): bool
@@ -228,6 +230,9 @@ trait SavedMethods
             if ($receipt['removed'] ?? false) throw new DisplayException('This payment method was removed. Add a new payment method.');
             return $receipt['consent'];
         });
+        if ($this->savedMethodIndex($user, $incomingId, $customer, $gateway)['removed'] ?? false) {
+            throw new DisplayException('This payment method was removed. Add a new payment method.');
+        }
         $method = $this->request('get', '/payment_methods/' . $incomingId);
         if (($method->customer ?? null) === null) {
             // An unfinished return from the previous release may refer to a duplicate it already detached.
