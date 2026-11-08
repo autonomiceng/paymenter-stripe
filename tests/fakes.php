@@ -245,6 +245,8 @@ namespace App\Models {
         public function getIterator(): \Traversable { return new \ArrayIterator($this->rows); }
     }
     class Service {
+        public static array $updatedCallbacks = [];
+        public static function updated($callback) { self::$updatedCallbacks[] = $callback; }
         public const STATUS_CANCELLED = 'cancelled';
         public static function whereIn($key, $values) { return NativeModelQuery::table('services')->whereIn($key, $values); }
         public static function whereNull($key) { return NativeModelQuery::table('services')->whereNull($key); }

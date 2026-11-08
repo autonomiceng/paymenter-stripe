@@ -485,3 +485,18 @@ Every attempt rechecks current account consent, service ownership, subscription 
 Revocation, removal, reassignment, explicit service opt-out or a newer selection cancels old work; it cannot re-enable Auto Pay.
 Stripe subscriptions retain their own billing method and reject local-only service card changes. Invoice defaults skip
 subscription services while ordinary invoice payment continues. No schema or extension version change is required.
+
+Pending Auto Pay retains valid work while AE Stripe is paused or bundled Stripe is active. Ten failed
+binding attempts stop automatic setup and explain manual service selection or invoice payment. Explicit
+account Off, customer clear, staff opt-out, a changed service selection and each ownership transfer cancel
+pending work immediately. The native staff Billing Agreement field offers Turn off Auto Pay because an
+already empty field cannot record a deliberate None selection separately from an unrelated save.
+Pending warnings appear once per page and state, including a pause or exhausted retries.
+
+Checkout confirmation records include the payment intent and original tab token before saving starts.
+A successful webhook or the scheduled recovery completes a deferred confirmation, and the original
+invoice can receive it on a later poll. Refused saving produces no success. Reusing a token for another
+intent allocates a distinct stable token. Consumed notices are pruned after 30 days; the existing saved
+method receipt preserves delivery history. Confirmations for intents older than 30 days are not recreated.
+Legacy notices keep their original delivery state; new confirmations use a separate intent-bound token.
+These changes use existing properties and require no schema or extension version change.

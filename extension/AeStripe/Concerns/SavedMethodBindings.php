@@ -33,6 +33,33 @@ trait SavedMethodBindings
             || ($index['removed'] ?? false) || isset($index['removing']);
     }
 
+    private function configureStaffAutoPay(): void
+    {
+        if (!class_exists(\Filament\Forms\Components\Select::class)) return;
+        \Filament\Forms\Components\Select::configureUsing(function ($field) {
+            if ($field->getName() !== 'billing_agreement_id') return;
+            // An already empty select cannot distinguish None from an unrelated staff save.
+            $field->hintAction(\Filament\Actions\Action::make('aeStripeAutoPayOff')->label('Turn off Auto Pay')
+                ->visible(fn ($livewire) => $livewire instanceof \App\Admin\Resources\ServiceResource\Pages\EditService
+                    && !$livewire->getRecord()->subscription_id
+                    && ($livewire->getRecord()->properties()->where('key', self::AUTO_PAY_PENDING)->exists()
+                        || $livewire->getRecord()->billingAgreement?->gateway?->extension === 'AeStripe'))
+                ->action(function ($livewire) {
+                    $record = $livewire->getRecord();
+                    \Illuminate\Support\Facades\Gate::authorize('update', $record);
+                    DB::transaction(function () use ($record) {
+                        User::where('id', $record->user_id)->lockForUpdate()->firstOrFail();
+                        $service = Service::where('id', $record->id)->where('user_id', $record->user_id)->lockForUpdate()->firstOrFail();
+                        abort_if((bool) $service->subscription_id, 409, 'This service uses its Stripe subscription billing method.');
+                        $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
+                        $service->update(['billing_agreement_id' => null]);
+                    });
+                    $livewire->data['billing_agreement_id'] = null;
+                    \Filament\Notifications\Notification::make()->title('Auto Pay is off for this service.')->success()->send();
+                }));
+        });
+    }
+
     // Replace native binding writes only for this gateway; payment execution stays in the native handler.
     private function bindNativeSavedMethod($component, string $method, callable $returnEarly): void
     {

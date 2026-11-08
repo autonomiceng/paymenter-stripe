@@ -17,6 +17,7 @@ $create = fn ($extra = []) => Service::create($extra + ['user_id' => $user->id, 
     'price' => 20, 'currency_code' => 'USD', 'quantity' => 1, 'status' => 'active']);
 $delivered = fn ($page) => array_values(array_filter($page->effects['dispatches'] ?? [], fn ($e) => $e['name'] === 'notify'));
 $pending = fn ($service) => $service->properties()->where('key', 'ae_stripe_auto_pay_pending')->exists();
+if (str_starts_with($case, 'polish-')) { require __DIR__ . '/native-pending-polish.php'; return; }
 if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
     $setDefault();
     if ($case === 'transaction') {
@@ -91,6 +92,7 @@ if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
     elseif ($case === 'pending-subscription') $service->update(['subscription_id' => 'sub_existing']);
     elseif ($case === 'pending-owner') { $otherUser = App\Models\User::create(['email' => 'other@example.com', 'password' => 'synthetic']); $service->update(['user_id' => $otherUser->id]); }
     else throw new RuntimeException('Unknown pending case');
+    if (in_array($case, ['pending-off', 'pending-clear'], true)) $assert(!$pending($service), 'Explicit opt-out cancels pending work before any worker runs.');
     $gateway->retryAutoPayInheritance();
     $assert($service->fresh()->billing_agreement_id === null && !$pending($service), 'Pending retry never overrides later consent, ownership, removal, subscription or service opt-out.');
 } elseif ($case === 'removal-partial') {

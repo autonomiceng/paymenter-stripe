@@ -65,6 +65,7 @@ require_once __DIR__ . '/Concerns/WebhookContinuity.php';
 require_once __DIR__ . '/Concerns/SetupConsent.php';
 require_once __DIR__ . '/Concerns/AutoPay.php';
 require_once __DIR__ . '/Concerns/AutoPayInheritance.php';
+require_once __DIR__ . '/Concerns/SavedMethodNotices.php';
 require_once __DIR__ . '/Concerns/SetupIntent.php';
 require_once __DIR__ . '/Concerns/Webhooks.php';
 require_once __DIR__ . '/Concerns/PaymentFees.php';
@@ -79,7 +80,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use Concerns\AutoPayInheritance, Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, Concerns\SavedMethods, Concerns\SavedMethodBindings, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\SavedMethodNotices, Concerns\AutoPayInheritance, Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, Concerns\SavedMethods, Concerns\SavedMethodBindings, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -120,10 +121,14 @@ class AeStripe extends Gateway
 
     public function boot()
     {
+        $this->configureStaffAutoPay();
         if (app()->runningInConsole()) {
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryAutoPayInheritance())
                 ->name('ae-stripe:auto-pay-inheritance')->everyMinute()->onOneServer()->withoutOverlapping(5));
-            app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryChargeAttempts())
+            app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(function () {
+                $this->retryChargeAttempts();
+                $this->retrySavedMethodNotices();
+            })
                 ->name('ae-stripe:charge-attempts')->everyFiveMinutes()->onOneServer()->withoutOverlapping(60));
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryReceiptReturns())
                 ->name('ae-stripe:receipt-returns')->everyFiveMinutes()->onOneServer()->withoutOverlapping(60));
@@ -141,9 +146,13 @@ class AeStripe extends Gateway
             });
         }
         if (function_exists('Livewire\\on')) {
-            app(\Livewire\EventBus::class)->before('dehydrate', function ($component) {
-                $this->deliverSavedMethodNotice($component);
-                $this->deliverAutoPayPendingNotice($component);
+            app(\Livewire\EventBus::class)->before('hydrate', function ($component, $memo) {
+                \Livewire\store($component)->set('aeStripePendingState', $memo['aeStripePendingState'] ?? null);
+                \Livewire\store($component)->set('aeStripeSavedNotice', $memo['aeStripeSavedNotice'] ?? null);
+            });
+            app(\Livewire\EventBus::class)->before('dehydrate', function ($component, $context) {
+                $this->deliverSavedMethodNotice($component, $context);
+                $this->deliverAutoPayPendingNotice($component, $context);
             });
             app(\Livewire\EventBus::class)->before('call', function ($component, $method, $params, $context, $returnEarly) {
                 $this->bindNativeSavedMethod($component, $method, $returnEarly);
@@ -160,6 +169,7 @@ class AeStripe extends Gateway
                 catch (\Throwable $e) { \Illuminate\Support\Facades\Log::warning('AeStripe invoice cancellation will retry', ['invoice_id' => $event->invoice->id]); }
             });
         });
+        Service::updated(fn ($service) => $this->invalidatePendingAutoPay($service));
         Event::listen(\App\Events\Service\Created::class, fn ($event) => $this->applyNewServiceAutoPay($event->service));
         // Core boots disabled gateways too. Let the bundled listener own legacy subscriptions.
         if (!$this->bundledInactive(requireAbsent: true)) {

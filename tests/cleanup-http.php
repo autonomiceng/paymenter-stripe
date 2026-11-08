@@ -181,15 +181,17 @@ if ($case === 'http') {
         'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1'],
         'payment_method_options' => (object) ['card' => (object) ['setup_future_usage' => 'off_session']]];
     $noticeToken = invoke($gateway, 'saveConsentedMethod', $intent);
-    $checkoutNotice = json_decode($user->props->values['ae_stripe_notice_' . hash('sha256', (string) $noticeToken)] ?? 'null', true)['notice'] ?? Session::$values['ae_stripe_saved_notice_12']['notice'] ?? null;
-    $actual = $checkoutNotice ?? Session::$flashes['notification'] ?? null;
+    $checkoutNotice = savedNotice($user, $noticeToken);
+    $actual = $checkoutNotice;
     check($actual === $expected, 'Independent first saves through Add card and checkout deliver the same notice');
     foreach (['no-consent', 'wrong-customer'] as $refusal) {
         Session::$flashes = Session::$values = [];
         if ($refusal === 'no-consent') $intent->metadata->ae_stripe_consent = '0';
         else { $intent->metadata->ae_stripe_consent = '1'; $methods['pm_new']->customer = 'cus_other'; }
+        $previousNotices = array_filter($user->props->values, fn ($key) => str_starts_with($key, 'ae_stripe_notice_'), ARRAY_FILTER_USE_KEY);
         $noticeToken = invoke($gateway, 'saveConsentedMethod', $intent);
-    $checkoutNotice = json_decode($user->props->values['ae_stripe_notice_' . hash('sha256', (string) $noticeToken)] ?? 'null', true)['notice'] ?? Session::$values['ae_stripe_saved_notice_12']['notice'] ?? null;
+        check($noticeToken === null, 'A refused save returns no confirmation token');
+        check(array_filter($user->props->values, fn ($key) => str_starts_with($key, 'ae_stripe_notice_'), ARRAY_FILTER_USE_KEY) === $previousNotices, 'Refusal preserves prior notices and creates no success destination');
         check(Session::$flashes === [] && Session::$values === [], 'A false/null save does not publish a success notice');
     }
 }

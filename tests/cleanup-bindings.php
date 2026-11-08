@@ -90,7 +90,7 @@ if (in_array($case, ['account-during', 'reserved-account'], true)) {
         check($service->billing_agreement_id === null, 'Contended inheritance does not choose a card');
     };
     check($gateway->deduplicateCards(true, fn ($line) => null) === 0 && $entered, 'Cleanup can finish while new-service inheritance is refused');
-    invoke($gateway, 'finishAutoPayInheritance', 7, $service->id);
+    invoke($gateway, 'finishAutoPayInheritance', 7, $service->id, $service->properties->values['ae_stripe_auto_pay_pending']);
     check($service->billing_agreement_id === 19, 'Retry inherits the exact existing account choice after cleanup');
 } elseif ($case === 'turn-off') {
     $user->props->values['ae_stripe_auto_pay_default'] = json_encode(array_replace($record, ['agreement_id' => 19]));

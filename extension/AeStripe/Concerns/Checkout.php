@@ -405,65 +405,20 @@ trait Checkout
         });
     }
 
-    // Save the consented method as soon as Stripe confirms. The payment_intent.succeeded webhook
-    // saves it again (idempotent) if this fails or the customer leaves before the response.
-    private function saveConsentedMethod($intent, ?string $token = null): ?string
+    private function savePaidMethod($intent)
     {
         try {
-            $saved = $this->savePaidMethod($intent);
-            if ($saved !== true && !is_array($saved)) return null;
-            $token = is_string($token) && preg_match('/\A[a-f0-9]{32}\z/', $token) ? $token : bin2hex(random_bytes(16));
-            $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
-            DB::transaction(function () use ($invoice, $saved, $token) {
-                $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
-                abort_unless($invoice->user_id == $user->id, 403);
-                $key = 'ae_stripe_notice_' . hash('sha256', $token);
-                // Preserve the consumed state when the same confirmation is returned more than once.
-                if ($existing = $user->properties()->where('key', $key)->lockForUpdate()->first()) {
-                    abort_unless((json_decode($existing->value, true)['invoice_id'] ?? null) == $invoice->id, 409);
-                    return;
-                }
-                $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode([
-                    'user_id' => (int) $user->id, 'invoice_id' => (int) $invoice->id, 'consumed' => false,
-                    'notice' => ['type' => 'success', 'message' => is_array($saved) ? $saved['message'] : 'Payment method added successfully.'],
-                ], JSON_THROW_ON_ERROR)]);
-            });
-            return $token;
+            $saved = $this->savePaidMethodDetails($intent);
+            if ($saved === true || is_array($saved)) $this->completeSavedMethodNotices($intent, $saved);
+            else $this->discardSavedMethodNotices($intent);
+            return $saved;
         } catch (DisplayException $e) {
-            \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'reason' => $e->getMessage()]);
-        } catch (\Throwable $e) {
-            if ($e instanceof \Symfony\Component\HttpKernel\Exception\HttpExceptionInterface) throw $e;
-            \Illuminate\Support\Facades\Log::warning('AeStripe saved method deferred to webhook', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'error' => get_class($e)]);
+            $this->discardSavedMethodNotices($intent);
+            throw $e;
         }
-        return null;
     }
 
-    private function savedMethodDestination($invoice, ?string $token): string
-    {
-        $url = route('invoices.show', $invoice);
-        return $url . (str_contains($url, '?') ? '&' : '?') . http_build_query(['checkPayment' => 'true', 'saved_notice' => $token]);
-    }
-
-    private function deliverSavedMethodNotice($component): void
-    {
-        if (!$component instanceof \App\Livewire\Invoices\Show) return;
-        $invoice = $component->invoice;
-        $owner = \Illuminate\Support\Facades\Auth::id();
-        if ($invoice->user_id != $owner) return;
-        $token = request()->input('saved_notice');
-        if (!is_string($token) || !preg_match('/\A[a-f0-9]{32}\z/', $token)) return;
-        DB::transaction(function () use ($component, $invoice, $owner, $token) {
-            $user = User::where('id', $owner)->lockForUpdate()->firstOrFail();
-            $property = $user->properties()->where('key', 'ae_stripe_notice_' . hash('sha256', $token))->lockForUpdate()->first();
-            $pending = json_decode($property?->value ?? 'null', true);
-            if (!$pending || ($pending['user_id'] ?? null) != $owner || ($pending['invoice_id'] ?? null) != $invoice->id || ($pending['consumed'] ?? false)) return;
-            $component->notify($pending['notice']['message'], $pending['notice']['type']);
-            $pending['consumed'] = true;
-            $user->properties()->updateOrCreate(['key' => $property->key], ['value' => json_encode($pending, JSON_THROW_ON_ERROR)]);
-        });
-    }
-
-    private function savePaidMethod($intent)
+    private function savePaidMethodDetails($intent)
     {
         if (($intent->metadata->ae_stripe_gateway ?? null) !== '1'
             || ($intent->metadata->ae_stripe_consent ?? null) !== '1') {
@@ -480,8 +435,9 @@ trait Checkout
             return; // The checkout opt-in authorizes saving a card or Link only.
         }
         if (($intent->payment_method_options->{$method->type}->setup_future_usage ?? null) !== 'off_session') return;
-        return $this->persistAgreement($invoice->user, $method, ['source' => $intent->id,
+        $saved = $this->persistAgreement($invoice->user, $method, ['source' => $intent->id,
             'version' => 'off_session_v1', 'accepted_at' => (int) ($intent->metadata->ae_stripe_consent_at ?? $intent->created ?? time()), 'user_id' => $invoice->user_id]);
+        return $saved;
     }
 
     private function methodCustomerMatches($user, $method, bool $current = false): bool
