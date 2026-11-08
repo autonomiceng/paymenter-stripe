@@ -412,7 +412,8 @@ try {
             window.failure = 'action-success';
             window.setupRequests = [];
             window.linkFailures = [];
-            window.fetch = async (url, options) => { setupRequests.push({url, body: JSON.parse(options.body)}); return {ok: true}; };
+            window.consentOk = false;
+            window.fetch = async (url, options) => { setupRequests.push({url, body: JSON.parse(options.body)}); return {ok: consentOk}; };
             window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf', name: 'Fixture', email: 'Fixture', linkDisplay: 'above_card', businessName: 'Fixture Hosting' });
             component.$el = document.querySelector('form');
             await component.init();
@@ -430,6 +431,16 @@ try {
         for (let i = 1; i < boxes.length; i++) assert(boxes[i - 1].bottom <= boxes[i].top, `${at}: consent, Link, card fields and Save read top to bottom`);
         assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${at}: nothing runs off the side`);
         assert.equal(await page.locator('[role=alert]').textContent(), '', `${at}: no error before a choice`);
+        for (const choice of ['Link', 'card']) {
+            if (choice === 'Link') await page.evaluate(() => elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)}));
+            else await page.getByRole('button', {name: 'Save card'}).click();
+            await page.waitForFunction(() => document.querySelector('[role=alert]').textContent.length > 0);
+            assert.equal(await page.evaluate(() => confirms), 0, `${at}: failed ${choice} consent cannot confirm setup`);
+            assert.equal(await page.locator('#submit').isEnabled(), true, `${at}: failed ${choice} consent permits retry`);
+        }
+        assert.deepEqual(await page.evaluate(() => linkFailures), [{reason: 'fail'}], `${at}: consent failure dismisses Link`);
+        assert.deepEqual(await page.evaluate(() => setupRequests), Array.from({length: 2}, () => ({url: '/consent', body: {intent: 'fixture-intent', consent: true, version: 'off_session_v2'}})));
+        await page.evaluate(() => {consentOk = true; setupRequests = []; linkFailures = [];});
         await page.evaluate(() => elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)}));
         assert.deepEqual(await page.evaluate(() => setupRequests), [{url: '/consent', body: {intent: 'fixture-intent', consent: true, version: 'off_session_v2'}}],
             `${at}: choosing Link records the agreement first`);
@@ -452,9 +463,9 @@ try {
         await page.route('https://example.com/return', route => route.fulfill({contentType: 'text/html', body: 'Payment received'}));
         await page.goto('https://example.com/new-card');
         await page.evaluate(scenario => {
-            window.handlers = {}; window.$wire = {on() {}};
+            window.handlers = {}; window.order = []; window.$wire = {on() {}};
             window.fetch = async (_, options) => {
-                await captureNewCard({body: JSON.parse(options.body), tokenOptions});
+                await captureNewCard({body: JSON.parse(options.body), tokenOptions, order});
                 return {ok: scenario !== 'decline', async json() { return scenario === 'decline'
                     ? {declined: true, message: 'Your bank declined this card. Try a different card, or contact your bank.'}
                     : {status: 'succeeded'}; }};
@@ -464,8 +475,8 @@ try {
                     window.currentOptions = {...options};
                     return {on(name, fn) {handlers[name] = fn;}, update(changes) {
                         // Stripe.js v3 returns void; the options reach the iframe later.
-                        setTimeout(() => {Object.assign(currentOptions, changes); handlers['update-end']?.();}, 20);
-                    }, async submit() {return {};},
+                        setTimeout(() => {Object.assign(currentOptions, changes); order.push('updated'); handlers['update-end']?.();}, 20);
+                    }, async submit() {order.push('submit'); return {};},
                         create(type) {
                             const events = handlers[type] = {};
                             return {on(name, fn) {events[name] = fn;}, mount() {events.ready?.({availablePaymentMethods: {link: true}});},
@@ -473,6 +484,7 @@ try {
                         }};
                 },
                 async createConfirmationToken() {
+                    order.push('token');
                     window.tokenOptions = JSON.parse(JSON.stringify(currentOptions));
                     return {confirmationToken: {id: 'ctoken_newcard'}};
                 },
@@ -491,6 +503,7 @@ try {
                 'A fresh-card bank decline offers Refresh payment form');
         } else await page.getByText('Payment received', {exact: true}).waitFor();
         assert.equal(sent.length, 1, 'One submit sends one confirmation');
+        assert.deepEqual(sent[0].order, ['updated', 'submit', 'token'], 'Card and Link submit only after options apply');
         const save = scenario.startsWith('save');
         assert.deepEqual(sent[0].body, {intent: 'fixture-intent', confirmation_token: 'ctoken_newcard', amount: 1099, save});
         assert.deepEqual(sent[0].tokenOptions.paymentMethodTypes, ['card', 'link']);
@@ -503,6 +516,50 @@ try {
             await page.locator('#refresh-payment').click();
             await page.getByText('Fresh payment checkout', {exact: true}).waitFor();
         }
+        await page.close();
+    }
+    // A missing iframe update event must release the form without creating a token or payment.
+    for (const choice of ['card', 'Link']) for (const updateFailure of ['missing-event', 'throw']) {
+        const page = activePage = await browser.newPage();
+        await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
+        await page.setContent('<html><body></body></html>');
+        await page.clock.install();
+        await installStripe(page, false);
+        await page.evaluate(updateFailure => {
+            window.updates = 0; window.submits = 0; window.tokens = 0; window.requests = 0; window.linkFailures = [];
+            window.failure = 'action-success';
+            window.fetch = async () => {requests++; return {ok: false, async json() {return {message: 'Try again.'};}};};
+            const makeStripe = window.Stripe;
+            window.Stripe = () => {
+                const stripe = makeStripe(); const makeElements = stripe.elements;
+                stripe.elements = options => {
+                    const elements = makeElements(options);
+                    elements.update = () => {updates++; if (updateFailure === 'throw') throw new Error('Update failed');};
+                    elements.submit = async () => {submits++; return {};};
+                    return elements;
+                };
+                stripe.createConfirmationToken = async () => {tokens++; return {confirmationToken: {id: 'ctoken_fixture'}};};
+                return stripe;
+            };
+        }, updateFailure);
+        await page.setContent(render('pay'));
+        await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
+        const submit = () => page.evaluate(choice => {
+            if (choice === 'Link') elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)});
+            else document.querySelector('form').dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+        }, choice);
+        await submit();
+        if (updateFailure === 'missing-event') {
+            await submit();
+            assert.equal(await page.evaluate(() => updates), 1, `${choice}: overlapping submission cannot start another update`);
+            await page.clock.fastForward(5001);
+        }
+        assert.equal(await page.locator('#submit').isEnabled(), true, `${choice}: ${updateFailure} releases the form`);
+        assert.equal(await page.locator('#submit').isVisible(), true, `${choice}: ${updateFailure} restores Pay`);
+        assert.match(await page.locator('[role=alert]').textContent(), /Could not check the payment/);
+        assert.deepEqual(await page.evaluate(() => [submits, tokens, requests]), [0, 0, 0], `${choice}: unresolved options cannot reach payment`);
+        if (choice === 'Link') assert.deepEqual(await page.evaluate(() => linkFailures), [{reason: 'fail'}]);
+        await page.evaluate(() => {elementsInstance.update = () => elementHandlers['unused']?.();});
         await page.close();
     }
     console.log('Pay and setup network failures, retry and card declines passed.');
