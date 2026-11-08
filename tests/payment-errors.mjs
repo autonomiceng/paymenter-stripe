@@ -519,7 +519,7 @@ try {
         await page.close();
     }
     // A missing iframe update event must release the form without creating a token or payment.
-    for (const choice of ['card', 'Link']) for (const updateFailure of ['missing-event', 'throw']) {
+    for (const choice of ['card', 'Link']) for (const updateFailure of ['missing-event', 'throw', 'reject']) {
         const page = activePage = await browser.newPage();
         await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
         await page.setContent('<html><body></body></html>');
@@ -534,7 +534,7 @@ try {
                 const stripe = makeStripe(); const makeElements = stripe.elements;
                 stripe.elements = options => {
                     const elements = makeElements(options);
-                    elements.update = () => {updates++; if (updateFailure === 'throw') throw new Error('Update failed');};
+                    elements.update = () => {updates++; if (updateFailure === 'throw') throw new Error('Update failed'); if (updateFailure === 'reject') return Promise.reject(new Error('Update failed'));};
                     elements.submit = async () => {submits++; return {};};
                     return elements;
                 };
@@ -554,6 +554,7 @@ try {
             assert.equal(await page.evaluate(() => updates), 1, `${choice}: overlapping submission cannot start another update`);
             await page.clock.fastForward(5001);
         }
+        // Rejected updates release the form immediately, without advancing the timeout clock.
         assert.equal(await page.locator('#submit').isEnabled(), true, `${choice}: ${updateFailure} releases the form`);
         assert.equal(await page.locator('#submit').isVisible(), true, `${choice}: ${updateFailure} restores Pay`);
         assert.match(await page.locator('[role=alert]').textContent(), /Could not check the payment/);
