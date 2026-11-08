@@ -406,7 +406,7 @@ trait Checkout
     {
         try {
             $saved = $this->savePaidMethod($intent);
-            if (is_array($saved)) \Illuminate\Support\Facades\Session::flash('ae_stripe_saved_notice', [
+            if (is_array($saved)) \Illuminate\Support\Facades\Session::flash('notification', [
                 'type' => 'success', 'message' => $saved['message'],
             ]);
         } catch (DisplayException $e) {

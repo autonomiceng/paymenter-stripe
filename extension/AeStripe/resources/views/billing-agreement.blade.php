@@ -8,7 +8,7 @@
 })">
     {{-- One line, shown before either choice, says what saving agrees to. Choosing Link or Save card is the agreement. --}}
     <p id="setup-terms">By saving with Link or a card, you agree to save it for future charges, including renewals.
-        @if(config('settings.tos'))<a href="{{ config('settings.tos') }}" target="_blank" rel="noopener" class="underline">Terms</a>@endif
+        @if(config('settings.tos'))<a href="{{ config('settings.tos') }}" target="_blank" rel="noopener" class="underline">Terms of Service</a>@endif
         <span id="setup-consent-note" class="mt-1 block text-sm opacity-75">Auto Pay can charge when you are away. Saving does not turn on Auto Pay.</span>
     </p>
     {{-- Link uses what the customer saved there; the wrapper keeps it above the card fields if a theme reorders the form. --}}

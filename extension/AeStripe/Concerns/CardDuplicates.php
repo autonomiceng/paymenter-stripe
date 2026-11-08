@@ -109,6 +109,13 @@ trait CardDuplicates
             if (!$duplicate) return false;
             [$kept, $remote] = $duplicate;
             $this->finishDuplicate($user, $fresh, $kept, $remote, $consented);
+            // Completed saves must keep replaying and removing through the verified surviving agreement.
+            foreach ($user->properties()->where('key', 'like', 'ae_stripe_saved_%')->lockForUpdate()->get() as $property) {
+                $receipt = json_decode($property->value, true);
+                if (($receipt['reference'] ?? null) !== $method->id || ($receipt['consent']['user_id'] ?? null) != $user->id) continue;
+                $receipt['reference'] = $kept->external_reference;
+                $user->properties()->updateOrCreate(['key' => $property->key], ['value' => json_encode($receipt, JSON_THROW_ON_ERROR)]);
+            }
             if ($incoming && !$incoming->trashed()) {
                 $incoming->delete();
                 if ($report) $report('Removed duplicate saved card #' . $incoming->id . '.');
@@ -145,7 +152,13 @@ trait CardDuplicates
         $rows = BillingAgreement::where('gateway_id', $gateway->id)->get();
         $skipped = 0;
         foreach ($rows as $row) {
+            $lock = null;
             try {
+                $lock = $this->savedMethodLock((int) $row->user_id);
+                if (!$lock->get()) {
+                    $lock = null;
+                    throw new \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException('Another saved payment method update is in progress. Try again.');
+                }
                 $action = DB::transaction(function () use ($gateway, $row, $apply, $report) {
                     $user = User::where('id', $row->user_id)->lockForUpdate()->firstOrFail();
                     $incoming = BillingAgreement::where('external_reference', $row->external_reference)->lockForUpdate()->first();
@@ -166,6 +179,8 @@ trait CardDuplicates
                 ++$skipped;
                 Log::warning('ae_stripe_deduplicate_agreement_skipped', ['agreement_id' => $row->id, 'error' => get_class($e)]);
                 $report('Saved card #' . $row->id . ' skipped. Review it manually.');
+            } finally {
+                $lock?->release();
             }
         }
         return $skipped;

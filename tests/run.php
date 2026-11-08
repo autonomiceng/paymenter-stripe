@@ -61,6 +61,11 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
     };
 };
 
+if (getenv('PAY_FOLLOWUP_CASE')) {
+    require __DIR__ . '/saved-method-followups.php';
+    return;
+}
+
 if (getenv('PAY_DEDUPE_CASE')) {
     require __DIR__ . '/saved-method-dedupe.php';
     echo "PASS: $count saved method assertions\n";
@@ -292,4 +297,7 @@ require __DIR__ . '/card-dedupe-races.php';
 require __DIR__ . '/converted-card-dedupe.php';
 require __DIR__ . '/card-dedupe-failures.php';
 require __DIR__ . '/card-dedupe-candidates.php';
+foreach (['pending', 'removed-replay', 'version', 'cleanup-replay', 'cleanup-removal', 'missing', 'warning', 'index', 'cleanup-lock', 'cleanup-setup', 'cleanup-checkout', 'cache', 'link', 'terms', 'notices'] as $followupCase) {
+    (function () use ($followupCase) { require __DIR__ . '/saved-method-followups.php'; })();
+}
 echo "PASS: $count offline assertions\n";
