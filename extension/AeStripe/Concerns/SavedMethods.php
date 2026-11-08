@@ -174,8 +174,8 @@ trait SavedMethods
         if ($removed && !$method && $identity === null) {
             $notice = ['type' => 'warning', 'message' => 'This payment method was already gone. We removed its saved entry, but could not verify or remove other copies.'];
             \Illuminate\Support\Facades\Session::flash('notification', $notice);
-            // Native removal flashes its success during the action, after bootHasNotifications has run.
-            if (function_exists('Livewire\\on')) \Livewire\on('dehydrate', static function ($component) use ($notice) {
+            // Native removal runs after bootHasNotifications. Notify before Livewire collects dispatched events.
+            if (function_exists('Livewire\\on')) app(\Livewire\EventBus::class)->before('dehydrate', static function ($component) use ($notice) {
                 if (\Illuminate\Support\Facades\Session::get('notification') !== $notice || !method_exists($component, 'notify')) return;
                 \Illuminate\Support\Facades\Session::forget('notification');
                 $component->notify($notice['message'], $notice['type']);
