@@ -557,6 +557,9 @@ try {
         assert.equal(await page.locator('#submit').isEnabled(), true, `${choice}: ${updateFailure} releases the form`);
         assert.equal(await page.locator('#submit').isVisible(), true, `${choice}: ${updateFailure} restores Pay`);
         assert.match(await page.locator('[role=alert]').textContent(), /Could not check the payment/);
+        const message = await page.locator('[role=alert]').textContent();
+        await page.clock.fastForward(30000);
+        assert.equal(await page.locator('[role=alert]').textContent(), message, 'The timeout error stays visible until another customer action');
         assert.deepEqual(await page.evaluate(() => [submits, tokens, requests]), [0, 0, 0], `${choice}: unresolved options cannot reach payment`);
         if (choice === 'Link') assert.deepEqual(await page.evaluate(() => linkFailures), Array.from({length: updateFailure === 'missing-event' ? 2 : 1}, () => ({reason: 'fail'})), 'Overlapping Link and unresolved options each dismiss their own payment UI');
         await page.close();

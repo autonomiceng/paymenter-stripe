@@ -37,7 +37,8 @@ foreach (['pay', 'billing-agreement'] as $name) {
             && str_contains($script, 'paymentElement?.destroy();'), 'Setup form removal releases listeners and Elements');
     }
     $formScript = $name === 'pay' ? $script : substr($script, strpos($script, "Alpine.data('aeStripeSetup'"));
-    check(!str_contains($formScript, 'setTimeout'), "$name: payment errors are never hidden on a timer");
+    preg_match_all('/function (?:showMessage|clearMessage)\([^)]*\)\s*\{[^}]*\}/s', $formScript, $messageFunctions);
+    check(count($messageFunctions[0]) === 2 && !str_contains(implode('', $messageFunctions[0]), 'setTimeout'), "$name: displaying an error never schedules its removal");
     check(str_contains($view, '<div id="error-message" role="alert"'), "$name: errors are announced and stay mounted");
     // The form and the Link button share one confirm function; it clears the previous error before loading.
     check(preg_match('/preventDefault\(\);\s+confirm(Payment|Setup)\(\);/', $view, $submit) === 1
