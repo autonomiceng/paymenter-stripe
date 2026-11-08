@@ -15,6 +15,7 @@ Gateway::$enabled = Gateway::$present = true;
 Gateway::$deleted = false;
 BillingAgreement::$snapshot = null;
 DB::$tables['services'] = [];
+ExtensionHelper::$payments = [];
 $gateway = new AeStripe(['stripe_secret_key' => 'fake-secret', 'stripe_webhook_secret' => 'whsec_test']);
 $card = fn ($id) => (object) ['id' => $id, 'customer' => 'cus_owner', 'type' => 'card', 'allow_redisplay' => 'limited',
     'card' => (object) ['fingerprint' => 'fp_same', 'brand' => 'visa', 'last4' => '4242', 'exp_month' => 5, 'exp_year' => 2030]];
@@ -32,7 +33,7 @@ Http::$handler = function ($verb, $path, $data) use (&$methods, &$fail, &$enforc
         if ($path !== '/payment_methods/' . $id) continue;
         if (isset($method->missing)) throw new RequestException(404, ['error' => ['code' => 'resource_missing']]);
         if ($verb === 'post') $method->allow_redisplay = $data['allow_redisplay'] ?? $method->allow_redisplay;
-        return $method;
+        return json_decode(json_encode($method));
     }
     throw new RuntimeException('Unexpected followup HTTP: ' . $path);
 };
@@ -55,6 +56,20 @@ if (in_array($case, ['pending', 'removed-replay'], true)) {
     check(ExtensionHelper::$agreements === $before, 'A removed receipt cannot recreate an agreement');
     try { $save('pm_new', 'seti_other'); throw new RuntimeException('A new source must not restore a removed reference'); }
     catch (\App\Exceptions\DisplayException $e) { check(str_contains($e->getMessage(), 'removed'), 'New sources cannot restore removed provider references'); }
+    $setup = (object) ['id' => 'seti_followup', 'status' => 'succeeded', 'customer' => 'cus_owner', 'payment_method' => 'pm_new', 'latest_attempt' => null,
+        'metadata' => (object) ['user_id' => '7', 'is_billing_agreement' => '1', 'ae_stripe_gateway' => '1', 'ae_stripe_setup_consent' => 'off_session_v2',
+            'ae_stripe_setup_consent_user' => '7', 'ae_stripe_setup_consent_at' => '1794071700']];
+    $handler = Http::$handler;
+    Http::$handler = fn ($verb, $path, $data) => $path === '/setup_intents/seti_followup' ? $setup : $handler($verb, $path, $data);
+    check($gateway->setupAgreement(new Request(['setup_intent' => $setup->id]))['type'] === 'danger', 'A delayed Add card return reports the removed source');
+    $warnings = count(\Illuminate\Support\Facades\Log::$warnings);
+    check($gateway->webhook(eventRequest($setup, type: 'setup_intent.succeeded'))['status'] === 200, 'A delayed setup webhook acknowledges the removed source');
+    check((bool) array_filter(array_slice(\Illuminate\Support\Facades\Log::$warnings, $warnings), fn ($warning) => str_contains($warning[1]['reason'] ?? '', 'removed')), 'The setup webhook reaches the removed-source refusal');
+    $paid = (object) ['id' => 'pi_removed', 'customer' => 'cus_owner', 'payment_method' => 'pm_new', 'status' => 'succeeded',
+        'amount' => 2000, 'amount_received' => 2000, 'currency' => 'usd', 'payment_method_options' => (object) ['card' => (object) ['setup_future_usage' => 'off_session']],
+        'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1', 'ae_stripe_consent_at' => '1794071700']];
+    check($gateway->webhook(eventRequest($paid))['status'] === 200 && ExtensionHelper::$agreements === $before, 'A delayed payment webhook cannot restore the removed method');
+    check(count(ExtensionHelper::$payments) === 1 && (ExtensionHelper::$payments['12:pi_removed']['status'] ?? null) === 'succeeded', 'Refusing to restore the saved method still records the completed payment exactly once');
 } elseif (in_array($case, ['cleanup-replay', 'cleanup-removal'], true)) {
     ExtensionHelper::$agreements['pm_new'] = $row(20, 'pm_new');
     $save('pm_alias'); // This completed receipt points at the newer local agreement, pm_new.
@@ -111,6 +126,36 @@ if (in_array($case, ['pending', 'removed-replay'], true)) {
         return $handler($verb, $path, $data);
     };
     check($gateway->deduplicateCards(true, fn ($line) => null) === 0 && $entered, 'Cleanup lock regression exercises provider writes');
+} elseif (in_array($case, ['cleanup-setup', 'cleanup-checkout'], true)) {
+    ExtensionHelper::$agreements['pm_new'] = $row(20, 'pm_new');
+    $methods['pm_old']->allow_redisplay = 'unspecified';
+    $setup = (object) ['id' => 'seti_cleanup', 'status' => 'succeeded', 'customer' => 'cus_owner', 'payment_method' => 'pm_alias', 'latest_attempt' => null,
+        'metadata' => (object) ['user_id' => '7', 'is_billing_agreement' => '1', 'ae_stripe_setup_consent' => 'off_session_v2',
+            'ae_stripe_setup_consent_user' => '7', 'ae_stripe_setup_consent_at' => '1794071700']];
+    $paid = (object) ['id' => 'pi_cleanup', 'customer' => 'cus_owner', 'payment_method' => 'pm_alias',
+        'payment_method_options' => (object) ['card' => (object) ['setup_future_usage' => 'off_session']],
+        'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1', 'ae_stripe_consent_at' => '1794071700']];
+    $saveEntry = $case === 'cleanup-setup' ? fn () => $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]))
+        : fn () => invoke($gateway, 'savePaidMethod', $paid);
+    $handler = Http::$handler;
+    $entered = false;
+    Http::$handler = function ($verb, $path, $data) use ($handler, $setup, $saveEntry, &$entered, $case) {
+        if ($path === '/setup_intents/seti_cleanup') return $setup;
+        if (!$entered && $verb === 'post' && $path === '/payment_methods/pm_old') {
+            $entered = true;
+            $before = count(Http::$calls);
+            if ($case === 'cleanup-setup') check(($saveEntry()['type'] ?? null) === 'danger', 'Cleanup makes an interleaved Add card return retryable');
+            else {
+                try { $saveEntry(); throw new RuntimeException('Cleanup must refuse interleaved checkout saving'); }
+                catch (\Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException $e) { check(true, 'Cleanup makes checkout saving retryable'); }
+            }
+            check(!array_filter(array_slice(Http::$calls, $before), fn ($call) => $call[0] === 'post'), 'An interleaved save sends no writes before cleanup finishes');
+        }
+        return $handler($verb, $path, $data);
+    };
+    check($gateway->deduplicateCards(true, fn ($line) => null) === 0 && $entered, 'The cleanup/save ordering scenario reaches the stale redisplay write');
+    $saveEntry();
+    check($methods['pm_old']->allow_redisplay === 'always', 'After cleanup, retrying the save retains always redisplay');
 } elseif ($case === 'cache') {
     $GLOBALS['fakeConfig']['cache.default'] = 'array';
     $GLOBALS['fakeConfig']['cache.stores.array.driver'] = 'array';
