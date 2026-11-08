@@ -81,6 +81,81 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
     check($gateway->autoPayCard($user) === 19 && $user->props->values['ae_stripe_auto_pay_default'] === $choice
         && ExtensionHelper::$agreements['pm_old']['deleted_at'] === null && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
         'An older selected Auto Pay agreement survives while the newest duplicate is updated');
+    if (!getenv('PAY_DEDUPE_RECHECK') || getenv('PAY_DEDUPE_RECHECK') === 'expiry') {
+        check($methods['pm_old']->card->exp_month === 6, 'The older Auto Pay copy has its Stripe expiry refreshed');
+        check(ExtensionHelper::$agreements['pm_old']['expiry'] === '2030-06-30', 'The older Auto Pay copy has its local expiry refreshed');
+    }
+    if (!getenv('PAY_DEDUPE_RECHECK')) {
+        // Each copy protects its own newer consent; the newest visible row cannot decide for the older copy.
+        $user->props->values = ['ae_stripe_method_pm_old' => json_encode(['customer' => 'cus_owner', 'gateway_id' => 2,
+            'consent' => ['accepted_at' => 1794071800, 'sequence' => 1]])];
+        $methods = ['pm_old' => $card('pm_old', 7), 'pm_new' => $card('pm_new', 6)];
+        ExtensionHelper::$agreements = ['pm_old' => array_replace($row(19, 'pm_old', 'card'), ['expiry' => '2030-07-31']),
+            'pm_new' => $row(20, 'pm_new', 'card')];
+        $setup->id = 'seti_per_copy_consent';
+        $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
+        check($methods['pm_old']->card->exp_month === 7 && ExtensionHelper::$agreements['pm_old']['expiry'] === '2030-07-31',
+            'An older save never rolls back the hidden copy with newer consent');
+        check($methods['pm_new']->card->exp_month === 6 && ExtensionHelper::$agreements['pm_new']['expiry'] === '2030-06-30',
+            'A hidden copy with newer consent does not prevent another matching copy from refreshing');
+    }
+    if (!getenv('PAY_DEDUPE_RECHECK') || getenv('PAY_DEDUPE_RECHECK') === 'double-return') {
+        $user->props->values = [];
+        ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old', 'card')];
+        $setup->id = 'seti_double_return';
+        \Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-7'] = true;
+        \Illuminate\Support\Facades\Cache::$beforeBlock = function () use ($gateway, $setup) {
+            unset(\Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-7']);
+            $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
+        };
+        $result = $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
+        check(str_contains($result['message'], 'already saved') && count(ExtensionHelper::$agreements) === 1,
+            'A double Add card return waits for the first save and reuses its receipt');
+        \Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-7'] = true;
+        $result = $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
+        check($result['type'] === 'danger' && str_contains($result['message'], 'in progress'),
+            'A long Add card conflict redirects with a retry notice instead of a 500');
+        try {
+            invoke($gateway, 'persistAgreement', $user, (object) ['id' => 'pm_new']);
+            throw new RuntimeException('Expected a retryable save conflict');
+        } catch (\Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException $e) {
+            check(!$e instanceof \App\Exceptions\DisplayException, 'Webhooks keep retrying temporary save conflicts');
+        }
+        unset(\Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-7']);
+    }
+    if (!getenv('PAY_DEDUPE_RECHECK') || getenv('PAY_DEDUPE_RECHECK') === 'remove') {
+        $user->props->values = [];
+        ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old', 'card')];
+        $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new', 6)];
+        $setup->id = 'seti_remove_alias';
+        $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
+        $native = Http::$handler;
+        $failed = false;
+        Http::$handler = function ($verb, $path, $data) use ($native, &$failed) {
+            if (!$failed && $path === '/payment_methods/pm_new/detach') { $failed = true; throw new \Illuminate\Http\Client\ConnectionException; }
+            return $native($verb, $path, $data);
+        };
+        check(!$gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements['pm_old']))
+            && $methods['pm_old']->customer === 'cus_owner' && $methods['pm_new']->customer === 'cus_owner',
+            'Remove stops on a duplicate detach failure and preserves the visible card for retry');
+        check($gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements['pm_old'])), 'Remove succeeds on retry');
+        check($methods['pm_old']->customer === null && $methods['pm_new']->customer === null,
+            'Remove detaches the incoming duplicate that has no local agreement');
+        check(!in_array(true, $heldLocks, true), 'Remove performs HTTP outside the owner lock');
+        $methods['pm_old']->customer = $methods['pm_new']->customer = 'cus_owner';
+        $failed = false;
+        Http::$handler = function ($verb, $path, $data) use ($native, &$failed) {
+            if (!$failed && $path === '/payment_methods/pm_old/detach') { $failed = true; throw new \Illuminate\Http\Client\RequestException(503); }
+            return $native($verb, $path, $data);
+        };
+        check(!$gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements['pm_old']))
+            && $methods['pm_new']->customer === null && $methods['pm_old']->customer === 'cus_owner',
+            'A later failure keeps local removal pending after an earlier copy detached');
+        check($gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements['pm_old']))
+            && $methods['pm_new']->customer === null && $methods['pm_old']->customer === null,
+            'Removal retries skip detached copies and finish the remaining copy');
+        Http::$handler = $native;
+    }
     // An in-flight return from the old dedupe path still resolves without reviving a removed method.
     $user->props->values = ['ae_stripe_duplicate_pm_new' => json_encode(['customer' => 'cus_owner', 'gateway' => 2, 'kept' => 'pm_old'])];
     $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];

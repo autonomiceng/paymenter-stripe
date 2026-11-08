@@ -491,9 +491,15 @@ namespace Illuminate\Support\Facades {
     class Session { public static array $flashes = []; public static function flash($key, $value) { self::$flashes[$key] = $value; } }
     class Cache {
         public static array $locks = [];
+        public static $beforeBlock = null;
         public static function lock($key, $seconds) { return new class($key) {
             public function __construct(private string $key) {}
             public function get() { if (Cache::$locks[$this->key] ?? false) return false; return Cache::$locks[$this->key] = true; }
+            public function block($seconds) {
+                if (Cache::$beforeBlock) { $callback = Cache::$beforeBlock; Cache::$beforeBlock = null; $callback(); }
+                if (!$this->get()) throw new \Illuminate\Contracts\Cache\LockTimeoutException;
+                return true;
+            }
             public function release() { unset(Cache::$locks[$this->key]); }
         }; }
     }
@@ -751,3 +757,5 @@ namespace {
         }
     }
 }
+
+namespace Illuminate\Contracts\Cache { class LockTimeoutException extends \RuntimeException {} }

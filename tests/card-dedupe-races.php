@@ -43,8 +43,8 @@ Http::$handler = $handler;
 // A removed comparison agreement cannot be written through a stale plan.
 ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
 DB::$afterTransaction = function () { ExtensionHelper::$agreements['pm_old']['deleted_at'] = '2026-10-23 13:00:00'; };
-try { $gateway->setupAgreement(new Request(['setup_intent' => $setup->id])); throw new RuntimeException('Expected changed methods'); }
-catch (RuntimeException $e) { check($e->getMessage() === 'Saved payment methods changed. Try again.', 'A changed agreement set stays retryable'); }
+$result = $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
+check($result['type'] === 'danger' && $result['message'] === 'Saved payment methods changed. Try again.', 'A changed agreement set shows a retry notice');
 $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
 check($methods['pm_new']->customer === 'cus_owner' && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
     'Retry preserves the current agreement and provider reference');
@@ -59,7 +59,7 @@ Http::$handler = function ($verb, $path, $data) use ($handler, $gateway, &$enter
         $entered = true;
         $before = count(Http::$calls);
         try { invoke($gateway, 'persistAgreement', User::$row, (object) ['id' => 'pm_new']); throw new RuntimeException('Expected lock contention'); }
-        catch (RuntimeException $e) { check(str_contains($e->getMessage(), 'in progress'), 'Concurrent saving stays retryable'); }
+        catch (\Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException $e) { check(str_contains($e->getMessage(), 'in progress'), 'Concurrent saving stays retryable'); }
         check(count(Http::$calls) === $before, 'Lock contention never starts provider work');
     }
     return $handler($verb, $path, $data);

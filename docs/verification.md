@@ -425,8 +425,13 @@ or enable a disabled endpoint.
 
 Saving a card reuses the newest local agreement with the same Stripe fingerprint. Link saves match the full
 Stripe Link account email, ignoring case; billing email and masked labels never identify an account. Existing
-duplicates and attached Stripe methods remain intact for provider references and Auto Pay. A native cache lock
+duplicates and attached Stripe methods remain intact for provider references and Auto Pay. Every verified copy
+receives the expiry and consent refresh, with a separate newer-consent check per method. A native cache lock
 serializes saves, while provider reads and writes run outside the database owner lock. Consent source receipts
 retain acceptance time and prevent a retried save from replacing a later expiry. The theme groups verified
 identities for display and keeps the original selected agreement IDs. Offline fakes do not prove distributed
 cache behavior or real database concurrency; check those in the test-mode sandbox before release.
+
+Repeated Add card returns wait up to five seconds for the saved receipt, then reuse its result. A longer wait
+shows a retry notice. Removal verifies and detaches every matching local method and its receipt-linked incoming
+copies outside the owner lock. Any provider failure stops native local removal so it can finish on retry.

@@ -5,9 +5,11 @@ namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 use App\Exceptions\DisplayException;
 use App\Helpers\ExtensionHelper;
 use App\Models\{BillingAgreement, Gateway, User};
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Support\Facades\{Cache, DB, Log};
+use Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException;
 
 trait SavedMethods
 {
@@ -45,12 +47,95 @@ trait SavedMethods
         return $identities;
     }
 
+    private function removeSavedMethodCopies(BillingAgreement $agreement): bool
+    {
+        $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
+        $snapshot = DB::transaction(function () use ($agreement, $gateway) {
+            $user = User::where('id', $agreement->user_id)->lockForUpdate()->firstOrFail();
+            $current = BillingAgreement::withTrashed()->where('external_reference', $agreement->external_reference)->lockForUpdate()->first();
+            if (!$current || $current->id != $agreement->id || $current->user_id != $user->id || $current->gateway_id != $gateway->id) return null;
+            return [$user, $current, $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value,
+                BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->get(),
+                $user->properties()->where('key', 'like', 'ae_stripe_saved_%')->lockForUpdate()->get()];
+        });
+        if (!$snapshot) return false;
+        [$user, $current, $customer, $rows, $receipts] = $snapshot;
+        if (!$customer) return false;
+        try {
+            $method = $this->request('get', '/payment_methods/' . $current->external_reference);
+            if (($method->customer ?? null) !== null && ($method->customer ?? null) !== $customer) return false;
+            $identity = $this->savedMethodIdentity($method);
+            $copies = [$current->external_reference => $method];
+            $matched = [$current];
+            if ($identity !== null) {
+                foreach ($rows as $row) {
+                    if ($row->external_reference === $current->external_reference) continue;
+                    $remote = $this->request('get', '/payment_methods/' . $row->external_reference);
+                    if (($remote->id ?? null) === $row->external_reference && in_array($remote->customer ?? null, [null, $customer], true)
+                        && $this->savedMethodIdentity($remote) === $identity) {
+                        $copies[$row->external_reference] = $remote;
+                        $matched[] = $row;
+                    }
+                }
+                // Saving keeps incoming copies attached for Stripe references. Their receipts survive without a local row.
+                foreach ($receipts as $property) {
+                    $receipt = json_decode($property->value, true);
+                    $incoming = $receipt['incoming'] ?? null;
+                    if (!$incoming || isset($copies[$incoming]) || !isset($copies[$receipt['reference'] ?? ''])
+                        || ($receipt['consent']['user_id'] ?? null) != $user->id) continue;
+                    $remote = $this->request('get', '/payment_methods/' . $incoming);
+                    if (($remote->id ?? null) === $incoming && ($remote->customer ?? null) === $customer
+                        && $this->savedMethodIdentity($remote) === $identity) $copies[$incoming] = $remote;
+                }
+            }
+            $valid = DB::transaction(function () use ($user, $gateway, $customer, $copies, $matched) {
+                User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+                if ($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value !== $customer) return false;
+                foreach ($copies as $reference => $remote) {
+                    $row = BillingAgreement::withTrashed()->where('external_reference', $reference)->lockForUpdate()->first();
+                    if ($row && ($row->user_id != $user->id || $row->gateway_id != $gateway->id)) return false;
+                }
+                foreach ($matched as $match) {
+                    $row = BillingAgreement::withTrashed()->where('external_reference', $match->external_reference)->lockForUpdate()->first();
+                    if (!$row || $row->id != $match->id) return false;
+                }
+                return true;
+            });
+            if (!$valid) return false;
+            // Detach the visible method last. If any copy fails, keep the local rows and retry the same removal.
+            $visible = $copies[$current->external_reference];
+            unset($copies[$current->external_reference]);
+            $copies[$current->external_reference] = $visible;
+            foreach ($copies as $reference => $remote) {
+                if (($remote->customer ?? null) === $customer) $this->request('post', '/payment_methods/' . $reference . '/detach');
+            }
+        } catch (ConnectionException | RequestException $e) {
+            Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
+            return false;
+        }
+        return DB::transaction(function () use ($user, $gateway, $customer, $matched) {
+            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+            if ($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value !== $customer) return false;
+            foreach ($matched as $match) {
+                $row = BillingAgreement::withTrashed()->where('external_reference', $match->external_reference)->lockForUpdate()->first();
+                if (!$row || $row->id != $match->id || $row->user_id != $user->id || $row->gateway_id != $gateway->id) return false;
+            }
+            foreach ($matched as $match) $this->autoPayCardRemoved($user, (int) $match->id);
+            return true;
+        });
+    }
+
     private function persistAgreement($user, $method, array $consent = [])
     {
         if (empty($method->id)) return false;
         // Serialize provider updates without holding a database owner lock across HTTP. Contention is retryable.
         $lock = Cache::lock('ae-stripe-save-method-' . $user->id, 600);
-        if (!$lock->get()) throw new \RuntimeException('Another saved payment method update is in progress. Try again.');
+        try {
+            // A second browser return waits for the first receipt, then returns the same saved result.
+            $lock->block(5);
+        } catch (LockTimeoutException $e) {
+            throw new SavedMethodRetryException('Another saved payment method update is in progress. Try again.');
+        }
         try {
             return $this->persistSavedMethod($user, $method, $consent);
         } finally {
@@ -126,12 +211,21 @@ trait SavedMethods
         usort($matches, fn ($a, $b) => strcmp((string) $b->created_at, (string) $a->created_at) ?: $b->id <=> $a->id);
         $kept = $matches[0] ?? null;
         // Validate globally unique references before any provider writes, including removed or foreign rows.
-        $validate = function () use ($user, $gateway, $incomingId) {
+        $validate = function (bool $checkRows = true) use ($user, $gateway, $incomingId, $rows) {
             $row = BillingAgreement::withTrashed()->where('external_reference', $incomingId)->lockForUpdate()->first();
             if ($row && ($row->user_id != $user->id || $row->gateway_id != $gateway->id)) {
                 throw new DisplayException('This payment method can\'t be used on this account. Add a new payment method.');
             }
             if ($row?->trashed()) throw new DisplayException('This payment method was removed. Add a new payment method.');
+            if (!$checkRows) return;
+            $current = BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->get();
+            $references = static function ($items) {
+                $result = [];
+                foreach ($items as $item) $result[$item->id] = $item->external_reference;
+                ksort($result);
+                return $result;
+            };
+            if ($references($current) !== $references($rows)) throw new SavedMethodRetryException('Saved payment methods changed. Try again.');
         };
         DB::transaction(function () use ($user, $customer, $validate) {
             User::where('id', $user->id)->lockForUpdate()->firstOrFail();
@@ -150,31 +244,31 @@ trait SavedMethods
         $data = $this->getPaymentDetails($method);
         $duplicate = $kept !== null;
         $reference = $kept?->external_reference ?? $incomingId;
-        $latest = json_decode($user->properties()->where('key', 'ae_stripe_method_' . $reference)->first()?->value ?? 'null', true);
-        $older = ($latest['customer'] ?? null) === $customer && ($latest['gateway_id'] ?? null) == $gateway->id
-            && [($latest['consent']['accepted_at'] ?? 0), ($latest['consent']['sequence'] ?? 0)] > [$consent['accepted_at'], $consent['sequence']];
-        if ($older && $kept) $data = ['name' => $kept->name, 'type' => $kept->type, 'expiry' => $kept->expiry];
-        $update = ['allow_redisplay' => 'always'];
-        if (!$older && $reference !== $incomingId && ($method->type ?? null) === 'card') {
-            $update['card'] = ['exp_month' => $method->card->exp_month, 'exp_year' => $method->card->exp_year];
+        $targets = [$incomingId => null];
+        foreach ($matches as $match) $targets[$match->external_reference] = $match;
+        $updates = [];
+        foreach ($targets as $target => $row) {
+            $latest = json_decode($user->properties()->where('key', 'ae_stripe_method_' . $target)->first()?->value ?? 'null', true);
+            $older = ($latest['customer'] ?? null) === $customer && ($latest['gateway_id'] ?? null) == $gateway->id
+                && [($latest['consent']['accepted_at'] ?? 0), ($latest['consent']['sequence'] ?? 0)] > [$consent['accepted_at'], $consent['sequence']];
+            $updates[$target] = ['older' => $older, 'data' => $older && $row
+                ? ['name' => $row->name, 'type' => $row->type, 'expiry' => $row->expiry] : $data];
+            $update = ['allow_redisplay' => 'always'];
+            if (!$older && $target !== $incomingId && ($method->type ?? null) === 'card') {
+                $update['card'] = ['exp_month' => $method->card->exp_month, 'exp_year' => $method->card->exp_year];
+            }
+            // Every retained copy can still be used by Auto Pay, a service or a Stripe subscription.
+            // Update them all without holding the database owner lock. Never detach on save.
+            $this->request('post', '/payment_methods/' . $target, $update);
         }
-        // The incoming method remains attached: Stripe intents and subscriptions may still refer to it.
-        $this->request('post', '/payment_methods/' . $reference, $update);
+        $data = $updates[$reference]['data'];
         $message = $duplicate ? (($method->type ?? null) === 'card'
             ? 'This card is already saved. We updated its expiry to ' . substr($data['expiry'], 5, 2) . '/' . substr($data['expiry'], 0, 4) . '.'
             : 'This Link account is already saved. We updated it.') : null;
-        return DB::transaction(function () use ($user, $gateway, $customer, $incomingId, $reference, $kept, $rows, $data, $identity, $consent, $key, $message, $validate, $older, $receipt) {
+        return DB::transaction(function () use ($user, $gateway, $customer, $incomingId, $reference, $kept, $rows, $data, $identity, $consent, $key, $message, $validate, $updates, $matches, $receipt) {
             User::where('id', $user->id)->lockForUpdate()->firstOrFail();
             abort_unless($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value === $customer, 409);
             $validate();
-            $current = BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->get();
-            $references = static function ($items) {
-                $result = [];
-                foreach ($items as $row) $result[$row->id] = $row->external_reference;
-                ksort($result);
-                return $result;
-            };
-            if ($references($current) !== $references($rows)) throw new \RuntimeException('Saved payment methods changed. Try again.');
             $agreement = $kept;
             if (!$agreement) {
                 try {
@@ -182,14 +276,22 @@ trait SavedMethods
                 } catch (UniqueConstraintViolationException $e) {
                     $agreement = BillingAgreement::withTrashed()->where('external_reference', $incomingId)->lockForUpdate()->first();
                     if (!$agreement) throw $e;
-                    $validate();
+                    // The insert itself found a new row; still recheck its owner, gateway and deletion.
+                    $validate(false);
                 }
             }
-            if (!$older) $agreement->update($data);
-            if (!$older) $user->properties()->updateOrCreate(['key' => 'ae_stripe_method_' . $reference], ['value' => json_encode([
-                'customer' => $customer, 'gateway_id' => $gateway->id, 'identity' => $identity,
-                'consent' => $consent + ['accepted_at' => time(), 'user_id' => $user->id],
-            ], JSON_THROW_ON_ERROR)]);
+            $local = $matches ?: [$agreement];
+            foreach ($local as $row) {
+                $change = $updates[$row->external_reference];
+                if (!$change['older']) $row->update($change['data']);
+            }
+            foreach ($updates as $target => $change) {
+                if ($change['older']) continue;
+                $user->properties()->updateOrCreate(['key' => 'ae_stripe_method_' . $target], ['value' => json_encode([
+                    'customer' => $customer, 'gateway_id' => $gateway->id, 'identity' => $identity,
+                    'consent' => $consent + ['accepted_at' => time(), 'user_id' => $user->id],
+                ], JSON_THROW_ON_ERROR)]);
+            }
             $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($receipt + ['reference' => $reference, 'message' => $message], JSON_THROW_ON_ERROR)]);
             return $message ? ['message' => $message] : true;
         });

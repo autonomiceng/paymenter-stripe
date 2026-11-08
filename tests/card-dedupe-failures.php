@@ -30,8 +30,8 @@ foreach ([404, 503] as $status) {
     };
     $start = count(Http::$calls);
     $warnings = count(Log::$warnings);
-    check($gateway->cancelBillingAgreement(new BillingAgreement($row(19, 'pm_cancel'))) === true,
-        "Cancellation proceeds locally after a Stripe $status read failure");
+    check($gateway->cancelBillingAgreement(new BillingAgreement($row(19, 'pm_cancel'))) === false,
+        "Cancellation stops before local removal after a Stripe $status read failure");
     check(count(Http::$calls) === $start + 1 && Http::$calls[$start][0] === 'get',
         "Cancellation never detaches after a Stripe $status read failure");
     check(count(Log::$warnings) === $warnings + 1 && end(Log::$warnings) === [
