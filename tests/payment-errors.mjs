@@ -333,7 +333,9 @@ try {
             } else {
                 await page.locator('#submit').click();
             }
-            await page.waitForURL('https://example.com/return?checkPayment=true&saved_notice=' + 'a'.repeat(32));
+            await page.waitForURL(url => url.origin === 'https://example.com' && url.pathname === '/return');
+            assert.equal(page.url(), 'https://example.com/return?checkPayment=true&saved_notice=' + 'a'.repeat(32),
+                'The checkout-tab notice token reaches the invoice destination');
             assert.equal(new Set(requests.map(r => r.saved_notice)).size, 1, 'Authentication keeps the same checkout-tab token');
             assert.deepEqual(actions, [{clientSecret: 'fixture-secret'}]);
             assert.deepEqual(requests.map(paymentFields), [
