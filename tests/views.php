@@ -148,7 +148,7 @@ check(str_contains($setupView, '<div id="express-checkout-element" class="shrink
 check(str_contains($elementsView, "layout: 'tabs',") && str_contains($elementsView, 'buttonHeight: 40,'),
     'Card fields show without a panel around them and the Link button keeps its smallest height');
 check(str_contains($payView, "@checked(in_array($" . "intent->status, ['requires_action', 'requires_confirmation']")
-    && str_contains($payView, 'const save = resuming ? savedConsent :') && str_contains($payView, 'amount: @js($intent->amount), save}')
+    && str_contains($payView, 'const save = resuming ? savedConsent :') && str_contains($payView, 'amount: @js($intent->amount), save, saved_notice: savedNoticeToken}')
     && str_contains($payView, 'saveCard.disabled = resuming ||'), '3DS resume visibly preserves its recorded save choice');
 
 check(str_contains($payView, 'if (customerSessionSecret) options.customerSessionClientSecret = customerSessionSecret;'),

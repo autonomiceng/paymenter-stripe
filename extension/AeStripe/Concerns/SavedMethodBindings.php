@@ -36,7 +36,8 @@ trait SavedMethodBindings
     // Replace native binding writes only for this gateway; payment execution stays in the native handler.
     private function bindNativeSavedMethod($component, string $method, callable $returnEarly): void
     {
-        if ($component instanceof \App\Livewire\Services\Show && $method === 'clearBillingAgreement') {
+        if ($component instanceof \App\Livewire\Services\Show && $method === 'clearBillingAgreement'
+            && $component->service->properties()->where('key', self::AUTO_PAY_PENDING)->exists()) {
             DB::transaction(function () use ($component) {
                 User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
                 $service = Service::where('id', $component->service->id)->where('user_id', Auth::id())->lockForUpdate()->firstOrFail();

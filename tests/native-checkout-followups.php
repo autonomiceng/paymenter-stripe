@@ -36,8 +36,8 @@ if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
                 $cart = App\Models\Cart::create(['user_id' => $user->id, 'currency_code' => 'USD']);
                 $cart->items()->create(['product_id' => $product->id, 'plan_id' => $plan->id, 'quantity' => 1, 'checkout_config' => [], 'config_options' => []]);
                 request()->cookies->set('cart', $cart->ulid); Illuminate\Support\Once::flush();
-                $page = Livewire::test(App\Livewire\Cart::class)->set('tos', true)->call('checkout');
-                $assert(Order::count() === 1 && Service::count() === 1, 'The real checkout commits the order while the saved-card lock is busy.');
+                $page = Livewire::withCookies(['cart' => $cart->ulid])->test(App\Livewire\Cart::class)->set('tos', true)->call('checkout');
+                $assert(Order::count() === 1 && Service::count() === 1, 'The real checkout commits the order while the saved-card lock is busy: ' . json_encode($delivered($page)));
                 $service = Service::firstOrFail();
             } else {
                 $service = DB::transaction(fn () => $create());
@@ -107,17 +107,17 @@ if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
         $assert($original !== null, 'Foreign invoice delivery does not consume the intended notice.');
         $saved = json_decode($original->value, true); $wrong = $saved; $wrong['user_id'] = 999;
         $original->update(['value' => json_encode($wrong)]);
-        $page = Livewire::test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
+        $page = Livewire::withQueryParams(['saved_notice' => $token ?? str_repeat('a', 32)])->test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
         $assert(!$delivered($page) && $original->fresh()->value === json_encode($wrong), 'A mismatched notice user cannot receive confirmation.');
         $original->update(['value' => json_encode($saved)]);
     }
-    $page = Livewire::test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
+    $page = Livewire::withQueryParams(['saved_notice' => $token ?? str_repeat('a', 32)])->test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
     $assert(count($delivered($page)) === 1, 'The checkout destination claims and delivers its confirmation.');
     session()->replace($sessionSnapshot);
-    $page = Livewire::test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
+    $page = Livewire::withQueryParams(['saved_notice' => $token ?? str_repeat('a', 32)])->test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
     $assert(!$delivered($page), 'Two requests with the same loaded session cannot deliver one notice twice.');
     (new ReflectionMethod($gateway, 'saveConsentedMethod'))->invoke($gateway, $intent, $token);
-    $page = Livewire::test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
+    $page = Livewire::withQueryParams(['saved_notice' => $token ?? str_repeat('a', 32)])->test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]);
     $assert(!$delivered($page), 'Repeated confirmation with the same checkout token cannot restore a consumed notice.');
 } else throw new RuntimeException('Unknown native checkout follow-up case');
 echo "PASS: $checks native checkout follow-up checks ($case, $theme)\n";

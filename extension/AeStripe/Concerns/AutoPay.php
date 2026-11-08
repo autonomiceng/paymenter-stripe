@@ -84,6 +84,7 @@ trait AutoPay
                 $this->stopWaitingRenewals($user);
                 $user->properties()->where('key', self::AUTO_PAY_PROPERTY)->delete();
                 foreach ($this->autoPayServices($user) as $service) {
+                    $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
                     if ($service->billing_agreement_id) $service->update(['billing_agreement_id' => null]);
                 }
                 return response()->json(['ok' => true, 'enabled' => false]);
@@ -103,6 +104,7 @@ trait AutoPay
             foreach ($this->autoPayServices($user) as $service) {
                 if (($service->plan?->type ?? null) !== 'recurring' || $service->status === Service::STATUS_CANCELLED) continue;
                 if ($service->billing_agreement_id != $agreement->id) $service->update(['billing_agreement_id' => (int) $agreement->id]);
+                $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
                 $services++;
             }
             return response()->json(['ok' => true, 'enabled' => true, 'services' => $services]);

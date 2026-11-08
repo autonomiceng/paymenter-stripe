@@ -146,8 +146,8 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
             return $native($verb, $path, $data);
         };
         check(!$gateway->cancelBillingAgreement($clicked)
-            && ExtensionHelper::$agreements['pm_old']['deleted_at'] === null && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
-            'A failed detach never soft-deletes matching local agreements');
+            && ExtensionHelper::$agreements['pm_old']['deleted_at'] !== null && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
+            'A failed later detach reconciles detached copies and preserves the still-attached clicked method');
         check($gateway->cancelBillingAgreement($clicked), 'Removing matching local copies succeeds on retry');
         Http::$handler = $native;
         check($methods['pm_old']->customer === null && $methods['pm_new']->customer === null, 'Every local matching copy is detached at Stripe');
@@ -164,8 +164,9 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         $setup->id = 'seti_notice_shape';
         $intent->payment_method_options = (object) ['card' => (object) ['setup_future_usage' => 'off_session']];
         $setupNotice = $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
-        invoke($gateway, 'saveConsentedMethod', $intent);
-        check((\Illuminate\Support\Facades\Session::$values['ae_stripe_saved_notice_12']['notice'] ?? null) === $setupNotice,
+        $noticeToken = invoke($gateway, 'saveConsentedMethod', $intent);
+    $checkoutNotice = json_decode($user->props->values['ae_stripe_checkout_notice_' . hash('sha256', (string) $noticeToken)] ?? 'null', true)['notice'] ?? \Illuminate\Support\Facades\Session::$values['ae_stripe_saved_notice_12']['notice'] ?? null;
+        check(($checkoutNotice) === $setupNotice,
             'Pay-with-Save and Add card flash the same success notice array');
         $user->props->values = [];
         ExtensionHelper::$agreements = [];
