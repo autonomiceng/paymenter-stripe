@@ -124,8 +124,14 @@ use Illuminate\Support\Facades\{DB, Http};
                 $result = null;
                 try { $result = $gateway->pay($invoice, 20); }
                 catch (\App\Exceptions\DisplayException $e) {
-                    if (in_array($state, ['requires_payment_method', 'requires_action'], true)) throw $e;
+                    if ($state !== 'partial') throw $e;
+                    check($e->getMessage() === 'Payment needs review. Contact support to check this payment.',
+                        'Partially received money reaches the specific payment-review refusal');
                 }
+                if ($state === 'processing') check(($result['name'] ?? null) === 'gateways.ae-stripe::payment-status'
+                    && $result['data']['message'] === 'Payment pending. Refresh the invoice to check its status.',
+                    'Processing reaches the pending payment view without throwing');
+                if ($state === 'partial') check($result === null, 'Partially received money never opens a replacement form');
                 if (in_array($state, ['requires_payment_method', 'requires_action'], true)) {
                     check($stripe->intents[$old->id]->status === 'canceled' && $result['data']['intent']->id !== $old->id,
                         'Opening an old mismatched form cancels the known unfunded intent and prepares card and Link');
@@ -148,6 +154,22 @@ use Illuminate\Support\Facades\{DB, Http};
                 && $result['data']['message'] === 'Your bank declined this card. Try a different card, or contact your bank.'
                 && (ExtensionHelper::$payments['920:'.$intent->id]['status'] ?? null) === 'failed' && !$stripe->charges,
                 'A new-card refusal reaches the bank decline path and records failure instead of a generic integration 409');
+        });
+        $run('new-card-missing-types-open', function ($invoice, $stripe) use ($gateway) {
+            $old = $gateway->pay($invoice, 20)['data']['intent'];
+            unset($stripe->intents[$old->id]->payment_method_types);
+            $fresh = $gateway->pay($invoice, 20)['data']['intent'];
+            check($stripe->intents[$old->id]->status === 'canceled' && $fresh->id !== $old->id
+                && $fresh->payment_method_types === ['card', 'link'], 'Missing method types retire only the unfunded old Elements form');
+            check(!$stripe->confirms && !$stripe->charges, 'Preparing a replacement never starts a debit');
+        });
+        $run('new-card-missing-types-confirm', function ($invoice, $stripe) use ($gateway) {
+            $intent = $gateway->pay($invoice, 20)['data']['intent'];
+            unset($stripe->intents[$intent->id]->payment_method_types);
+            $result = $gateway->confirmPayment(new Request(['intent' => $intent->id, 'amount' => 2000,
+                'confirmation_token' => 'ctoken_old', 'save' => false]));
+            check($result['status'] === 409 && str_contains($result['data']['message'], 'form changed')
+                && !$stripe->confirms && !$stripe->charges, 'Missing method types cannot authorize an open-tab confirmation token');
         });
         $run('new-card-old-tab', function ($invoice, $stripe) use ($gateway) {
             $intent = $gateway->pay($invoice, 20)['data']['intent'];
