@@ -10,6 +10,8 @@ $oldHandler = Http::$handler;
 $optIntent = (object) ['id' => 'pi_options', 'confirmation_method' => 'manual', 'status' => 'requires_confirmation', 'customer' => 'cus_owner',
     'payment_method' => 'pm_options', 'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1']];
 Http::$handler = fn () => $optIntent;
+$priorStripeTime = $GLOBALS['fakeStripeTime'] ?? null;
+$GLOBALS['fakeStripeTime'] = 1794071701;
 foreach ([true, false] as $save) {
     $gateway->consent(new Request(['intent' => 'pi_options', 'save' => $save]));
     check(end(Http::$calls)[2] === [
@@ -17,11 +19,11 @@ foreach ([true, false] as $save) {
         'payment_method_options' => ['card' => ['setup_future_usage' => $save ? 'off_session' : 'none'],
             'link' => ['setup_future_usage' => $save ? 'off_session' : 'none']],
         'metadata' => ['ae_stripe_consent' => $save ? '1' : '0',
-            'ae_stripe_consent_at' => $save ? end(Http::$calls)[2]['metadata']['ae_stripe_consent_at'] : ''],
+            'ae_stripe_consent_at' => $save ? '1794071701' : ''],
     ], $save ? 'Saving sets card and Link usage and clears legacy usage' : 'Clearing removes legacy, card and Link usage');
-    $consentAt = end(Http::$calls)[2]['metadata']['ae_stripe_consent_at'];
-    check(!$save || (is_string($consentAt) && preg_match('/\A[0-9]+\z/', $consentAt) === 1), 'Saving records the server acceptance time');
 }
+if ($priorStripeTime === null) unset($GLOBALS['fakeStripeTime']);
+else $GLOBALS['fakeStripeTime'] = $priorStripeTime;
 $optIntent->status = 'requires_action';
 $optIntent->metadata->ae_stripe_consent = '1';
 $before = count(Http::$calls);

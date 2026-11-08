@@ -566,6 +566,8 @@ namespace Carbon {
     }
 }
 namespace {
+    $GLOBALS['fakeConfig']['cache.default'] = 'database';
+    $GLOBALS['fakeConfig']['cache.stores.database.driver'] = 'database';
     class TransactionClassificationQuery {
         private $id;
         public function where($key, $value) {

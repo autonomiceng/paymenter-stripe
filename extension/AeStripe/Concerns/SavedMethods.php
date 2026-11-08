@@ -57,6 +57,21 @@ trait SavedMethods
         }
     }
 
+    private function savedMethodLock(int $userId)
+    {
+        $driver = config('cache.stores.' . config('cache.default') . '.driver');
+        if (!in_array($driver, ['database', 'redis', 'memcached', 'dynamodb'], true)) {
+            throw new SavedMethodRetryException('Saved payment method changes need a shared cache store. Contact support.');
+        }
+        return Cache::lock('ae-stripe-save-method-' . $userId, 600);
+    }
+
+    private function savedMethodIndex($user, string $reference, $customer, $gateway): array
+    {
+        $index = json_decode($user->properties()->where('key', 'ae_stripe_method_' . $reference)->first()?->value ?? 'null', true);
+        return ($index['customer'] ?? null) === $customer && ($index['gateway_id'] ?? null) == $gateway->id ? $index : [];
+    }
+
     private function removeSavedMethodCopies(BillingAgreement $agreement): bool
     {
         $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
@@ -74,8 +89,10 @@ trait SavedMethods
         try {
             $method = $this->readSavedMethod($current->external_reference);
             if (($method->customer ?? null) !== null && ($method->customer ?? null) !== $customer) return false;
+            if ($method && ($method->id ?? null) !== $current->external_reference) return false;
             $identity = $this->savedMethodIdentity($method);
-            // A confirmed missing method has no identity, so leave other agreements alone.
+            // Only a server-verified, customer-scoped index can recover a missing method's identity.
+            if (!$method) $identity = $this->savedMethodIndex($user, $current->external_reference, $customer, $gateway)['identity'] ?? null;
             $copies = [$current->external_reference => $method];
             $matched = [$current];
             if ($identity !== null) {
@@ -92,8 +109,10 @@ trait SavedMethods
                 foreach ($receipts as $property) {
                     $receipt = json_decode($property->value, true);
                     $incoming = $receipt['incoming'] ?? null;
-                    if (!$incoming || isset($copies[$incoming]) || !isset($copies[$receipt['reference'] ?? ''])
+                    if (!$incoming || array_key_exists($incoming, $copies)
                         || ($receipt['consent']['user_id'] ?? null) != $user->id) continue;
+                    $known = $this->savedMethodIndex($user, $incoming, $customer, $gateway);
+                    if (isset($known['identity']) && $known['identity'] !== $identity) continue;
                     $remote = $this->readSavedMethod($incoming);
                     if (($remote->id ?? null) === $incoming && ($remote->customer ?? null) === $customer
                         && $this->savedMethodIdentity($remote) === $identity) $copies[$incoming] = $remote;
@@ -124,7 +143,7 @@ trait SavedMethods
             Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
             return false;
         }
-        return DB::transaction(function () use ($user, $gateway, $customer, $matched, $current) {
+        $removed = DB::transaction(function () use ($user, $gateway, $customer, $matched, $current, $copies, $identity) {
             User::where('id', $user->id)->lockForUpdate()->firstOrFail();
             if ($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value !== $customer) return false;
             foreach ($matched as $match) {
@@ -136,15 +155,38 @@ trait SavedMethods
                 // Core deletes only the clicked agreement after this call returns true.
                 if ($match->id != $current->id && !$match->trashed()) $match->delete();
             }
+            foreach ($copies as $reference => $remote) {
+                $index = $this->savedMethodIndex($user, $reference, $customer, $gateway);
+                $user->properties()->updateOrCreate(['key' => 'ae_stripe_method_' . $reference], ['value' => json_encode(
+                    array_replace($index, ['customer' => $customer, 'gateway_id' => $gateway->id, 'identity' => $identity, 'removed' => true]), JSON_THROW_ON_ERROR)]);
+            }
+            foreach ($user->properties()->where('key', 'like', 'ae_stripe_saved_%')->lockForUpdate()->get() as $property) {
+                $receipt = json_decode($property->value, true);
+                if (($receipt['consent']['user_id'] ?? null) != $user->id
+                    || (!array_key_exists($receipt['incoming'] ?? '', $copies) && !array_key_exists($receipt['reference'] ?? '', $copies))) continue;
+                $receipt['removed'] = true;
+                $user->properties()->updateOrCreate(['key' => $property->key], ['value' => json_encode($receipt, JSON_THROW_ON_ERROR)]);
+            }
             return true;
         });
+        if ($removed && !$method && $identity === null) {
+            $notice = ['type' => 'warning', 'message' => 'This payment method was already gone. We removed its saved entry, but could not verify or remove other copies.'];
+            \Illuminate\Support\Facades\Session::flash('notification', $notice);
+            // Native removal flashes its success during the action, after bootHasNotifications has run.
+            if (function_exists('Livewire\\on')) \Livewire\on('dehydrate', static function ($component) use ($notice) {
+                if (\Illuminate\Support\Facades\Session::get('notification') !== $notice || !method_exists($component, 'notify')) return;
+                \Illuminate\Support\Facades\Session::forget('notification');
+                $component->notify($notice['message'], $notice['type']);
+            });
+        }
+        return $removed;
     }
 
     private function persistAgreement($user, $method, array $consent = [])
     {
         if (empty($method->id)) return false;
         // Serialize provider updates without holding a database owner lock across HTTP. Contention is retryable.
-        $lock = Cache::lock('ae-stripe-save-method-' . $user->id, 600);
+        $lock = $this->savedMethodLock((int) $user->id);
         try {
             // A second browser return waits for the first receipt, then returns the same saved result.
             $lock->block(5);
@@ -183,6 +225,7 @@ trait SavedMethods
                 $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($receipt, JSON_THROW_ON_ERROR)]);
             }
             if (($receipt['incoming'] ?? null) !== $incomingId) throw new DisplayException('This saved payment method changed. Add it again.');
+            if ($receipt['removed'] ?? false) throw new DisplayException('This payment method was removed. Add a new payment method.');
             return $receipt['consent'];
         });
         $method = $this->request('get', '/payment_methods/' . $incomingId);
@@ -227,13 +270,16 @@ trait SavedMethods
         usort($matches, fn ($a, $b) => strcmp((string) $b->created_at, (string) $a->created_at) ?: $b->id <=> $a->id);
         $kept = $matches[0] ?? null;
         // Validate globally unique references before any provider writes, including removed or foreign rows.
-        $validate = function (bool $checkRows = true, array $references = []) use ($user, $gateway, $incomingId, $rows) {
+        $validate = function (bool $checkRows = true, array $references = []) use ($user, $gateway, $customer, $incomingId, $rows) {
             foreach (array_unique([$incomingId, ...$references]) as $reference) {
                 $row = BillingAgreement::withTrashed()->where('external_reference', $reference)->lockForUpdate()->first();
                 if ($row && ($row->user_id != $user->id || $row->gateway_id != $gateway->id)) {
                     throw new DisplayException('This payment method can\'t be used on this account. Add a new payment method.');
                 }
                 if ($row?->trashed()) throw new DisplayException('This payment method was removed. Add a new payment method.');
+                if ($this->savedMethodIndex($user, $reference, $customer, $gateway)['removed'] ?? false) {
+                    throw new DisplayException('This payment method was removed. Add a new payment method.');
+                }
             }
             if (!$checkRows) return;
             $current = BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->get();
@@ -270,7 +316,9 @@ trait SavedMethods
             $stored = json_decode($property->value, true);
             $incoming = $stored['incoming'] ?? null;
             if (!$incoming || array_key_exists($incoming, $targets) || isset($localReferences[$incoming])
-                || ($stored['consent']['user_id'] ?? null) != $user->id) continue;
+                || ($stored['removed'] ?? false) || ($stored['consent']['user_id'] ?? null) != $user->id) continue;
+            $known = $this->savedMethodIndex($user, $incoming, $customer, $gateway);
+            if (isset($known['identity']) && $known['identity'] !== $identity) continue;
             $remote = $this->readSavedMethod($incoming);
             if (($remote->id ?? null) === $incoming && ($remote->customer ?? null) === $customer
                 && $this->savedMethodIdentity($remote) === $identity) $targets[$incoming] = null;

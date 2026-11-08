@@ -661,7 +661,11 @@ class AeStripe extends Gateway
 
     public function cancelBillingAgreement(BillingAgreement $billingAgreement): bool
     {
-        $lock = \Illuminate\Support\Facades\Cache::lock('ae-stripe-save-method-' . $billingAgreement->user_id, 600);
+        try {
+            $lock = $this->savedMethodLock((int) $billingAgreement->user_id);
+        } catch (SavedMethodRetryException $e) {
+            return false;
+        }
         if (!$lock->get()) return false;
         try {
             return $this->removeSavedMethodCopies($billingAgreement);
@@ -699,7 +703,7 @@ class AeStripe extends Gateway
             ]);
         }
 
-        if (is_array($saved)) return redirect()->route('account.payment-methods')->with('ae_stripe_saved_notice', [
+        if (is_array($saved)) return redirect()->route('account.payment-methods')->with('notification', [
             'type' => 'success', 'message' => $saved['message'],
         ]);
         return redirect()->route('account.payment-methods')->with('notification', [

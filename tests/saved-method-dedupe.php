@@ -165,7 +165,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         $intent->payment_method_options = (object) ['card' => (object) ['setup_future_usage' => 'off_session']];
         $setupNotice = $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
         invoke($gateway, 'saveConsentedMethod', $intent);
-        check(\Illuminate\Support\Facades\Session::$flashes['ae_stripe_saved_notice'] === $setupNotice,
+        check(\Illuminate\Support\Facades\Session::$flashes['notification'] === $setupNotice,
             'Pay-with-Save and Add card flash the same success notice array');
         $user->props->values = [];
         ExtensionHelper::$agreements = [];
