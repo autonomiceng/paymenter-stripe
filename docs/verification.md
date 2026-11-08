@@ -426,7 +426,9 @@ or enable a disabled endpoint.
 Saving a card reuses the newest local agreement with the same Stripe fingerprint. Link saves match the full
 Stripe Link account email, ignoring case; billing email and masked labels never identify an account. Existing
 duplicates and attached Stripe methods remain intact for provider references and Auto Pay. Every verified copy
-receives the expiry and consent refresh, with a separate newer-consent check per method. A native cache lock
+receives the expiry and consent refresh, including verified receipt-only incoming copies that provider
+subscriptions may still charge. Card matching uses the provider fingerprint for every brand. Each copy has
+its own newer-consent check. A native cache lock
 serializes saves, while provider reads and writes run outside the database owner lock. Consent source receipts
 retain acceptance time and prevent a retried save from replacing a later expiry. The theme groups verified
 identities for display and keeps the original selected agreement IDs. Offline fakes do not prove distributed

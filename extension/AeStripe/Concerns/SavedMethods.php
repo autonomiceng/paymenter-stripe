@@ -47,7 +47,7 @@ trait SavedMethods
         return $identities;
     }
 
-    private function readMethodForRemoval(string $reference): ?object
+    private function readSavedMethod(string $reference): ?object
     {
         try {
             return $this->request('get', '/payment_methods/' . $reference);
@@ -72,7 +72,7 @@ trait SavedMethods
         [$user, $current, $customer, $rows, $receipts] = $snapshot;
         if (!$customer) return false;
         try {
-            $method = $this->readMethodForRemoval($current->external_reference);
+            $method = $this->readSavedMethod($current->external_reference);
             if (($method->customer ?? null) !== null && ($method->customer ?? null) !== $customer) return false;
             $identity = $this->savedMethodIdentity($method);
             // A confirmed missing method has no identity, so leave other agreements alone.
@@ -81,7 +81,7 @@ trait SavedMethods
             if ($identity !== null) {
                 foreach ($rows as $row) {
                     if ($row->external_reference === $current->external_reference) continue;
-                    $remote = $this->readMethodForRemoval($row->external_reference);
+                    $remote = $this->readSavedMethod($row->external_reference);
                     if (($remote->id ?? null) === $row->external_reference && in_array($remote->customer ?? null, [null, $customer], true)
                         && $this->savedMethodIdentity($remote) === $identity) {
                         $copies[$row->external_reference] = $remote;
@@ -94,7 +94,7 @@ trait SavedMethods
                     $incoming = $receipt['incoming'] ?? null;
                     if (!$incoming || isset($copies[$incoming]) || !isset($copies[$receipt['reference'] ?? ''])
                         || ($receipt['consent']['user_id'] ?? null) != $user->id) continue;
-                    $remote = $this->readMethodForRemoval($incoming);
+                    $remote = $this->readSavedMethod($incoming);
                     if (($remote->id ?? null) === $incoming && ($remote->customer ?? null) === $customer
                         && $this->savedMethodIdentity($remote) === $identity) $copies[$incoming] = $remote;
                 }
@@ -165,11 +165,12 @@ trait SavedMethods
         $source = $consent['source'] ?? $incomingId;
         $key = 'ae_stripe_saved_' . hash('sha256', $source . ':' . $incomingId);
         // Current reads include saves committed after an earlier REPEATABLE READ snapshot.
-        [$customer, $rows, $receipt] = DB::transaction(function () use ($user, $gateway, $key) {
+        [$customer, $rows, $receipt, $receipts] = DB::transaction(function () use ($user, $gateway, $key) {
             User::where('id', $user->id)->lockForUpdate()->firstOrFail();
             return [$user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value,
                 BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->get(),
-                json_decode($user->properties()->where('key', $key)->lockForUpdate()->first()?->value ?? 'null', true)];
+                json_decode($user->properties()->where('key', $key)->lockForUpdate()->first()?->value ?? 'null', true),
+                $user->properties()->where('key', 'like', 'ae_stripe_saved_%')->lockForUpdate()->get()];
         });
         if (!$customer) return false;
         $consent = DB::transaction(function () use ($user, $key, $consent, $incomingId, &$receipt) {
@@ -206,7 +207,7 @@ trait SavedMethods
         $matches = [];
         foreach ($rows as $row) {
             if (($method->type ?? null) === 'link' && $row->type !== 'link') continue;
-            if (($method->type ?? null) === 'card' && !in_array($row->type, ['card', 'visa', 'mastercard', 'amex', 'diners', 'discover', 'jcb', 'unionpay', 'unknown'], true)) continue;
+            // Local card types are display brands. Verify the actual Stripe identity for every brand.
             $known = json_decode($user->properties()->where('key', 'ae_stripe_method_' . $row->external_reference)->first()?->value ?? 'null', true);
             if ($identity !== null && ($known['customer'] ?? null) === $customer && ($known['gateway_id'] ?? null) == $gateway->id
                 && ($known['identity'] ?? null) !== null && $known['identity'] !== $identity) continue;
@@ -226,12 +227,14 @@ trait SavedMethods
         usort($matches, fn ($a, $b) => strcmp((string) $b->created_at, (string) $a->created_at) ?: $b->id <=> $a->id);
         $kept = $matches[0] ?? null;
         // Validate globally unique references before any provider writes, including removed or foreign rows.
-        $validate = function (bool $checkRows = true) use ($user, $gateway, $incomingId, $rows) {
-            $row = BillingAgreement::withTrashed()->where('external_reference', $incomingId)->lockForUpdate()->first();
-            if ($row && ($row->user_id != $user->id || $row->gateway_id != $gateway->id)) {
-                throw new DisplayException('This payment method can\'t be used on this account. Add a new payment method.');
+        $validate = function (bool $checkRows = true, array $references = []) use ($user, $gateway, $incomingId, $rows) {
+            foreach (array_unique([$incomingId, ...$references]) as $reference) {
+                $row = BillingAgreement::withTrashed()->where('external_reference', $reference)->lockForUpdate()->first();
+                if ($row && ($row->user_id != $user->id || $row->gateway_id != $gateway->id)) {
+                    throw new DisplayException('This payment method can\'t be used on this account. Add a new payment method.');
+                }
+                if ($row?->trashed()) throw new DisplayException('This payment method was removed. Add a new payment method.');
             }
-            if ($row?->trashed()) throw new DisplayException('This payment method was removed. Add a new payment method.');
             if (!$checkRows) return;
             $current = BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->get();
             $references = static function ($items) {
@@ -261,6 +264,23 @@ trait SavedMethods
         $reference = $kept?->external_reference ?? $incomingId;
         $targets = [$incomingId => null];
         foreach ($matches as $match) $targets[$match->external_reference] = $match;
+        $localReferences = [];
+        foreach ($rows as $row) $localReferences[$row->external_reference] = true;
+        if ($identity !== null) foreach ($receipts as $property) {
+            $stored = json_decode($property->value, true);
+            $incoming = $stored['incoming'] ?? null;
+            if (!$incoming || array_key_exists($incoming, $targets) || isset($localReferences[$incoming])
+                || ($stored['consent']['user_id'] ?? null) != $user->id) continue;
+            $remote = $this->readSavedMethod($incoming);
+            if (($remote->id ?? null) === $incoming && ($remote->customer ?? null) === $customer
+                && $this->savedMethodIdentity($remote) === $identity) $targets[$incoming] = null;
+        }
+        $references = array_keys($targets);
+        DB::transaction(function () use ($user, $customer, $validate, $references) {
+            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+            abort_unless($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value === $customer, 409);
+            $validate(true, $references);
+        });
         $updates = [];
         foreach ($targets as $target => $row) {
             $latest = json_decode($user->properties()->where('key', 'ae_stripe_method_' . $target)->first()?->value ?? 'null', true);
@@ -280,10 +300,10 @@ trait SavedMethods
         $message = $duplicate ? (($method->type ?? null) === 'card'
             ? 'This card is already saved. We updated its expiry to ' . substr($data['expiry'], 5, 2) . '/' . substr($data['expiry'], 0, 4) . '.'
             : 'This Link account is already saved. We updated it.') : null;
-        return DB::transaction(function () use ($user, $gateway, $customer, $incomingId, $reference, $kept, $rows, $data, $identity, $consent, $key, $message, $validate, $updates, $matches, $receipt) {
+        return DB::transaction(function () use ($user, $gateway, $customer, $incomingId, $reference, $kept, $rows, $data, $identity, $consent, $key, $message, $validate, $updates, $matches, $receipt, $references) {
             User::where('id', $user->id)->lockForUpdate()->firstOrFail();
             abort_unless($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value === $customer, 409);
-            $validate();
+            $validate(true, $references);
             $agreement = $kept;
             if (!$agreement) {
                 try {
@@ -292,7 +312,7 @@ trait SavedMethods
                     $agreement = BillingAgreement::withTrashed()->where('external_reference', $incomingId)->lockForUpdate()->first();
                     if (!$agreement) throw $e;
                     // The insert itself found a new row; still recheck its owner, gateway and deletion.
-                    $validate(false);
+                    $validate(false, $references);
                 }
             }
             $local = $matches ?: [$agreement];

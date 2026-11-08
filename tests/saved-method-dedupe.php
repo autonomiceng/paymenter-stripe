@@ -62,6 +62,78 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         check(count(ExtensionHelper::$agreements) === 1, 'Repeated delivery stays idempotent');
         check(!in_array(true, $heldLocks, true), 'Saving never performs HTTP under the owner lock');
     }
+    if (!getenv('PAY_DEDUPE_PR69_CASE') || getenv('PAY_DEDUPE_PR69_CASE') === 'brands') {
+        foreach (['setup', 'checkout'] as $entry) {
+            $user->props->values = ['ae_stripe_auto_pay_default' => json_encode(['version' => AeStripe::AUTO_PAY_CONSENT,
+                'user_id' => 7, 'accepted_at' => 1794071700, 'agreement_id' => 19])];
+            $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new', 6)];
+            foreach ($methods as $remote) $remote->card->brand = 'eftpos_au';
+            ExtensionHelper::$agreements = ['pm_old' => array_replace($row(19, 'pm_old', 'eftpos_au'), ['name' => 'Card **** 4242'])];
+            $setup->id = 'seti_brand_' . $entry;
+            $intent->id = 'pi_brand_' . $entry;
+            $intent->payment_method_options = (object) ['card' => (object) ['setup_future_usage' => 'off_session']];
+            $entry === 'setup' ? $gateway->setupAgreement(new Request(['setup_intent' => $setup->id])) : invoke($gateway, 'savePaidMethod', $intent);
+            check(count(ExtensionHelper::$agreements) === 1 && $gateway->autoPayCard($user) === 19, "$entry keeps the selected eftpos agreement instead of hiding a stale duplicate");
+            check($methods['pm_old']->card->exp_month === 6 && ExtensionHelper::$agreements['pm_old']['expiry'] === '2030-06-30',
+                "$entry refreshes the eftpos copy that Auto Pay still charges");
+        }
+    }
+    if (!getenv('PAY_DEDUPE_PR69_CASE') || getenv('PAY_DEDUPE_PR69_CASE') === 'aliases') {
+        foreach (['setup', 'checkout'] as $entry) {
+            $user->props->values = [];
+            $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
+            ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old', 'card')];
+            $setup->id = 'seti_alias_first_' . $entry;
+            $setup->payment_method = $intent->payment_method = 'pm_new';
+            $intent->id = 'pi_alias_first_' . $entry;
+            $intent->payment_method_options = (object) ['card' => (object) ['setup_future_usage' => 'off_session']];
+            $setup->metadata->ae_stripe_setup_consent_at = $intent->metadata->ae_stripe_consent_at = '1794071700';
+            $save = $entry === 'setup' ? fn () => $gateway->setupAgreement(new Request(['setup_intent' => $setup->id])) : fn () => invoke($gateway, 'savePaidMethod', $intent);
+            $save();
+            check(!isset(ExtensionHelper::$agreements['pm_new']) && $methods['pm_new']->customer === 'cus_owner', 'The subscription-referenced incoming copy has no local agreement');
+            // A Stripe subscription can retain this attached reference independently of the local agreement.
+            $subscriptionMethod = 'pm_new';
+            $methods['pm_fresh'] = $card('pm_fresh', 6);
+            $setup->id = 'seti_alias_refresh_' . $entry;
+            $intent->id = 'pi_alias_refresh_' . $entry;
+            $setup->payment_method = $intent->payment_method = 'pm_fresh';
+            $setup->metadata->ae_stripe_setup_consent_at = $intent->metadata->ae_stripe_consent_at = '1794071800';
+            $save();
+            check($methods[$subscriptionMethod]->card->exp_month === 6, "$entry refreshes the receipt-only method a Stripe subscription can still charge");
+            check(count(ExtensionHelper::$agreements) === 1 && ExtensionHelper::$agreements['pm_old']['expiry'] === '2030-06-30', 'Alias refresh retains one local agreement');
+            $latest = json_decode($user->props->values['ae_stripe_method_pm_new'], true);
+            check($latest['consent']['accepted_at'] === 1794071800, 'The receipt-only copy records its refreshed consent');
+            $methods['pm_new']->card->exp_month = 7;
+            $user->props->values['ae_stripe_method_pm_new'] = json_encode(array_replace($latest, ['consent' => ['accepted_at' => 1794071900, 'sequence' => 99]]));
+            $methods['pm_later'] = $card('pm_later', 8);
+            $setup->id = 'seti_alias_order_' . $entry;
+            $intent->id = 'pi_alias_order_' . $entry;
+            $setup->payment_method = $intent->payment_method = 'pm_later';
+            $setup->metadata->ae_stripe_setup_consent_at = $intent->metadata->ae_stripe_consent_at = '1794071850';
+            $save();
+            check($methods['pm_new']->card->exp_month === 7 && json_decode($user->props->values['ae_stripe_method_pm_new'], true)['consent']['accepted_at'] === 1794071900,
+                'Receipt-only copies preserve their own newer consent and expiry');
+        }
+        // Restore the shared source fixture for the remaining lifecycle checks.
+        $setup->payment_method = $intent->payment_method = 'pm_new';
+        $setup->metadata->ae_stripe_setup_consent_at = $intent->metadata->ae_stripe_consent_at = '1794071700';
+    }
+    foreach (['foreign user', 'foreign gateway', 'removed'] as $conflict) {
+        $user->props->values = ['ae_stripe_saved_alias_fixture' => json_encode(['incoming' => 'pm_alias', 'reference' => 'pm_old', 'consent' => ['user_id' => 7]])];
+        $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new', 6), 'pm_alias' => $card('pm_alias')];
+        $alias = $row(21, 'pm_alias', 'card');
+        if ($conflict === 'foreign user') $alias['user_id'] = 99;
+        if ($conflict === 'foreign gateway') $alias['gateway_id'] = 1;
+        if ($conflict === 'removed') $alias['deleted_at'] = '2026-11-08';
+        ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old', 'card'), 'pm_alias' => $alias];
+        $before = ExtensionHelper::$agreements;
+        $setup->id = 'seti_alias_guard_' . str_replace(' ', '_', $conflict);
+        $calls = count(Http::$calls);
+        $result = $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
+        check($result['type'] === 'danger' && ExtensionHelper::$agreements === $before,
+            'Receipt alias refresh refuses a ' . $conflict . ' reference');
+        check(!array_filter(array_slice(Http::$calls, $calls), fn ($call) => $call[0] === 'post'), 'Conflicting alias references never authorize provider writes');
+    }
     if (!getenv('PAY_DEDUPE_CR_CASE') || getenv('PAY_DEDUPE_CR_CASE') === 'remove') {
         $user->props->values = ['ae_stripe_auto_pay_default' => json_encode(['agreement_id' => 19])];
         ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old', 'card'), 'pm_new' => $row(20, 'pm_new', 'card')];
