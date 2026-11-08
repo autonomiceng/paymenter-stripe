@@ -21,16 +21,33 @@ trait SavedMethodBindings
     private function assertSavedMethodBindable($user, $agreement): void
     {
         $customer = $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value;
-        $reservation = json_decode($user->properties()->where('key', 'ae_stripe_duplicate_' . $agreement->external_reference)->lockForUpdate()->first()?->value ?? 'null', true);
         $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
-        $index = $this->savedMethodIndex($user, $agreement->external_reference, $customer, $gateway);
-        if (($reservation['customer'] ?? null) === $customer && ($reservation['gateway'] ?? null) == $agreement->gateway_id
-            || ($index['removed'] ?? false) || isset($index['removing'])) throw new SavedMethodRetryException(self::BINDING_RETRY);
+        if ($this->savedMethodUnavailable($user, $agreement->external_reference, $customer, $gateway)) throw new SavedMethodRetryException(self::BINDING_RETRY);
+    }
+
+    private function savedMethodUnavailable($user, string $reference, $customer, $gateway): bool
+    {
+        $reservation = json_decode($user->properties()->where('key', 'ae_stripe_duplicate_' . $reference)->first()?->value ?? 'null', true);
+        $index = $this->savedMethodIndex($user, $reference, $customer, $gateway);
+        return (($reservation['customer'] ?? null) === $customer && ($reservation['gateway'] ?? null) == $gateway->id)
+            || ($index['removed'] ?? false) || isset($index['removing']);
     }
 
     // Replace native binding writes only for this gateway; payment execution stays in the native handler.
     private function bindNativeSavedMethod($component, string $method, callable $returnEarly): void
     {
+        if ($component instanceof \App\Livewire\Services\Show && $method === 'clearBillingAgreement') {
+            DB::transaction(function () use ($component) {
+                User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
+                $service = Service::where('id', $component->service->id)->where('user_id', Auth::id())->lockForUpdate()->firstOrFail();
+                $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
+                $service->update(['billing_agreement_id' => null]);
+                $component->service = $service;
+                $component->selectedMethod = null;
+            });
+            $returnEarly();
+            return;
+        }
         $servicePage = $component instanceof \App\Livewire\Services\Show && $method === 'updateBillingAgreement';
         $invoicePage = $component instanceof \App\Livewire\Invoices\Show && $method === 'processPayment'
             && $component->setAsDefault && $component->invoice->status === 'pending';
@@ -47,7 +64,9 @@ trait SavedMethodBindings
                     $this->assertSavedMethodBindable($user, $current);
                     if ($servicePage) {
                         $service = Service::where('id', $component->service->id)->where('user_id', $user->id)->lockForUpdate()->firstOrFail();
+                        if ($service->subscription_id) throw new SavedMethodRetryException('This service uses its Stripe subscription billing method.');
                         $service->update(['billing_agreement_id' => $current->id]);
+                        $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
                         $component->service = $service;
                         $component->showBillingAgreement = false;
                         return;
@@ -57,7 +76,9 @@ trait SavedMethodBindings
                     $count = 0;
                     foreach ($component->recurringServices()->get() as $item) {
                         $service = Service::where('id', $item->reference_id)->where('user_id', $user->id)->lockForUpdate()->firstOrFail();
+                        if ($service->subscription_id) continue;
                         $service->update(['billing_agreement_id' => $current->id]);
+                        $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
                         ++$count;
                     }
                     if ($count) $component->notify('Default payment method has been updated for recurring services.', 'success');

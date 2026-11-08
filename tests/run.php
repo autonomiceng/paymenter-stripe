@@ -1,6 +1,6 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-if (getenv('PAY_CLEANUP_CASE') === 'notice-native' || getenv('PAY_BINDING_CASE') === 'native') {
+if (getenv('PAY_CLEANUP_CASE') === 'notice-native' || getenv('PAY_BINDING_CASE') === 'native' || getenv('PAY_CHECKOUT_NATIVE')) {
     require __DIR__ . '/native-saved-notices.php';
     return;
 }
@@ -64,6 +64,11 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
         default => throw new RuntimeException('Unexpected HTTP request: ' . $path),
     };
 };
+
+if (getenv('PAY_CHECKOUT_CASE')) {
+    require __DIR__ . '/checkout-followups.php';
+    return;
+}
 
 if (getenv('PAY_BINDING_CASE')) {
     require __DIR__ . '/cleanup-bindings.php';

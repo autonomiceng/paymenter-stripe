@@ -80,6 +80,7 @@ async function initializePaymentForm() {
             const resuming = @js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true));
             const savedConsent = @js(($intent->metadata->ae_stripe_consent ?? null) === '1');
             let intentId = @js($intent->id);
+            const savedNoticeToken = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
             // The server still checks the invoice balance before confirming.
             const {elements, paymentElement, expressCheckout, mountExpress} = createStripeElements(stripe, options, {
                 linkDisplay: @js($linkDisplay),
@@ -183,7 +184,7 @@ async function initializePaymentForm() {
                             headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
                                 'X-CSRF-TOKEN': @js(csrf_token())},
                             body: JSON.stringify({intent: intentId, confirmation_token: token,
-                                amount: @js($intent->amount), save}),
+                                amount: @js($intent->amount), save, saved_notice: savedNoticeToken}),
                         });
                         const result = await response.json();
                         if (result.intent) intentId = result.intent;
@@ -201,7 +202,10 @@ async function initializePaymentForm() {
                             continue;
                         }
                         if (['succeeded', 'processing', 'requires_capture'].includes(result.status)) {
-                            window.location.assign(@js(route('invoices.show', $invoice) . '?checkPayment=true'));
+                            const destination = new URL(@js(route('invoices.show', $invoice)), window.location.href);
+                            destination.searchParams.set('checkPayment', 'true');
+                            if (result.saved_notice) destination.searchParams.set('saved_notice', result.saved_notice);
+                            window.location.assign(destination.toString());
                             return;
                         }
                         clearDeclinedPayment();

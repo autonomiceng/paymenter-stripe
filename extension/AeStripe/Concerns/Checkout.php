@@ -160,6 +160,7 @@ trait Checkout
             'intent' => 'required|string|regex:/^pi_[a-zA-Z0-9]+$/|max:255',
             'confirmation_token' => 'nullable|string|regex:/^ctoken_[a-zA-Z0-9]+$/|max:255',
             'amount' => 'required|integer|min:1', 'save' => 'required|boolean',
+            'saved_notice' => 'nullable|string|regex:/^[a-f0-9]{32}$/',
         ]);
         try {
             $intent = $this->request('get', '/payment_intents/' . $request->input('intent'));
@@ -178,7 +179,8 @@ trait Checkout
             $intent = $this->retireFailedElementsPayment($invoice, $intent);
             if ($intent->status === 'canceled') throw new DisplayException('This payment was not completed. Refresh the invoice to try another payment.');
             $agreement = null;
-            $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id]), 'use_stripe_sdk' => 'true'];
+            $noticeToken = $request->input('saved_notice');
+            $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id, 'saved_notice' => $noticeToken]), 'use_stripe_sdk' => 'true'];
             if ($request->input('confirmation_token')) {
                 $params += ['confirmation_token' => $request->input('confirmation_token'), 'setup_future_usage' => '',
                     'payment_method_options' => ['card' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : 'none'],
@@ -197,9 +199,10 @@ trait Checkout
             }
             if ($intent->status === 'succeeded') {
                 $this->recordIntentPayment($intent, 'succeeded');
-                $this->saveConsentedMethod($intent);
+                $noticeToken = $this->saveConsentedMethod($intent, $noticeToken);
             }
-            return response()->json(['intent' => $intent->id, 'status' => $intent->status, 'client_secret' => $intent->status === 'requires_action' ? $intent->client_secret : null]);
+            return response()->json(['intent' => $intent->id, 'status' => $intent->status, 'saved_notice' => $noticeToken,
+                'client_secret' => $intent->status === 'requires_action' ? $intent->client_secret : null]);
         } catch (DisplayException $e) {
             return response()->json(['message' => $e->getMessage(), 'intent' => $intent->id ?? null,
                 'declined' => $e instanceof \Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException], 409);
@@ -210,6 +213,8 @@ trait Checkout
 
     public function finishPayment(Request $request)
     {
+        $noticeToken = $request->input('saved_notice');
+        if (!is_string($noticeToken) || !preg_match('/\A[a-f0-9]{32}\z/', $noticeToken)) $noticeToken = null;
         // Keep a local invoice link even when Stripe cannot be reached on the bank return.
         $invoice = null;
         if ($request->input('invoice')) {
@@ -244,17 +249,17 @@ trait Checkout
                 });
                 if ($amount === null) throw new DisplayException('Refresh the invoice before finishing this payment.');
                 $agreement = $this->paymentResumeAgreement($invoice);
-                $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id]), 'use_stripe_sdk' => 'true'];
+                $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id, 'saved_notice' => $noticeToken]), 'use_stripe_sdk' => 'true'];
                 if ($agreement) $params['payment_method'] = $agreement->external_reference;
                 $intent = $this->confirmAttempt($invoice, $id, $params, $agreement, expectedAmount: $amount);
             }
             if ($intent->status === 'succeeded') {
                 $this->recordIntentPayment($intent, 'succeeded');
-                $this->saveConsentedMethod($intent);
+                $noticeToken = $this->saveConsentedMethod($intent, $noticeToken);
             }
             if (in_array($intent->status, ['requires_payment_method', 'canceled'], true)) throw new DisplayException('This payment was not completed. Choose another payment method on the invoice.');
             if ($intent->status === 'requires_action') throw new DisplayException('This payment still needs authentication. Open the invoice to finish it.');
-            return redirect()->to(route('invoices.show', $invoice) . '?checkPayment=true');
+            return redirect()->to($this->savedMethodDestination($invoice, $noticeToken));
         } catch (DisplayException $e) {
             $message = $e->getMessage();
         } catch (RequestException | ConnectionException $e) {
@@ -402,20 +407,41 @@ trait Checkout
 
     // Save the consented method as soon as Stripe confirms. The payment_intent.succeeded webhook
     // saves it again (idempotent) if this fails or the customer leaves before the response.
-    private function saveConsentedMethod($intent): void
+    private function saveConsentedMethod($intent, ?string $token = null): ?string
     {
         try {
             $saved = $this->savePaidMethod($intent);
-            if ($saved === true || is_array($saved)) \Illuminate\Support\Facades\Session::put('ae_stripe_saved_notice_' . $intent->metadata->invoice_id, [
-                'user_id' => \Illuminate\Support\Facades\Auth::id(),
-                'notice' => ['type' => 'success', 'message' => is_array($saved) ? $saved['message'] : 'Payment method added successfully.'],
-            ]);
+            if ($saved !== true && !is_array($saved)) return null;
+            $token = is_string($token) && preg_match('/\A[a-f0-9]{32}\z/', $token) ? $token : bin2hex(random_bytes(16));
+            $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
+            DB::transaction(function () use ($invoice, $saved, $token) {
+                $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
+                abort_unless($invoice->user_id == $user->id, 403);
+                $key = 'ae_stripe_checkout_notice_' . hash('sha256', $token);
+                // Preserve the consumed state when the same confirmation is returned more than once.
+                if ($existing = $user->properties()->where('key', $key)->lockForUpdate()->first()) {
+                    abort_unless((json_decode($existing->value, true)['invoice_id'] ?? null) == $invoice->id, 409);
+                    return;
+                }
+                $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode([
+                    'user_id' => (int) $user->id, 'invoice_id' => (int) $invoice->id, 'consumed' => false,
+                    'notice' => ['type' => 'success', 'message' => is_array($saved) ? $saved['message'] : 'Payment method added successfully.'],
+                ], JSON_THROW_ON_ERROR)]);
+            });
+            return $token;
         } catch (DisplayException $e) {
             \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'reason' => $e->getMessage()]);
         } catch (\Throwable $e) {
             if ($e instanceof \Symfony\Component\HttpKernel\Exception\HttpExceptionInterface) throw $e;
             \Illuminate\Support\Facades\Log::warning('AeStripe saved method deferred to webhook', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'error' => get_class($e)]);
         }
+        return null;
+    }
+
+    private function savedMethodDestination($invoice, ?string $token): string
+    {
+        $url = route('invoices.show', $invoice);
+        return $url . (str_contains($url, '?') ? '&' : '?') . http_build_query(['checkPayment' => 'true', 'saved_notice' => $token]);
     }
 
     private function deliverSavedMethodNotice($component): void
@@ -424,11 +450,17 @@ trait Checkout
         $invoice = $component->invoice;
         $owner = \Illuminate\Support\Facades\Auth::id();
         if ($invoice->user_id != $owner) return;
-        $key = 'ae_stripe_saved_notice_' . $invoice->id;
-        $pending = \Illuminate\Support\Facades\Session::get($key);
-        if (!$pending || ($pending['user_id'] ?? null) != $owner) return;
-        $component->notify($pending['notice']['message'], $pending['notice']['type']);
-        \Illuminate\Support\Facades\Session::forget($key);
+        $token = request()->input('saved_notice');
+        if (!is_string($token) || !preg_match('/\A[a-f0-9]{32}\z/', $token)) return;
+        DB::transaction(function () use ($component, $invoice, $owner, $token) {
+            $user = User::where('id', $owner)->lockForUpdate()->firstOrFail();
+            $property = $user->properties()->where('key', 'ae_stripe_checkout_notice_' . hash('sha256', $token))->lockForUpdate()->first();
+            $pending = json_decode($property?->value ?? 'null', true);
+            if (!$pending || ($pending['user_id'] ?? null) != $owner || ($pending['invoice_id'] ?? null) != $invoice->id || ($pending['consumed'] ?? false)) return;
+            $component->notify($pending['notice']['message'], $pending['notice']['type']);
+            $pending['consumed'] = true;
+            $user->properties()->updateOrCreate(['key' => $property->key], ['value' => json_encode($pending, JSON_THROW_ON_ERROR)]);
+        });
     }
 
     private function savePaidMethod($intent)

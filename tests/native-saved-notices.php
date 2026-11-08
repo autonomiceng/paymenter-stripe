@@ -88,6 +88,11 @@ Illuminate\Support\Facades\Http::fake(function ($request) use (&$methods, $setup
     }
     throw new RuntimeException('Unexpected native fixture request.');
 });
+if (getenv('PAY_CHECKOUT_NATIVE')) {
+    require __DIR__ . '/native-checkout-followups.php';
+    $successful = true;
+    return;
+}
 if (getenv('PAY_BINDING_CASE') === 'native') {
     require __DIR__ . '/native-cleanup-bindings.php';
     $successful = true;

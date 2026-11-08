@@ -80,6 +80,10 @@ trait SavedMethods
         $journalKey = 'ae_stripe_removal_' . $agreement->external_reference;
         $owner = User::where('id', $agreement->user_id)->firstOrFail();
         $previous = json_decode($owner->properties()->where('key', $journalKey)->first()?->value ?? 'null', true);
+        if (($previous['gateway_id'] ?? null) == $gateway->id && ($previous['user_id'] ?? null) == $owner->id) {
+            // Confirmed detach progress remains authorized even when a different planned row was reassigned.
+            DB::transaction(fn () => $this->reconcileRemoval($owner, $gateway, $journalKey, $previous, $agreement->external_reference));
+        }
         if (($previous['gateway_id'] ?? null) == $gateway->id && ($previous['user_id'] ?? null) == $owner->id
             && ($previous['customer'] ?? null) !== $owner->properties()->where('key', 'stripe_id')->first()?->value) {
             // A lost detach/progress response is resolved by a read, never by another owner's authorization.
@@ -201,6 +205,7 @@ trait SavedMethods
             }
         } catch (ConnectionException | RequestException $e) {
             Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
+            if (isset($journal) && is_array($journal)) DB::transaction(fn () => $this->reconcileRemoval($user, $gateway, $journalKey, $journal, ''));
             return false;
         }
         $removed = DB::transaction(fn () => $this->reconcileRemoval($user, $gateway, $journalKey, $journal, $current->external_reference));
@@ -300,7 +305,7 @@ trait SavedMethods
             throw new DisplayException('This payment method was removed. Add a new payment method.');
         }
         if (isset($this->savedMethodIndex($user, $incomingId, $customer, $gateway)['removing'])) {
-            throw new SavedMethodRetryException('This payment method is being removed. Try again with a new payment method.');
+            throw new SavedMethodRetryException('This payment method is being removed. Retry the removal, or add the card again.');
         }
         $method = $this->request('get', '/payment_methods/' . $incomingId);
         if (($method->customer ?? null) === null) {
@@ -319,6 +324,7 @@ trait SavedMethods
             }
         }
         if (!$this->methodCustomerMatches($user, $method)) return false;
+        if ($this->savedMethodUnavailable($user, $incomingId, $customer, $gateway)) throw new SavedMethodRetryException(self::BINDING_RETRY);
         $identity = $this->savedMethodIdentity($method);
         $remotes = [$incomingId => $method];
         $matches = [];
@@ -327,7 +333,7 @@ trait SavedMethods
             // Local card types are display brands. Verify the actual Stripe identity for every brand.
             $known = json_decode($user->properties()->where('key', 'ae_stripe_method_' . $row->external_reference)->first()?->value ?? 'null', true);
             // A fresh provider reference can replace a failed removal without reusing its uncertain copies.
-            if (($known['customer'] ?? null) === $customer && ($known['gateway_id'] ?? null) == $gateway->id && isset($known['removing'])) continue;
+            if ($this->savedMethodUnavailable($user, $row->external_reference, $customer, $gateway)) continue;
             if ($identity !== null && ($known['customer'] ?? null) === $customer && ($known['gateway_id'] ?? null) == $gateway->id
                 && ($known['identity'] ?? null) !== null && $known['identity'] !== $identity) continue;
             if ($row->external_reference !== $incomingId && $identity !== null) {
@@ -379,6 +385,7 @@ trait SavedMethods
                 return BillingAgreement::where('external_reference', $receipt['reference'])->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
             });
             if (!$active) throw new DisplayException('This payment method was removed. Add a new payment method.');
+            if ($this->savedMethodUnavailable($user, $active->external_reference, $customer, $gateway)) throw new SavedMethodRetryException(self::BINDING_RETRY);
             return $receipt['message'] ? ['message' => $receipt['message']] : true;
         }
         $data = $this->getPaymentDetails($method);

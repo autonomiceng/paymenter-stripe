@@ -47,19 +47,24 @@ trait CardDuplicates
 
     private function duplicateIsBound($user, $incoming, ?callable $report): bool
     {
-        if ($incoming->services()->lockForUpdate()->first()) {
+        $service = $incoming->services()->lockForUpdate()->first();
+        $bound = $service || $this->autoPayCard($user, lock: true) == $incoming->id;
+        if (!$bound) return false;
+        $reservation = json_decode($user->properties()->where('key', 'ae_stripe_duplicate_' . $incoming->external_reference)->lockForUpdate()->first()?->value ?? 'null', true);
+        if (($reservation['customer'] ?? null) === $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value
+            && ($reservation['gateway'] ?? null) == $incoming->gateway_id) throw new DisplayException('Reserved saved card is still bound. Review its cleanup plan.');
+        if ($service) {
             Log::info('AeStripe duplicate card kept: agreement is bound to a service', ['agreement_id' => $incoming->id]);
             if ($report) $report('Saved card #' . $incoming->id . ' kept: the duplicate is linked to a service.');
             return true;
         }
-        if ($this->autoPayCard($user, lock: true) != $incoming->id) return false;
         Log::info('AeStripe duplicate card kept: agreement is the account Auto Pay card', ['agreement_id' => $incoming->id]);
         if ($report) $report('Saved card #' . $incoming->id . ' kept: the duplicate is the account Auto Pay card.');
         return true;
     }
 
     // No transaction may surround this provider verification, including detached receipt retries.
-    private function cleanupCandidate($user, $gateway, $incoming, array $snapshot): ?array
+    private function cleanupCandidate($user, $gateway, $incoming, array $snapshot, bool $apply, callable $report): ?array
     {
         $method = $this->request('get', '/payment_methods/' . $incoming->external_reference);
         if (($method->id ?? null) !== $incoming->external_reference || !($identity = $this->cardIdentity($method))) {
@@ -75,7 +80,16 @@ trait CardDuplicates
         $receipt = json_decode($snapshot['properties']['ae_stripe_duplicate_' . $method->id] ?? 'null');
         if (($receipt->customer ?? null) === $snapshot['customer'] && ($receipt->gateway ?? null) == $gateway->id) {
             $candidates = array_filter($snapshot['rows'], fn ($row) => $row->external_reference === ($receipt->kept ?? null));
-            if (!$candidates) throw new DisplayException('This payment method was removed. Add a new payment method.');
+            if (!$candidates) {
+                if (($method->customer ?? null) !== $snapshot['customer']) throw new DisplayException('Detached saved card could not be reconciled. Review it manually.');
+                if (!$apply) throw new SavedMethodRetryException('Unused saved card reservation needs cancellation. Run cleanup with --apply.');
+                DB::transaction(function () use ($user, $gateway, $snapshot, $method) {
+                    $this->cleanupUnchanged($user, $gateway, $snapshot);
+                    $user->properties()->where('key', 'ae_stripe_duplicate_' . $method->id)->delete();
+                });
+                $report('Cancelled unused reservation for saved card #' . $incoming->id . '; its original method is still attached.');
+                return null;
+            }
         } else {
             if (($method->customer ?? null) !== $snapshot['customer']) throw new DisplayException('Detached saved card could not be reconciled. Review it manually.');
             $candidates = $snapshot['rows'];
@@ -83,6 +97,10 @@ trait CardDuplicates
         usort($candidates, fn ($a, $b) => $a->id <=> $b->id);
         foreach ($candidates as $kept) {
             if ($kept->id >= $incoming->id) continue;
+            if ($this->savedMethodUnavailable($user, $kept->external_reference, $snapshot['customer'], $gateway)) {
+                if ($receipt) throw new DisplayException('Reserved survivor is not available. Review its cleanup plan.');
+                continue;
+            }
             try {
                 $remote = $this->request('get', '/payment_methods/' . $kept->external_reference);
             } catch (RequestException $e) {
@@ -108,7 +126,7 @@ trait CardDuplicates
             if (isset($snapshot['properties']['ae_stripe_duplicate_' . $incoming->external_reference])) throw new DisplayException('Reserved saved card could not be reconciled. Review it manually.');
             return;
         }
-        $candidate = $this->cleanupCandidate($user, $gateway, $incoming, $snapshot);
+        $candidate = $this->cleanupCandidate($user, $gateway, $incoming, $snapshot, $apply, $report);
         if (!$candidate) return;
         [$method, $kept, $remote] = $candidate;
         $detached = ($method->customer ?? null) === null;

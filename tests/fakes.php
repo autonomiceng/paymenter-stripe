@@ -112,7 +112,7 @@ namespace App\Models {
                 return new class($rows) { public function __construct(private $rows) {} public function lockForUpdate() { return $this; } public function get() { return $this->rows; } };
             }
             $stored = $value === 'stripe_id' ? $this->customer : ($this->values[$value] ?? null);
-            return new class($stored ? (object) ['value' => $stored] : null, $this, $value) extends Query {
+            return new class($stored ? (object) ['key' => $value, 'value' => $stored] : null, $this, $value) extends Query {
                 public function __construct($stored, private Properties $properties, private string $key) { parent::__construct($stored); }
                 public function delete() { unset($this->properties->values[$this->key]); }
             };
@@ -488,6 +488,7 @@ namespace Illuminate\Support\Facades {
         public static function call($callback) { self::$callbacks[] = $callback; return self::$events[] = new self; }
         public function name($value) { return $this; }
         public function hourly() { return $this; }
+        public function everyMinute() { return $this; }
         public function everyFiveMinutes() { return $this; }
         public $singleServer = false, $overlapMinutes = null;
         public function onOneServer() { $this->singleServer = true; return $this; }
@@ -525,7 +526,7 @@ namespace Illuminate\Support\Facades {
         public static $beforeUserLock = null, $beforeServiceLock = null, $afterTransaction = null;
         public static function transactionLevel() { return self::$locked ? 1 : 0; }
         private static $afterCommit = [];
-        public static function afterCommit($callback) { self::$afterCommit[] = $callback; }
+        public static function afterCommit($callback) { if (!self::$locked) $callback(); else self::$afterCommit[] = $callback; }
         public static $locked = false, $userLocked = false;
         public static $modelLocks = [];
         public static function transaction($callback) {
