@@ -81,6 +81,45 @@ if ($case === 'http') {
     check($entered, 'The state change occurs between verified discovery and apply');
     check(!$writes && $methods['pm_new']->customer === 'cus_owner' && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
         'Cleanup refuses changed exact state before any provider write: ' . $change);
+} elseif ($case === 'post-state') {
+    $handler = Http::$handler;
+    $changed = false;
+    Http::$handler = function ($verb, $path, $data) use ($handler, &$changed, $user) {
+        $result = $handler($verb, $path, $data);
+        if (!$changed && $verb === 'post') { $changed = true; $user->props->values['ae_stripe_save_sequence'] = '17'; }
+        return $result;
+    };
+    check($gateway->deduplicateCards(true, fn ($line) => null) > 0 && $changed, 'A change during provider writes refuses final local cleanup');
+    check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $user->props->values['ae_stripe_save_sequence'] === '17', 'Final cleanup preserves changed local state');
+    Http::$handler = $handler;
+    check($gateway->deduplicateCards(true, fn ($line) => null) === 0 && ExtensionHelper::$agreements['pm_new']['deleted_at'] !== null, 'A reserved detached cleanup finishes safely on retry');
+} elseif ($case === 'retry') {
+    $methods['pm_alias'] = $card('pm_alias');
+    $user->props->values['ae_stripe_saved_pending'] = json_encode(['incoming' => 'pm_alias', 'consent' => ['user_id' => 7]]);
+    $handler = Http::$handler;
+    $failed = $reserved = false;
+    Http::$handler = function ($verb, $path, $data) use ($handler, &$failed, &$reserved, $user) {
+        if (!$reserved && $verb === 'post') {
+            $reserved = true;
+            check(isset($user->props->values['ae_stripe_removal_pm_new']), 'Removal records the plan durably before any detach');
+        }
+        if ($path === '/payment_methods/pm_new/detach' && !$failed) {
+            $failed = true;
+            throw new RequestException(503);
+        }
+        return $handler($verb, $path, $data);
+    };
+    $remove = fn () => $gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements['pm_new']));
+    check(!$remove() && ExtensionHelper::$agreements['pm_old']['deleted_at'] === null, 'Partial failure preserves local rows for retry');
+    try { invoke($gateway, 'persistAgreement', $user, $methods['pm_alias'], ['source' => 'seti_late', 'user_id' => 7]); throw new RuntimeException('Expected removal refusal'); }
+    catch (App\Exceptions\DisplayException $e) { check(str_contains($e->getMessage(), 'removed'), 'An interrupted removal cannot be undone by a delayed save'); }
+    Http::$handler = function ($verb, $path, $data) use ($handler) {
+        if ($verb === 'get' && $path === '/payment_methods/pm_alias') throw new RequestException(404, ['error' => ['code' => 'resource_missing']]);
+        return $handler($verb, $path, $data);
+    };
+    check($remove(), 'A partial removal resumes receipt-only copies even if they now return 404');
+    $journal = json_decode($user->props->values['ae_stripe_removal_pm_new'], true);
+    check($journal['complete'] && count($journal['detached']) === 3, 'The resumed journal accounts for every copy');
 } elseif (str_starts_with($case, 'removal-')) {
     $change = substr($case, 8);
     $service = App\Models\Service::$row = new App\Models\Service;

@@ -45,10 +45,12 @@ trait CardDuplicates
     private function duplicateIsBound($user, $incoming, ?callable $report): bool
     {
         if ($incoming->services()->lockForUpdate()->first()) {
+            Log::info('AeStripe duplicate card kept: agreement is bound to a service', ['agreement_id' => $incoming->id]);
             if ($report) $report('Saved card #' . $incoming->id . ' kept: the duplicate is linked to a service.');
             return true;
         }
         if ($this->autoPayCard($user, lock: true) != $incoming->id) return false;
+        Log::info('AeStripe duplicate card kept: agreement is the account Auto Pay card', ['agreement_id' => $incoming->id]);
         if ($report) $report('Saved card #' . $incoming->id . ' kept: the duplicate is the account Auto Pay card.');
         return true;
     }

@@ -19,7 +19,8 @@ foreach (['APP_ENV' => 'testing', 'APP_KEY' => 'base64:' . base64_encode(str_rep
     'SESSION_DRIVER' => 'array', 'MAIL_MAILER' => 'array', 'APP_TELEMETRY_ENABLED' => 'false'] as $key => $value) {
     putenv($key . '=' . $value); $_ENV[$key] = $_SERVER[$key] = $value;
 }
-require $release . '/vendor/autoload.php';
+$loader = require $release . '/vendor/autoload.php';
+if ($themeRoot) $loader->addPsr4('Paymenter\\Extensions\\Others\\', dirname($themeRoot) . '/extensions/');
 $app = require $root . '/bootstrap/app.php';
 $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
 require_once $release . '/app/Classes/helpers.php';
@@ -37,6 +38,16 @@ foreach (['cache' => false, 'cache_locks' => true] as $table => $locks) Illumina
 config(['theme.base_path' => $root . '/themes']);
 Qirolab\Theme\Theme::set($theme, $themeRoot ? 'default' : null);
 $app['view']->addLocation($release . '/themes/default/views');
+// The upstream breadcrumb declares a global function on each render. Isolate that unrelated fixture issue.
+$fixtureViews = $root . '/fixture-views';
+mkdir($fixtureViews . '/components/navigation', 0700, true);
+$breadcrumb = file_get_contents($release . '/themes/default/views/components/navigation/breadcrumb.blade.php');
+$breadcrumb = str_replace('    function findBreadcrumb(', "    if (!function_exists('findBreadcrumb')) {\n    function findBreadcrumb(", $breadcrumb);
+$breadcrumb = str_replace('    $breadcrumbs = [];', "    }\n    \$breadcrumbs = [];", $breadcrumb);
+file_put_contents($fixtureViews . '/components/navigation/breadcrumb.blade.php', $breadcrumb);
+$app['view']->prependLocation($fixtureViews);
+Illuminate\Support\Facades\Blade::anonymousComponentPath($fixtureViews . '/components');
+
 if ($themeRoot) {
     $app['view']->prependLocation($themeRoot . '/views');
     Illuminate\Support\Facades\Blade::anonymousComponentPath($themeRoot . '/views/components');
@@ -46,7 +57,7 @@ foreach (['theme' => $theme, 'pagination' => 10, 'default_currency' => 'USD', 't
     App\Models\Setting::withoutEvents(fn () => App\Models\Setting::create(['key' => $key, 'value' => $value]));
 }
 App\Models\Currency::create(['code' => 'USD', 'name' => 'US Dollar', 'format' => '1,000.00', 'prefix' => '$']);
-App\Models\Invoice::creating(fn ($invoice) => $invoice->send_create_email = false);
+App\Models\Invoice::creating(function ($invoice) { $invoice->send_create_email = false; });
 $user = App\Models\User::create(['email' => 'fixture@example.com', 'password' => 'synthetic', 'first_name' => 'Test', 'last_name' => 'Owner']);
 auth()->login($user);
 $invoice = App\Models\Invoice::create(['user_id' => $user->id, 'currency_code' => 'USD', 'due_at' => now()->addWeek(), 'status' => 'pending']);
@@ -79,6 +90,7 @@ Illuminate\Support\Facades\Http::fake(function ($request) use (&$methods, $setup
 });
 $delivered = fn ($page) => array_values(array_filter($page->effects['dispatches'] ?? [], fn ($event) => $event['name'] === 'notify'));
 foreach (['first', 'duplicate'] as $case) {
+    if (getenv('PAY_NOTICE_CASE') && getenv('PAY_NOTICE_CASE') !== $case) continue;
     App\Models\BillingAgreement::query()->forceDelete();
     $user->properties()->where('key', 'like', 'ae_stripe_%')->delete();
     session()->flush();

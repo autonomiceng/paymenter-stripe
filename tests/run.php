@@ -309,7 +309,7 @@ require __DIR__ . '/card-dedupe-candidates.php';
 foreach (['pending', 'removed-replay', 'version', 'cleanup-replay', 'cleanup-removal', 'missing', 'warning', 'index', 'cleanup-lock', 'cleanup-setup', 'cleanup-checkout', 'cache', 'link', 'terms', 'notices'] as $followupCase) {
     (function () use ($followupCase) { require __DIR__ . '/saved-method-followups.php'; })();
 }
-foreach (['http', 'contention', 'notice-first', 'state-customer', 'state-owner', 'state-gateway', 'state-id', 'state-expiry', 'state-receipt', 'state-service', 'state-account', 'removal-customer', 'removal-owner', 'removal-gateway', 'removal-id'] as $cleanupCase) {
+foreach (['http', 'contention', 'notice-first', 'post-state', 'retry', 'state-customer', 'state-owner', 'state-gateway', 'state-id', 'state-expiry', 'state-receipt', 'state-service', 'state-account', 'removal-customer', 'removal-owner', 'removal-gateway', 'removal-id'] as $cleanupCase) {
     (function () use ($cleanupCase) { require __DIR__ . '/cleanup-http.php'; })();
 }
 echo "PASS: $count offline assertions\n";

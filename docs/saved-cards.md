@@ -18,7 +18,9 @@ From the Paymenter root, review existing duplicates with
 agreement IDs, matching both fingerprint and expiry.
 `php artisan ae-stripe:deduplicate-cards --apply` detaches and soft-deletes only duplicates with no service binding. It preserves the broadest
 existing redisplay setting and rechecks ownership and bindings before removal.
-Failed agreements are reported for manual review while the remaining rows continue.
+Cleanup makes provider calls outside database transactions and rechecks exact local state before writes.
+Failed agreements are reported while the remaining rows continue. Busy shared locks and changed plans
+are identified as retryable; other failures retain the manual-review message.
 If any agreements are skipped, the command reports the count and exits nonzero.
 Stripe supports changing the retained card’s [expiry fields](https://docs.stripe.com/api/payment_methods/update?api-version=2025-07-30.basil&query=card).
 Use a sandbox first. No cleanup has been run against a live installation.

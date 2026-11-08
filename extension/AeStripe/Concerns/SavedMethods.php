@@ -82,7 +82,17 @@ trait SavedMethods
         $previous = json_decode($owner->properties()->where('key', $journalKey)->first()?->value ?? 'null', true);
         if (($previous['gateway_id'] ?? null) == $gateway->id && ($previous['user_id'] ?? null) == $owner->id
             && ($previous['customer'] ?? null) !== $owner->properties()->where('key', 'stripe_id')->first()?->value) {
-            DB::transaction(fn () => $this->reconcileRemoval($owner, $gateway, $journalKey, $previous, $agreement->external_reference));
+            // A lost detach/progress response is resolved by a read, never by another owner's authorization.
+            try {
+                foreach ($previous['copies'] as $reference => $id) {
+                    if (isset($previous['detached'][$reference])) continue;
+                    $remote = $this->readSavedMethod($reference);
+                    if (!$remote || (($remote->id ?? null) === $reference && ($remote->customer ?? null) === null)) $previous['detached'][$reference] = true;
+                }
+            } catch (ConnectionException | RequestException $e) {
+                Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
+            }
+            DB::transaction(fn () => $this->reconcileRemoval($owner, $gateway, $journalKey, $previous, ''));
             return false;
         }
         $snapshot = DB::transaction(function () use ($agreement, $gateway) {
