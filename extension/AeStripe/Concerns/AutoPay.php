@@ -66,7 +66,7 @@ trait AutoPay
             'version' => 'required_if:enabled,true|string',
         ]);
         abort_unless(!$request->boolean('enabled') || $this->gatewayEnabled() && $this->bundledInactive(), 409);
-        return DB::transaction(function () use ($request) {
+        $change = fn () => DB::transaction(function () use ($request) {
             $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
             // A picker change alone saves a preference, never enables or disables any service.
             if ($request->input('enabled') === null) {
@@ -74,6 +74,7 @@ trait AutoPay
                 $agreement = BillingAgreement::where('id', $request->input('agreement_id'))
                     ->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
                 abort_unless($agreement, 403);
+                $this->assertSavedMethodBindable($user, $agreement);
                 $this->rememberAutoPayCard($user, (int) $agreement->id);
                 return response()->json(['ok' => true]);
             }
@@ -92,6 +93,7 @@ trait AutoPay
             $agreement = BillingAgreement::where('id', $request->input('agreement_id'))
                 ->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
             abort_unless($agreement, 403);
+            $this->assertSavedMethodBindable($user, $agreement);
             $this->stopWaitingRenewals($user);
             $this->rememberAutoPayCard($user, (int) $agreement->id);
             $record = ['version' => self::AUTO_PAY_CONSENT, 'user_id' => (int) $user->id,
@@ -105,6 +107,12 @@ trait AutoPay
             }
             return response()->json(['ok' => true, 'enabled' => true, 'services' => $services]);
         });
+        if ($request->input('enabled') !== null && !$request->boolean('enabled')) return $change();
+        try {
+            return $this->withSavedMethodBindingLock((int) Auth::id(), $change);
+        } catch (\Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException $e) {
+            return response()->json(['message' => $e->getMessage()], 409);
+        }
     }
 
     /** The user's services under lock, without Stripe subscriptions. Callers hold the user row lock. */
@@ -152,14 +160,20 @@ trait AutoPay
     private function applyNewServiceAutoPay(Service $service): void
     {
         if (!$this->gatewayEnabled() || !$this->bundledInactive()) return;
-        DB::transaction(function () use ($service) {
+        $owner = User::where('id', $service->user_id)->firstOrFail();
+        if (!$this->autoPayDefault($owner)) return;
+        $this->withSavedMethodBindingLock((int) $owner->id, fn () => DB::transaction(function () use ($service) {
             $user = User::where('id', $service->user_id)->lockForUpdate()->firstOrFail();
             $current = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
             if ($current->user_id != $user->id || $current->billing_agreement_id || $current->subscription_id
                 || ($current->plan?->type ?? null) !== 'recurring' || $current->status === Service::STATUS_CANCELLED) return;
             $record = $this->autoPayDefault($user, lock: true);
-            if ($record) $current->update(['billing_agreement_id' => $record['agreement_id']]);
-        });
+            if ($record) {
+                $agreement = BillingAgreement::where('id', $record['agreement_id'])->where('user_id', $user->id)->lockForUpdate()->firstOrFail();
+                $this->assertSavedMethodBindable($user, $agreement);
+                $current->update(['billing_agreement_id' => $record['agreement_id']]);
+            }
+        }));
     }
 
     /** Local read-only dates for account, service and invoice opt-ins. No provider calls. */

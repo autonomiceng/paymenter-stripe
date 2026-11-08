@@ -429,8 +429,10 @@ duplicates and attached Stripe methods remain intact for provider references and
 receives the expiry and consent refresh, including verified receipt-only incoming copies that provider
 subscriptions may still charge. Card matching uses the provider fingerprint for every brand. Each copy has
 its own newer-consent check. A shared native cache lock
-serializes saves, removal and duplicate cleanup. Save and removal HTTP runs outside the database owner lock;
-cleanup retains its existing binding locks through detachment. Consent source receipts
+serializes saves, removal and duplicate cleanup. Save, removal and cleanup HTTP run outside database owner transactions. Cleanup verifies provider
+identity outside locks, then rechecks the exact customer, agreement set, local details, receipt state and
+current service/account bindings before reserving its plan and after provider writes. A stale plan is retryable;
+its committed duplicate receipt permits recovery after an interrupted detach. Consent source receipts
 retain acceptance time and prevent a retried save from replacing a later expiry. The theme groups verified
 identities for display and keeps the original selected agreement IDs. Offline fakes do not prove distributed
 cache behavior or real database concurrency; check those in the test-mode sandbox before release. All workers must use the same database, Redis, Memcached
@@ -446,3 +448,26 @@ removed so a delayed setup or payment webhook cannot restore them. Cleanup redir
 verified surviving agreement, including retries after a detach. Unrelated receipt-only methods with a verified
 different identity are skipped before Stripe reads; unknown identities are still verified remotely. Other provider failures stop native local
 removal so it can finish on retry.
+
+Removal records its verified plan and per-copy detach progress in native user properties before final
+local cleanup. If the customer or an agreement changes during detach, reconciliation removes only the
+original agreements still owned by that user and gateway, unlinks their services, and preserves reassigned
+rows. Interrupted removal prevents delayed saves from restoring its references; provider failures keep
+local removal pending for retry. No schema or extension version change is required.
+
+Checkout first saves and duplicate saves retain the same success notice shape as Add card. The notice
+is stored for that user and invoice until the native invoice component delivers it, including after
+intervening session requests. Other invoices cannot consume it, and refreshing does not deliver it twice.
+
+Account card selection, the Auto Pay switch, new-service inheritance, and the native service/invoice
+recurring-default actions use the same shared per-user lock as cleanup. Binding a reserved or removing
+reference returns a retry message before any preference or consent changes. Turning Auto Pay off remains
+available. Cleanup verifies the survivor again after detachment, then moves remaining owned service and
+account links to that same-card survivor under the owner lock, preserving consent and other settings.
+Interrupted detached plans resume reconciliation even when bound; unresolved ownership, customer or
+identity conflicts remain reported with a nonzero exit on every rerun, including a read-only dry run.
+
+Removal marks a reference in progress before HTTP and permanently removed only after its detach is
+confirmed. A fresh Add card save of the same physical card may create a new provider reference while a
+failed removal is pending, without reusing or refreshing its uncertain references. Retrying Remove still
+verifies all matching copies, including the newly saved one. Confirmed removed references remain removed.

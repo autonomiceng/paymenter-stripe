@@ -48,6 +48,7 @@ require_once __DIR__ . '/Concerns/Signature.php';
 require_once __DIR__ . '/Concerns/Checkout.php';
 require_once __DIR__ . '/Concerns/CardDuplicates.php';
 require_once __DIR__ . '/Concerns/SavedMethods.php';
+require_once __DIR__ . '/Concerns/SavedMethodBindings.php';
 require_once __DIR__ . '/SavedMethodRetryException.php';
 require_once __DIR__ . '/Concerns/Amounts.php';
 require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
@@ -77,7 +78,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, Concerns\SavedMethods, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, Concerns\SavedMethods, Concerns\SavedMethodBindings, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -134,6 +135,12 @@ class AeStripe extends Gateway
                 $artisan->resolve(DeduplicateCardsCommand::class);
                 $artisan->resolve(AdoptBundledCommand::class);
                 $artisan->resolve(ConvertFromStripeSavedCommand::class);
+            });
+        }
+        if (function_exists('Livewire\\on')) {
+            app(\Livewire\EventBus::class)->before('dehydrate', fn ($component) => $this->deliverSavedMethodNotice($component));
+            app(\Livewire\EventBus::class)->before('call', function ($component, $method, $params, $context, $returnEarly) {
+                $this->bindNativeSavedMethod($component, $method, $returnEarly);
             });
         }
         require __DIR__ . '/routes.php';

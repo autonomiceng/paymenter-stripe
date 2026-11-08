@@ -191,9 +191,9 @@ if (in_array($case, ['pending', 'removed-replay'], true)) {
         'payment_method_options' => (object) ['card' => (object) ['setup_future_usage' => 'off_session']],
         'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1', 'ae_stripe_consent_at' => '1794071700']];
     invoke($gateway, 'saveConsentedMethod', $intent);
-    check((Session::$flashes['notification']['type'] ?? null) === 'success'
-        && str_contains(Session::$flashes['notification']['message'] ?? '', 'already saved'), 'Checkout reuse notice uses the native notification handler');
-    $expected = Session::$flashes['notification'];
+    check((Session::$values['ae_stripe_saved_notice_12']['notice']['type'] ?? null) === 'success'
+        && str_contains(Session::$values['ae_stripe_saved_notice_12']['notice']['message'] ?? '', 'already saved'), 'Checkout reuse notice uses the native notification handler');
+    $expected = Session::$values['ae_stripe_saved_notice_12']['notice'];
     $setup = (object) ['id' => 'seti_followup', 'status' => 'succeeded', 'customer' => 'cus_owner', 'payment_method' => 'pm_new', 'latest_attempt' => null,
         'metadata' => (object) ['user_id' => '7', 'is_billing_agreement' => '1', 'ae_stripe_setup_consent' => 'off_session_v2',
             'ae_stripe_setup_consent_user' => '7', 'ae_stripe_setup_consent_at' => '1794071700']];

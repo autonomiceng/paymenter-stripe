@@ -406,8 +406,9 @@ trait Checkout
     {
         try {
             $saved = $this->savePaidMethod($intent);
-            if (is_array($saved)) \Illuminate\Support\Facades\Session::flash('notification', [
-                'type' => 'success', 'message' => $saved['message'],
+            if ($saved === true || is_array($saved)) \Illuminate\Support\Facades\Session::put('ae_stripe_saved_notice_' . $intent->metadata->invoice_id, [
+                'user_id' => \Illuminate\Support\Facades\Auth::id(),
+                'notice' => ['type' => 'success', 'message' => is_array($saved) ? $saved['message'] : 'Payment method added successfully.'],
             ]);
         } catch (DisplayException $e) {
             \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'reason' => $e->getMessage()]);
@@ -415,6 +416,19 @@ trait Checkout
             if ($e instanceof \Symfony\Component\HttpKernel\Exception\HttpExceptionInterface) throw $e;
             \Illuminate\Support\Facades\Log::warning('AeStripe saved method deferred to webhook', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'error' => get_class($e)]);
         }
+    }
+
+    private function deliverSavedMethodNotice($component): void
+    {
+        if (!$component instanceof \App\Livewire\Invoices\Show) return;
+        $invoice = $component->invoice;
+        $owner = \Illuminate\Support\Facades\Auth::id();
+        if ($invoice->user_id != $owner) return;
+        $key = 'ae_stripe_saved_notice_' . $invoice->id;
+        $pending = \Illuminate\Support\Facades\Session::get($key);
+        if (!$pending || ($pending['user_id'] ?? null) != $owner) return;
+        $component->notify($pending['notice']['message'], $pending['notice']['type']);
+        \Illuminate\Support\Facades\Session::forget($key);
     }
 
     private function savePaidMethod($intent)
