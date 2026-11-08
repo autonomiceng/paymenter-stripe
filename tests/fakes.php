@@ -325,6 +325,7 @@ namespace App\Models {
             return $result ?? [];
         }
         public function first() { return $this->get()[0] ?? null; }
+        public function firstOrFail() { return $this->first() ?? throw new \RuntimeException('Missing row'); }
     }
     #[\AllowDynamicProperties]
     class Extension {
