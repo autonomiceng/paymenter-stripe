@@ -4,7 +4,7 @@ namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Exceptions\DisplayException;
 use App\Models\{Invoice, Property, User};
-use Illuminate\Support\Facades\{Auth, DB, Log};
+use Illuminate\Support\Facades\{Auth, Cache, DB, Log};
 
 trait SavedMethodNotices
 {
@@ -117,10 +117,11 @@ trait SavedMethodNotices
         return [$token, $property, $notice];
     }
 
-    private function savedNoticeNeedsPolling($component): bool
+    private function savedNoticePollInterval($component): int
     {
         $state = $this->savedNoticeForPage($component);
-        return $state && ($state[2]['state'] ?? null) === 'pending' && !($state[2]['consumed'] ?? false);
+        if (!$state || ($state[2]['state'] ?? null) !== 'pending' || ($state[2]['consumed'] ?? false)) return 0;
+        return ($state[2]['backoff'] ?? 0) > 0 ? 60 : 5;
     }
 
     private function deliverSavedMethodNotice($component, $context = null): void
@@ -133,7 +134,11 @@ trait SavedMethodNotices
         }
         [$token, $snapshot, $notice] = $state;
         $context?->addMemo('aeStripeSavedNotice', $token);
-        $done = !$notice || ($notice['consumed'] ?? false) || ($notice['state'] ?? null) === 'failed';
+        $done = !$notice || ($notice['consumed'] ?? false);
+        if (!$done && ($notice['state'] ?? null) === 'pending' && ($notice['backoff'] ?? 0) > 0) {
+            if (!\Livewire\store($component)->get('aeStripeNoticeDelay', false)) $component->notify('Saving your payment method is delayed. We will keep trying.', 'warning');
+            $context?->addMemo('aeStripeNoticeDelay', true);
+        }
         if (!$done && !empty($notice['notice'])) {
             DB::transaction(function () use ($component, $token, &$done) {
                 $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
@@ -160,7 +165,7 @@ trait SavedMethodNotices
         DB::transaction(function () use ($snapshot, $change) {
             $user = User::where('id', $snapshot->model_id)->lockForUpdate()->first();
             $current = $user?->properties()->where('key', $snapshot->key)->lockForUpdate()->first();
-            if (!$current || $current->value !== $snapshot->value) return;
+            if (!$current || $current->id !== $snapshot->id || $current->value !== $snapshot->value) return;
             $notice = json_decode($current->value, true);
             $next = $change($user, is_array($notice) ? $notice : [], $current);
             if ($next === null) $user->properties()->where('key', $current->key)->delete();
@@ -173,32 +178,67 @@ trait SavedMethodNotices
         try { Log::warning($message, $context); } catch (\Throwable $e) {} // Notice housekeeping cannot fail a settled payment.
     }
 
+    // Keyset rotation makes progress without rewriting young or future-due reservations.
+    private function savedNoticeBatch(string $kind)
+    {
+        $key = 'ae-stripe-notice-cursor-' . $kind;
+        $cursor = 0;
+        try { $cursor = (int) Cache::get($key, 0); } catch (\Throwable $e) {}
+        $query = Property::where('key', 'like', 'ae_stripe_notice_%')->where('model_type', (new User)->getMorphClass())
+            ->whereIn('model_id', User::select('id'));
+        if ($kind === 'retry') $query->where('value', 'like', '%"state"%"pending"%');
+        $rows = (clone $query)->where('id', '>', $cursor)->orderBy('id')->limit(200)->get();
+        if ($rows->isEmpty() && $cursor) $rows = $query->orderBy('id')->limit(200)->get();
+        try { Cache::put($key, $rows->last()?->id ?? 0, 3600); } catch (\Throwable $e) {}
+        return $rows;
+    }
+
+    private function savedNoticeCreatedAt(array $notice, $property): ?int
+    {
+        return is_numeric($notice['created_at'] ?? null) ? (int) $notice['created_at']
+            : ($property->created_at?->timestamp ?? $property->updated_at?->timestamp);
+    }
+
+    private function savedNoticeAccessWarning(string $reason, $property, string $stage): void
+    {
+        try {
+            // Aggregate by configured account key, without logging the key or provider response.
+            if (!Cache::add('ae-stripe-notice-warning-' . hash('sha256', $this->config('stripe_secret_key') . ':' . $reason), true, 3600)) return;
+            $notice = json_decode($property->value, true);
+            $this->noticeWarning('AeStripe saved method confirmation delayed: ' . $reason,
+                ['invoice_id' => $notice['invoice_id'] ?? null, 'intent_id' => $notice['intent_id'] ?? null, 'stage' => $stage]);
+        } catch (\Throwable $e) {} // Diagnostics cannot block saving or payment settlement.
+    }
+
     private function pruneSavedMethodNotices(): void
     {
-        foreach (Property::where('key', 'like', 'ae_stripe_notice_%')->where('model_type', (new User)->getMorphClass())
-            ->orderBy('updated_at')->orderBy('id')->limit(200)->get() as $property) {
-            $this->changeSavedNotice($property, function ($user, $notice, $current) {
-                $created = $notice['created_at'] ?? $current->created_at->timestamp;
-                if (!is_numeric($created) || $created >= now()->timestamp - 30 * 86400) return $notice;
+        foreach ($this->savedNoticeBatch('prune') as $property) {
+            $snapshot = json_decode($property->value, true);
+            $created = $this->savedNoticeCreatedAt(is_array($snapshot) ? $snapshot : [], $property);
+            if ($created !== null && $created >= now()->timestamp - 30 * 86400) continue;
+            try { $this->changeSavedNotice($property, function ($user, $notice, $current) {
+                $created = $this->savedNoticeCreatedAt($notice, $current);
+                // Unknown legacy age starts a retention period once; it cannot discard consented work.
+                if ($created === null) return array_replace($notice, ['created_at' => now()->timestamp]);
+                if ($created >= now()->timestamp - 30 * 86400) return $notice;
                 if (isset($notice['receipt_key'])) {
                     $receipt = json_decode($user->properties()->where('key', $notice['receipt_key'])->lockForUpdate()->first()?->value ?? 'null', true);
                     if (is_array($receipt)) $user->properties()->updateOrCreate(['key' => $notice['receipt_key']],
                         ['value' => json_encode(array_replace($receipt, ['notice_consumed' => true]), JSON_THROW_ON_ERROR)]);
                 }
                 return null; // Retire only notice metadata; payment and saving receipts remain intact.
-            });
+            }); } catch (\Throwable $e) { $this->savedNoticeAccessWarning('retention storage unavailable', $property, 'local'); }
         }
     }
 
     private function retrySavedMethodNotices(): void
     {
         if (!$this->gatewayEnabled() || !$this->bundledInactive()) return;
-        foreach (Property::where('key', 'like', 'ae_stripe_notice_%')->where('model_type', (new User)->getMorphClass())
-            ->where('value', 'like', '%"state"%"pending"%')->orderBy('updated_at')->orderBy('id')->limit(200)->get() as $property) {
+        foreach ($this->savedNoticeBatch('retry') as $property) {
+            $saving = false;
             try {
                 $notice = json_decode($property->value, true);
                 if (is_array($notice) && ($notice['state'] ?? null) !== 'pending') {
-                    $this->changeSavedNotice($property, fn ($user, $record) => $record);
                     continue;
                 }
                 $invoice = is_array($notice) ? Invoice::find($notice['invoice_id'] ?? null) : null;
@@ -208,42 +248,47 @@ trait SavedMethodNotices
                     continue;
                 }
                 if (($notice['retry_at'] ?? 0) > now()->timestamp) {
-                    $this->changeSavedNotice($property, fn ($user, $record) => $record);
                     continue;
                 }
                 $intent = $this->request('get', '/payment_intents/' . $notice['intent_id']);
                 $confirmed = ($intent->id ?? null) === $notice['intent_id'] && ($intent->metadata->invoice_id ?? null) == $invoice->id && ($intent->status ?? null) === 'succeeded';
                 if ($confirmed) {
-                    $this->savePaidMethod($intent);
+                    $saving = true;
+                    $this->savePaidMethod($intent, $property);
                 }
                 $readable = is_object($intent) && is_string($intent->id ?? null) && is_string($intent->status ?? null);
                 $this->deferSavedNotice($property, consumeAttempt: $readable && !$confirmed);
+                if (!$readable) $this->savedNoticeAccessWarning('intent response unavailable', $property, 'intent');
             } catch (\Illuminate\Http\Client\RequestException $e) {
-                $missing = $e->response->status() === 404 && $e->response->json('error.code') === 'resource_missing';
-                $this->deferSavedNotice($property, $missing ? 86400 : null, consumeAttempt: $missing);
-                if (!$missing) break; // Access problems/rate limits/outages must not fan out across customers.
+                $status = $e->response->status();
+                $missing = !$saving && $status === 404 && $e->response->json('error.code') === 'resource_missing';
+                $this->deferSavedNotice($property, $missing ? 86400 : null, consumeAttempt: $missing, missingIntent: $missing);
+                $this->savedNoticeAccessWarning(in_array($status, [401, 403, 404], true) ? 'check Stripe account and mode; resource access unavailable' : 'provider HTTP ' . $status, $property, $saving ? 'saving' : 'intent');
+                if (in_array($status, [401, 403, 429], true) || $status >= 500) break;
             } catch (\Illuminate\Http\Client\ConnectionException $e) {
-                $this->deferSavedNotice($property); break;
+                $this->deferSavedNotice($property);
+                $this->savedNoticeAccessWarning('provider connection unavailable', $property, $saving ? 'saving' : 'intent'); break;
             } catch (\Throwable $e) {
                 $this->deferSavedNotice($property);
-                $this->noticeWarning('AeStripe saved method confirmation pending');
+                $this->savedNoticeAccessWarning('local recovery unavailable', $property, $saving ? 'saving' : 'intent');
             }
         }
     }
 
-    private function deferSavedNotice($property, ?int $delay = null, bool $consumeAttempt = false): void
+    private function deferSavedNotice($property, ?int $delay = null, bool $consumeAttempt = false, bool $missingIntent = false): void
     {
-        try { $this->changeSavedNotice($property, function ($user, $notice) use ($delay, $consumeAttempt) {
+        try { $this->changeSavedNotice($property, function ($user, $notice) use ($delay, $consumeAttempt, $missingIntent) {
             if (($notice['state'] ?? null) !== 'pending') return $notice;
             // Only the intent's own missing/mismatched/non-success state consumes its budget.
             $attempts = ($notice['attempts'] ?? 0) + (int) $consumeAttempt;
-            $next = ['retry_at' => now()->timestamp + ($delay ?? min(3600, 60 * 2 ** min($attempts, 6)))];
+            $backoff = min(6, ($notice['backoff'] ?? 0) + 1);
+            $next = ['backoff' => $backoff, 'retry_at' => now()->timestamp + ($delay ?? min(3600, 60 * 2 ** ($consumeAttempt ? min($attempts, 6) : $backoff - 1)))];
             if ($consumeAttempt) {
                 $next += ['attempts' => $attempts, 'state' => $attempts >= 20 ? 'failed' : 'pending'];
-                if ($attempts === 20) DB::afterCommit(fn () => $this->noticeWarning('AeStripe saved method confirmation recovery exhausted; check Stripe account access',
+                if ($attempts === 20) DB::afterCommit(fn () => $this->noticeWarning('AeStripe saved method confirmation recovery exhausted; ' . ($missingIntent ? 'check Stripe account access or missing intent' : 'intent did not succeed or match'),
                     ['invoice_id' => $notice['invoice_id'] ?? null, 'intent_id' => $notice['intent_id'] ?? null]));
             }
             return array_replace($notice, $next);
-        }); } catch (\Throwable $e) { $this->noticeWarning('AeStripe confirmation retry state will retry'); }
+        }); } catch (\Throwable $e) { $this->savedNoticeAccessWarning('retry storage unavailable', $property, 'local'); }
     }
 }

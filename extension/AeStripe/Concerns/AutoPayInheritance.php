@@ -12,14 +12,21 @@ trait AutoPayInheritance
     private function invalidatePendingAutoPay(Service $service): void
     {
         if (!$service->isDirty('user_id') && !$service->isDirty('billing_agreement_id')) return;
-        // Revoke before SQL: an autocommit interruption cannot leave usable old consent.
-        // An enclosing native transaction rolls this deletion back with a failed transfer.
-        $property = $service->properties()->where('key', self::AUTO_PAY_PENDING)->first();
-        if (!$property) return;
-        $pending = json_decode($property->value, true);
-        if ($service->isDirty('billing_agreement_id') || ($pending['user_id'] ?? null) == $service->getOriginal('user_id')) {
-            $service->properties()->where('id', $property->id)->where('value', $property->value)->delete();
-        }
+        // Serialize cancellation before SQL, using the same row order as inheritance.
+        DB::transaction(function () use ($service) {
+            $ownerId = $service->getOriginal('user_id');
+            User::where('id', $ownerId)->lockForUpdate()->firstOrFail();
+            $current = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
+            if ($current->user_id != $ownerId) throw new \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException('Service ownership changed. Refresh and try again.');
+            $property = $service->properties()->where('key', self::AUTO_PAY_PENDING)->lockForUpdate()->first();
+            if (!$property) return;
+            $pending = json_decode($property->value, true);
+            if ($service->isDirty('billing_agreement_id') || ($pending['user_id'] ?? null) == $ownerId) {
+                if (!$service->properties()->where('id', $property->id)->where('value', $property->value)->delete()) {
+                    throw new \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException('Auto Pay setup changed. Refresh and try again.');
+                }
+            }
+        });
     }
 
     // Persist with the new service, before checkout commits. No card lock or binding belongs here.

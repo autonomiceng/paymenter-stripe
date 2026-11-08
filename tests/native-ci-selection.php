@@ -9,3 +9,16 @@ $environment['PAYMENTER_TEST_APP'] = __DIR__ . '/missing-native-app';
 $process = proc_open([PHP_BINARY, '-n', __DIR__ . '/native-pending-matrix.php'], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $environment);
 fclose($pipes[0]); $output = stream_get_contents($pipes[1]) . stream_get_contents($pipes[2]); fclose($pipes[1]); fclose($pipes[2]);
 check(proc_close($process) !== 0 && str_contains($output, 'Native CI requires provisioned Paymenter dependencies'), 'Missing native dependencies fail explicitly rather than silently skipping');
+$fixture = sys_get_temp_dir() . '/ae-stripe-matrix-' . bin2hex(random_bytes(6));
+mkdir($fixture . '/app/vendor', 0700, true); mkdir($fixture . '/other/vendor', 0700, true);
+file_put_contents($fixture . '/app/vendor/autoload.php', '<?php'); file_put_contents($fixture . '/other/vendor/autoload.php', '<?php');
+file_put_contents($fixture . '/child', '#!/bin/sh' . "\n" . 'printf \'%s\' "$PAY_NATIVE_PINNED_APP" > "$PAY_NATIVE_SELECTION_OUTPUT"' . "\nexit 1\n");
+chmod($fixture . '/child', 0700);
+foreach (['other', 'missing'] as $conflict) {
+    $environment = array_replace(getenv(), ['PAYMENTER_TEST_APP' => $fixture . '/app', 'PAY_NATIVE_PINNED_APP' => $fixture . '/' . $conflict,
+        'PAYMENTER_TEST_PHP' => $fixture . '/child', 'PAY_NATIVE_SELECTION_OUTPUT' => $fixture . '/selected']);
+    $process = proc_open([PHP_BINARY, '-n', __DIR__ . '/native-pending-matrix.php'], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $environment);
+    fclose($pipes[0]); $output = stream_get_contents($pipes[1]) . stream_get_contents($pipes[2]); fclose($pipes[1]); fclose($pipes[2]);
+    check(proc_close($process) !== 0 && str_contains($output, 'Native integration failed: transaction') && is_file($fixture . '/selected')
+        && file_get_contents($fixture . '/selected') === $fixture . '/app', 'Every native matrix child uses the validated application despite conflicting ' . $conflict . ' inheritance');
+}

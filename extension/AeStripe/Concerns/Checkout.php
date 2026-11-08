@@ -405,17 +405,23 @@ trait Checkout
         });
     }
 
-    private function savePaidMethod($intent)
+    private function savePaidMethod($intent, $recoveryNotice = null)
     {
         try { $saved = $this->savePaidMethodDetails($intent); }
         catch (DisplayException $e) {
-            try { $this->discardSavedMethodNotices($intent); } catch (\Throwable $ignored) { $this->noticeWarning('AeStripe notice cleanup will retry'); }
+            try { $this->discardSavedMethodNotices($intent); } catch (\Throwable $ignored) {
+                if ($recoveryNotice) $this->savedNoticeAccessWarning('refusal cleanup unavailable', $recoveryNotice, 'local');
+                else $this->noticeWarning('AeStripe notice cleanup will retry');
+            }
             throw $e;
         }
         try {
             if ($saved === true || is_array($saved)) $this->completeSavedMethodNotices($intent, $saved);
             else $this->discardSavedMethodNotices($intent);
-        } catch (\Throwable $e) { $this->noticeWarning('AeStripe saved method notice will retry'); }
+        } catch (\Throwable $e) {
+            if ($recoveryNotice) $this->savedNoticeAccessWarning('notice completion unavailable', $recoveryNotice, 'local');
+            else $this->noticeWarning('AeStripe saved method notice will retry');
+        }
         return $saved;
     }
 
