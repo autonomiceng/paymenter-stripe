@@ -24,19 +24,22 @@ $row = fn ($id, $pm) => ['id' => $id, 'external_reference' => $pm, 'user_id' => 
     'name' => 'Visa **** 4242', 'type' => 'visa', 'expiry' => '2030-05-31', 'deleted_at' => null];
 ExtensionHelper::$agreements = ['pm_cancel' => $row(19, 'pm_cancel')];
 foreach ([404, 503] as $status) {
+    if ($status === 404 && getenv('PAY_REMOVE_MISSING_CASE') === 'candidate') continue;
     Http::$handler = function ($verb, $path) use ($status) {
-        if ($verb === 'get' && $path === '/payment_methods/pm_cancel') throw new RequestException($status);
+        if ($verb === 'get' && $path === '/payment_methods/pm_cancel') throw new RequestException($status, ['error' => ['code' => 'resource_missing']]);
         throw new RuntimeException('Unexpected cancellation request');
     };
     $start = count(Http::$calls);
     $warnings = count(Log::$warnings);
-    check($gateway->cancelBillingAgreement(new BillingAgreement($row(19, 'pm_cancel'))) === false,
-        "Cancellation stops before local removal after a Stripe $status read failure");
+    $proceeds = $status === 404;
+    check($gateway->cancelBillingAgreement(new BillingAgreement($row(19, 'pm_cancel'))) === $proceeds,
+        $proceeds ? 'Cancellation proceeds locally when the clicked method is missing at Stripe'
+            : "Cancellation stops before local removal after a Stripe $status read failure");
     check(count(Http::$calls) === $start + 1 && Http::$calls[$start][0] === 'get',
         "Cancellation never detaches after a Stripe $status read failure");
-    check(count(Log::$warnings) === $warnings + 1 && end(Log::$warnings) === [
+    check($proceeds ? count(Log::$warnings) === $warnings : count(Log::$warnings) === $warnings + 1 && end(Log::$warnings) === [
         'ae_stripe_cancel_method_read_failed', ['error' => RequestException::class],
-    ], 'Cancellation read warnings contain only a fixed code and exception class');
+    ], 'Only uncertain cancellation read failures warn, with a fixed code and exception class');
 }
 Http::$handler = function ($verb, $path) {
     if ($verb === 'get' && $path === '/payment_methods/pm_cancel') return ['customer' => 'cus_other'];
@@ -47,6 +50,48 @@ check($gateway->cancelBillingAgreement(new BillingAgreement($row(19, 'pm_cancel'
     'Cancellation refuses a method belonging to another customer');
 check(count(Http::$calls) === $start + 1 && Http::$calls[$start][0] === 'get',
     'Cancellation never detaches a method belonging to another customer');
+if (getenv('PAY_REMOVE_MISSING_CASE') !== 'candidate') {
+    ExtensionHelper::$agreements = ['pm_cancel' => $row(19, 'pm_cancel'), 'pm_live' => $row(20, 'pm_live')];
+    $otherBefore = ExtensionHelper::$agreements['pm_live'];
+    $user->props->values['ae_stripe_auto_pay_default'] = json_encode(['agreement_id' => 19]);
+    Http::$handler = function ($verb, $path) {
+        check(!DB::$userLocked, 'A missing clicked method is read outside the owner lock');
+        if ($verb === 'get' && $path === '/payment_methods/pm_cancel') throw new RequestException(404, ['error' => ['code' => 'resource_missing']]);
+        throw new RuntimeException('A missing clicked method cannot authorize reading or detaching other methods');
+    };
+    check($gateway->cancelBillingAgreement(new BillingAgreement($row(19, 'pm_cancel')))
+        && !isset($user->props->values['ae_stripe_auto_pay_default']), 'A missing clicked method proceeds locally and clears its Auto Pay choice');
+    check(ExtensionHelper::$agreements['pm_live'] === $otherBefore, 'A missing clicked method leaves other agreements alone');
+}
+// A dead row must not stop removal of a live card, even if its saved details look identical.
+foreach (['row', 'receipt'] as $source) foreach (['missing', 'server', 'connection', 'unconfirmed 404'] as $failure) {
+    $user->props->values = [];
+    ExtensionHelper::$agreements = ['pm_cancel' => $row(19, 'pm_cancel')];
+    if ($source === 'row') ExtensionHelper::$agreements['pm_dead'] = $row(20, 'pm_dead');
+    else $user->props->values['ae_stripe_saved_fixture'] = json_encode(['incoming' => 'pm_dead', 'reference' => 'pm_cancel', 'consent' => ['user_id' => 7]]);
+    $deadBefore = ExtensionHelper::$agreements['pm_dead'] ?? null;
+    $detached = [];
+    $ownerLocks = [];
+    Http::$handler = function ($verb, $path) use ($failure, &$detached, &$ownerLocks) {
+        $ownerLocks[] = DB::$userLocked;
+        if ($verb === 'get' && $path === '/payment_methods/pm_dead') {
+            if ($failure === 'connection') throw new \Illuminate\Http\Client\ConnectionException('Synthetic outage');
+            throw new RequestException($failure === 'server' ? 503 : 404,
+                ['error' => ['code' => $failure === 'missing' ? 'resource_missing' : 'unknown']]);
+        }
+        if ($verb === 'get' && $path === '/payment_methods/pm_cancel') return (object) ['id' => 'pm_cancel', 'type' => 'card', 'customer' => 'cus_owner',
+            'card' => (object) ['fingerprint' => 'fp_live', 'brand' => 'visa', 'last4' => '4242', 'exp_month' => 5, 'exp_year' => 2030]];
+        if ($verb === 'post' && $path === '/payment_methods/pm_cancel/detach') { $detached[] = 'pm_cancel'; return (object) ['id' => 'pm_cancel', 'customer' => null]; }
+        throw new RuntimeException('Unexpected missing-copy removal request');
+    };
+    $proceeds = $failure === 'missing';
+    check($gateway->cancelBillingAgreement(new BillingAgreement($row(19, 'pm_cancel'))) === $proceeds,
+        $proceeds ? 'Another missing copy does not block removing the live card' : 'An uncertain candidate read still stops removal: ' . $failure);
+    check($detached === ($proceeds ? ['pm_cancel'] : []), 'Only the verified live card is detached after a confirmed missing candidate');
+    check((ExtensionHelper::$agreements['pm_dead'] ?? null) === $deadBefore, 'Skipping a missing candidate never changes its local row');
+    check(!in_array(true, $ownerLocks, true), 'Missing-method handling keeps all Stripe HTTP outside the owner lock');
+}
+ExtensionHelper::$agreements = ['pm_cancel' => $row(19, 'pm_cancel')];
 echo "PASS: cancellation read failures and customer binding\n";
 
 require_once __DIR__ . '/../extension/AeStripe/DeduplicateCardsCommand.php';

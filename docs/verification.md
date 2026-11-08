@@ -434,4 +434,6 @@ cache behavior or real database concurrency; check those in the test-mode sandbo
 
 Repeated Add card returns wait up to five seconds for the saved receipt, then reuse its result. A longer wait
 shows a retry notice. Removal verifies and detaches every matching local method and its receipt-linked incoming
-copies outside the owner lock. Any provider failure stops native local removal so it can finish on retry.
+copies outside the owner lock. A confirmed missing candidate is skipped; a confirmed missing clicked method
+proceeds with its own local removal without touching other copies. Other provider failures stop native local
+removal so it can finish on retry.

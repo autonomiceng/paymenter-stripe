@@ -47,6 +47,16 @@ trait SavedMethods
         return $identities;
     }
 
+    private function readMethodForRemoval(string $reference): ?object
+    {
+        try {
+            return $this->request('get', '/payment_methods/' . $reference);
+        } catch (RequestException $e) {
+            if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') throw $e;
+            return null;
+        }
+    }
+
     private function removeSavedMethodCopies(BillingAgreement $agreement): bool
     {
         $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
@@ -62,15 +72,16 @@ trait SavedMethods
         [$user, $current, $customer, $rows, $receipts] = $snapshot;
         if (!$customer) return false;
         try {
-            $method = $this->request('get', '/payment_methods/' . $current->external_reference);
+            $method = $this->readMethodForRemoval($current->external_reference);
             if (($method->customer ?? null) !== null && ($method->customer ?? null) !== $customer) return false;
             $identity = $this->savedMethodIdentity($method);
+            // A confirmed missing method has no identity, so leave other agreements alone.
             $copies = [$current->external_reference => $method];
             $matched = [$current];
             if ($identity !== null) {
                 foreach ($rows as $row) {
                     if ($row->external_reference === $current->external_reference) continue;
-                    $remote = $this->request('get', '/payment_methods/' . $row->external_reference);
+                    $remote = $this->readMethodForRemoval($row->external_reference);
                     if (($remote->id ?? null) === $row->external_reference && in_array($remote->customer ?? null, [null, $customer], true)
                         && $this->savedMethodIdentity($remote) === $identity) {
                         $copies[$row->external_reference] = $remote;
@@ -83,7 +94,7 @@ trait SavedMethods
                     $incoming = $receipt['incoming'] ?? null;
                     if (!$incoming || isset($copies[$incoming]) || !isset($copies[$receipt['reference'] ?? ''])
                         || ($receipt['consent']['user_id'] ?? null) != $user->id) continue;
-                    $remote = $this->request('get', '/payment_methods/' . $incoming);
+                    $remote = $this->readMethodForRemoval($incoming);
                     if (($remote->id ?? null) === $incoming && ($remote->customer ?? null) === $customer
                         && $this->savedMethodIdentity($remote) === $identity) $copies[$incoming] = $remote;
                 }
