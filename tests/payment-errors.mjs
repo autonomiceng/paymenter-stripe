@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const views = new URL('../extension/AeStripe/resources/views/', import.meta.url);
 const theme = readFileSync(new URL('stripe-theme.blade.php', views), 'utf8');
-function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hosting', resuming = false, savedConsent = false) {
+function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hosting', resuming = false, savedConsent = false, amount = 2000) {
     let source = readFileSync(new URL(`${name}.blade.php`, views), 'utf8')
         .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
         .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(new URL('stripe-elements.blade.php', views), 'utf8'))
@@ -22,13 +22,79 @@ function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hostin
         .replace('@js($linkDisplay)', JSON.stringify(linkDisplay))
         .replace('@js($businessName)', JSON.stringify(businessName))
         .replace("@js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true))", JSON.stringify(resuming))
-        .replaceAll('@js($intent->amount)', '2000').replace("@js(strtolower($intent->currency))", "'usd'")
+        .replaceAll('@js($intent->amount)', JSON.stringify(amount)).replace("@js(strtolower($intent->currency))", "'usd'")
         .replace("@js(($intent->metadata->ae_stripe_consent ?? null) === '1')", JSON.stringify(savedConsent))
         .replace(/@checked\([^\n]+? disabled/, resuming && savedConsent ? 'checked disabled' : 'disabled')
         .replace(/\{\{[^\n]+?\}\}/g, "'Fixture'")
         .replaceAll('@script', '').replaceAll('@endscript', '');
     assert(!/@js|@checked|\{\{|@include/.test(source), 'Blade expressions are rendered');
     return source;
+}
+// Offline Stripe.js and fetch boundaries; each Element records its options and handlers for the checks.
+async function installStripe(page, expressThrows) {
+    await page.evaluate(expressThrows => {
+        window.expressThrows = expressThrows;
+        window.failure = 'network';
+        window.confirms = 0;
+        window.clears = 0;
+        window.elementCalls = [];
+        window.elementHandlers = {};
+        window.fetch = async () => {
+            if (failure === 'network') throw new TypeError('Failed to fetch');
+            if (failure === 'server-decline') return { ok: false, async json() { return {message: 'Server decline wording.', intent: 'fixture-intent', declined: true}; } };
+            return { ok: failure !== 'consent', async json() { return {message: 'Could not record payment preferences. Refresh the invoice.', status: 'requires_action', client_secret: 'fixture-secret'}; } };
+        };
+        window.$wire = { on() {} };
+        window.Alpine = { data: (_, factory) => { window.setupFactory = factory; } };
+        window.Stripe = () => ({
+            elements: (options) => { window.elementOptions = options; let updated; return window.elementsInstance = {
+                on(name, fn) { if (name === 'update-end') updated = fn; }, update() { updated?.(); }, async submit() {
+                if (failure === 'updates') return { error: { type: 'api_connection_error' } };
+                return {};
+            }, async fetchUpdates() {
+                if (failure === 'updates') return { error: { type: 'api_connection_error', message: 'Raw update detail' } };
+                return {};
+            }, create(type, options) {
+                elementCalls.push({type, options});
+                if (type === 'expressCheckout' && expressThrows === 'create') throw new Error('Express Checkout is unsupported');
+                if (type === 'payment') window.paymentElementOptions = options;
+                const handlers = elementHandlers[type] = {};
+                return { on: (name, fn) => { handlers[name] = fn; }, mount(selector) {
+                    if (type === 'expressCheckout' && expressThrows === 'mount') throw new Error('Express Checkout cannot mount');
+                    (typeof selector === 'string' ? document.querySelector(selector) : selector).textContent =
+                        type === 'payment' ? 'Card form' : 'Pay with Link';
+                    // No available methods also models Link being disabled on the account.
+                    handlers.ready?.({availablePaymentMethods: expressThrows === 'unavailable' ? null : {link: true}});
+                }, clear() {
+                    if (type !== 'payment') return;
+                    clears++;
+                    // Stripe reports the empty form after clear() returns and submission unlocks.
+                    window.clearChange = new Promise(resolve => requestAnimationFrame(() => {
+                        handlers.change?.({empty: true, complete: false, value: {type: 'card'}});
+                        resolve();
+                    }));
+                }, destroy() {} };
+            } }; },
+            async createConfirmationToken({elements}) {
+                if (elements !== elementsInstance) throw new Error('Token must use the mounted Elements instance');
+                if (failure === 'confirmation') throw new TypeError('Failed to tokenize');
+                if (failure === 'decline') return {error: {type: 'card_error', message: 'Your card was declined.'}};
+                return {confirmationToken: {id: 'ctoken_fixture'}};
+            },
+            async handleNextAction(options) { if (window.onAction) await window.onAction(options); return confirm(); },
+            async confirmSetup({elements, confirmParams}) {
+                if (elements !== elementsInstance) throw new Error('Setup must use the mounted Elements instance');
+                window.setupConfirmParams = confirmParams;
+                return confirm();
+            },
+        });
+        function confirm() {
+            confirms++;
+            if (failure === 'confirmation') throw new TypeError('NetworkError when attempting to fetch resource.');
+            if (failure === 'action-success') return {};
+            return { error: { type: 'card_error', message: 'Your card was declined.' } };
+        }
+    }, expressThrows);
 }
 const browser = await chromium.launch({ headless: true });
 let activePage;
@@ -46,68 +112,7 @@ try {
         await page.route('**/*', route => route.fulfill({ contentType: 'text/javascript', body: '' }));
         page.setDefaultTimeout(5000);
         await page.setContent('<html><body></body></html>');
-        await page.evaluate(expressThrows => {
-            window.expressThrows = expressThrows;
-            window.failure = 'network';
-            window.confirms = 0;
-            window.clears = 0;
-            window.elementCalls = [];
-            window.elementHandlers = {};
-            window.fetch = async () => {
-                if (failure === 'network') throw new TypeError('Failed to fetch');
-                if (failure === 'server-decline') return { ok: false, async json() { return {message: 'Server decline wording.', intent: 'fixture-intent', declined: true}; } };
-                return { ok: failure !== 'consent', async json() { return {message: 'Could not record payment preferences. Refresh the invoice.', status: 'requires_action', client_secret: 'fixture-secret'}; } };
-            };
-            window.$wire = { on() {} };
-            window.Alpine = { data: (_, factory) => { window.setupFactory = factory; } };
-            window.Stripe = () => ({
-                elements: (options) => { window.elementOptions = options; return window.elementsInstance = { update() {}, async submit() {
-                    if (failure === 'updates') return { error: { type: 'api_connection_error' } };
-                    return {};
-                }, async fetchUpdates() {
-                    if (failure === 'updates') return { error: { type: 'api_connection_error', message: 'Raw update detail' } };
-                    return {};
-                }, create(type, options) {
-                    elementCalls.push({type, options});
-                    if (type === 'expressCheckout' && expressThrows === 'create') throw new Error('Express Checkout is unsupported');
-                    if (type === 'payment') window.paymentElementOptions = options;
-                    const handlers = elementHandlers[type] = {};
-                    return { on: (name, fn) => { handlers[name] = fn; }, mount(selector) {
-                        if (type === 'expressCheckout' && expressThrows === 'mount') throw new Error('Express Checkout cannot mount');
-                        (typeof selector === 'string' ? document.querySelector(selector) : selector).textContent =
-                            type === 'payment' ? 'Card form' : 'Pay with Link';
-                        // No available methods also models Link being disabled on the account.
-                        handlers.ready?.({availablePaymentMethods: expressThrows === 'unavailable' ? null : {link: true}});
-                    }, clear() {
-                        if (type !== 'payment') return;
-                        clears++;
-                        // Stripe reports the empty form after clear() returns and submission unlocks.
-                        window.clearChange = new Promise(resolve => requestAnimationFrame(() => {
-                            handlers.change?.({empty: true, complete: false, value: {type: 'card'}});
-                            resolve();
-                        }));
-                    }, destroy() {} };
-                } }; },
-                async createConfirmationToken({elements}) {
-                    if (elements !== elementsInstance) throw new Error('Token must use the mounted Elements instance');
-                    if (failure === 'confirmation') throw new TypeError('Failed to tokenize');
-                    if (failure === 'decline') return {error: {type: 'card_error', message: 'Your card was declined.'}};
-                    return {confirmationToken: {id: 'ctoken_fixture'}};
-                },
-                async handleNextAction(options) { if (window.onAction) await window.onAction(options); return confirm(); },
-                async confirmSetup({elements, confirmParams}) {
-                    if (elements !== elementsInstance) throw new Error('Setup must use the mounted Elements instance');
-                    window.setupConfirmParams = confirmParams;
-                    return confirm();
-                },
-            });
-            function confirm() {
-                confirms++;
-                if (failure === 'confirmation') throw new TypeError('NetworkError when attempting to fetch resource.');
-                if (failure === 'action-success') return {};
-                return { error: { type: 'card_error', message: 'Your card was declined.' } };
-            }
-        }, expressThrows);
+        await installStripe(page, expressThrows);
         await page.setContent(render(name, linkDisplay, businessName));
         if (name === 'pay') {
             await page.waitForFunction(() => !!document.querySelector('script[src]'));
@@ -135,13 +140,11 @@ try {
                 component.$el = document.querySelector('form');
                 await component.init();
             }, {linkDisplay, businessName});
-            assert.equal(await page.locator('#submit').isEnabled(), true, 'Save stays live so it can say why it waits');
-            await page.locator('#submit').click();
-            assert.equal(await page.locator('[role=alert]').textContent(), 'Tick the box to save this card.');
-            assert.equal(await page.evaluate(() => document.activeElement?.id), 'setup-consent', 'The reason moves focus to the box');
-            assert.equal(await page.evaluate(() => confirms), 0, 'Save without the tick confirms nothing');
-            assert.equal(await page.locator('#payment-element').evaluate(element => element.inert), false, 'Card fields are live before the tick');
-            assert.equal(await page.locator('#express-checkout').evaluate(element => element.inert), true, 'Link waits for the tick');
+            assert.equal(await page.locator('#submit').isEnabled(), true, 'Save card is ready once Stripe is');
+            assert.equal(await page.locator('[role=alert]').textContent(), '', 'The form opens without an error');
+            assert.equal(await page.locator('#setup-consent').count(), 0, 'There is no box to tick');
+            assert.equal(await page.locator('#payment-element').evaluate(element => element.inert), false, 'Card fields are live at once');
+            assert.equal(await page.locator('#express-checkout').evaluate(element => element.inert), false, 'Link is live at once');
             const options = await page.evaluate(() => elementOptions);
             assert.equal(options.clientSecret, 'fixture-secret', 'Setup keeps the existing SetupIntent flow');
             assert.equal(options.mode, undefined);
@@ -153,8 +156,6 @@ try {
             assert.deepEqual(calls.filter(call => call.type === 'expressCheckout').map(call => call.options),
                 linkDisplay === 'above_card' ? [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
                     amazonPay: 'never', paypal: 'never', klarna: 'never'}, buttonHeight: 40, ...(businessName ? {business: {name: businessName}} : {})}] : []);
-            if (expressThrows) assert.equal(await page.locator('#setup-consent').isEnabled(), true, 'Card setup stays ready when Express fails');
-            await page.locator('#setup-consent').check();
         }
         if (expressThrows) {
             assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${name}: card form mounts when Express fails`);
@@ -202,8 +203,8 @@ try {
         }
         if (name === 'billing-agreement' && linkDisplay === 'above_card' && !expressThrows) {
             assert.equal(await page.locator('#express-checkout').isVisible(), true);
-            assert.equal(await page.evaluate(() => document.querySelector('#submit').compareDocumentPosition(
-                document.querySelector('#express-checkout')) & Node.DOCUMENT_POSITION_FOLLOWING), 4, 'Link sits below Save');
+            assert.equal(await page.evaluate(() => document.querySelector('#express-checkout').compareDocumentPosition(
+                document.querySelector('#payment-element')) & Node.DOCUMENT_POSITION_FOLLOWING), 4, 'Link sits above the card fields');
             await page.evaluate(() => {
                 window.setupRequests = [];
                 window.linkFailures = [];
@@ -213,20 +214,13 @@ try {
                     return {ok: true};
                 };
             });
-            await page.locator('#setup-consent').uncheck();
-            const before = await page.evaluate(() => confirms);
             const confirmLink = () => page.evaluate(() => elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)}));
-            await confirmLink();
-            assert.equal(await page.locator('[role=alert]').textContent(), 'Tick the box to save with Link.');
-            assert.equal(await page.evaluate(() => confirms), before);
-            assert.deepEqual(await page.evaluate(() => setupRequests), [], 'Unchecked consent never reaches the server');
-            await page.locator('#setup-consent').check();
             await confirmLink();
             assert.deepEqual(await page.evaluate(() => setupRequests), [{url: '/consent', method: 'POST', csrf: 'fixture-csrf',
                 body: {intent: 'fixture-intent', consent: true, version: 'off_session_v2'}}]);
             assert.deepEqual(await page.evaluate(() => setupConfirmParams), {return_url: '/return'});
             assert.equal(await page.locator('[role=alert]').textContent(), 'Your card was declined.');
-            assert.deepEqual(await page.evaluate(() => linkFailures), [{reason: 'fail'}, {reason: 'fail'}]);
+            assert.deepEqual(await page.evaluate(() => linkFailures), [{reason: 'fail'}], 'Only the decline fails Link');
             for (const failure of ['network', 'consent', 'confirmation']) {
                 await page.evaluate(value => {
                     window.failure = value;
@@ -247,7 +241,7 @@ try {
                 window.fetch = () => new Promise(resolve => { window.releaseConsent = () => resolve({ok: true}); });
                 window.setupPending = elementHandlers.expressCheckout.confirm({paymentFailed() { throw new Error('Successful setup must not fail'); }});
             });
-            assert.equal(await page.locator('#setup-consent').isEnabled(), false, 'Consent stays frozen during Link setup');
+            assert.equal(await page.locator('#submit').isEnabled(), false, 'Save card waits while Link saves');
             assert.equal(await page.locator('#express-checkout').evaluate(element => element.inert), true);
             const beforeDuplicate = await page.evaluate(() => confirms);
             await confirmLink();
@@ -371,7 +365,7 @@ try {
                     : {status: 'requires_payment_method'}; }};
             };
             window.Stripe = () => ({
-                elements: () => ({update() {}, async submit() {return {};}, create(type) {
+                elements: () => ({on() {}, update() {}, async submit() {return {};}, create(type) {
                     if (type !== 'payment') throw new Error('A resumed payment cannot offer Express Checkout');
                     return {on(name, fn) {handlers[name] = fn;}, mount() {handlers.ready();},
                         clear() {handlers.change?.({empty: true});}, destroy() {}};
@@ -404,6 +398,171 @@ try {
         await page.route('https://example.com/resume', route => route.fulfill({contentType: 'text/html', body: 'Fresh payment checkout'}));
         await page.locator('#refresh-payment').click();
         await page.getByText('Fresh payment checkout').waitFor();
+        await page.close();
+    }
+    // Add card offers two choices under one consent line: the Link wallet, or a card. Each saves at once, phone and desktop.
+    for (const viewport of [{width: 390, height: 844}, {width: 1440, height: 900}]) {
+        const page = activePage = await browser.newPage({viewport});
+        await page.route('**/*', route => route.fulfill({ contentType: 'text/javascript', body: '' }));
+        page.setDefaultTimeout(5000);
+        await page.setContent('<html><body></body></html>');
+        await installStripe(page, false);
+        await page.setContent(render('billing-agreement'));
+        await page.evaluate(async () => {
+            window.failure = 'action-success';
+            window.setupRequests = [];
+            window.linkFailures = [];
+            window.consentOk = false;
+            window.fetch = async (url, options) => { setupRequests.push({url, body: JSON.parse(options.body)}); return {ok: consentOk}; };
+            window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf', name: 'Fixture', email: 'Fixture', linkDisplay: 'above_card', businessName: 'Fixture Hosting' });
+            component.$el = document.querySelector('form');
+            await component.init();
+        });
+        const at = `${viewport.width}px`;
+        const terms = page.locator('#setup-terms');
+        assert.match(await terms.textContent(), /By saving with Link or a card, you agree to save it for future charges, including renewals\./, `${at}: one consent line`);
+        assert.match(await terms.textContent(), /Saving does not turn on Auto Pay\./, `${at}: saving stays apart from Auto Pay`);
+        for (const [label, locator] of [['consent line', terms], ['Link choice', page.getByText('Use your Link wallet')],
+            ['divider', page.getByText('or add a card')], ['card fields', page.locator('#payment-element')], ['Save card', page.getByRole('button', {name: 'Save card'})]]) {
+            assert.equal(await locator.isVisible(), true, `${at}: ${label} shows before any choice`);
+        }
+        const boxes = await page.evaluate(() => ['#setup-terms', '#express-checkout', '#payment-element', '#submit']
+            .map(selector => document.querySelector(selector).getBoundingClientRect().toJSON()));
+        for (let i = 1; i < boxes.length; i++) assert(boxes[i - 1].bottom <= boxes[i].top, `${at}: consent, Link, card fields and Save read top to bottom`);
+        assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${at}: nothing runs off the side`);
+        assert.equal(await page.locator('[role=alert]').textContent(), '', `${at}: no error before a choice`);
+        for (const choice of ['Link', 'card']) {
+            if (choice === 'Link') await page.evaluate(() => elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)}));
+            else await page.getByRole('button', {name: 'Save card'}).click();
+            await page.waitForFunction(() => document.querySelector('[role=alert]').textContent.length > 0);
+            assert.equal(await page.evaluate(() => confirms), 0, `${at}: failed ${choice} consent cannot confirm setup`);
+            assert.equal(await page.locator('#submit').isEnabled(), true, `${at}: failed ${choice} consent permits retry`);
+        }
+        assert.deepEqual(await page.evaluate(() => linkFailures), [{reason: 'fail'}], `${at}: consent failure dismisses Link`);
+        assert.deepEqual(await page.evaluate(() => setupRequests), Array.from({length: 2}, () => ({url: '/consent', body: {intent: 'fixture-intent', consent: true, version: 'off_session_v2'}})));
+        await page.evaluate(() => {consentOk = true; setupRequests = []; linkFailures = [];});
+        await page.evaluate(() => elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)}));
+        assert.deepEqual(await page.evaluate(() => setupRequests), [{url: '/consent', body: {intent: 'fixture-intent', consent: true, version: 'off_session_v2'}}],
+            `${at}: choosing Link records the agreement first`);
+        assert.equal(await page.evaluate(() => confirms), 1, `${at}: Link saves at once`);
+        assert.deepEqual(await page.evaluate(() => linkFailures), [], `${at}: Link never fails for consent`);
+        assert.equal(await page.locator('[role=alert]').textContent(), '', `${at}: Link shows no error`);
+        await page.getByRole('button', {name: 'Save card'}).click();
+        await page.waitForFunction(() => confirms === 2);
+        assert.equal(await page.evaluate(() => setupRequests.length), 2, `${at}: choosing a card records the agreement first`);
+        assert.equal(await page.locator('[role=alert]').textContent(), '', `${at}: the card saves without an error`);
+        await page.close();
+    }
+    for (const scenario of ['decline', 'save-card', 'once-card', 'save-link', 'once-link']) {
+        const page = activePage = await browser.newPage({viewport: {width: 390, height: 844}});
+        const sent = [];
+        page.setDefaultTimeout(5000);
+        await page.exposeFunction('captureNewCard', request => sent.push(request));
+        await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
+        await page.route('https://example.com/new-card', route => route.fulfill({contentType: 'text/html', body: '<html><body></body></html>'}));
+        await page.route('https://example.com/return', route => route.fulfill({contentType: 'text/html', body: 'Payment received'}));
+        await page.goto('https://example.com/new-card');
+        await page.evaluate(scenario => {
+            window.handlers = {}; window.order = []; window.$wire = {on() {}};
+            window.fetch = async (_, options) => {
+                await captureNewCard({body: JSON.parse(options.body), tokenOptions, order});
+                return {ok: scenario !== 'decline', async json() { return scenario === 'decline'
+                    ? {declined: true, message: 'Your bank declined this card. Try a different card, or contact your bank.'}
+                    : {status: 'succeeded'}; }};
+            };
+            window.Stripe = () => ({
+                elements: options => {
+                    window.currentOptions = {...options};
+                    return {on(name, fn) {handlers[name] = fn;}, update(changes) {
+                        // Stripe.js v3 returns void; the options reach the iframe later.
+                        setTimeout(() => {Object.assign(currentOptions, changes); order.push('updated'); handlers['update-end']?.();}, 20);
+                    }, async submit() {order.push('submit'); return {};},
+                        create(type) {
+                            const events = handlers[type] = {};
+                            return {on(name, fn) {events[name] = fn;}, mount() {events.ready?.({availablePaymentMethods: {link: true}});},
+                                clear() {events.change?.({empty: true});}, destroy() {}};
+                        }};
+                },
+                async createConfirmationToken() {
+                    order.push('token');
+                    window.tokenOptions = JSON.parse(JSON.stringify(currentOptions));
+                    return {confirmationToken: {id: 'ctoken_newcard'}};
+                },
+            });
+        }, scenario);
+        await page.setContent(render('pay', 'above_card', 'Fixture Hosting', false, false, 1099));
+        await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
+        await page.evaluate(() => handlers.payment.change({empty: false, value: {type: 'card'}}));
+        await page.locator('#save-card').setChecked(scenario.startsWith('save'));
+        if (scenario.endsWith('link')) {
+            await page.evaluate(() => handlers.expressCheckout.confirm({paymentFailed() {}}));
+        } else await page.locator('#submit').click();
+        if (scenario === 'decline') {
+            await page.waitForFunction(() => document.querySelector('[role=alert]').textContent.includes('Your bank declined'));
+            assert.equal(await page.locator('#refresh-payment').isVisible(), true,
+                'A fresh-card bank decline offers Refresh payment form');
+        } else await page.getByText('Payment received', {exact: true}).waitFor();
+        assert.equal(sent.length, 1, 'One submit sends one confirmation');
+        assert.deepEqual(sent[0].order, ['updated', 'submit', 'token'], 'Card and Link submit only after options apply');
+        const save = scenario.startsWith('save');
+        assert.deepEqual(sent[0].body, {intent: 'fixture-intent', confirmation_token: 'ctoken_newcard', amount: 1099, save});
+        assert.deepEqual(sent[0].tokenOptions.paymentMethodTypes, ['card', 'link']);
+        assert.deepEqual(sent[0].tokenOptions.paymentMethodOptions, {
+            card: {setup_future_usage: save ? 'off_session' : 'none'},
+            link: {setup_future_usage: save ? 'off_session' : 'none'},
+        }, 'The token collects the same saving options the server will confirm');
+        if (scenario === 'decline') {
+            await page.route('https://example.com/new-card', route => route.fulfill({contentType: 'text/html', body: 'Fresh payment checkout'}));
+            await page.locator('#refresh-payment').click();
+            await page.getByText('Fresh payment checkout', {exact: true}).waitFor();
+        }
+        await page.close();
+    }
+    // A missing iframe update event must release the form without creating a token or payment.
+    for (const choice of ['card', 'Link']) for (const updateFailure of ['missing-event', 'throw', 'reject']) {
+        const page = activePage = await browser.newPage();
+        await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
+        await page.setContent('<html><body></body></html>');
+        await page.clock.install();
+        await installStripe(page, false);
+        await page.evaluate(updateFailure => {
+            window.updates = 0; window.submits = 0; window.tokens = 0; window.requests = 0; window.linkFailures = [];
+            window.failure = 'action-success';
+            window.fetch = async () => {requests++; return {ok: false, async json() {return {message: 'Try again.'};}};};
+            const makeStripe = window.Stripe;
+            window.Stripe = () => {
+                const stripe = makeStripe(); const makeElements = stripe.elements;
+                stripe.elements = options => {
+                    const elements = makeElements(options);
+                    elements.update = () => {updates++; if (updateFailure === 'throw') throw new Error('Update failed'); if (updateFailure === 'reject') return Promise.reject(new Error('Update failed'));};
+                    elements.submit = async () => {submits++; return {};};
+                    return elements;
+                };
+                stripe.createConfirmationToken = async () => {tokens++; return {confirmationToken: {id: 'ctoken_fixture'}};};
+                return stripe;
+            };
+        }, updateFailure);
+        await page.setContent(render('pay'));
+        await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
+        const submit = () => page.evaluate(choice => {
+            if (choice === 'Link') elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)});
+            else document.querySelector('form').dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+        }, choice);
+        await submit();
+        if (updateFailure === 'missing-event') {
+            await submit();
+            assert.equal(await page.evaluate(() => updates), 1, `${choice}: overlapping submission cannot start another update`);
+            await page.clock.fastForward(5001);
+        }
+        // Rejected updates release the form immediately, without advancing the timeout clock.
+        assert.equal(await page.locator('#submit').isEnabled(), true, `${choice}: ${updateFailure} releases the form`);
+        assert.equal(await page.locator('#submit').isVisible(), true, `${choice}: ${updateFailure} restores Pay`);
+        assert.match(await page.locator('[role=alert]').textContent(), /Could not check the payment/);
+        const message = await page.locator('[role=alert]').textContent();
+        await page.clock.fastForward(30000);
+        assert.equal(await page.locator('[role=alert]').textContent(), message, 'The timeout error stays visible until another customer action');
+        assert.deepEqual(await page.evaluate(() => [submits, tokens, requests]), [0, 0, 0], `${choice}: unresolved options cannot reach payment`);
+        if (choice === 'Link') assert.deepEqual(await page.evaluate(() => linkFailures), Array.from({length: updateFailure === 'missing-event' ? 2 : 1}, () => ({reason: 'fail'})), 'Overlapping Link and unresolved options each dismiss their own payment UI');
         await page.close();
     }
     console.log('Pay and setup network failures, retry and card declines passed.');

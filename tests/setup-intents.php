@@ -182,4 +182,55 @@ $remoteSetups[$cardAndLink->id]->payment_method_types = ['card', 'klarna', 'link
 $replaced = $setupGateway->createBillingAgreement($setupUser)['data']['intent'];
 check($cancelledSetups === [$cardAndLink->id] && $replaced->id !== $cardAndLink->id && count($createdTypes) === 2,
     'An open intent offering other methods is cancelled and replaced');
+// A concurrent confirmation/cancellation can win after the first lookup and before cancel.
+$setupMethodHandler = Http::$handler;
+foreach (['succeeded', 'canceled', 'requires_payment_method', 'read-failure', 'other-error', 'processing-response'] as $race) {
+    unset($setupUser->props->values[$property]);
+    Http::$handler = $setupMethodHandler;
+    $old = $setupGateway->createBillingAgreement($setupUser)['data']['intent'];
+    $remoteSetups[$old->id]->payment_method_types = ['card', 'klarna', 'link'];
+    $storedBefore = $setupUser->props->values[$property];
+    $before = count($setupKeys); $cancelCalls = 0; $freshReads = 0; $afterCancel = false;
+    $refusal = new \Illuminate\Http\Client\RequestException(400, ['error' => [
+        'code' => $race === 'other-error' ? 'parameter_invalid' : 'setup_intent_unexpected_state']]);
+    Http::$handler = function ($verb, $path, $data) use ($setupMethodHandler, $race, $old, $refusal,
+        &$remoteSetups, &$cancelCalls, &$freshReads, &$afterCancel) {
+        if ($verb === 'post' && $path === '/setup_intents/'.$old->id.'/cancel') {
+            check(!DB::$userLocked, 'Setup cancellation stays outside the owner lock');
+            $cancelCalls++; $afterCancel = true;
+            if (in_array($race, ['succeeded', 'canceled'], true)) $remoteSetups[$old->id]->status = $race;
+            if ($race === 'processing-response') {
+                $remoteSetups[$old->id]->status = 'processing';
+                return clone $remoteSetups[$old->id];
+            }
+            throw $refusal;
+        }
+        if ($verb === 'get' && $path === '/setup_intents/'.$old->id && $afterCancel) {
+            $freshReads++;
+            if ($race === 'read-failure') throw new \Illuminate\Http\Client\ConnectionException('Setup status unavailable');
+        }
+        return $setupMethodHandler($verb, $path, $data);
+    };
+    if (in_array($race, ['succeeded', 'canceled'], true)) {
+        $next = $setupGateway->createBillingAgreement($setupUser)['data']['intent'];
+        check($next->id !== $old->id && count($setupKeys) === $before + 1,
+            'A confirmed terminal setup permits exactly one replacement after '.$race);
+        check($freshReads === 1, 'A cancellation race uses one fresh status read: '.$race);
+        $stored = json_decode($setupUser->props->values[$property], true);
+        check($stored['intent'] === $next->id, 'The committed setup pointer names the new unfinished intent');
+    } else {
+        try { $setupGateway->createBillingAgreement($setupUser); check(false, 'An unresolved cancellation cannot rotate: '.$race); }
+        catch (\Illuminate\Http\Client\RequestException|\Illuminate\Http\Client\ConnectionException|\RuntimeException $error) {
+            if ($race === 'requires_payment_method' || $race === 'other-error') check($error === $refusal, 'Unresolved cancellation keeps its original refusal');
+            elseif ($race === 'read-failure') check($error instanceof \Illuminate\Http\Client\ConnectionException, 'Failed fresh read remains unresolved');
+            else check($error->getMessage() === 'HTTP 409', 'A nonterminal cancellation response cannot prove retirement');
+        }
+        check(count($setupKeys) === $before && $setupUser->props->values[$property] === $storedBefore,
+            'Unresolved cancellation preserves its committed setup key and intent: '.$race);
+        check($freshReads === (in_array($race, ['requires_payment_method', 'read-failure'], true) ? 1 : 0),
+            'Only a definite cancellation-state race gets a bounded status read: '.$race);
+    }
+    check($cancelCalls === 1, 'A cancellation refusal is never retried in the request');
+}
+Http::$handler = $setupMethodHandler;
 [User::$row, Gateway::$enabled, Auth::$id, Http::$handler] = $savedSetupState;

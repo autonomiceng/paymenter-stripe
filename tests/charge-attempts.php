@@ -23,7 +23,7 @@ use Illuminate\Support\Facades\{DB, Http};
             public array $intents = [], $setups = [], $cache = [], $charges = [], $confirms = [], $refunds = [];
             public $beforeCreate, $beforeConfirm, $failure;
             public string $status = 'succeeded';
-            public bool $loseCreate = false, $loseConfirm = false, $dropCreate = false;
+            public bool $loseCreate = false, $loseConfirm = false, $dropCreate = false, $strictElements = false;
             public function request($verb, $path, $data) {
                 if ($path === '/customers/cus_owner') return ['id' => 'cus_owner'];
                 if ($path === '/customer_sessions') return ['client_secret' => 'cuss_test'];
@@ -54,6 +54,7 @@ use Illuminate\Support\Facades\{DB, Http};
                     $intent = (object) ['id' => $id, 'status' => 'requires_payment_method', 'amount_received' => 0,
                         'client_secret' => $id . '_secret', 'confirmation_method' => $data['confirmation_method'] ?? 'automatic',
                         'amount' => $data['amount'], 'currency' => $data['currency'], 'customer' => $data['customer'],
+                        'payment_method_types' => $data['payment_method_types'] ?? ['card', 'klarna', 'link', 'cashapp'],
                         'metadata' => (object) $data['metadata']];
                     $this->intents[$id] = $intent;
                     if (!empty($data['confirm'])) $this->settle($intent, $data);
@@ -71,6 +72,12 @@ use Illuminate\Support\Facades\{DB, Http};
                 if (($match[2] ?? '') === '/confirm') {
                     // Observed on Stripe TEST / 2025-07-30.basil in the live pass; this is only a regression fixture.
                     if (isset($data['confirmation_token']) && $intent->confirmation_method === 'manual') throw new RequestException(400, ['error' => ['param' => 'confirmation_method', 'message' => 'Payment details were collected through Stripe Elements and cannot be confirmed with a Payment Intent configured with manual confirmation_method.']]);
+                    // Model the mismatched configuration recovered from r30f, where Elements collected
+                    // card/Link but the intent had card/Klarna/Link/Cash App. The original 400 body was not retained.
+                    if ($this->strictElements && isset($data['confirmation_token']) && $intent->payment_method_types !== ['card', 'link']) {
+                        throw new RequestException(400, ['error' => ['type' => 'invalid_request_error',
+                            'param' => 'payment_method_types', 'message' => 'Deferred Elements and PaymentIntent payment method types do not match.']]);
+                    }
                     if (!in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) throw new RequestException(400, ['error' => ['code' => 'payment_intent_unexpected_state']]);
                     if ($this->beforeConfirm) ($this->beforeConfirm)($intent, $data);
                     $this->confirms[] = [$key, $data, $intent->amount];
@@ -108,6 +115,88 @@ use Illuminate\Support\Facades\{DB, Http};
     };
     try {
         require __DIR__ . '/renewal-retries.php';
+        foreach (['requires_payment_method', 'requires_action', 'processing', 'partial'] as $state) {
+            $run('new-card-old-form-'.$state, function ($invoice, $stripe) use ($gateway, $state) {
+                $old = $gateway->pay($invoice, 20)['data']['intent'];
+                $stripe->intents[$old->id]->payment_method_types = ['card', 'klarna', 'link', 'cashapp'];
+                $stripe->intents[$old->id]->status = $state === 'partial' ? 'requires_payment_method' : $state;
+                if ($state === 'partial') $stripe->intents[$old->id]->amount_received = 100;
+                $result = null;
+                try { $result = $gateway->pay($invoice, 20); }
+                catch (\App\Exceptions\DisplayException $e) {
+                    if ($state !== 'partial') throw $e;
+                    check($e->getMessage() === 'Payment needs review. Contact support to check this payment.',
+                        'Partially received money reaches the specific payment-review refusal');
+                }
+                if ($state === 'processing') check(($result['name'] ?? null) === 'gateways.ae-stripe::payment-status'
+                    && $result['data']['message'] === 'Payment pending. Refresh the invoice to check its status.',
+                    'Processing reaches the pending payment view without throwing');
+                if ($state === 'partial') check($result === null, 'Partially received money never opens a replacement form');
+                if (in_array($state, ['requires_payment_method', 'requires_action'], true)) {
+                    check($stripe->intents[$old->id]->status === 'canceled' && $result['data']['intent']->id !== $old->id,
+                        'Opening an old mismatched form cancels the known unfunded intent and prepares card and Link');
+                } else check(count($stripe->intents) === 1 && $stripe->intents[$old->id]->status !== 'canceled',
+                    'A method-set change cannot replace processing or partially received funds');
+                check(!$stripe->confirms && !$stripe->charges, 'Changing the form never starts a debit');
+            });
+        }
+        $run('new-card-decline', function ($invoice, $stripe) use ($gateway) {
+            $stripe->strictElements = true;
+            $intent = $gateway->pay($invoice, 20)['data']['intent'];
+            $stripe->beforeConfirm = function ($current) {
+                $current->last_payment_error = (object) ['code' => 'card_declined', 'decline_code' => 'generic_decline'];
+                $current->latest_charge = 'ch_declined';
+                throw new RequestException(402, ['error' => ['type' => 'card_error', 'code' => 'card_declined']]);
+            };
+            $result = $gateway->confirmPayment(new Request(['intent' => $intent->id, 'amount' => 2000,
+                'confirmation_token' => 'ctoken_declined', 'save' => false]));
+            check($result['status'] === 409 && $result['data']['declined'] === true
+                && $result['data']['message'] === 'Your bank declined this card. Try a different card, or contact your bank.'
+                && (ExtensionHelper::$payments['920:'.$intent->id]['status'] ?? null) === 'failed' && !$stripe->charges,
+                'A new-card refusal reaches the bank decline path and records failure instead of a generic integration 409');
+        });
+        $run('new-card-missing-types-open', function ($invoice, $stripe) use ($gateway) {
+            $old = $gateway->pay($invoice, 20)['data']['intent'];
+            unset($stripe->intents[$old->id]->payment_method_types);
+            $fresh = $gateway->pay($invoice, 20)['data']['intent'];
+            check($stripe->intents[$old->id]->status === 'canceled' && $fresh->id !== $old->id
+                && $fresh->payment_method_types === ['card', 'link'], 'Missing method types retire only the unfunded old Elements form');
+            check(!$stripe->confirms && !$stripe->charges, 'Preparing a replacement never starts a debit');
+        });
+        $run('new-card-missing-types-confirm', function ($invoice, $stripe) use ($gateway) {
+            $intent = $gateway->pay($invoice, 20)['data']['intent'];
+            unset($stripe->intents[$intent->id]->payment_method_types);
+            $result = $gateway->confirmPayment(new Request(['intent' => $intent->id, 'amount' => 2000,
+                'confirmation_token' => 'ctoken_old', 'save' => false]));
+            check($result['status'] === 409 && str_contains($result['data']['message'], 'form changed')
+                && !$stripe->confirms && !$stripe->charges, 'Missing method types cannot authorize an open-tab confirmation token');
+        });
+        $run('new-card-old-tab', function ($invoice, $stripe) use ($gateway) {
+            $intent = $gateway->pay($invoice, 20)['data']['intent'];
+            $stripe->intents[$intent->id]->payment_method_types = ['card', 'klarna', 'link', 'cashapp'];
+            $result = $gateway->confirmPayment(new Request(['intent' => $intent->id, 'amount' => 2000,
+                'confirmation_token' => 'ctoken_old', 'save' => false]));
+            check($result['status'] === 409 && str_contains($result['data']['message'], 'form changed')
+                && !$stripe->confirms && !$stripe->charges, 'An already open mismatched form is refused before any debit');
+        });
+        foreach ([false, true] as $save) {
+            $run('new-card-confirm-'.($save ? 'save' : 'once'), function ($invoice, $stripe) use ($gateway, $save) {
+                $invoice->total = 10.99;
+                $stripe->strictElements = true;
+                $intent = $gateway->pay($invoice, 10.99)['data']['intent'];
+                $result = $gateway->confirmPayment(new Request(['intent' => $intent->id, 'amount' => 1099,
+                    'confirmation_token' => 'ctoken_card', 'save' => $save]));
+                check($result['status'] === 200 && ($result['data']['status'] ?? null) === 'succeeded',
+                    'A new-card invoice payment confirms instead of the generic 409: '.json_encode($result));
+                check(count($stripe->charges) === 1 && $stripe->charges[0][1] === 1099
+                    && (ExtensionHelper::$payments['920:'.$intent->id]['status'] ?? null) === 'succeeded',
+                    'The accepted 10.99 is charged and recorded once');
+                $method = $stripe->intents[$intent->id]->payment_method_options;
+                check($method->card->setup_future_usage === ($save ? 'off_session' : 'none')
+                    && $method->link->setup_future_usage === ($save ? 'off_session' : 'none'),
+                    'Confirmation keeps the explicit saving choice for card and Link');
+            });
+        }
         $run('elements-replacement-currency', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20);
             $stripe->intents['pi_test1']->status = 'canceled';

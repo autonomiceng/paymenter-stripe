@@ -89,6 +89,8 @@ async function initializePaymentForm() {
                 allowExpress: !resuming,
                 onLinkAvailability: updateLinkAvailability,
             });
+            let finishOptionsUpdate = null;
+            elements.on('update-end', () => finishOptionsUpdate?.());
             let canSave = resuming && savedConsent;
             let linkAvailable = false;
             let loading = false;
@@ -97,9 +99,9 @@ async function initializePaymentForm() {
             refreshPayment.addEventListener('click', () => window.location.reload());
             function clearDeclinedPayment() {
                 paymentElement.clear();
+                refreshPayment.hidden = false;
                 if (resuming) {
                     refreshRequired = true;
-                    refreshPayment.hidden = false;
                 }
             }
             const saveCard = document.getElementById('save-card');
@@ -146,6 +148,27 @@ async function initializePaymentForm() {
                 try {
                     let token = null;
                     if (!resuming) {
+                        // Deferred Elements and confirmation must agree on the customer's saving choice.
+                        // Current releases return a Promise; older releases signal update-end.
+                        await new Promise((resolve, reject) => {
+                            const finish = (error = null) => {
+                                if (finishOptionsUpdate !== finish) return;
+                                finishOptionsUpdate = null;
+                                clearTimeout(timer);
+                                error ? reject(error) : resolve();
+                            };
+                            const timer = setTimeout(() => finish(new Error('Payment options did not update.')), 5000);
+                            finishOptionsUpdate = finish;
+                            try {
+                                const updating = elements.update({paymentMethodOptions: {
+                                    card: {setup_future_usage: save ? 'off_session' : 'none'},
+                                    link: {setup_future_usage: save ? 'off_session' : 'none'},
+                                }});
+                                if (typeof updating?.then === 'function') {
+                                    updating.then(() => finish(), error => finish(error || new Error('Payment options did not update.')));
+                                }
+                            } catch (error) { finish(error); }
+                        });
                         const submitted = await elements.submit();
                         if (submitted.error) throw submitted.error;
                         const created = await stripe.createConfirmationToken({elements});

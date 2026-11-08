@@ -11,8 +11,8 @@ python3 tools/build_release.py --output dist/AeStripe.zip
 
 Upgrade through the native admin upload over an installed copy; root PHP files must declare only classes for Paymenter 1.5.9 `getExtensionType()`.
 
-Account setup displays an unchecked opt-in: “I agree to save this payment method
-for future charges, including renewals.” The configured Terms link stays beside it.
+Account setup shows one consent line above both choices: “By saving with Link or a
+card, you agree to save it for future charges, including renewals.” The configured Terms link stays beside it.
 It explains that Auto Pay can charge when the customer is away and saving does
 not enable it. The authenticated CSRF-protected setup-consent endpoint checks the
 SetupIntent's user, customer, purpose and unfinished status, then records
@@ -20,9 +20,9 @@ SetupIntent's user, customer, purpose and unfinished status, then records
 Legacy forms without a version retain `off_session_v1`; a v1 authentication resume
 keeps its original metadata. Both versions save only a payment method. Neither can
 enroll services through a webhook or redirect. Existing agreements stay unchanged.
-The consent checkbox appears before the Stripe controls. Both the Payment Element
-and Link stay inactive until it is accepted, so Link cannot open and then fail on
-the page’s unchecked consent. The separate account switch requires fresh `auto_pay_account_v1` consent;
+The line appears before the Stripe controls, so the customer reads it before
+choosing. Choosing Link or Save card is the agreement: the form records consent
+before it confirms, and no choice waits on a box or fails for a missing tick. The separate account switch requires fresh `auto_pay_account_v1` consent;
 see [Auto Pay integration](auto-pay.md) for the theme calls and dates.
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.
@@ -79,7 +79,10 @@ parameters before HTTP and never confirms or supplies a card. Elements attempts 
 automatic confirmation; native saved-method and bank-debit attempts use manual confirmation.
 The rendered checkout never includes the PaymentIntent client secret. Only a locked confirm
 result requiring authentication returns it. Opening checkout only prepares the form. Elements uses deferred `mode: payment` with the intent's integer amount and lowercase currency,
-plus manual payment-method creation. It offers only card and Link (`paymentMethodTypes`).
+plus manual payment-method creation. It offers only card and Link (`paymentMethodTypes`),
+and new Elements intents explicitly use the same `payment_method_types`.
+Opening checkout retires an older mismatched form only after confirmed cancellation without funds;
+an already open mismatched form cannot confirm a token. Processing and partial payments stay protected.
 Ilya checked creation in Stripe test mode on 2026-10-30 at 12:00 PM PT (2025-07-30.basil): manual confirmation alone returned 200; adding automatic_payment_methods returned 400.
 The live pass on 2026-10-30 then proved Elements tokens are rejected on manual intents.
 Elements now uses the documented automatic flow; its real Stripe acceptance must be checked again.
@@ -175,14 +178,14 @@ compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
   duplicate subscription listeners even when bundled Stripe is disabled.
 - Check CustomerSession feature names on pinned Basil, restricted-key access,
   `customerSessionClientSecret`, saved-card selection and Link email display.
-- Verify setup cannot save without the opt-in, recorded terms/user/time survive
-  redirect and webhook retries, and setup errors permit retry.
+- Verify setup cannot save without recorded consent, the consent POST completes before `confirmSetup`, and its `off_session_v2` terms, authenticated user ID and acceptance time survive
+  redirect and webhook retries. Refused consent must prevent both Link and card confirmation at phone and desktop widths and permit retry.
 - Verify own-customer isolation, legacy unspecified-redisplay exclusions and
   account setup redisplay. Test card, wallet and Link with saving checked/clear.
 - First verify ConfirmationTokens with deferred Elements (`mode`, amount, currency), Customer Sessions and automatic confirmation
   on pinned Basil, including card, Link, SEPA/ACH mandates, declines, 3DS and bank redirects.
   Check that the pay form and account setup offer only card and Link before release.
-  Check the bank/3DS error page and its invoice link. Check clearing method-specific future usage with `''` and preserving consent after authentication.
+  Check the bank/3DS error page and its invoice link. Check method-specific `setup_future_usage=none` when unchecked and preservation of consent after authentication.
 - Run concurrent success deliveries/setup redirects against the real database;
   assert one agreement/transaction, preserved success after late failed/processing
   events, no automatic service assignment from saving a method, and unchanged existing Auto Pay.
@@ -199,11 +202,14 @@ mismatches are logged and acknowledged after settlement. Transient request and l
 persistence failures remain retryable; retries preserve one payment and one agreement.
 Verify Customer Session failure and recovery in the sandbox as well as normal redisplay.
 
-Checkout's opt-in covers card and Link only. Consent sets (or clears with `''`)
-`payment_method_options.card.setup_future_usage` and the matching Link option,
-and clears top-level future usage left by earlier versions. Saving requires
+Checkout's opt-in covers card and Link only. New-card token collection and confirmation
+use matching card and Link `setup_future_usage`: `off_session` when checked, `none` otherwise.
+Token collection waits for Stripe.js v3's `update-end` before submitting the updated Elements.
+The consent endpoint sets method-specific values to `none` when unchecked; confirmation clears top-level
+future usage left by earlier versions. Saving requires
 consent metadata and `off_session` for the actual method type. Bank debits are not saved by this checkout opt-in.
-Verify both method-specific options against pinned Basil before release.
+Offline regressions cover $10.99 with saving on/off and a bank decline with a visible, clickable
+Refresh payment form action. Both method-specific options still need a live pinned-Basil check.
 
 A successful checkout or bound subscription charge on an already paid invoice is
 recorded in full. Each validated excess reserves one row in the extension-owned

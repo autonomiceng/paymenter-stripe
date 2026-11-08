@@ -144,8 +144,8 @@ trait Checkout
         $this->request('post', '/payment_intents/' . $intent->id, [
             'setup_future_usage' => '',
             'payment_method_options' => [
-                'card' => ['setup_future_usage' => $save ? 'off_session' : ''],
-                'link' => ['setup_future_usage' => $save ? 'off_session' : ''],
+                'card' => ['setup_future_usage' => $save ? 'off_session' : 'none'],
+                'link' => ['setup_future_usage' => $save ? 'off_session' : 'none'],
             ],
             'metadata' => ['ae_stripe_consent' => $save ? '1' : '0'],
         ]);
@@ -181,8 +181,8 @@ trait Checkout
             $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id]), 'use_stripe_sdk' => 'true'];
             if ($request->input('confirmation_token')) {
                 $params += ['confirmation_token' => $request->input('confirmation_token'), 'setup_future_usage' => '',
-                    'payment_method_options' => ['card' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : ''],
-                        'link' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : '']],
+                    'payment_method_options' => ['card' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : 'none'],
+                        'link' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : 'none']],
                     'metadata' => ['ae_stripe_consent' => $request->boolean('save') ? '1' : '0']];
             } else {
                 abort_unless(in_array($intent->status, ['requires_action', 'requires_confirmation', 'processing', 'succeeded'], true), 409);

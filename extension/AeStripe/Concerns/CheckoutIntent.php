@@ -121,8 +121,10 @@ trait CheckoutIntent
                 || $elements && !$usesElements && $intent->status === 'requires_payment_method';
             $revokedAutoPay = $elements && isset($attempt['auto_pay_agreement'])
                 && (int) ($this->autoPayDefault($invoice->user)['agreement_id'] ?? 0) !== $attempt['auto_pay_agreement'];
+            $mismatchedElements = $elements && $usesElements && (!isset($intent->payment_method_types)
+                || !self::sameMethodTypes($intent->payment_method_types, ['card', 'link']));
             $failedElements = $usesElements && $intent->status === 'requires_payment_method' && !empty($intent->last_payment_error);
-            if ($legacyAutomatic || $changeFlow || $failedElements || $revokedAutoPay
+            if ($legacyAutomatic || $changeFlow || $failedElements || $revokedAutoPay || $mismatchedElements
                 || strtolower($intent->currency) !== strtolower($invoice->currency_code)
                 || $intent->customer !== $invoice->user->properties()->where('key', 'stripe_id')->first()?->value) {
                 // Retire legacy tabs, failed Elements authentication and changes between native Pay and Elements.
@@ -285,10 +287,9 @@ trait CheckoutIntent
         $params = $this->checkoutPaymentData($invoice, $amount, $data['customer']);
         // Stripe rejects automatic_payment_methods together with confirmation_method.
         // Keep checkoutPaymentData unchanged for legacy digest reconstruction.
-        if (!$elements) {
-            unset($params['automatic_payment_methods']);
-            $params['confirmation_method'] = 'manual';
-        }
+        unset($params['automatic_payment_methods']);
+        if ($elements) $params['payment_method_types'] = ['card', 'link'];
+        else $params['confirmation_method'] = 'manual';
         $key = 'checkout_' . bin2hex(random_bytes(16));
         $params['metadata']['ae_stripe_attempt'] = $key;
         return ['version' => 2, 'key' => $key, 'created' => time(), 'params' => $params, 'elements' => $elements];
@@ -459,7 +460,8 @@ trait CheckoutIntent
                 }
                 if ($intent->customer !== $user->properties()->where('key', 'stripe_id')->first()?->value) return new DisplayException('The payment account changed. Refresh the invoice before paying.');
                 if (($intent->confirmation_method ?? null) !== 'manual' && !$this->isElementsAttempt($stored, $intent)) return new DisplayException('The payment form changed. Refresh the invoice before paying.');
-                if (isset($params['confirmation_token']) && !$this->isElementsAttempt($stored, $intent)) return new DisplayException('The payment form changed. Refresh the invoice before paying.');
+                if (isset($params['confirmation_token']) && (!$this->isElementsAttempt($stored, $intent)
+                    || !isset($intent->payment_method_types) || !self::sameMethodTypes($intent->payment_method_types, ['card', 'link']))) return new DisplayException('The payment form changed. Refresh the invoice before paying.');
                 $updates = ['amount' => $amount];
                 foreach (['metadata', 'setup_future_usage'] as $field) {
                     if (array_key_exists($field, $params)) { $updates[$field] = $params[$field]; unset($params[$field]); }

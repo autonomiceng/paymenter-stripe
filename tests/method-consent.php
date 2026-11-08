@@ -14,8 +14,8 @@ foreach ([true, false] as $save) {
     $gateway->consent(new Request(['intent' => 'pi_options', 'save' => $save]));
     check(end(Http::$calls)[2] === [
         'setup_future_usage' => '',
-        'payment_method_options' => ['card' => ['setup_future_usage' => $save ? 'off_session' : ''],
-            'link' => ['setup_future_usage' => $save ? 'off_session' : '']],
+        'payment_method_options' => ['card' => ['setup_future_usage' => $save ? 'off_session' : 'none'],
+            'link' => ['setup_future_usage' => $save ? 'off_session' : 'none']],
         'metadata' => ['ae_stripe_consent' => $save ? '1' : '0'],
     ], $save ? 'Saving sets card and Link usage and clears legacy usage' : 'Clearing removes legacy, card and Link usage');
 }

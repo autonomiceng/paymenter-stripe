@@ -35,7 +35,7 @@ $invoice = Invoice::$row = new Invoice($user);
 $gateway = new AeStripe(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
 $gateway->installed();
 $intent = (object) ['id' => 'pi_test', 'customer' => 'cus_owner', 'status' => 'requires_payment_method',
-    'confirmation_method' => 'automatic', 'client_secret' => 'pi_test_secret', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 0, 'payment_method' => 'pm_test',
+    'payment_method_types' => ['card', 'link'], 'confirmation_method' => 'automatic', 'client_secret' => 'pi_test_secret', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 0, 'payment_method' => 'pm_test',
     'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1']];
 $method = (object) ['id' => 'pm_test', 'customer' => 'cus_owner', 'type' => 'card',
     'card' => (object) ['brand' => 'visa', 'last4' => '4242', 'exp_year' => 2030, 'exp_month' => 5]];
@@ -144,7 +144,7 @@ $intent->metadata->ae_stripe_gateway = '0';
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 403');
 $intent->metadata->ae_stripe_gateway = '1';
 $gateway->consent(new Request(['intent' => 'pi_test', 'save' => false]));
-check($intent->payment_method_options->card->setup_future_usage === '' && $intent->payment_method_options->link->setup_future_usage === '' && $intent->metadata->ae_stripe_consent === '0', 'Unchecked clears future usage');
+check($intent->payment_method_options->card->setup_future_usage === 'none' && $intent->payment_method_options->link->setup_future_usage === 'none' && $intent->metadata->ae_stripe_consent === '0', 'Unchecked clears future usage');
 $intent->amount_received = 2000;
 $gateway->webhook(eventRequest($intent));
 check(ExtensionHelper::$agreements === [], 'Unchecked never creates agreement');

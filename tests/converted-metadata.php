@@ -50,7 +50,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
                     return $intent;
                 }
                 check($intent->status === 'canceled' && !isset($data['confirmation_method']), 'Converted checkout is canceled before replacement with the automatic Elements flow');
-                $intent = (object) array_replace((array) $intent, ['id' => 'pi_replacement', 'status' => 'requires_payment_method', 'metadata' => (object) $data['metadata']]);
+                $intent = (object) array_replace((array) $intent, ['id' => 'pi_replacement', 'status' => 'requires_payment_method', 'payment_method_types' => $data['payment_method_types'], 'metadata' => (object) $data['metadata']]);
                 return $intent;
             }
             if ($path === '/payment_intents/' . $intent->id . '/cancel') { $intent->status = 'canceled'; return $intent; }

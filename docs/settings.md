@@ -36,9 +36,10 @@ All paths start with `/v1`. Read uses `GET`; write uses `POST` unless marked `DE
 
 The Payment Element and account setup offer only a new card and Link, the methods saved payments
 and Auto Pay can charge later. Link must stay on in the Stripe Dashboard (it is on by default).
-With **Link at checkout** set to the small button, Link sits below the form's main button and shows
-only its mark, so the main button stays the obvious action. Account setup shows one consent text:
-Stripe's card terms are hidden because the form's own required checkbox covers saving. An unfinished
+With **Link at checkout** set to the small button, Link shows only its mark, so the main button stays
+the obvious action. On the invoice it sits below Pay. Account setup offers two choices under one
+consent line: the Link wallet first, then "or add a card" and the card fields with Save card.
+Stripe's card terms are hidden because the form's own consent line covers saving. An unfinished
 account SetupIntent from an earlier release that offers other methods is cancelled and replaced when
 the form opens. The Payment Element does not list saved methods again: Paymenter's invoice page lists them beside it.
 It and the Link button name the business from Paymenter's **Company Name** setting; when that
@@ -51,7 +52,7 @@ consent path. Successful opted-in card/Link payments create/update one native
 agreement per user, gateway and payment-method ID, serialized by user-row lock.
 The agreement is saved when the payment confirms or returns from the bank; the
 `payment_intent.succeeded` webhook saves it again if that step failed.
-Account payment-method setup also authorizes saving and redisplay. Customer setup
+Choosing Link or Save card in account setup records `off_session_v2` agreement to saving and redisplay before confirming the SetupIntent. Customer setup
 and checkout never assign an agreement to services or enable Auto Pay.
 
 Checkout redisplay is off. Where a method is redisplayed, only methods Stripe permits appear. This fork sets

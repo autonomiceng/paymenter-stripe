@@ -33,7 +33,7 @@ $agreementSetup = (object) ['id' => 'seti_duplicate', 'status' => 'succeeded', '
     'latest_attempt' => null, 'customer' => 'cus_owner', 'metadata' => (object) ['user_id' => '7',
         'is_billing_agreement' => '1', 'ae_stripe_gateway' => '1', 'ae_stripe_setup_consent' => 'off_session_v1',
         'ae_stripe_setup_consent_at' => '1700000000', 'ae_stripe_setup_consent_user' => '7']];
-$agreementPaid = (object) ['id' => 'pi_duplicate', 'status' => 'succeeded', 'customer' => 'cus_owner',
+$agreementPaid = (object) ['id' => 'pi_duplicate', 'payment_method_types' => ['card', 'link'], 'status' => 'succeeded', 'customer' => 'cus_owner',
     'client_secret' => 'pi_duplicate_secret', 'currency' => 'usd', 'amount' => 2000, 'amount_received' => 2000,
     'payment_method' => $agreementMethod->id, 'payment_method_options' => (object) ['card' => (object) ['setup_future_usage' => 'off_session']],
     'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1']];
