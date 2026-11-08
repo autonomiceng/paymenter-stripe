@@ -149,7 +149,7 @@ async function initializePaymentForm() {
                     let token = null;
                     if (!resuming) {
                         // Deferred Elements and confirmation must agree on the customer's saving choice.
-                        // Stripe.js v3 returns void; update-end confirms the iframe has applied it.
+                        // Current releases return a Promise; older releases signal update-end.
                         await new Promise((resolve, reject) => {
                             const finish = (error = null) => {
                                 if (finishOptionsUpdate !== finish) return;
@@ -160,10 +160,13 @@ async function initializePaymentForm() {
                             const timer = setTimeout(() => finish(new Error('Payment options did not update.')), 5000);
                             finishOptionsUpdate = finish;
                             try {
-                                elements.update({paymentMethodOptions: {
+                                const updating = elements.update({paymentMethodOptions: {
                                     card: {setup_future_usage: save ? 'off_session' : 'none'},
                                     link: {setup_future_usage: save ? 'off_session' : 'none'},
                                 }});
+                                if (typeof updating?.then === 'function') {
+                                    updating.then(() => finish(), error => finish(error || new Error('Payment options did not update.')));
+                                }
                             } catch (error) { finish(error); }
                         });
                         const submitted = await elements.submit();
