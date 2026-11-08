@@ -73,7 +73,8 @@ foreach (['incoming user', 'incoming gateway', 'incoming removed', 'incoming bou
     $user->props->values = [];
     DB::$tables['services'] = [];
     ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
-    DB::$afterTransaction = function () use ($case, &$methods) {
+    $injected = null;
+    DB::$afterTransaction = function () use ($case, &$methods, &$injected) {
         switch ($case) {
             case 'incoming user': ExtensionHelper::$agreements['pm_new']['user_id'] = 99; break;
             case 'incoming gateway': ExtensionHelper::$agreements['pm_new']['gateway_id'] = 1; break;
@@ -83,10 +84,18 @@ foreach (['incoming user', 'incoming gateway', 'incoming removed', 'incoming bou
             case 'retained gateway': ExtensionHelper::$agreements['pm_old']['gateway_id'] = 1; break;
             case 'method customer': $methods['pm_new']->customer = 'cus_other'; break;
         }
+        $injected = ExtensionHelper::$agreements;
     };
     $start = count(Http::$calls);
-    try { $gateway->setupAgreement(new Request(['setup_intent' => $setup->id])); }
-    catch (RuntimeException $e) { check(in_array($e->getMessage(), ['HTTP 409', 'Saved payment methods changed. Try again.'], true), 'Only an expected concurrent change is retryable'); }
+    $refused = false;
+    try { $result = $gateway->setupAgreement(new Request(['setup_intent' => $setup->id])); $refused = ($result['type'] ?? null) === 'danger'; }
+    catch (RuntimeException $e) {
+        check($e->getMessage() === 'HTTP 409', 'Only an expected HTTP 409 may escape the concurrent save');
+        $refused = true;
+    }
+    check($injected !== null, "The concurrent change is injected for $case");
+    check($refused || ExtensionHelper::$agreements === $injected, "Setup refuses or preserves the injected agreements after $case");
+    if ($case !== 'incoming bound') check($refused, "Setup refuses the unsafe concurrent change after $case");
     check(!array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach')),
         "Setup preserves provider references after $case");
     if ($case === 'incoming bound') check(DB::$tables['services'][0]['billing_agreement_id'] === 20, 'A concurrent service choice is retained');

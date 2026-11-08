@@ -62,6 +62,46 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         check(count(ExtensionHelper::$agreements) === 1, 'Repeated delivery stays idempotent');
         check(!in_array(true, $heldLocks, true), 'Saving never performs HTTP under the owner lock');
     }
+    if (!getenv('PAY_DEDUPE_CR_CASE') || getenv('PAY_DEDUPE_CR_CASE') === 'remove') {
+        $user->props->values = ['ae_stripe_auto_pay_default' => json_encode(['agreement_id' => 19])];
+        ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old', 'card'), 'pm_new' => $row(20, 'pm_new', 'card')];
+        $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
+        $clicked = new BillingAgreement(ExtensionHelper::$agreements['pm_new']);
+        $native = Http::$handler;
+        $failed = false;
+        Http::$handler = function ($verb, $path, $data) use ($native, &$failed) {
+            if (!$failed && $path === '/payment_methods/pm_new/detach') { $failed = true; throw new \Illuminate\Http\Client\RequestException(503); }
+            return $native($verb, $path, $data);
+        };
+        check(!$gateway->cancelBillingAgreement($clicked)
+            && ExtensionHelper::$agreements['pm_old']['deleted_at'] === null && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
+            'A failed detach never soft-deletes matching local agreements');
+        check($gateway->cancelBillingAgreement($clicked), 'Removing matching local copies succeeds on retry');
+        Http::$handler = $native;
+        check($methods['pm_old']->customer === null && $methods['pm_new']->customer === null, 'Every local matching copy is detached at Stripe');
+        check(ExtensionHelper::$agreements['pm_old']['deleted_at'] !== null && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
+            'Gateway soft-deletes the other matching local agreements and leaves the clicked row to core');
+        $clicked->delete();
+        check(count(BillingAgreement::where('user_id', 7)->get()) === 0, 'Core deleting the clicked row leaves no active detached copies');
+        check(!isset($user->props->values['ae_stripe_auto_pay_default']), 'Removing copies clears the older Auto Pay selection');
+    }
+    if (!getenv('PAY_DEDUPE_CR_CASE') || getenv('PAY_DEDUPE_CR_CASE') === 'notice') {
+        $user->props->values = [];
+        ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old', 'card')];
+        $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new', 6)];
+        $setup->id = 'seti_notice_shape';
+        $intent->payment_method_options = (object) ['card' => (object) ['setup_future_usage' => 'off_session']];
+        $setupNotice = $gateway->setupAgreement(new Request(['setup_intent' => $setup->id]));
+        invoke($gateway, 'saveConsentedMethod', $intent);
+        check(\Illuminate\Support\Facades\Session::$flashes['ae_stripe_saved_notice'] === $setupNotice,
+            'Pay-with-Save and Add card flash the same success notice array');
+        $user->props->values = [];
+        ExtensionHelper::$agreements = [];
+        $setup->id = 'seti_new_method_notice';
+        check($gateway->setupAgreement(new Request(['setup_intent' => $setup->id])) === [
+            'type' => 'success', 'message' => 'Payment method added successfully.',
+        ], 'A first save keeps the default success notification');
+    }
     // Masked display labels and billing contact emails cannot identify a Link account.
     foreach (['different account', 'missing account'] as $case) {
         $user->props->values = [];

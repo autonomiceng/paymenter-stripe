@@ -124,14 +124,18 @@ trait SavedMethods
             Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
             return false;
         }
-        return DB::transaction(function () use ($user, $gateway, $customer, $matched) {
+        return DB::transaction(function () use ($user, $gateway, $customer, $matched, $current) {
             User::where('id', $user->id)->lockForUpdate()->firstOrFail();
             if ($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value !== $customer) return false;
             foreach ($matched as $match) {
                 $row = BillingAgreement::withTrashed()->where('external_reference', $match->external_reference)->lockForUpdate()->first();
                 if (!$row || $row->id != $match->id || $row->user_id != $user->id || $row->gateway_id != $gateway->id) return false;
             }
-            foreach ($matched as $match) $this->autoPayCardRemoved($user, (int) $match->id);
+            foreach ($matched as $match) {
+                $this->autoPayCardRemoved($user, (int) $match->id);
+                // Core deletes only the clicked agreement after this call returns true.
+                if ($match->id != $current->id && !$match->trashed()) $match->delete();
+            }
             return true;
         });
     }

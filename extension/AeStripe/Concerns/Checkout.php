@@ -406,7 +406,9 @@ trait Checkout
     {
         try {
             $saved = $this->savePaidMethod($intent);
-            if (is_array($saved)) \Illuminate\Support\Facades\Session::flash('ae_stripe_saved_notice', $saved['message']);
+            if (is_array($saved)) \Illuminate\Support\Facades\Session::flash('ae_stripe_saved_notice', [
+                'type' => 'success', 'message' => $saved['message'],
+            ]);
         } catch (DisplayException $e) {
             \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['invoice_id' => $intent->metadata->invoice_id ?? null, 'reason' => $e->getMessage()]);
         } catch (\Throwable $e) {
