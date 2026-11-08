@@ -12,7 +12,8 @@ trait AutoPayInheritance
     private function invalidatePendingAutoPay(Service $service): void
     {
         if (!$service->isDirty('user_id') && !$service->isDirty('billing_agreement_id')) return;
-        // Cancel in the native write, including transfers away and back; leave newer owners' work alone.
+        // Revoke before SQL: an autocommit interruption cannot leave usable old consent.
+        // An enclosing native transaction rolls this deletion back with a failed transfer.
         $property = $service->properties()->where('key', self::AUTO_PAY_PENDING)->first();
         if (!$property) return;
         $pending = json_decode($property->value, true);
@@ -36,7 +37,7 @@ trait AutoPayInheritance
     // The scheduled pass also covers a process lost between commit and its callback.
     public function retryAutoPayInheritance(): void
     {
-        $this->pruneSavedMethodNotices();
+        try { $this->pruneSavedMethodNotices(); } catch (\Throwable $e) { $this->noticeWarning('AeStripe notice cleanup will retry'); }
         Service::whereHas('properties', fn ($query) => $query->where('key', self::AUTO_PAY_PENDING))
             ->chunkById(100, function ($services) {
                 foreach ($services as $service) {
@@ -48,7 +49,7 @@ trait AutoPayInheritance
 
     private function finishAutoPayInheritance(int $ownerId, int $serviceId, ?string $value = null): void
     {
-        if ($value === null || (json_decode($value, true)['retry']['state'] ?? null) === 'stopped') return;
+        if ($value === null) return;
         try {
             $this->withSavedMethodBindingLock($ownerId, fn () => DB::transaction(function () use ($ownerId, $serviceId, $value) {
                 $user = User::where('id', $ownerId)->lockForUpdate()->first();
@@ -66,15 +67,16 @@ trait AutoPayInheritance
                     $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
                     return;
                 }
-                if (!$this->gatewayEnabled() || !$this->bundledInactive()) return;
+                if (($pending['retry']['state'] ?? null) === 'stopped' || !$this->gatewayEnabled() || !$this->bundledInactive()) return;
                 $agreement = BillingAgreement::where('id', $record['agreement_id'])->where('user_id', $user->id)->lockForUpdate()->firstOrFail();
                 $this->assertSavedMethodBindable($user, $agreement);
                 $service->update(['billing_agreement_id' => $agreement->id]);
                 $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
             }));
         } catch (\Throwable $e) {
-            if (!$this->gatewayEnabled() || !$this->bundledInactive()) return;
+            if ($e instanceof \Paymenter\Extensions\Gateways\AeStripe\SavedMethodBusyException) return;
             try {
+                if (!$this->gatewayEnabled() || !$this->bundledInactive()) return;
                 // Persist bounded retry state without the busy cache lock; user then service rows still serialize opt-out.
                 DB::transaction(function () use ($ownerId, $serviceId, $value) {
                     User::where('id', $ownerId)->lockForUpdate()->first();
@@ -89,7 +91,7 @@ trait AutoPayInheritance
                 });
             } catch (\Throwable $storageError) {
                 // The original pending record is still eligible for the next scheduled pass.
-                Log::warning('ae_stripe_auto_pay_binding_pending', ['service_id' => $serviceId, 'error' => get_class($storageError)]);
+                try { Log::warning('ae_stripe_auto_pay_binding_pending', ['service_id' => $serviceId, 'error' => get_class($storageError)]); } catch (\Throwable $ignored) {}
             }
         }
     }
@@ -106,6 +108,9 @@ trait AutoPayInheritance
             $property = $service->properties()->where('key', self::AUTO_PAY_PENDING)->first();
             if ($service->user_id != Auth::id() || $service->billing_agreement_id || !$property) continue;
             $pending = json_decode($property->value, true);
+            if (!is_array($pending) || ($pending['version'] ?? null) !== self::AUTO_PAY_CONSENT || empty($pending['accepted_at'])
+                || ($pending['user_id'] ?? null) != Auth::id() || !is_int($pending['agreement_id'] ?? null)
+                || $service->subscription_id || $service->status === Service::STATUS_CANCELLED || ($service->plan?->type ?? null) !== 'recurring') continue;
             $state = ($pending['retry']['state'] ?? null) === 'stopped' ? 'stopped'
                 : (!$this->gatewayEnabled() || !$this->bundledInactive() ? 'paused' : 'pending');
             $states[$service->id] = [$state, array_diff_key($pending, ['retry' => true])];

@@ -68,7 +68,7 @@ trait Webhooks
                 try {
                     $this->savePaidMethod($paymentIntent);
                 } catch (DisplayException $e) {
-                    \Illuminate\Support\Facades\Log::warning('AeStripe saved method refused', ['payment_intent_id' => $paymentIntent->id ?? null, 'reason' => $e->getMessage()]);
+                    $this->noticeWarning('AeStripe saved method refused', ['payment_intent_id' => $paymentIntent->id ?? null, 'reason' => $e->getMessage()]);
                 }
                 break;
             case 'payment_intent.payment_failed':
