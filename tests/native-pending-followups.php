@@ -15,9 +15,9 @@ $notice = function ($token, $changes = []) use ($user, $invoice, $intent) {
         'invoice_id' => $invoice->id, 'intent_id' => $intent->id, 'created_at' => now()->timestamp, 'state' => 'pending', 'consumed' => false])]);
     return $key;
 };
-$requests = []; $error = null;
+$requests = []; $error = null; $methodError = null;
 Http::swap(new Illuminate\Http\Client\Factory); Http::preventStrayRequests();
-Http::fake(function ($request) use (&$requests, &$error, $intent, &$methods, $assert) {
+Http::fake(function ($request) use (&$requests, &$error, &$methodError, $intent, &$methods, $assert) {
     $assert(DB::transactionLevel() === 0, 'Changed notice HTTP stays outside owner transactions.');
     $path = parse_url($request->url(), PHP_URL_PATH); $requests[] = $path;
     if (str_starts_with($path, '/v1/payment_intents/')) {
@@ -29,7 +29,7 @@ Http::fake(function ($request) use (&$requests, &$error, $intent, &$methods, $as
         }
         return Http::response((array) $intent);
     }
-    foreach ($methods as $id => &$remote) if ($path === '/v1/payment_methods/' . $id) return Http::response($remote);
+    foreach ($methods as $id => &$remote) if ($path === '/v1/payment_methods/' . $id) return $methodError ? Http::response(['error' => ['code' => 'api_error']], $methodError) : Http::response($remote);
     throw new RuntimeException('Unexpected fixture HTTP: ' . $path);
 });
 $token = str_repeat('b', 32);
@@ -86,6 +86,29 @@ if ($case === 'followup-staff-race') {
     $state = json_decode($user->properties()->where('key', $key)->first()?->value ?? 'null', true);
     $assert(str_contains($case, 'discard') ? $state === null : ($state['state'] ?? null) === 'ready', 'Original notice recovers or safely retires after storage returns.');
     $assert($gateway->webhook($request)->getStatusCode() === 200 && App\Models\InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->count() === 1, 'Duplicate webhook never duplicates settlement.');
+} elseif (in_array($case, ['followup-queue-local-budget', 'followup-queue-save-budget', 'followup-queue-notice-budget', 'followup-queue-save-outage'], true)) {
+    $key = $notice($token, ['attempts' => 19]); $armed = true; $faults = 0;
+    if ($case === 'followup-queue-save-outage') $methodError = 503;
+    DB::listen(function ($query) use (&$armed, &$faults, $case) {
+        if (!$armed || !str_starts_with($query->sql, 'select')) return;
+        $fail = match ($case) {
+            'followup-queue-local-budget' => str_contains($query->sql, '"invoices"'),
+            'followup-queue-save-budget' => in_array('ae_stripe_saved_%', $query->bindings, true),
+            'followup-queue-notice-budget' => DB::transactionLevel() > 0 && in_array('ae_stripe_notice_%', $query->bindings, true),
+            default => false,
+        };
+        if ($fail) { ++$faults; throw new RuntimeException('Synthetic local recovery outage'); }
+    });
+    for ($i = 0; $i < 22; ++$i) {
+        $invoke('retrySavedMethodNotices');
+        $state = json_decode($user->properties()->where('key', $key)->first()->value, true);
+        $assert($state['state'] === 'pending' && $state['attempts'] === 19 && $state['retry_at'] > now()->timestamp, 'Local or saving outages back off without exhausting confirmations.');
+        Illuminate\Support\Carbon::setTestNow(now()->addHours(2));
+    }
+    $armed = false; $methodError = null;
+    $assert($faults > 0 || $case === 'followup-queue-save-outage', 'The intended local fault actually fired.');
+    $invoke('retrySavedMethodNotices');
+    $assert(json_decode($user->properties()->where('key', $key)->first()->value, true)['state'] === 'ready', 'Local or saving recovery completes the original confirmation after access returns.');
 } elseif (str_starts_with($case, 'followup-queue')) {
     if ($case === 'followup-queue-missing') $notice(str_repeat('a', 32), ['intent_id' => 'pi_missing']);
     elseif ($case === 'followup-queue-progress') {
@@ -98,7 +121,7 @@ if ($case === 'followup-staff-race') {
     } elseif (str_starts_with($case, 'followup-queue-outage-')) {
         $error = substr($case, strlen('followup-queue-outage-'));
         if ($error !== 'connection') $error = (int) $error;
-        $first = $notice(str_repeat('a', 32), ['intent_id' => 'pi_missing']);
+        $first = $notice(str_repeat('a', 32), ['intent_id' => 'pi_missing', 'attempts' => 19]);
     } elseif ($case === 'followup-queue-state-race') {
         $key = $notice($token); $changed = false;
         Http::fake(function () use (&$changed, $user, $key) {
@@ -114,8 +137,14 @@ if ($case === 'followup-staff-race') {
     } elseif ($case === 'followup-queue-spaces') {
         // Legacy/imported JSON need not use the current encoder's whitespace.
     } elseif ($case === 'followup-queue-malformed') {
-        $error = 'malformed'; $first = $notice(str_repeat('a', 32), ['intent_id' => 'pi_missing']);
-    } elseif ($case === 'followup-queue-terminal') {
+        $error = 'malformed'; $first = $notice(str_repeat('a', 32), ['intent_id' => 'pi_missing', 'attempts' => 19]);
+    } elseif (str_starts_with($case, 'followup-queue-terminal')) {
+        $exhaustedLogs = [];
+        Log::listen(function ($event) use (&$exhaustedLogs, $case) {
+            if (!str_starts_with($event->message, 'AeStripe saved method confirmation recovery exhausted')) return;
+            $exhaustedLogs[] = $event->context;
+            if ($case === 'followup-queue-terminal-log-failure') throw new RuntimeException('Synthetic logging outage');
+        });
         $first = $notice(str_repeat('a', 32), ['intent_id' => 'pi_missing', 'attempts' => 19]);
     } else throw new RuntimeException('Unknown queue case');
     $key = $notice($token);
@@ -126,21 +155,31 @@ if ($case === 'followup-staff-race') {
     if ($case === 'followup-queue-progress') $invoke('retrySavedMethodNotices');
     if (str_starts_with($case, 'followup-queue-outage-')) {
         $assert(count($requests) === 1 && json_decode($user->properties()->where('key', $key)->first()->value, true)['state'] === 'pending', 'Global access/outage failure backs off without fanning out across the queue.');
-        $error = 'restored'; Illuminate\Support\Carbon::setTestNow(now()->addDays(2)); $invoke('retrySavedMethodNotices');
+        for ($i = 0; $i < 22; ++$i) {
+            $state = json_decode($user->properties()->where('key', $first)->first()->value, true);
+            $assert($state['state'] === 'pending' && $state['attempts'] === 19 && $state['retry_at'] > now()->timestamp, 'Provider outages preserve the near-cap attempt count and pending confirmation.');
+            Illuminate\Support\Carbon::setTestNow(now()->addHours(2)); $invoke('retrySavedMethodNotices');
+        }
+        $error = 'restored'; Illuminate\Support\Carbon::setTestNow(now()->addHours(2)); $invoke('retrySavedMethodNotices');
+        $assert(json_decode($user->properties()->where('key', $first)->first()->value, true)['state'] === 'ready', 'Restored provider access completes a near-cap consented save.');
     }
     if ($case === 'followup-queue-malformed') {
         $firstState = json_decode($user->properties()->where('key', $first)->first()->value, true);
-        $assert($firstState['state'] === 'pending' && $firstState['attempts'] === 1, 'Malformed provider responses never publish saving success.');
+        $assert($firstState['state'] === 'pending' && $firstState['attempts'] === 19, 'Unreadable provider responses preserve the near-cap confirmation budget.');
+        $error = 'restored'; Illuminate\Support\Carbon::setTestNow(now()->addHours(2)); $invoke('retrySavedMethodNotices');
+        $assert(json_decode($user->properties()->where('key', $first)->first()->value, true)['state'] === 'ready', 'Readable provider responses resume the original consented save.');
     }
-    if ($case === 'followup-queue-terminal') {
+    if (str_starts_with($case, 'followup-queue-terminal')) {
         $value = json_decode($user->properties()->where('key', $first)->first()->value, true);
         $assert($value['state'] === 'failed' && $value['attempts'] === 20, 'Irrecoverable notices stop at the bounded retry cap.');
+        $invoke('retrySavedMethodNotices');
+        $assert(count($exhaustedLogs) === 1 && ($exhaustedLogs[0]['invoice_id'] ?? null) === $invoice->id && ($exhaustedLogs[0]['intent_id'] ?? null) === 'pi_missing', 'Exhausted missing-intent recovery logs its invoice and intent once, including possible account-key mismatch.');
         $late = clone $intent; $late->id = 'pi_missing'; $invoke('savePaidMethod', $late);
         $assert(json_decode($user->properties()->where('key', $first)->first()->value, true)['state'] === 'ready', 'A late successful webhook may complete original work without a new debit.');
     }
     $value = json_decode($user->properties()->where('key', $key)->firstOrFail()->value, true);
     $assert(($value['state'] ?? null) === 'ready', 'Later valid confirmation recovers past missing or ineligible older reservations.');
-    $assert(count(array_filter($requests, fn ($p) => str_contains($p, 'payment_intents'))) <= (str_starts_with($case, 'followup-queue-outage-') ? 3 : 2), 'Ineligible records do not generate provider reads.');
+    $assert(count(array_filter($requests, fn ($p) => str_contains($p, 'payment_intents'))) <= (str_starts_with($case, 'followup-queue-outage-') ? 26 : ($case === 'followup-queue-malformed' ? 3 : 2)), 'Ineligible records do not generate provider reads.');
 } elseif (str_starts_with($case, 'followup-after-commit')) {
     $setDefault(); $armed = false;
     $failure = substr($case, strlen('followup-after-commit-'));

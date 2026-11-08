@@ -212,13 +212,15 @@ trait SavedMethodNotices
                     continue;
                 }
                 $intent = $this->request('get', '/payment_intents/' . $notice['intent_id']);
-                if (($intent->id ?? null) === $notice['intent_id'] && ($intent->metadata->invoice_id ?? null) == $invoice->id && ($intent->status ?? null) === 'succeeded') {
+                $confirmed = ($intent->id ?? null) === $notice['intent_id'] && ($intent->metadata->invoice_id ?? null) == $invoice->id && ($intent->status ?? null) === 'succeeded';
+                if ($confirmed) {
                     $this->savePaidMethod($intent);
                 }
-                $this->deferSavedNotice($property);
+                $readable = is_object($intent) && is_string($intent->id ?? null) && is_string($intent->status ?? null);
+                $this->deferSavedNotice($property, consumeAttempt: $readable && !$confirmed);
             } catch (\Illuminate\Http\Client\RequestException $e) {
                 $missing = $e->response->status() === 404 && $e->response->json('error.code') === 'resource_missing';
-                $this->deferSavedNotice($property, $missing ? 86400 : null);
+                $this->deferSavedNotice($property, $missing ? 86400 : null, consumeAttempt: $missing);
                 if (!$missing) break; // Access problems/rate limits/outages must not fan out across customers.
             } catch (\Illuminate\Http\Client\ConnectionException $e) {
                 $this->deferSavedNotice($property); break;
@@ -229,13 +231,19 @@ trait SavedMethodNotices
         }
     }
 
-    private function deferSavedNotice($property, ?int $delay = null): void
+    private function deferSavedNotice($property, ?int $delay = null, bool $consumeAttempt = false): void
     {
-        try { $this->changeSavedNotice($property, function ($user, $notice) use ($delay) {
+        try { $this->changeSavedNotice($property, function ($user, $notice) use ($delay, $consumeAttempt) {
             if (($notice['state'] ?? null) !== 'pending') return $notice;
-            $attempts = ($notice['attempts'] ?? 0) + 1;
-            return array_replace($notice, ['attempts' => $attempts, 'state' => $attempts >= 20 ? 'failed' : 'pending',
-                'retry_at' => now()->timestamp + ($delay ?? min(3600, 60 * 2 ** min($attempts, 6)))]);
+            // Only the intent's own missing/mismatched/non-success state consumes its budget.
+            $attempts = ($notice['attempts'] ?? 0) + (int) $consumeAttempt;
+            $next = ['retry_at' => now()->timestamp + ($delay ?? min(3600, 60 * 2 ** min($attempts, 6)))];
+            if ($consumeAttempt) {
+                $next += ['attempts' => $attempts, 'state' => $attempts >= 20 ? 'failed' : 'pending'];
+                if ($attempts === 20) DB::afterCommit(fn () => $this->noticeWarning('AeStripe saved method confirmation recovery exhausted; check Stripe account access',
+                    ['invoice_id' => $notice['invoice_id'] ?? null, 'intent_id' => $notice['intent_id'] ?? null]));
+            }
+            return array_replace($notice, $next);
         }); } catch (\Throwable $e) { $this->noticeWarning('AeStripe confirmation retry state will retry'); }
     }
 }

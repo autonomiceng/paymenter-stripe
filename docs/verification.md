@@ -499,7 +499,11 @@ invoice can receive it on a later poll. Refused saving produces no success. Reus
 intent allocates a distinct stable token. Abandoned pending, ready and consumed notices expire after 30 days; existing saved
 method receipts preserve delivery history. Missing intents back off independently, and irrecoverable
 confirmations stop scheduled recovery after 20 attempts. A later successful webhook can still finish
-a retained confirmation. Access errors, rate limits and outages stop each recovery pass.
+a retained confirmation. Access errors, rate limits, connection, unreadable responses and local failures only back off;
+they never consume the confirmation attempt budget. A succeeded intent whose notice completion is
+still pending also keeps its budget. Only missing, mismatched or non-succeeded intent outcomes
+consume attempts. Exhaustion logs the invoice and intent once, with a reminder to check Stripe
+account access. Access errors, rate limits and outages stop each recovery pass.
 Notice-only maintenance failures do not fail settlement or unrelated inheritance.
 The invoice keeps a notice-specific poll until completion/refusal/expiry, including after payment polling stops. Confirmations for intents older than 30 days are not recreated.
 Legacy notices keep their original delivery state; new confirmations use a separate intent-bound token.

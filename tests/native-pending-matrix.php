@@ -8,7 +8,7 @@ $cases = ['transaction', 'checkout', 'pending-retry', 'polish-staff', 'polish-st
     'polish-owner', 'polish-owner-callback', 'polish-exhausted', 'polish-poll', 'polish-poll-many', 'polish-inflight-off', 'polish-inflight-clear',
     'polish-select-service', 'polish-select-invoice', 'polish-select-account', 'polish-deferred', 'polish-deferred-first', 'polish-deferred-before',
     'polish-deferred-first-before', 'polish-deferred-recovery', 'polish-deferred-first-recovery', 'polish-deferred-connection', 'polish-token', 'polish-legacy', 'polish-prune', 'polish-refused',
-    'followup-queue-missing', 'followup-queue-progress', 'followup-queue-storage', 'followup-queue-terminal', 'followup-queue-state-race', 'followup-queue-malformed', 'followup-queue-spaces',
+    'followup-queue-missing', 'followup-queue-progress', 'followup-queue-storage', 'followup-queue-terminal', 'followup-queue-terminal-log-failure', 'followup-queue-local-budget', 'followup-queue-save-budget', 'followup-queue-notice-budget', 'followup-queue-save-outage', 'followup-queue-state-race', 'followup-queue-malformed', 'followup-queue-spaces',
     'followup-after-commit-gateway', 'followup-after-commit-bundled', 'followup-after-commit-state', 'followup-after-commit-log',
     'followup-retention', 'followup-contention', 'followup-stopped', 'followup-malformed', 'followup-transfer', 'followup-transfer-rollback', 'followup-prune-failure',
     'followup-poll', 'followup-staff-race', 'followup-webhook-complete', 'followup-webhook-discard', 'followup-webhook-discard-log', 'followup-webhook-save-failure'];
