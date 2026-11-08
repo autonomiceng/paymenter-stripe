@@ -47,6 +47,7 @@ require_once __DIR__ . '/Concerns/StripeMetadata.php';
 require_once __DIR__ . '/Concerns/Signature.php';
 require_once __DIR__ . '/Concerns/Checkout.php';
 require_once __DIR__ . '/Concerns/CardDuplicates.php';
+require_once __DIR__ . '/Concerns/SavedMethods.php';
 require_once __DIR__ . '/Concerns/Amounts.php';
 require_once __DIR__ . '/Concerns/SubscriptionAttempt.php';
 require_once __DIR__ . '/Concerns/SubscriptionPayments.php';
@@ -75,7 +76,7 @@ require_once __DIR__ . '/Concerns/TransactionMethod.php';
 )]
 class AeStripe extends Gateway
 {
-    use Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
+    use Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, Concerns\SavedMethods, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
 
@@ -714,9 +715,12 @@ class AeStripe extends Gateway
             ]);
         }
 
+        if (is_array($saved)) return redirect()->route('account.payment-methods')->with('ae_stripe_saved_notice', [
+            'type' => 'success', 'message' => $saved['message'],
+        ]);
         return redirect()->route('account.payment-methods')->with('notification', [
             'type' => 'success',
-            'message' => $saved === 'duplicate' ? 'This card is already saved. We updated it.' : 'Payment method added successfully.',
+            'message' => is_array($saved) ? $saved['message'] : 'Payment method added successfully.',
         ]);
     }
 
@@ -739,7 +743,9 @@ class AeStripe extends Gateway
         // Get the actual payment method that will be used for future charges
         $actualPaymentMethod = $this->getActualPaymentMethod($setupIntent);
 
-        return $this->persistAgreement($user, $actualPaymentMethod, deduplicate: true);
+        return $this->persistAgreement($user, $actualPaymentMethod, ['source' => $setupIntent->id,
+            'version' => $setupIntent->metadata->ae_stripe_setup_consent,
+            'accepted_at' => (int) $setupIntent->metadata->ae_stripe_setup_consent_at, 'user_id' => $user->id]);
     }
 
     private function getActualPaymentMethod($setupIntent)

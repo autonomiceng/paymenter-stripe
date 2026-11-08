@@ -23,6 +23,8 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         throw new RuntimeException('Unexpected converted metadata request: ' . $path);
     };
     try {
+        ExtensionHelper::$agreements = [];
+        User::$row->props->values = [];
         $gateway->webhook(eventRequest($setup, type: 'setup_intent.succeeded'));
         check(isset(ExtensionHelper::$agreements['pm_converted']), 'Converted sandbox SetupIntent keeps routing and recorded consent');
         [$returnClass, $returnMethod] = \Illuminate\Support\Facades\Route::$definitions['/extensions/stripe-saved/setup-agreement']['action'];
@@ -55,7 +57,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
             }
             if ($path === '/payment_intents/' . $intent->id . '/cancel') { $intent->status = 'canceled'; return $intent; }
             if ($path === '/payment_intents/' . $intent->id) {
-                if ($verb === 'post') check($data['metadata'] === ['ae_stripe_consent' => '0'], 'New consent writes use only AE Stripe metadata');
+                if ($verb === 'post') check($data['metadata'] === ['ae_stripe_consent' => '0', 'ae_stripe_consent_at' => ''], 'New consent writes use only AE Stripe metadata');
                 return $intent;
             }
             throw new RuntimeException('Unexpected converted checkout request: ' . $path);

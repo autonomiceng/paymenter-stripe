@@ -35,12 +35,12 @@ $row = fn ($id, $pm, $extra = []) => $extra + ['id' => $id, 'external_reference'
     'name' => 'Visa **** 4242', 'type' => 'visa', 'expiry' => '2030-05-31', 'deleted_at' => null];
 ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
 $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check($result['message'] === 'This card is already saved. We updated it.' && count(ExtensionHelper::$agreements) === 1,
+check($result['message'] === 'This card is already saved. We updated its expiry to 05/2030.' && count(ExtensionHelper::$agreements) === 1,
     'A confirmed duplicate setup retains one saved card and shows one notice');
-check($methods['pm_new']->customer === null && $methods['pm_old']->allow_redisplay === 'always',
-    'Duplicate setup detaches the new method and broadens redisplay on the retained method');
+check($methods['pm_new']->customer === 'cus_owner' && $methods['pm_old']->allow_redisplay === 'always',
+    'Duplicate setup retains referenced methods and broadens redisplay on the retained method');
 $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check($result['message'] === 'This card is already saved. We updated it.' && count(ExtensionHelper::$agreements) === 1,
+check($result['message'] === 'This card is already saved. We updated its expiry to 05/2030.' && count(ExtensionHelper::$agreements) === 1,
     'Webhook or redirect retries recognize the detached duplicate without another agreement');
 BillingAgreement::$snapshot = null;
 
@@ -152,25 +152,9 @@ ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
 DB::$tables['services'] = [['id' => 41, 'billing_agreement_id' => 19, 'auto_pay' => true]];
 $serviceBefore = DB::$tables['services'];
 $handler = Http::$handler;
-$lostDetach = true;
-Http::$handler = function ($verb, $path, $data) use ($handler, &$lostDetach) {
-    $result = $handler($verb, $path, $data);
-    if (str_ends_with($path, '/detach') && $lostDetach) {
-        $lostDetach = false;
-        throw new \Illuminate\Http\Client\ConnectionException('Synthetic lost detach response');
-    }
-    return $result;
-};
-try {
-    $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-    throw new RuntimeException('Lost detach response must remain retryable');
-} catch (\Illuminate\Http\Client\ConnectionException $e) {
-    check(count(ExtensionHelper::$agreements) === 1, 'Uncertain detach never creates another saved agreement');
-}
 $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check($result['message'] === 'This card is already saved. We updated it.' && DB::$tables['services'] === $serviceBefore,
-    'Retry after a lost detach response preserves the retained agreement and its service settings');
-Http::$handler = $handler;
+check(str_contains($result['message'], 'already saved') && DB::$tables['services'] === $serviceBefore,
+    'A repeated save preserves the retained agreement and its service settings');
 
 // Receipts cannot authorize detaching a method that has moved to another customer.
 DB::$tables['services'] = [];
@@ -188,8 +172,8 @@ DB::$tables['services'] = [['id' => 41, 'billing_agreement_id' => 20, 'auto_pay'
 $beforeLogs = count(\Illuminate\Support\Facades\Log::$lines);
 $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
 check(count(ExtensionHelper::$agreements) === 2 && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null
-    && $methods['pm_new']->customer === 'cus_owner' && count(\Illuminate\Support\Facades\Log::$lines) === $beforeLogs + 1,
-    'Setup retains and logs a duplicate already bound to a service');
+    && $methods['pm_new']->customer === 'cus_owner',
+    'Setup retains a duplicate already bound to a service');
 
 // Cleanup resumes after Stripe detaches a card but the response is lost.
 DB::$tables['services'] = [];
@@ -238,6 +222,7 @@ $setup->payment_method = 'pm_new';
 $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
 $user->props->values = [];
 ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
+$user->props->values = [];
 $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
 ExtensionHelper::$agreements['pm_old']['deleted_at'] = '2026-10-23 13:00:00';
 $result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));

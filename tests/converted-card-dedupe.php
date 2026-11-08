@@ -61,7 +61,7 @@ use Paymenter\Extensions\Gateways\AeStripe\ConvertFromStripeSavedCommand;
                     }
                     if ($path !== '/payment_methods/' . $id) continue;
                     if ($verb === 'post') {
-                        check(DB::$userLocked, 'Converted card redisplay holds the owner lock');
+                        check(!DB::$userLocked, 'Converted card redisplay happens outside the owner lock');
                         $method->allow_redisplay = $data['allow_redisplay'];
                     }
                     return $method;
@@ -88,20 +88,17 @@ use Paymenter\Extensions\Gateways\AeStripe\ConvertFromStripeSavedCommand;
             check(DB::$tables['services'] === $services
                 && User::$row->props->values['ae_stripe_checkout_12'] === $before['properties'][0]['value'],
                 'Duplicate handling preserves converted checkout retries and service preferences for ' . $case);
-            if ($case === 'unbound') {
-                check($result['message'] === 'This card is already saved. We updated it.' && $incoming['deleted_at'] !== null
-                    && $methods['pm_converted_new']->customer === null && $methods['pm_converted_old']->allow_redisplay === 'always',
-                    'Legacy setup redirect resumes webhook dedupe of converted cards and preserves consent');
-                $receipt = json_decode(User::$row->props->values['ae_stripe_duplicate_pm_converted_new']);
-                check($receipt->gateway === 42 && $receipt->kept === 'pm_converted_old',
-                    'Duplicate retry receipt uses the preserved converted gateway ID');
-                $detaches = array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach'));
-                check(count($detaches) === 1, 'Converted webhook and legacy redirect detach a duplicate only once');
-            } else {
-                check($incoming['deleted_at'] === null && $methods['pm_converted_new']->customer === 'cus_owner'
-                    && !array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach')),
-                    'Converted ' . $case . ' card remains saved despite matching last four digits and expiry');
+            check($incoming['deleted_at'] === null && $methods['pm_converted_new']->customer === 'cus_owner'
+                && !array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach')),
+                'Converted cards and provider references remain intact for ' . $case);
+            if ($case !== 'different fingerprint') {
+                check(str_contains($result['message'], 'already saved') && $methods['pm_converted_new']->allow_redisplay === 'always',
+                    'Converted duplicate saves update the newest agreement and retain consent');
+                $record = json_decode(User::$row->props->values['ae_stripe_method_pm_converted_new']);
+                check($record->gateway_id === 42 && $record->consent->version === 'off_session_v1',
+                    'Converted consent retains the original gateway and consent version');
             }
+
         }
     } finally {
         DB::$tables = $tables; Gateway::$rows = $gatewayRows; Gateway::$bundled = $bundled;

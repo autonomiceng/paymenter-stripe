@@ -422,3 +422,11 @@ from Stripe, since Stripe's list API cannot recover it. No endpoint is deleted.
 Cutover still follows the paused-writer and missed-event reconciliation steps in
 [migration](migrating-from-bundled.md); this does not redirect the bundled core route
 or enable a disabled endpoint.
+
+Saving a card reuses the newest local agreement with the same Stripe fingerprint. Link saves match the full
+Stripe Link account email, ignoring case; billing email and masked labels never identify an account. Existing
+duplicates and attached Stripe methods remain intact for provider references and Auto Pay. A native cache lock
+serializes saves, while provider reads and writes run outside the database owner lock. Consent source receipts
+retain acceptance time and prevent a retried save from replacing a later expiry. The theme groups verified
+identities for display and keeps the original selected agreement IDs. Offline fakes do not prove distributed
+cache behavior or real database concurrency; check those in the test-mode sandbox before release.

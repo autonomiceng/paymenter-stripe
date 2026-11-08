@@ -6,6 +6,8 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\{Auth, Http};
 
 Gateway::$enabled = true;
+$consentAgreements = ExtensionHelper::$agreements;
+ExtensionHelper::$agreements = [];
 $previousHandler = Http::$handler;
 $agreementIntent = (object) ['id' => 'seti_consent', 'status' => 'requires_payment_method',
     'customer' => 'cus_owner', 'payment_method' => 'pm_consent', 'latest_attempt' => null,
@@ -76,3 +78,4 @@ rejects(fn () => $gateway->setupConsent(new Request(['intent' => 'seti_consent',
 Gateway::$enabled = false;
 rejects(fn () => $gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true])), 'HTTP 409');
 Http::$handler = $previousHandler;
+ExtensionHelper::$agreements = $consentAgreements;
