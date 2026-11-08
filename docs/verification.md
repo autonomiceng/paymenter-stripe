@@ -429,7 +429,8 @@ duplicates and attached Stripe methods remain intact for provider references and
 receives the expiry and consent refresh, including verified receipt-only incoming copies that provider
 subscriptions may still charge. Card matching uses the provider fingerprint for every brand. Each copy has
 its own newer-consent check. A shared native cache lock
-serializes saves, removal and duplicate cleanup, while provider reads and writes run outside the database owner lock. Consent source receipts
+serializes saves, removal and duplicate cleanup. Save and removal HTTP runs outside the database owner lock;
+cleanup retains its existing binding locks through detachment. Consent source receipts
 retain acceptance time and prevent a retried save from replacing a later expiry. The theme groups verified
 identities for display and keeps the original selected agreement IDs. Offline fakes do not prove distributed
 cache behavior or real database concurrency; check those in the test-mode sandbox before release. All workers must use the same database, Redis, Memcached
