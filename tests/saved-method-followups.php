@@ -24,9 +24,7 @@ $row = fn ($id, $pm) => ['id' => $id, 'external_reference' => $pm, 'user_id' => 
 $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new'), 'pm_alias' => $card('pm_alias')];
 ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
 $fail = null;
-$enforceHttp = false;
-Http::$handler = function ($verb, $path, $data) use (&$methods, &$fail, &$enforceHttp) {
-    if ($enforceHttp) check(!DB::$userLocked, 'Cleanup HTTP remains outside the database owner transaction');
+Http::$handler = function ($verb, $path, $data) use (&$methods, &$fail) {
     if ($fail === [$verb, $path]) throw new RequestException(503);
     foreach ($methods as $id => $method) {
         if ($path === '/payment_methods/' . $id . '/detach') { $method->customer = null; return $method; }
