@@ -174,7 +174,7 @@ if (in_array($case, ['pending', 'removed-replay'], true)) {
     ExtensionHelper::$agreements['pm_new'] = array_replace($row(20, 'pm_new'), ['type' => 'link']);
     $save('pm_alias');
     $fail = ['post', '/payment_methods/pm_alias/detach'];
-    check(!$remove('pm_new') && ExtensionHelper::$agreements['pm_old']['deleted_at'] === null, 'Failed Link removal retains local agreements for retry');
+    check(!$remove('pm_new') && ExtensionHelper::$agreements['pm_old']['deleted_at'] !== null && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null, 'Failed Link removal reconciles detached copies and retains its live clicked row for retry');
     $fail = null;
     check($remove('pm_new'), 'Link copy removal succeeds on retry');
     check($methods['pm_old']->customer === null && $methods['pm_new']->customer === null && $methods['pm_alias']->customer === null,

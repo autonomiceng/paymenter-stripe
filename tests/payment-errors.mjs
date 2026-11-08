@@ -7,14 +7,14 @@ const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const views = new URL('../extension/AeStripe/resources/views/', import.meta.url);
 const theme = readFileSync(new URL('stripe-theme.blade.php', views), 'utf8');
-function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hosting', resuming = false, savedConsent = false, amount = 2000) {
+function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hosting', resuming = false, savedConsent = false, amount = 2000, destination = 'https://example.com/return') {
     let source = readFileSync(new URL(`${name}.blade.php`, views), 'utf8')
         .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
         .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(new URL('stripe-elements.blade.php', views), 'utf8'))
         .replace(/@if\(config\('settings.tos'\)\)[\s\S]*?@endif/g, '')
         .replace(/@js\(route\('([^']+)'\)\)/g, (_, route) => JSON.stringify('/' + route))
         .replace("@js(route('invoices.show', $invoice) . '?checkPayment=true')", "'/return'")
-        .replace("@js(route('invoices.show', $invoice))", "'https://example.com/return'")
+        .replace("@js(route('invoices.show', $invoice))", JSON.stringify(destination))
         .replace('@js(csrf_token())', "'fixture-csrf'")
         .replaceAll('@js($stripePublishableKey)', "'fixture-key'")
         .replaceAll('@js($intent->client_secret)', "'fixture-secret'")
@@ -570,6 +570,22 @@ try {
         assert.equal(await page.locator('[role=alert]').textContent(), message, 'The timeout error stays visible until another customer action');
         assert.deepEqual(await page.evaluate(() => [submits, tokens, requests]), [0, 0, 0], `${choice}: unresolved options cannot reach payment`);
         if (choice === 'Link') assert.deepEqual(await page.evaluate(() => linkFailures), Array.from({length: updateFailure === 'missing-event' ? 2 : 1}, () => ({reason: 'fail'})), 'Overlapping Link and unresolved options each dismiss their own payment UI');
+        await page.close();
+    }
+    for (const destination of ['https://example.com/invoices/fixture', 'https://example.com/account/billing/invoices/fixture?tab=history']) {
+        const page = activePage = await browser.newPage({viewport: {width: 390, height: 844}});
+        await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
+        await page.goto('https://example.com/checkout');
+        await installStripe(page, false);
+        await page.evaluate(() => {
+            window.fetch = async () => ({ok: true, async json() { return {status: 'succeeded', saved_notice: 'b'.repeat(32)}; }});
+        });
+        await page.setContent(render('pay', 'above_card', 'Fixture', false, false, 2000, destination));
+        await page.waitForFunction(() => !document.querySelector('#submit').disabled);
+        await page.locator('#submit').click();
+        const expected = new URL(destination);
+        expected.searchParams.set('checkPayment', 'true'); expected.searchParams.set('saved_notice', 'b'.repeat(32));
+        await page.waitForURL(expected.toString());
         await page.close();
     }
     console.log('Pay and setup network failures, retry and card declines passed.');

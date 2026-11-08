@@ -53,11 +53,23 @@ if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
             $events = $delivered($page);
             $assert((bool) array_filter($events, fn ($e) => str_contains($e['params'][0]['message'] ?? '', 'Auto Pay setup is pending')), 'The customer sees pending Auto Pay and an automatic retry explanation.');
         } finally { $lock->release(); }
-        $gateway->retryAutoPayInheritance();
+        $retryGateway = new Paymenter\Extensions\Gateways\AeStripe\AeStripe(['stripe_secret_key' => 'rk_test_fixture']);
+        $retryGateway->retryAutoPayInheritance();
         $assert($service->fresh()->billing_agreement_id === $old->id && !$pending($service), 'The scheduler retries after contention clears.');
         $gateway->retryAutoPayInheritance();
         $assert($service->fresh()->billing_agreement_id === $old->id, 'Repeated retry does not alter the completed binding.');
     }
+} elseif ($case === 'pending-reserved') {
+    $setDefault();
+    $user->properties()->create(['key' => 'ae_stripe_duplicate_pm_old', 'value' => json_encode(['customer' => 'cus_fixture', 'gateway' => $native->id, 'kept' => 'pm_other'])]);
+    $service = DB::transaction(fn () => $create());
+    $gateway->retryAutoPayInheritance();
+    $assert($pending($service) && $service->fresh()->billing_agreement_id === null, 'A reserved card leaves inheritance pending even after the cache lock is free.');
+    $lock = Cache::lock('ae-stripe-save-method-' . $user->id, 600);
+    $assert($lock->get(), 'Failed binding releases its acquired card lock.'); $lock->release();
+    $user->properties()->where('key', 'ae_stripe_duplicate_pm_old')->delete();
+    $gateway->retryAutoPayInheritance();
+    $assert(!$pending($service) && $service->fresh()->billing_agreement_id === $old->id, 'Resolved reservation lets pending inheritance finish.');
 } elseif (str_starts_with($case, 'pending-')) {
     $setDefault();
     $lock = Cache::lock('ae-stripe-save-method-' . $user->id, 600); $lock->get();
@@ -109,6 +121,7 @@ if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
     $page = Livewire::test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()])->set('selectedMethod', $old->ulid)->set('setAsDefault', true)->call('processPayment');
     $assert($service->fresh()->billing_agreement_id === ($case === 'subscription' ? null : $old->id), 'Invoice default selection binds only ordinary recurring services.');
     $assert($payments === 1, 'Native invoice payment continues exactly once after default selection.');
+    $page->assertSet('setAsDefault', false);
 } elseif (str_starts_with($case, 'notice-')) {
     $intent = json_decode(json_encode(['id' => 'pi_notice', 'customer' => 'cus_fixture', 'payment_method' => 'pm_new',
         'payment_method_options' => ['card' => ['setup_future_usage' => 'off_session']],

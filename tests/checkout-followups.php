@@ -28,6 +28,7 @@ Http::$handler = function ($verb, $path, $data) use (&$methods, &$writes, &$fail
     foreach ($methods as $id => $method) {
         if ($path === '/payment_methods/' . $id . '/detach') $method->customer = null;
         elseif ($path !== '/payment_methods/' . $id) continue;
+        elseif ($verb === 'post' && isset($data['card'])) foreach ($data['card'] as $field => $value) $method->card->$field = $value;
         return json_decode(json_encode($method));
     }
     throw new RuntimeException('Unexpected follow-up provider request');
@@ -51,6 +52,15 @@ if (in_array($case, ['pending-survivor', 'removed-survivor', 'reserved-survivor'
         $index(['removing' => 'other-owner'], 'cus_other');
         check($gateway->deduplicateCards(true, fn ($line) => null) === 0 && $methods['pm_new']->customer === null, 'Other-customer indexes do not block valid cleanup');
     }
+} elseif ($case === 'notice-during-cleanup') {
+    $handler = Http::$handler;
+    Http::$handler = function ($verb, $path, $data) use ($handler, $user) {
+        $result = $handler($verb, $path, $data);
+        if (str_ends_with($path, '/detach')) $user->props->values['ae_stripe_notice_fixture'] = json_encode(['consumed' => true]);
+        return $result;
+    };
+    check($gateway->deduplicateCards(true, fn ($line) => null) === 0 && ExtensionHelper::$agreements['pm_new']['deleted_at'] !== null,
+        'Consuming an unrelated checkout notice cannot interrupt a detached cleanup plan');
 } elseif (str_starts_with($case, 'bound-reservation')) {
     $reserve();
     foreach ([false, true] as $apply) {
@@ -96,7 +106,7 @@ if (in_array($case, ['pending-survivor', 'removed-survivor', 'reserved-survivor'
     }
     check(!isset($user->props->values['ae_stripe_auto_pay_card']), 'Removal recovery clears the detached account card');
     check(json_decode($user->props->values['ae_stripe_saved_fixture'], true)['removed'] ?? false, 'Removal recovery retires the detached receipt');
-} elseif (in_array($case, ['save-reserved', 'save-reserved-new', 'save-replay'], true)) {
+} elseif (in_array($case, ['save-reserved', 'save-reserved-new', 'save-reserved-expiry', 'save-replay'], true)) {
     if ($case === 'save-replay') {
         invoke($gateway, 'persistAgreement', $user, $methods['pm_new'], ['source' => 'seti_replay', 'user_id' => 7]);
         $reserve(); $writes = [];
@@ -106,6 +116,7 @@ if (in_array($case, ['pending-survivor', 'removed-survivor', 'reserved-survivor'
         return;
     }
     $reserve();
+    if ($case === 'save-reserved-expiry') $methods['pm_added']->card->exp_year = 2035;
     if ($case === 'save-reserved-new') unset(ExtensionHelper::$agreements['pm_old']);
     foreach (['seti_fresh', 'pi_fresh'] as $source) {
         $result = invoke($gateway, 'persistAgreement', $user, $methods['pm_added'], ['source' => $source, 'user_id' => 7, 'accepted_at' => time()]);
@@ -114,6 +125,15 @@ if (in_array($case, ['pending-survivor', 'removed-survivor', 'reserved-survivor'
         check(isset($user->props->values['ae_stripe_duplicate_pm_new']), 'Fresh save preserves recovery evidence');
         check($result === true || is_array($result), 'A bindable matching or fresh card is saved');
     }
+    if ($case === 'save-reserved-expiry') {
+        check($methods['pm_new']->card->exp_year === 2035 && ExtensionHelper::$agreements['pm_new']['expiry'] === '2035-05-31', 'Reserved attached copies still receive remote and local expiry updates');
+        check($gateway->deduplicateCards(true, fn ($line) => null) === 0 && $methods['pm_new']->customer === null, 'Fresh saves preserve same-card cleanup recovery after an expiry update');
+    }
+} elseif ($case === 'legacy-reserved-survivor') {
+    $reserve(); $methods['pm_new']->customer = null;
+    $user->props->values['ae_stripe_duplicate_pm_old'] = json_encode(['customer' => 'cus_owner', 'gateway' => 2, 'kept' => 'pm_other']);
+    try { invoke($gateway, 'persistAgreement', $user, $methods['pm_new'], ['source' => 'seti_legacy', 'user_id' => 7]); throw new RuntimeException('Expected unavailable legacy survivor refusal'); }
+    catch (Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException $e) { check(!$writes, 'A legacy detached receipt cannot claim a reserved survivor is usable'); }
 } elseif ($case === 'removing-message') {
     $index(['removing' => 'ae_stripe_removal_pm_old']);
     try { invoke($gateway, 'persistAgreement', $user, $methods['pm_old'], ['source' => 'seti_pending', 'user_id' => 7]); throw new RuntimeException('Expected pending removal refusal'); }

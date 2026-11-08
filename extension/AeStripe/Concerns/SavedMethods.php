@@ -318,6 +318,7 @@ trait SavedMethods
                 $remote = $this->request('get', '/payment_methods/' . $retained->external_reference);
                 if (($remote->customer ?? null) === $customer && ($identity = $this->savedMethodIdentity($method)) !== null
                     && $this->savedMethodIdentity($remote) === $identity) {
+                    if ($this->savedMethodUnavailable($user, $retained->external_reference, $customer, $gateway)) throw new SavedMethodRetryException(self::BINDING_RETRY);
                     return ['message' => 'This card is already saved. We updated its expiry to '
                         . substr($retained->expiry, 5, 2) . '/' . substr($retained->expiry, 0, 4) . '.'];
                 }
@@ -332,7 +333,8 @@ trait SavedMethods
             // Local card types are display brands. Verify the actual Stripe identity for every brand.
             $known = json_decode($user->properties()->where('key', 'ae_stripe_method_' . $row->external_reference)->first()?->value ?? 'null', true);
             // A fresh provider reference can replace a failed removal without reusing its uncertain copies.
-            if ($this->savedMethodUnavailable($user, $row->external_reference, $customer, $gateway)) continue;
+            if (($known['customer'] ?? null) === $customer && ($known['gateway_id'] ?? null) == $gateway->id
+                && (isset($known['removing']) || ($known['removed'] ?? false))) continue;
             if ($identity !== null && ($known['customer'] ?? null) === $customer && ($known['gateway_id'] ?? null) == $gateway->id
                 && ($known['identity'] ?? null) !== null && $known['identity'] !== $identity) continue;
             if ($row->external_reference !== $incomingId && $identity !== null) {
@@ -349,7 +351,9 @@ trait SavedMethods
                 && ($row->external_reference === $incomingId || ($identity !== null && $this->savedMethodIdentity($remote) === $identity))) $matches[] = $row;
         }
         usort($matches, fn ($a, $b) => strcmp((string) $b->created_at, (string) $a->created_at) ?: $b->id <=> $a->id);
-        $kept = $matches[0] ?? null;
+        // Reserved attached copies still need expiry refresh, but cannot be the saved selection.
+        $selectable = array_values(array_filter($matches, fn ($row) => !$this->savedMethodUnavailable($user, $row->external_reference, $customer, $gateway)));
+        $kept = $selectable[0] ?? null;
         if (!$kept && $this->savedMethodUnavailable($user, $incomingId, $customer, $gateway)) throw new SavedMethodRetryException(self::BINDING_RETRY);
         // Validate globally unique references before any provider writes, including removed or foreign rows.
         $validate = function (bool $checkRows = true, array $references = []) use ($user, $gateway, $customer, $incomingId, $rows) {
