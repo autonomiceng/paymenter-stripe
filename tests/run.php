@@ -144,7 +144,7 @@ $intent->metadata->ae_stripe_gateway = '0';
 rejects(fn () => $gateway->consent(new Request(['intent' => 'pi_test', 'save' => true])), 'HTTP 403');
 $intent->metadata->ae_stripe_gateway = '1';
 $gateway->consent(new Request(['intent' => 'pi_test', 'save' => false]));
-check($intent->payment_method_options->card->setup_future_usage === '' && $intent->payment_method_options->link->setup_future_usage === '' && $intent->metadata->ae_stripe_consent === '0', 'Unchecked clears future usage');
+check($intent->payment_method_options->card->setup_future_usage === 'none' && $intent->payment_method_options->link->setup_future_usage === 'none' && $intent->metadata->ae_stripe_consent === '0', 'Unchecked clears future usage');
 $intent->amount_received = 2000;
 $gateway->webhook(eventRequest($intent));
 check(ExtensionHelper::$agreements === [], 'Unchecked never creates agreement');

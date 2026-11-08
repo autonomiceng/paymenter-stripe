@@ -206,8 +206,8 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         $gateway->consent(new Request(['intent' => $legacy->id, 'save' => $save]));
         check($legacy->setup_future_usage === null, 'Consent update clears previous-release top-level future usage');
         check($legacy->metadata->ae_stripe_consent === ($save ? '1' : '0')
-            && $legacy->payment_method_options->card->setup_future_usage === ($save ? 'off_session' : '')
-            && $legacy->payment_method_options->link->setup_future_usage === ($save ? 'off_session' : ''),
+            && $legacy->payment_method_options->card->setup_future_usage === ($save ? 'off_session' : 'none')
+            && $legacy->payment_method_options->link->setup_future_usage === ($save ? 'off_session' : 'none'),
             'Consent cycles preserve card and Link preferences');
     }
     $legacy->status = 'requires_action';
