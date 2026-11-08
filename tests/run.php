@@ -1,5 +1,9 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
+if (getenv('PAY_CLEANUP_CASE') === 'notice-native') {
+    require __DIR__ . '/native-saved-notices.php';
+    return;
+}
 require __DIR__ . '/fakes.php';
 require __DIR__ . '/../extension/AeStripe/AeStripe.php';
 

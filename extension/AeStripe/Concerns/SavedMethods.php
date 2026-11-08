@@ -128,6 +128,21 @@ trait SavedMethods
                         && $this->savedMethodIdentity($remote) === $identity) $copies[$incoming] = $remote;
                 }
             }
+            // Resume receipt-only copies even after a previous detach lost its response or became a 404.
+            if (($previous['customer'] ?? null) === $customer && ($previous['gateway_id'] ?? null) == $gateway->id) {
+                foreach ($previous['copies'] as $reference => $id) {
+                    if (array_key_exists($reference, $copies)) continue;
+                    $remote = $this->readSavedMethod($reference);
+                    if ($remote && (($remote->id ?? null) !== $reference || !in_array($remote->customer ?? null, [null, $customer], true)
+                        || $this->savedMethodIdentity($remote) !== $identity)) return false;
+                    $copies[$reference] = $remote;
+                    if ($id !== null) {
+                        $row = BillingAgreement::withTrashed()->where('external_reference', $reference)->first();
+                        if (!$row || $row->id != $id || $row->user_id != $user->id || $row->gateway_id != $gateway->id) return false;
+                        $matched[] = $row;
+                    }
+                }
+            }
             $journal = DB::transaction(function () use ($user, $gateway, $customer, $copies, $matched, $journalKey, $identity) {
                 User::where('id', $user->id)->lockForUpdate()->firstOrFail();
                 if ($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value !== $customer) return false;

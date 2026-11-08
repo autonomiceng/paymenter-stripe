@@ -7,6 +7,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\{Cache, DB, Http, Session};
 use Paymenter\Extensions\Gateways\AeStripe\{AeStripe, DeduplicateCardsCommand};
 
+global $count;
 $case = $cleanupCase ?? getenv('PAY_CLEANUP_CASE');
 $user = User::$row = new User(new Properties('cus_owner'));
 Invoice::$row = new Invoice($user);
@@ -82,7 +83,8 @@ if ($case === 'http') {
         'Cleanup refuses changed exact state before any provider write: ' . $change);
 } elseif (str_starts_with($case, 'removal-')) {
     $change = substr($case, 8);
-    DB::$tables['services'] = [['id' => 41, 'user_id' => 7, 'billing_agreement_id' => 19, 'auto_pay' => true]];
+    $service = App\Models\Service::$row = new App\Models\Service;
+    $service->subscription_id = null; $service->billing_agreement_id = 19;
     $user->props->values['ae_stripe_saved_pending'] = json_encode(['incoming' => 'pm_new', 'consent' => ['user_id' => 7]]);
     $handler = Http::$handler;
     $changed = false;
@@ -101,7 +103,7 @@ if ($case === 'http') {
     };
     $result = $gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements['pm_new']));
     check($changed && !$result, 'Final validation refuses the concurrent customer/agreement change');
-    check(ExtensionHelper::$agreements['pm_old']['deleted_at'] !== null && DB::$tables['services'][0]['billing_agreement_id'] === null,
+    check(ExtensionHelper::$agreements['pm_old']['deleted_at'] !== null && $service->billing_agreement_id === null,
         'Already detached owned copies are reconciled and their services unlinked');
     check($change === 'customer' ? ExtensionHelper::$agreements['pm_new']['deleted_at'] !== null : ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
         'Reconciliation removes the original owned clicked row but preserves reassigned/replaced rows');
@@ -131,6 +133,7 @@ if ($case === 'http') {
         check(Session::$flashes === [] && Session::$values === [], 'A false/null save does not publish a success notice');
     }
 }
+App\Models\Service::$row = null;
 DB::$beforeUserLock = DB::$afterTransaction = null;
 DB::$tables['services'] = [];
 echo "PASS: $case, $count cleanup assertions\n";
