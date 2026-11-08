@@ -23,6 +23,13 @@ function check($value, $label) {
     if (!$value) throw new RuntimeException($label);
     ++$count;
 }
+function savedNotice($user, $token) {
+    check(is_string($token) && preg_match('/\A[a-f0-9]{32}\z/', $token), 'Successful save returns a valid tab token');
+    $state = json_decode($user->props->values['ae_stripe_notice_' . hash('sha256', $token)] ?? 'null', true);
+    check(($state['user_id'] ?? null) === (int) $user->id && ($state['invoice_id'] ?? null) === 12
+        && ($state['consumed'] ?? true) === false && ($state['notice']['type'] ?? null) === 'success', 'Only the matching owned unconsumed property supplies success');
+    return $state['notice'];
+}
 function rejects($callback, $message) {
     try { $callback(); } catch (Exception $e) { check($e->getMessage() === $message, $message); return; }
     throw new RuntimeException('Expected: ' . $message);
