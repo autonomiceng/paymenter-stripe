@@ -35,12 +35,14 @@ trait AutoPayInheritance
             $this->withSavedMethodBindingLock($ownerId, fn () => DB::transaction(function () use ($ownerId, $serviceId) {
                 $user = User::where('id', $ownerId)->lockForUpdate()->first();
                 $service = Service::where('id', $serviceId)->lockForUpdate()->first();
-                if (!$service) return;
+                if (!$service || $service->user_id != $ownerId) return;
                 $property = $service->properties()->where('key', self::AUTO_PAY_PENDING)->lockForUpdate()->first();
                 if (!$property) return;
                 $pending = json_decode($property->value, true);
                 $record = $user && $this->gatewayEnabled() && $this->bundledInactive() ? $this->autoPayDefault($user, lock: true) : null;
-                if (!$record || $pending !== $record || $service->user_id != $ownerId || ($pending['user_id'] ?? null) != $ownerId
+                // Cleanup can move this acceptance to a verified same-card survivor without renewing consent.
+                $expected = is_array($pending) && $record ? array_replace($pending, ['agreement_id' => $record['agreement_id']]) : null;
+                if (!$record || $expected !== $record || ($pending['user_id'] ?? null) != $ownerId
                     || $service->billing_agreement_id || $service->subscription_id || ($service->plan?->type ?? null) !== 'recurring'
                     || $service->status === Service::STATUS_CANCELLED) {
                     $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();

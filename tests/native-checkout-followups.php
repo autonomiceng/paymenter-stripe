@@ -59,6 +59,16 @@ if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
         $gateway->retryAutoPayInheritance();
         $assert($service->fresh()->billing_agreement_id === $old->id, 'Repeated retry does not alter the completed binding.');
     }
+} elseif ($case === 'pending-survivor') {
+    $new = BillingAgreement::create(['user_id' => $user->id, 'gateway_id' => $native->id, 'name' => 'Visa **** 4242', 'type' => 'visa', 'expiry' => '2030-06-30', 'external_reference' => 'pm_new']);
+    $user->properties()->updateOrCreate(['key' => 'ae_stripe_auto_pay_default'], ['value' => json_encode(array_replace($record, ['agreement_id' => $new->id]))]);
+    $lock = Cache::lock('ae-stripe-save-method-' . $user->id, 600); $lock->get();
+    try { $service = DB::transaction(fn () => $create()); } finally { $lock->release(); }
+    $methods['pm_new']['customer'] = null;
+    $user->properties()->create(['key' => 'ae_stripe_duplicate_pm_new', 'value' => json_encode(['customer' => 'cus_fixture', 'gateway' => $native->id, 'kept' => 'pm_old'])]);
+    $assert($gateway->deduplicateCards(true, fn ($line) => null) === 0, 'Interrupted cleanup moves the same consent to its verified survivor.');
+    $gateway->retryAutoPayInheritance();
+    $assert($service->fresh()->billing_agreement_id === $old->id && !$pending($service), 'Pending inheritance follows the verified survivor without losing the original consent.');
 } elseif ($case === 'pending-reserved') {
     $setDefault();
     $user->properties()->create(['key' => 'ae_stripe_duplicate_pm_old', 'value' => json_encode(['customer' => 'cus_fixture', 'gateway' => $native->id, 'kept' => 'pm_other'])]);
