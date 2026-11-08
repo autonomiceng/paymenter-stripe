@@ -7,7 +7,7 @@ use Illuminate\Support\Facades\{DB, Http};
 use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
 
 global $count;
-$case = getenv('PAY_CHECKOUT_CASE');
+$case = $checkoutCase ?? getenv('PAY_CHECKOUT_CASE');
 $user = User::$row = new User(new Properties('cus_owner'));
 Gateway::$rows = null; Gateway::$bundled = Gateway::$bundledEnabled = Gateway::$deleted = false;
 Gateway::$enabled = Gateway::$present = true;
@@ -96,8 +96,17 @@ if (in_array($case, ['pending-survivor', 'removed-survivor', 'reserved-survivor'
     }
     check(!isset($user->props->values['ae_stripe_auto_pay_card']), 'Removal recovery clears the detached account card');
     check(json_decode($user->props->values['ae_stripe_saved_fixture'], true)['removed'] ?? false, 'Removal recovery retires the detached receipt');
-} elseif ($case === 'save-reserved') {
+} elseif (in_array($case, ['save-reserved', 'save-reserved-new', 'save-replay'], true)) {
+    if ($case === 'save-replay') {
+        invoke($gateway, 'persistAgreement', $user, $methods['pm_new'], ['source' => 'seti_replay', 'user_id' => 7]);
+        $reserve(); $writes = [];
+        try { invoke($gateway, 'persistAgreement', $user, $methods['pm_new'], ['source' => 'seti_replay', 'user_id' => 7]); throw new RuntimeException('Expected reserved receipt refusal'); }
+        catch (Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException $e) { check(!$writes, 'Replaying a receipt cannot report success for its reserved agreement'); }
+        echo "PASS: $case, $count checkout follow-up assertions\n";
+        return;
+    }
     $reserve();
+    if ($case === 'save-reserved-new') unset(ExtensionHelper::$agreements['pm_old']);
     foreach (['seti_fresh', 'pi_fresh'] as $source) {
         $result = invoke($gateway, 'persistAgreement', $user, $methods['pm_added'], ['source' => $source, 'user_id' => 7, 'accepted_at' => time()]);
         $receipt = json_decode($user->props->values['ae_stripe_saved_' . hash('sha256', $source . ':pm_added')], true);

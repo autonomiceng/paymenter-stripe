@@ -8,7 +8,7 @@ use Illuminate\Console\Command;
 final class DeduplicateCardsCommand extends Command
 {
     protected $signature = 'ae-stripe:deduplicate-cards {--apply}';
-    protected $description = 'List duplicate saved cards; --apply removes only duplicates without service bindings';
+    protected $description = 'List duplicate saved cards; --apply removes unbound duplicates and reconciles interrupted detached plans';
 
     public function handle(): int
     {
@@ -20,7 +20,7 @@ final class DeduplicateCardsCommand extends Command
                 $this->error($skipped . ' saved card(s) skipped. See the per-card reasons above.');
                 return self::FAILURE;
             }
-            $this->info($this->option('apply') ? 'Duplicate cleanup completed.' : 'Dry run. No changes. Use --apply to remove unbound duplicates.');
+            $this->info($this->option('apply') ? 'Duplicate cleanup completed.' : 'Dry run. No changes. Use --apply to remove unbound duplicates or reconcile interrupted detached plans.');
             return self::SUCCESS;
         } catch (\Throwable $e) {
             $this->error('Duplicate cleanup failed. Review the saved cards and try again.');

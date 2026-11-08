@@ -54,8 +54,11 @@ The property `ae_stripe_auto_pay_default` records version, user ID, server accep
 time and agreement ID. On links every recurring, uncancelled service of the user to the
 card, under the user lock; off unlinks every service and keeps the card choice in
 `ae_stripe_auto_pay_card`, separately from charging consent. Stripe subscriptions keep their own
-billing either way. Native Service Created applies the record to new recurring services
-without a selected agreement or subscription; Service Updated never reapplies it.
+billing either way. Native Service Created records pending inheritance with each new recurring service
+without a selected agreement or subscription. Binding runs after the order commits. A busy card lock leaves
+the order intact; the once-per-minute scheduler retries durable pending work with current ownership and consent checks.
+The invoice and service show pending setup and manual-payment guidance. Turning Auto Pay off, clearing a service
+selection or choosing another card cancels old pending work. Service Updated never reapplies account consent.
 Linking charges nothing: native renewal charges happen when an invoice is issued, so open
 invoices stay for the customer to pay. On and Off both stop a renewal retry waiting on an
 open invoice, so the confirm can say open invoices are not charged. Removing the account card

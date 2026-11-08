@@ -447,7 +447,8 @@ local entry and warns that other copies could not be verified. Pending and compl
 removed so a delayed setup or payment webhook cannot restore them. Cleanup redirects completed receipts to the
 verified surviving agreement, including retries after a detach. Unrelated receipt-only methods with a verified
 different identity are skipped before Stripe reads; unknown identities are still verified remotely. Other provider failures stop native local
-removal so it can finish on retry.
+removal so it can finish on retry. Confirmed detached copies are reconciled immediately even if a later copy fails:
+their owned service/account links are cleared, their local entries retired and their receipts prevented from replaying.
 
 Removal records its verified plan and per-copy detach progress in native user properties before final
 local cleanup. If the customer or an agreement changes during detach, reconciliation removes only the
@@ -455,11 +456,15 @@ original agreements still owned by that user and gateway, unlinks their services
 rows. Interrupted removal prevents delayed saves from restoring its references; provider failures keep
 local removal pending for retry. No schema or extension version change is required.
 
-Checkout first saves and duplicate saves retain the same success notice shape as Add card. The notice
-is stored for that user and invoice until the native invoice component delivers it, including after
-intervening session requests. Other invoices cannot consume it, and refreshing does not deliver it twice.
+Checkout first saves and duplicate saves retain the same success notice shape as Add card. Each checkout tab
+sends an opaque token through confirmation, bank authentication and the invoice return URL. The notice is stored
+in native user properties under `ae_stripe_notice_<token hash>`, scoped to that user and invoice. The matching
+native invoice component claims it under the user row lock; requests with stale sessions cannot deliver it twice.
+A consumed marker prevents repeated confirmation from restoring it. Requests without the token, other invoices/users
+and non-invoice components leave it untouched. A failed delivery transaction can retry. Notice state is independent
+of cleanup snapshots and the payment-attempt recovery namespace.
 
-Account card selection, the Auto Pay switch, new-service inheritance, and the native service/invoice
+Account card selection, the Auto Pay switch, new-service inheritance after checkout commits, and the native service/invoice
 recurring-default actions use the same shared per-user lock as cleanup. Binding a reserved or removing
 reference returns a retry message before any preference or consent changes. Turning Auto Pay off remains
 available. Cleanup verifies the survivor again after detachment, then moves remaining owned service and
@@ -471,3 +476,12 @@ Removal marks a reference in progress before HTTP and permanently removed only a
 confirmed. A fresh Add card save of the same physical card may create a new provider reference while a
 failed removal is pending, without reusing or refreshing its uncertain references. Retrying Remove still
 verifies all matching copies, including the newly saved one. Confirmed removed references remain removed.
+
+Service Created persists the exact account consent in the new service's `ae_stripe_auto_pay_pending` property
+with the order. The after-commit attempt uses the shared card lock before opening its own user/service transaction.
+A busy lock never fails the order. Pending work survives a lost callback and the once-per-minute scheduler retries it.
+The service and its invoice show a warning explaining pending setup, automatic retry and manual invoice payment.
+Every attempt rechecks current account consent, service ownership, subscription state, plan and card eligibility.
+Revocation, removal, reassignment, explicit service opt-out or a newer selection cancels old work; it cannot re-enable Auto Pay.
+Stripe subscriptions retain their own billing method and reject local-only service card changes. Invoice defaults skip
+subscription services while ordinary invoice payment continues. No schema or extension version change is required.

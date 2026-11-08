@@ -14,6 +14,7 @@ function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hostin
         .replace(/@if\(config\('settings.tos'\)\)[\s\S]*?@endif/g, '')
         .replace(/@js\(route\('([^']+)'\)\)/g, (_, route) => JSON.stringify('/' + route))
         .replace("@js(route('invoices.show', $invoice) . '?checkPayment=true')", "'/return'")
+        .replace("@js(route('invoices.show', $invoice))", "'https://example.com/return'")
         .replace('@js(csrf_token())', "'fixture-csrf'")
         .replaceAll('@js($stripePublishableKey)', "'fixture-key'")
         .replaceAll('@js($intent->client_secret)', "'fixture-secret'")
@@ -29,6 +30,11 @@ function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hostin
         .replaceAll('@script', '').replaceAll('@endscript', '');
     assert(!/@js|@checked|\{\{|@include/.test(source), 'Blade expressions are rendered');
     return source;
+}
+function paymentFields(body) {
+    assert.match(body.saved_notice, /^[a-f0-9]{32}$/, 'Each checkout sends its opaque notice token');
+    const {saved_notice, ...fields} = body;
+    return fields;
 }
 // Offline Stripe.js and fetch boundaries; each Element records its options and handlers for the checks.
 async function installStripe(page, expressThrows) {
@@ -293,7 +299,7 @@ try {
                 }
                 await page.locator('#submit').click();
                 await page.waitForFunction(() => linkRequests.length === 3);
-                assert.deepEqual(await page.evaluate(() => linkRequests), [false, true, false].map(save => ({
+                assert.deepEqual((await page.evaluate(() => linkRequests)).map(r => ({...r, body: paymentFields(r.body)})), [false, true, false].map(save => ({
                     url: '/extensions.gateways.ae-stripe.confirm', method: 'POST', csrf: 'fixture-csrf',
                     body: {intent: 'fixture-intent', confirmation_token: 'ctoken_fixture', amount: 2000, save},
                 })), 'Link uses the same deferred server confirm route and amount; a bank form cannot inherit Link saving');
@@ -306,7 +312,7 @@ try {
             const requests = [], actions = [];
             await page.exposeFunction('onRequest', body => requests.push(body));
             await page.exposeFunction('onAction', options => actions.push(options));
-            await page.route('https://example.com/return', route => route.fulfill({contentType: 'text/html', body: 'Returned'}));
+            await page.route('https://example.com/return**', route => route.fulfill({contentType: 'text/html', body: 'Returned'}));
             await page.evaluate(() => {
                 const base = document.createElement('base'); base.href = 'https://example.com/'; document.head.append(base);
                 window.failure = 'action-success';
@@ -314,7 +320,7 @@ try {
                 window.fetch = async (_, options) => {
                     await onRequest(JSON.parse(options.body));
                     return {ok: true, async json() { return ++calls === 1
-                        ? {status: 'requires_action', client_secret: 'fixture-secret'} : {status: 'succeeded'}; }};
+                        ? {status: 'requires_action', client_secret: 'fixture-secret'} : {status: 'succeeded', saved_notice: 'a'.repeat(32)}; }};
                 };
             });
             if (linkDisplay === 'above_card' && !expressThrows) {
@@ -327,9 +333,10 @@ try {
             } else {
                 await page.locator('#submit').click();
             }
-            await page.waitForURL('https://example.com/return');
+            await page.waitForURL('https://example.com/return?checkPayment=true&saved_notice=' + 'a'.repeat(32));
+            assert.equal(new Set(requests.map(r => r.saved_notice)).size, 1, 'Authentication keeps the same checkout-tab token');
             assert.deepEqual(actions, [{clientSecret: 'fixture-secret'}]);
-            assert.deepEqual(requests, [
+            assert.deepEqual(requests.map(paymentFields), [
                 {intent: 'fixture-intent', confirmation_token: 'ctoken_fixture', amount: 2000, save: false},
                 {intent: 'fixture-intent', confirmation_token: null, amount: 2000, save: false},
             ], `${linkDisplay}: authentication reads the same payment without replaying its token before redirecting`);
@@ -392,7 +399,7 @@ try {
         const requestCount = decline === 'sdk-error' ? 1 : 2;
         assert.equal(await page.evaluate(() => requests.length), requestCount, 'A second card cannot send another tokenless request');
         assert.equal(await page.evaluate(() => tokens), 0);
-        assert.deepEqual(await page.evaluate(() => requests), Array.from({length: requestCount}, () => ({
+        assert.deepEqual((await page.evaluate(() => requests)).map(paymentFields), Array.from({length: requestCount}, () => ({
             intent: 'fixture-intent', confirmation_token: null, amount: 2000, save: true,
         })), 'Authentication keeps the resumed intent, amount and consent');
         await page.route('https://example.com/resume', route => route.fulfill({contentType: 'text/html', body: 'Fresh payment checkout'}));
@@ -460,7 +467,7 @@ try {
         await page.exposeFunction('captureNewCard', request => sent.push(request));
         await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
         await page.route('https://example.com/new-card', route => route.fulfill({contentType: 'text/html', body: '<html><body></body></html>'}));
-        await page.route('https://example.com/return', route => route.fulfill({contentType: 'text/html', body: 'Payment received'}));
+        await page.route('https://example.com/return**', route => route.fulfill({contentType: 'text/html', body: 'Payment received'}));
         await page.goto('https://example.com/new-card');
         await page.evaluate(scenario => {
             window.handlers = {}; window.order = []; window.$wire = {on() {}};
@@ -505,7 +512,7 @@ try {
         assert.equal(sent.length, 1, 'One submit sends one confirmation');
         assert.deepEqual(sent[0].order, ['updated', 'submit', 'token'], 'Card and Link submit only after options apply');
         const save = scenario.startsWith('save');
-        assert.deepEqual(sent[0].body, {intent: 'fixture-intent', confirmation_token: 'ctoken_newcard', amount: 1099, save});
+        assert.deepEqual(paymentFields(sent[0].body), {intent: 'fixture-intent', confirmation_token: 'ctoken_newcard', amount: 1099, save});
         assert.deepEqual(sent[0].tokenOptions.paymentMethodTypes, ['card', 'link']);
         assert.deepEqual(sent[0].tokenOptions.paymentMethodOptions, {
             card: {setup_future_usage: save ? 'off_session' : 'none'},

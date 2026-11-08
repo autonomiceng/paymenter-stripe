@@ -191,7 +191,7 @@ if (in_array($case, ['pending', 'removed-replay'], true)) {
         'payment_method_options' => (object) ['card' => (object) ['setup_future_usage' => 'off_session']],
         'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1', 'ae_stripe_consent_at' => '1794071700']];
     $noticeToken = invoke($gateway, 'saveConsentedMethod', $intent);
-    $checkoutNotice = json_decode($user->props->values['ae_stripe_checkout_notice_' . hash('sha256', (string) $noticeToken)] ?? 'null', true)['notice'] ?? Session::$values['ae_stripe_saved_notice_12']['notice'] ?? null;
+    $checkoutNotice = json_decode($user->props->values['ae_stripe_notice_' . hash('sha256', (string) $noticeToken)] ?? 'null', true)['notice'] ?? Session::$values['ae_stripe_saved_notice_12']['notice'] ?? null;
     check(($checkoutNotice['type'] ?? null) === 'success'
         && str_contains($checkoutNotice['message'] ?? '', 'already saved'), 'Checkout reuse notice uses the native notification handler');
     $expected = $checkoutNotice;

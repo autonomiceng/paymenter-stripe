@@ -59,9 +59,16 @@ trait AutoPayInheritance
 
     private function deliverAutoPayPendingNotice($component): void
     {
-        if (!$component instanceof \App\Livewire\Services\Show || $component->service->user_id != Auth::id()) return;
-        $service = $component->service;
-        if ($service->billing_agreement_id || !$service->properties()->where('key', self::AUTO_PAY_PENDING)->exists()) return;
-        $component->notify('Auto Pay setup is pending. We will retry automatically. You can still pay invoices manually.', 'warning');
+        $services = [];
+        if ($component instanceof \App\Livewire\Services\Show) $services = [$component->service];
+        elseif ($component instanceof \App\Livewire\Invoices\Show && $component->invoice->user_id == Auth::id()) {
+            foreach ($component->recurringServices()->get() as $item) if ($item->reference) $services[] = $item->reference;
+        }
+        foreach ($services as $service) {
+            if ($service->user_id != Auth::id() || $service->billing_agreement_id
+                || !$service->properties()->where('key', self::AUTO_PAY_PENDING)->exists()) continue;
+            $component->notify('Auto Pay setup is pending. We will retry automatically. You can still pay invoices manually.', 'warning');
+            return;
+        }
     }
 }

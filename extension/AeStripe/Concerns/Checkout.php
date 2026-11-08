@@ -417,7 +417,7 @@ trait Checkout
             DB::transaction(function () use ($invoice, $saved, $token) {
                 $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
                 abort_unless($invoice->user_id == $user->id, 403);
-                $key = 'ae_stripe_checkout_notice_' . hash('sha256', $token);
+                $key = 'ae_stripe_notice_' . hash('sha256', $token);
                 // Preserve the consumed state when the same confirmation is returned more than once.
                 if ($existing = $user->properties()->where('key', $key)->lockForUpdate()->first()) {
                     abort_unless((json_decode($existing->value, true)['invoice_id'] ?? null) == $invoice->id, 409);
@@ -454,7 +454,7 @@ trait Checkout
         if (!is_string($token) || !preg_match('/\A[a-f0-9]{32}\z/', $token)) return;
         DB::transaction(function () use ($component, $invoice, $owner, $token) {
             $user = User::where('id', $owner)->lockForUpdate()->firstOrFail();
-            $property = $user->properties()->where('key', 'ae_stripe_checkout_notice_' . hash('sha256', $token))->lockForUpdate()->first();
+            $property = $user->properties()->where('key', 'ae_stripe_notice_' . hash('sha256', $token))->lockForUpdate()->first();
             $pending = json_decode($property?->value ?? 'null', true);
             if (!$pending || ($pending['user_id'] ?? null) != $owner || ($pending['invoice_id'] ?? null) != $invoice->id || ($pending['consumed'] ?? false)) return;
             $component->notify($pending['notice']['message'], $pending['notice']['type']);

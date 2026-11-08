@@ -324,7 +324,6 @@ trait SavedMethods
             }
         }
         if (!$this->methodCustomerMatches($user, $method)) return false;
-        if ($this->savedMethodUnavailable($user, $incomingId, $customer, $gateway)) throw new SavedMethodRetryException(self::BINDING_RETRY);
         $identity = $this->savedMethodIdentity($method);
         $remotes = [$incomingId => $method];
         $matches = [];
@@ -351,6 +350,7 @@ trait SavedMethods
         }
         usort($matches, fn ($a, $b) => strcmp((string) $b->created_at, (string) $a->created_at) ?: $b->id <=> $a->id);
         $kept = $matches[0] ?? null;
+        if (!$kept && $this->savedMethodUnavailable($user, $incomingId, $customer, $gateway)) throw new SavedMethodRetryException(self::BINDING_RETRY);
         // Validate globally unique references before any provider writes, including removed or foreign rows.
         $validate = function (bool $checkRows = true, array $references = []) use ($user, $gateway, $customer, $incomingId, $rows) {
             foreach (array_unique([$incomingId, ...$references]) as $reference) {

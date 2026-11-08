@@ -4,6 +4,10 @@ if (getenv('PAY_CLEANUP_CASE') === 'notice-native' || getenv('PAY_BINDING_CASE')
     require __DIR__ . '/native-saved-notices.php';
     return;
 }
+if (getenv('PAY_CHECKOUT_BROWSER')) {
+    $run = proc_open([getenv('PAYMENTER_TEST_NODE') ?: 'node', __DIR__ . '/payment-errors.mjs', 'pay'], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
+    exit(proc_close($run));
+}
 require __DIR__ . '/fakes.php';
 require __DIR__ . '/../extension/AeStripe/AeStripe.php';
 
@@ -321,6 +325,9 @@ foreach (['pending', 'removed-replay', 'version', 'cleanup-replay', 'cleanup-rem
 }
 foreach (['http', 'contention', 'notice-first', 'post-state', 'retry', 'recovery', 'state-customer', 'state-owner', 'state-gateway', 'state-id', 'state-expiry', 'state-receipt', 'state-service', 'state-account', 'removal-customer', 'removal-owner', 'removal-gateway', 'removal-id'] as $cleanupCase) {
     (function () use ($cleanupCase) { require __DIR__ . '/cleanup-http.php'; })();
+}
+foreach (['pending-survivor', 'removed-survivor', 'reserved-survivor', 'bound-reservation', 'bound-reservation-late', 'orphan-reservation', 'removal-partial', 'removal-owner', 'removal-gateway', 'removal-id', 'removal-missing', 'save-reserved', 'save-reserved-new', 'save-replay', 'removing-message'] as $checkoutCase) {
+    (function () use ($checkoutCase) { require __DIR__ . '/checkout-followups.php'; })();
 }
 foreach (['account-during', 'reserved-account', 'repair-account', 'repair-service', 'lost-detach', 'unreconciled', 'survivor-change', 'missing-identity', 'missing-customer', 'turn-off', 'inherit-during', 're-add'] as $bindingCase) {
     (function () use ($bindingCase) { require __DIR__ . '/cleanup-bindings.php'; })();

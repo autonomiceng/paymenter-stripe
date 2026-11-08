@@ -44,6 +44,11 @@ if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
                 $assert($service->fresh()->billing_agreement_id === null, 'Busy inheritance leaves the committed service unbound.');
             }
             $assert($pending($service), 'Busy inheritance retains durable pending work.');
+            if ($case === 'checkout') {
+                $bill = Invoice::latest('id')->firstOrFail();
+                $invoicePage = Livewire::test(App\Livewire\Invoices\Show::class, ['invoice' => $bill]);
+                $assert((bool) array_filter($delivered($invoicePage), fn ($e) => str_contains($e['params'][0]['message'] ?? '', 'Auto Pay setup is pending')), 'The order invoice also shows the pending setup.');
+            }
             $page = Livewire::test(App\Livewire\Services\Show::class, ['service' => $service->fresh()]);
             $events = $delivered($page);
             $assert((bool) array_filter($events, fn ($e) => str_contains($e['params'][0]['message'] ?? '', 'Auto Pay setup is pending')), 'The customer sees pending Auto Pay and an automatic retry explanation.');
@@ -66,6 +71,26 @@ if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
     else throw new RuntimeException('Unknown pending case');
     $gateway->retryAutoPayInheritance();
     $assert($service->fresh()->billing_agreement_id === null && !$pending($service), 'Pending retry never overrides later consent, ownership, removal, subscription or service opt-out.');
+} elseif ($case === 'removal-partial') {
+    $service = $create(['billing_agreement_id' => $old->id]);
+    $setDefault();
+    $new = BillingAgreement::create(['user_id' => $user->id, 'gateway_id' => $native->id, 'name' => 'Visa **** 4242', 'type' => 'visa', 'expiry' => '2030-06-30', 'external_reference' => 'pm_new']);
+    Http::swap(new Illuminate\Http\Client\Factory); Http::preventStrayRequests();
+    Http::fake(function ($request) use (&$methods, $assert) {
+        $assert(DB::transactionLevel() === 0, 'Native removal HTTP stays outside transactions.');
+        $path = parse_url($request->url(), PHP_URL_PATH);
+        if ($path === '/v1/payment_methods/pm_new/detach') return Http::response(['error' => ['code' => 'api_error']], 503);
+        foreach ($methods as $id => &$method) {
+            if ($path === '/v1/payment_methods/' . $id . '/detach') $method['customer'] = null;
+            elseif ($path !== '/v1/payment_methods/' . $id) continue;
+            return Http::response($method);
+        }
+        throw new RuntimeException('Unexpected native removal request.');
+    });
+    $assert(!$gateway->cancelBillingAgreement($new), 'Native partial removal retains failure.');
+    $assert($old->fresh()->trashed() && !$new->fresh()->trashed() && $service->fresh()->billing_agreement_id === null,
+        'Native partial failure reconciles the detached copy and its real service link.');
+    $assert($gateway->autoPayDefault($user) === null, 'Native partial failure clears the detached account default.');
 } elseif ($case === 'subscription' || $case === 'invoice-success') {
     $service = $create($case === 'subscription' ? ['subscription_id' => 'sub_existing'] : []);
     $invoice->items()->first()->update(['reference_type' => Service::class, 'reference_id' => $service->id]);
@@ -96,6 +121,16 @@ if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
         $assert(!$delivered($poll), 'Another tab polling the same invoice cannot consume checkout confirmation.');
     }
     request()->query->set('saved_notice', $token ?? str_repeat('a', 32));
+    if ($case === 'notice-failure') {
+        $broken = new class extends App\Livewire\Invoices\Show {
+            public function notify($message, $type = 'success', $redirect = false) { throw new RuntimeException('Synthetic delivery failure'); }
+        };
+        $broken->invoice = $invoice;
+        try { (new ReflectionMethod($gateway, 'deliverSavedMethodNotice'))->invoke($gateway, $broken); throw new RuntimeException('Expected delivery failure'); }
+        catch (RuntimeException $e) { $assert($e->getMessage() === 'Synthetic delivery failure', 'Notice delivery failure is observable.'); }
+        $state = json_decode($user->properties()->where('key', 'ae_stripe_notice_' . hash('sha256', $token))->firstOrFail()->value, true);
+        $assert(!$state['consumed'], 'Failed delivery rolls back its claim so the same tab can retry.');
+    }
     if ($case === 'notice-guards') {
         $account = Livewire::test(App\Livewire\Client\PaymentMethods::class);
         $assert(!$delivered($account), 'A non-invoice component leaves checkout confirmation pending.');
@@ -103,7 +138,7 @@ if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
         // Invoke only the guard so native invoice routing does not reject ownership before it runs.
         $component = new App\Livewire\Invoices\Show; $component->invoice = $foreign;
         (new ReflectionMethod($gateway, 'deliverSavedMethodNotice'))->invoke($gateway, $component);
-        $original = $user->properties()->where('key', 'like', 'ae_stripe_checkout_notice_%')->first();
+        $original = $user->properties()->where('key', 'like', 'ae_stripe_notice_%')->first();
         $assert($original !== null, 'Foreign invoice delivery does not consume the intended notice.');
         $saved = json_decode($original->value, true); $wrong = $saved; $wrong['user_id'] = 999;
         $original->update(['value' => json_encode($wrong)]);
