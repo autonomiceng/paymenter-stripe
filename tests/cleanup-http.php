@@ -120,6 +120,25 @@ if ($case === 'http') {
     check($remove(), 'A partial removal resumes receipt-only copies even if they now return 404');
     $journal = json_decode($user->props->values['ae_stripe_removal_pm_new'], true);
     check($journal['complete'] && count($journal['detached']) === 3, 'The resumed journal accounts for every copy');
+} elseif ($case === 'recovery') {
+    $handler = Http::$handler;
+    Http::$handler = function ($verb, $path, $data) use ($handler, $user) {
+        $result = $handler($verb, $path, $data);
+        if ($path === '/payment_methods/pm_old/detach') $user->props->customer = 'cus_other';
+        return $result;
+    };
+    Properties::$beforeWrite = function ($key) use (&$methods) {
+        if ($key['key'] === 'ae_stripe_removal_pm_new' && $methods['pm_old']->customer === null) throw new RuntimeException('Synthetic progress commit failure');
+    };
+    $remove = fn () => $gateway->cancelBillingAgreement(new BillingAgreement(ExtensionHelper::$agreements['pm_new']));
+    try { $remove(); throw new RuntimeException('Expected interrupted progress commit'); }
+    catch (RuntimeException $e) { check($e->getMessage() === 'Synthetic progress commit failure', 'Removal records the provider outcome in a separate durable phase'); }
+    Properties::$beforeWrite = null;
+    $start = count(Http::$calls);
+    check(!$remove(), 'Customer reassignment cannot authorize finishing provider detaches');
+    check(ExtensionHelper::$agreements['pm_old']['deleted_at'] !== null && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null,
+        'Retry confirms an uncertain detached copy and removes only that owned entry');
+    check(!array_filter(array_slice(Http::$calls, $start), fn ($call) => $call[0] !== 'get'), 'Reconciliation after reassignment performs verification reads only');
 } elseif (str_starts_with($case, 'removal-')) {
     $change = substr($case, 8);
     $service = App\Models\Service::$row = new App\Models\Service;
