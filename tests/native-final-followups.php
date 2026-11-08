@@ -154,6 +154,20 @@ if ($case === 'final-transfer-race' || $case === 'final-transfer-order') {
     $invoke('retrySavedMethodNotices');
     $assert(json_decode($user->properties()->where('key', $key)->first()->value, true)['state'] === 'ready', 'A saving-stage row refusal does not block a later live confirmation.');
     $assert(json_decode($user->properties()->where('key', $first)->first()->value, true)['attempts'] === 19, 'A saving-stage refusal preserves the intent budget.');
+} elseif ($case === 'final-render-pcre') {
+    // Exercise the real invoice render hook: a callback-only unit cannot prove checkout survives.
+    require __DIR__ . '/native-render-failure.php';
+    $key = $notice($token); $rendered = null;
+    app(\Livewire\EventBus::class)->after('render', function ($component) use (&$rendered) {
+        if (!$component instanceof App\Livewire\Invoices\Show) return;
+        return function ($html) use (&$rendered) { $rendered = $html; };
+    });
+    $failure = null;
+    try { Livewire::withQueryParams(['saved_notice' => $token])->test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()]); }
+    catch (Throwable $e) { $failure = $e; }
+    $assert(Paymenter\Extensions\Gateways\AeStripe\RenderFailure::$hits === 1, 'The extension notice injection actually received the PCRE null result.');
+    $assert(!$failure && is_string($rendered) && str_contains($rendered, 'wire:id') && str_contains($rendered, 'showPayModal'), 'A failed notice injection preserves the unpaid invoice and checkout controls.');
+    $assert(!$requests && $invoice->fresh()->status === 'pending' && json_decode($user->properties()->where('key', $key)->first()->value, true)['state'] === 'pending', 'Render failure neither charges nor consumes the saved-card confirmation.');
 } elseif ($case === 'final-browser') {
     mkdir($fixtureViews . '/invoices', 0700, true);
     $view = file_get_contents(($themeRoot ?: $release . '/themes/default') . '/views/invoices/show.blade.php');

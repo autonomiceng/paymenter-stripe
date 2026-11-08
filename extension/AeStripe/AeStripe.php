@@ -157,7 +157,8 @@ class AeStripe extends Gateway
                     if ($interval = $this->savedNoticePollInterval($component)) {
                         // Skip non-element prefixes and respect quoted '>' inside the actual root tag.
                         $root = '/\A(?:\s|<!--.*?-->|<\?.*?\?>|<!DOCTYPE[^>]*>)*<[a-zA-Z][a-zA-Z0-9:-]*(?:[^>"\']|"[^"]*"|\'[^\']*\')*>/s';
-                        $replaceHtml(preg_replace_callback($root, fn ($match) => $match[0] . '<span hidden data-ae-stripe-notice-poll wire:key="ae-stripe-notice-poll-' . $interval . '" wire:poll.' . $interval . 's="$refresh"></span>', $html, 1));
+                        $patched = preg_replace_callback($root, fn ($match) => $match[0] . '<span hidden data-ae-stripe-notice-poll wire:key="ae-stripe-notice-poll-' . $interval . '" wire:poll.' . $interval . 's="$refresh"></span>', $html, 1);
+                        if (is_string($patched)) $replaceHtml($patched);
                     }
                 };
             });

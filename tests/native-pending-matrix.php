@@ -17,7 +17,7 @@ foreach (['disabled', 'bundled'] as $state) foreach (['', '-off', '-removed', '-
 foreach (['off', 'removed', 'cancelled', 'plan'] as $state) $cases[] = 'followup-stopped-' . $state;
 foreach (['401', '403', '429', '503', 'connection'] as $error) $cases[] = 'followup-queue-outage-' . $error;
 foreach (['transfer-race', 'transfer-order', 'method-404', 'orphans', 'retention', 'rotation', 'row-400', 'row-402', 'row-409', 'backoff', 'diagnostics', 'late-notice', 'delay-notice',
-    'replacement', 'prune-isolation', 'terminal-status', 'diagnostics-account', 'method-row-400', 'method-row-402', 'method-row-409', 'logging', 'clean-log', 'backoff-fresh'] as $suffix) $cases[] = 'final-' . $suffix;
+    'replacement', 'prune-isolation', 'terminal-status', 'diagnostics-account', 'method-row-400', 'method-row-402', 'method-row-409', 'logging', 'clean-log', 'backoff-fresh', 'render-pcre'] as $suffix) $cases[] = 'final-' . $suffix;
 foreach (['401', '403', '429', '503', 'connection'] as $error) $cases[] = 'final-method-' . $error;
 putenv('PAY_PENDING_MATRIX');
 foreach ($cases as $case) {
