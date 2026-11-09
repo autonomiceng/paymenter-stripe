@@ -23,7 +23,7 @@ $setup = function ($amount = 2000, $total = 10, $currency = 'usd') use ($owner, 
     $nativeGateway->update(['enabled' => true]);
     $invoice = nativeInvoice(810, $total, strtoupper($currency), 'INV-12');
     $stripe = new class($amount, $currency) {
-        public $refunds = [], $posts = [], $lose = false, $drop = false, $failWrite = false, $status = 'succeeded';
+        public $refunds = [], $posts = [], $lose = false, $drop = false, $failWrite = false, $status = 'succeeded', $marker = null;
         public $intent, $dispute;
         public function __construct($amount, $currency) {
             $this->intent = (object) ['id' => 'pi_return', 'status' => 'succeeded', 'amount' => $amount, 'amount_received' => $amount,
@@ -43,6 +43,7 @@ $setup = function ($amount = 2000, $total = 10, $currency = 'usd') use ($owner, 
             $key = idempotencyKey($request);
             $stored = tableRows('ae_stripe_receipt_returns', ['payment_intent_id', 'allocation_key']);
             check(!empty($stored[array_key_last($stored)]['sent_at']), 'First-send marker survives outside the external-write transaction');
+            $this->marker = $stored[array_key_last($stored)]['sent_at'];
             $this->posts[] = [$key, $data];
             if ($this->drop) throw new ConnectionException('Not sent');
             $this->refunds[$key] ??= (object) ['id' => 're_' . count($this->refunds), 'payment_intent' => $data['payment_intent'],
@@ -67,6 +68,8 @@ check($a['state'] === 'refunded' && $a['amount_minor'] === 1000 && count($s->ref
     'Duplicate success and scheduled retries return only the excess once');
 check(payments()['810:pi_return']['amount'] === 20.0 && payments()['810:' . $a['key']]['amount'] === -10.0
     && !credits() && count(notices()) === 1, 'Native receipt, return adjustment and customer notice remain distinct and deduplicated');
+check(moneyRows() === ['payments' => ['810:pi_return' => 1, '810:' . $a['key'] => 1], 'credits' => []],
+    'Duplicate success stores one raw receipt row, one return adjustment row and no credit row');
 $r = $gateway->allocateReceiptReturn($i, 'pi_return', 'domains:failed:1', 1000);
 $gateway->allocateReceiptReturn($i, 'pi_return', 'domains:failed:1', 1000);
 check($r['state'] === 'refunded' && count($s->refunds) === 2, 'Domains and excess share one receipt budget and immutable allocations');
@@ -108,10 +111,21 @@ foreach (['succeeded', 'failed'] as $remoteStatus) {
     $deliver($s);
     check($status($i)['state'] === 'review' && !credits() && count(payments()) === 1,
         'Interrupted local settlement rolls back credit and the return adjustment');
+    check(moneyRows() === ['payments' => ['810:pi_return' => 1], 'credits' => []],
+        'Rollback leaves only the raw receipt row and no credit row');
+    $marker = $returns()['pi_return:excess']['sent_at'];
+    check($marker !== null && $marker === $s->marker && count($s->posts) === 1,
+        'Interrupted settlement keeps the exact first-send marker committed before the ' . $remoteStatus . ' refund');
+    // A fixed older marker cannot match a rewrite made in the same second.
+    $setReturn('pi_return:excess', ['sent_at' => $marker = $marker - 60]);
     $gateway->retryReceiptReturns(); $deliver($s);
     check(count($s->posts) === 1 && count(payments()) === 2
         && ($remoteStatus === 'failed' ? credits()['7:usd'] === 10.0 : !credits()),
         'Recovery reconciles the remote outcome after local rollback and completes only once');
+    check(moneyRows() === ['payments' => ['810:pi_return' => 1, '810:' . $status($i)['key'] => 1],
+        'credits' => $remoteStatus === 'failed' ? ['7:usd' => 1] : []],
+        'Recovery adds one raw adjustment row and at most one credit row');
+    check($returns()['pi_return:excess']['sent_at'] === $marker, 'Recovery keeps the first-send marker unchanged');
 }
 
 foreach (['succeeded', 'failed'] as $remoteStatus) {
@@ -126,6 +140,9 @@ foreach (['succeeded', 'failed'] as $remoteStatus) {
         && count($s->posts) === 1 && count(payments()) === 2
         && ($remoteStatus === 'failed' ? credits()['7:usd'] === 10.0 : !credits()),
         'A lost commit acknowledgement preserves a completed return instead of crediting it twice');
+    check(moneyRows() === ['payments' => ['810:pi_return' => 1, '810:' . $status($i)['key'] => 1],
+        'credits' => $remoteStatus === 'failed' ? ['7:usd' => 1] : []],
+        'A lost commit acknowledgement stores one raw adjustment row and at most one credit row');
 }
 
 [$i, $s] = $setup(); $s->intent->latest_charge->disputed = true; $deliver($s); $gateway->retryReceiptReturns();

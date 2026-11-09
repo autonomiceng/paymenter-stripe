@@ -178,6 +178,20 @@ function credits(): array
     foreach (App\Models\Credit::orderBy('id')->get() as $row) $rows[$row->user_id . ':' . strtolower($row->currency_code)] = (float) $row->amount;
     return $rows;
 }
+/** Raw row counts per ledger (invoice:transaction) and credit (user:currency) identity; the projections above keep one row per key. */
+function moneyRows(): array
+{
+    $rows = ['payments' => [], 'credits' => []];
+    foreach (DB::table('invoice_transactions')->orderBy('id')->get(['invoice_id', 'transaction_id']) as $row) {
+        $key = $row->invoice_id . ':' . $row->transaction_id;
+        $rows['payments'][$key] = ($rows['payments'][$key] ?? 0) + 1;
+    }
+    foreach (DB::table('credits')->orderBy('id')->get(['user_id', 'currency_code']) as $row) {
+        $key = $row->user_id . ':' . strtolower($row->currency_code);
+        $rows['credits'][$key] = ($rows['credits'][$key] ?? 0) + 1;
+    }
+    return $rows;
+}
 /** In-app notifications in creation order. */
 function notices(): array { return App\Models\Notification::orderBy('id')->get(['user_id', 'title', 'body', 'url'])->map->toArray()->all(); }
 /** Audit records in creation order, with decoded values. */
