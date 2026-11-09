@@ -34,165 +34,104 @@
 @script
 <script>
 // Livewire runs this registration once. Alpine owns each teleported form's lifetime.
-let stripeScript;
-const timedOutScripts = new WeakSet();
-function loadStripe() {
-    if (window.Stripe) return Promise.resolve();
-    if (!stripeScript) {
-        stripeScript = new Promise((resolve, reject) => {
-            let existingScript = document.querySelector('script[src^="https://js.stripe.com/v3"]');
-            if (existingScript && timedOutScripts.has(existingScript)) existingScript = null;
-            const script = existingScript || document.createElement('script');
-            const cleanup = () => {
-                clearTimeout(timeout);
-                script.removeEventListener('load', loaded);
-                script.removeEventListener('error', failed);
-                if (!existingScript) {
-                    script.onload = null;
-                    script.onerror = null;
-                }
-            };
-            const loaded = () => {
-                if (window.Stripe) {
-                    cleanup();
-                    return resolve();
-                }
-                failed();
-            };
-            const failed = () => {
-                cleanup();
-                stripeScript = null;
-                if (existingScript && !window.Stripe) timedOutScripts.add(existingScript);
-                if (!existingScript) script.remove();
-                reject(new Error('Could not load Stripe.js.'));
-            };
-            // An existing tag may have finished before these listeners were added.
-            // Give fresh requests more time, but allow retry if neither event fires.
-            const timeout = setTimeout(() => {
-                failed();
-            }, existingScript ? 5000 : 30000);
-            if (existingScript) {
-                script.addEventListener('load', loaded, {once: true});
-                script.addEventListener('error', failed, {once: true});
-            } else {
-                script.src = 'https://js.stripe.com/v3/';
-                script.async = true;
-                script.onload = loaded;
-                script.onerror = () => { failed(); };
-                document.body.appendChild(script);
-            }
-        });
-    }
-    return stripeScript;
-}
+@include('gateways.ae-stripe::stripe-form')
 Alpine.data('aeStripeSetup', (config) => {
     @include('gateways.ae-stripe::stripe-theme')
     @include('gateways.ae-stripe::stripe-elements')
     let disposed = false;
     let cleanup = () => {};
     return {
-        async init() {
+        init() {
             const form = this.$el;
-            const submit = form.querySelector('#submit');
-            const message = form.querySelector('#error-message');
-            const container = form.querySelector('#payment-element');
             const expressContainer = form.querySelector('#express-checkout');
             const controller = new AbortController();
-            let paymentElement;
-            let expressCheckout;
-            let stopThemeSync = () => {};
-            let ready = false;
-            let loading = false;
+            let release = () => {};
             cleanup = () => {
                 controller.abort();
-                stopThemeSync();
-                paymentElement?.destroy();
-                expressCheckout?.destroy();
-                expressCheckout = null;
-                paymentElement = null;
-                stopThemeSync = () => {};
+                release();
             };
             // Both choices open together once Stripe is ready, and lock together while one saves.
-            function setLoading(isLoading) {
-                loading = isLoading;
-                if (disposed) return;
-                container.inert = isLoading || !ready;
-                expressContainer.inert = container.inert;
-                submit.disabled = isLoading || !ready;
-                submit.classList.toggle('hidden', isLoading);
-            }
-            function initializationError() {
-                ready = false;
-                setLoading(false);
-                if (!disposed) message.textContent = 'Could not load the payment form. Reload to try again.';
-            }
+            const controls = stripeFormControls(form, {inertUntilReady: true, isDisposed: () => disposed, onRetry: start});
+            const {showMessage, clearMessage, setLoading, initializationError} = controls;
             // Block native submits even while Stripe.js is loading.
             form.addEventListener('submit', (event) => event.preventDefault(), {signal: controller.signal});
-            try {
-                await loadStripe();
-                if (disposed || !form.isConnected) return;
-                const stripe = Stripe(config.publishableKey);
-                const created = createStripeElements(stripe, {clientSecret: config.clientSecret, appearance: stripeAppearance(form)}, {
-                    linkDisplay: config.linkDisplay, name: config.name, email: config.email, businessName: config.businessName, ownTerms: true,
-                    onLinkAvailability: available => { if (!disposed) expressContainer.hidden = !available; },
-                });
-                const {elements} = created;
-                paymentElement = created.paymentElement;
-                expressCheckout = created.expressCheckout;
-                stopThemeSync = syncStripeTheme(form, elements);
-                paymentElement.on('change', () => { if (!loading) message.replaceChildren(); });
-                form.addEventListener('submit', (event) => {
-                    event.preventDefault();
-                    confirmSetup();
-                }, {signal: controller.signal});
-                expressCheckout?.on('confirm', event => confirmSetup(event));
-                async function confirmSetup(expressEvent = null) {
-                    if (disposed || loading || !ready) {
-                        expressEvent?.paymentFailed({reason: 'fail'});
-                        return;
-                    }
-                    function failSetup(value) {
-                        showMessage(value);
-                        expressEvent?.paymentFailed({reason: 'fail'});
-                    }
-                    message.replaceChildren();
-                    setLoading(true);
-                    try {
-                        const result = await fetch(config.consentUrl, {
-                            method: 'POST', signal: controller.signal,
-                            headers: {'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': config.csrf},
-                            // The customer chose Link or Save card under the agreement line, so the choice is the consent.
-                            body: JSON.stringify({intent: config.intent, consent: true, version: 'off_session_v2'}),
-                        });
-                        if (!result.ok) {
-                            failSetup('Could not record your agreement. Try again.');
+            // Try again releases the failed attempt and starts a new one.
+            async function start() {
+                release();
+                const attempt = new AbortController();
+                let paymentElement;
+                let expressCheckout;
+                let stopThemeSync = () => {};
+                release = () => {
+                    attempt.abort();
+                    stopThemeSync();
+                    paymentElement?.destroy();
+                    expressCheckout?.destroy();
+                    expressCheckout = null;
+                    paymentElement = null;
+                    stopThemeSync = () => {};
+                };
+                try {
+                    await loadStripe();
+                    if (disposed || attempt.signal.aborted || !form.isConnected) return;
+                    const stripe = Stripe(config.publishableKey);
+                    const created = createStripeElements(stripe, {clientSecret: config.clientSecret, appearance: stripeAppearance(form)}, {
+                        linkDisplay: config.linkDisplay, name: config.name, email: config.email, businessName: config.businessName, ownTerms: true,
+                        onLinkAvailability: available => { if (!disposed) expressContainer.hidden = !available; },
+                    });
+                    const {elements} = created;
+                    paymentElement = created.paymentElement;
+                    expressCheckout = created.expressCheckout;
+                    stopThemeSync = syncStripeTheme(form, elements);
+                    paymentElement.on('change', () => { if (!controls.loading) clearMessage(); });
+                    form.addEventListener('submit', (event) => {
+                        event.preventDefault();
+                        confirmSetup();
+                    }, {signal: attempt.signal});
+                    expressCheckout?.on('confirm', event => confirmSetup(event));
+                    async function confirmSetup(expressEvent = null) {
+                        if (disposed || controls.loading || !controls.ready) {
+                            expressEvent?.paymentFailed({reason: 'fail'});
                             return;
                         }
-                        if (disposed) return;
-                        const {error} = await stripe.confirmSetup({elements, confirmParams: {return_url: config.returnUrl}});
-                        if (error) throw error;
-                    } catch (error) {
-                        if (disposed) return;
-                        failSetup(['card_error', 'validation_error'].includes(error?.type) && error.message
-                            ? error.message : 'Could not save your payment method. Try again.');
-                    } finally {
-                        setLoading(false);
+                        function failSetup(value) {
+                            showMessage(value);
+                            expressEvent?.paymentFailed({reason: 'fail'});
+                        }
+                        clearMessage();
+                        setLoading(true);
+                        try {
+                            const result = await fetch(config.consentUrl, {
+                                method: 'POST', signal: attempt.signal,
+                                headers: {'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': config.csrf},
+                                // The customer chose Link or Save card under the agreement line, so the choice is the consent.
+                                body: JSON.stringify({intent: config.intent, consent: true, version: 'off_session_v2'}),
+                            });
+                            if (!result.ok) {
+                                failSetup('Could not record your agreement. Try again.');
+                                return;
+                            }
+                            if (disposed) return;
+                            const {error} = await stripe.confirmSetup({elements, confirmParams: {return_url: config.returnUrl}});
+                            if (error) throw error;
+                        } catch (error) {
+                            if (disposed) return;
+                            failSetup(['card_error', 'validation_error'].includes(error?.type) && error.message
+                                ? error.message : 'Could not save your payment method. Try again.');
+                        } finally {
+                            setLoading(false);
+                        }
                     }
+                    paymentElement.on('ready', () => { controls.ready = true; setLoading(false); });
+                    paymentElement.on('loaderror', initializationError);
+                    paymentElement.mount(form.querySelector('#payment-element'));
+                    created.mountExpress(form.querySelector('#express-checkout-element'));
+                } catch (error) {
+                    release();
+                    initializationError();
                 }
-                function showMessage(value) {
-                    const text = document.createElement('p');
-                    text.className = 'mb-2';
-                    text.textContent = value;
-                    message.replaceChildren(text);
-                }
-                paymentElement.on('ready', () => { ready = true; setLoading(false); });
-                paymentElement.on('loaderror', initializationError);
-                paymentElement.mount(container);
-                created.mountExpress(form.querySelector('#express-checkout-element'));
-            } catch (error) {
-                cleanup();
-                initializationError();
             }
+            return start();
         },
         destroy() {
             disposed = true;
