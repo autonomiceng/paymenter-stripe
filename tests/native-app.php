@@ -11,8 +11,8 @@ use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 
 $release = getenv('PAY_NATIVE_PINNED_APP') ?: getenv('PAYMENTER_TEST_APP');
 if (!$release || !is_file($release . '/vendor/autoload.php')) throw new RuntimeException('A cached Paymenter test release is required (PAYMENTER_TEST_APP).');
-$root = sys_get_temp_dir() . '/ae-stripe-native-' . bin2hex(random_bytes(6));
-mkdir($root, 0700);
+require_once __DIR__ . '/temporary-root.php';
+$root = TemporaryRoot::create('ae-stripe-native-');
 foreach (['bootstrap/cache', 'storage/framework/cache', 'storage/framework/sessions', 'storage/framework/views', 'storage/logs', 'extensions/Gateways'] as $path) mkdir($root . '/' . $path, 0700, true);
 foreach (['app', 'config', 'database', 'routes', 'vendor', 'resources', 'public', 'themes', 'lang'] as $path) symlink($release . '/' . $path, $root . '/' . $path);
 foreach (['bootstrap/app.php', 'bootstrap/providers.php', 'composer.json'] as $path) copy($release . '/' . $path, $root . '/' . $path);

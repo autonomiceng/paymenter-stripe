@@ -5,8 +5,9 @@ require_once __DIR__ . '/entered.php';
 if (!in_array(getenv('PAY_PENDING_MATRIX'), [false, ''], true)) { require __DIR__ . '/native-pending-matrix.php'; return; }
 if (in_array('--receipt-returns', $argv, true)) putenv('PAY_NATIVE_SUITE=receipt-returns');
 if (getenv('PAY_NATIVE_SUITE')) {
-    // A separate process: the native suite declares its own helpers on real Paymenter classes.
-    $run = proc_open([getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY, '-d', 'auto_prepend_file=' . __DIR__ . '/entered.php', '-d', 'memory_limit=512M', __DIR__ . '/native-suite.php'], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
+    // A separate process: the native suite declares its own helpers on real Paymenter classes. It inherits the
+    // descriptors: passing STDOUT rewinds a file log, so the child would overwrite output written before it started.
+    $run = proc_open([getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY, '-d', 'auto_prepend_file=' . __DIR__ . '/entered.php', '-d', 'memory_limit=512M', __DIR__ . '/native-suite.php'], [], $pipes);
     exit(proc_close($run));
 }
 if (getenv('PAY_CLEANUP_CASE') === 'notice-native' || getenv('PAY_BINDING_CASE') === 'native' || getenv('PAY_CHECKOUT_NATIVE')) {
@@ -338,4 +339,5 @@ foreach (['account-during', 'reserved-account', 'repair-account', 'repair-servic
     (function () use ($bindingCase) { require __DIR__ . '/cleanup-bindings.php'; })();
 }
 require __DIR__ . '/native-ci-selection.php';
+require __DIR__ . '/native-fixture-lifetime.php';
 echo "PASS: $count offline assertions\n";

@@ -184,7 +184,8 @@ if ($case === 'final-transfer-race' || $case === 'final-transfer-order') {
     $otherTab = Livewire::test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()])->html();
     $fixture = $root . '/browser.json';
     file_put_contents($fixture, json_encode(['html' => $initial, 'other' => $otherTab, 'responses' => [$delayed, $ready], 'javascript' => $release . '/vendor/livewire/livewire/dist/livewire.js'], JSON_THROW_ON_ERROR));
-    $run = proc_open([getenv('PAYMENTER_TEST_NODE') ?: 'node', __DIR__ . '/native-notice-poll.mjs', $fixture], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
+    // Inherit the descriptors: passing STDOUT rewinds a shared file log over the earlier native runs.
+    $run = proc_open([getenv('PAYMENTER_TEST_NODE') ?: 'node', __DIR__ . '/native-notice-poll.mjs', $fixture], [], $pipes);
     $assert(is_resource($run) && proc_close($run) === 0, 'The real browser polls the native component and delivers once without manual refresh.');
 } else throw new RuntimeException('Unknown final follow-up case');
 echo "PASS: $checks final follow-up checks ($case, $theme)\n";

@@ -50,3 +50,7 @@ unused branch does not count. Support files that load, launch or record suites a
 `tests/ci-coverage.php`; they must be loaded too, and loading one never counts for its suites.
 Start a new PHP child with `-d auto_prepend_file=tests/entered.php` and import
 `./entered.mjs` in a new Node check.
+Native fixtures create their temporary trees with `tests/temporary-root.php`, which removes
+only that tree, without following links, when the process exits. A child whose output the
+caller does not read inherits the descriptors (`proc_open` with an empty list), so a file log
+keeps every line.
