@@ -2,6 +2,9 @@
 
 Requires PHP 8.3+; Python 3 is needed only to build release archives. The offline
 tests use local fakes and need no dependency installation or network access.
+Suites listed in `tests/native-suites.php` run on a pristine Paymenter 1.5.9 release
+with its Composer dependencies and in-memory SQLite, for example
+`PAYMENTER_TEST_APP=/path/to/pristine-release php tests/run.php --receipt-returns`.
 
 ```sh
 php -n tests/run.php

@@ -14,6 +14,8 @@ while ($queue) {
     if (isset($reached[$file])) continue;
     $reached[$file] = true;
     array_push($queue, ...$named('#[\'"]/?([\w-]+\.(?:php|mjs))[\'"]#', file_get_contents(__DIR__ . '/' . $file)));
+    // native-suites.php lists suites by name; native-suite.php loads each as '<name>.php'.
+    if ($file === 'native-suites.php') array_push($queue, ...array_intersect(array_map(fn ($suite) => $suite . '.php', require __DIR__ . '/native-suites.php'), $tests));
 }
 $unreached = array_diff($tests, array_keys($reached));
 check(!$unreached, 'Every test file runs in CI; unreached: ' . implode(', ', $unreached));
@@ -40,3 +42,8 @@ foreach (['other', 'missing'] as $conflict) {
     check(proc_close($process) !== 0 && str_contains($output, 'Native integration failed: transaction') && is_file($fixture . '/selected')
         && file_get_contents($fixture . '/selected') === $fixture . '/app', 'Every native matrix child uses the validated application despite conflicting ' . $conflict . ' inheritance');
 }
+$offline = file_get_contents(__DIR__ . '/run.php');
+foreach (require __DIR__ . '/native-suites.php' as $suite) {
+    check(is_file(__DIR__ . '/' . $suite . '.php') && !str_contains($offline, "require __DIR__ . '/" . $suite . ".php'"), 'Native suite ' . $suite . ' runs only on the native harness');
+}
+check(str_contains(file_get_contents(__DIR__ . '/native-pending-matrix.php'), "require __DIR__ . '/native-suites.php'"), 'Native CI runs every native suite');

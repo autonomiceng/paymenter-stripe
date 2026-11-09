@@ -36,10 +36,13 @@ if (getenv('PAY_PENDING_MATRIX') === 'browser') {
         $runs[] = [$file, [], [$php, '-d', 'memory_limit=256M', __DIR__ . '/' . $file]];
     }
     $runs[] = ['conversion-bootstrap.php', [], [$php, '-n', __DIR__ . '/conversion-bootstrap.php', $app]];
+    foreach (require __DIR__ . '/native-suites.php' as $suite) {
+        $runs[] = [$suite, ['PAY_NATIVE_SUITE' => $suite], [$php, '-d', 'memory_limit=512M', __DIR__ . '/native-suite.php']];
+    }
 }
 putenv('PAY_PENDING_MATRIX');
 foreach ($runs as [$label, $environment, $command]) {
-    foreach (['PAY_CHECKOUT_NATIVE', 'PAY_CLEANUP_CASE', 'PAY_BINDING_CASE'] as $name) putenv(isset($environment[$name]) ? $name . '=' . $environment[$name] : $name);
+    foreach (['PAY_CHECKOUT_NATIVE', 'PAY_CLEANUP_CASE', 'PAY_BINDING_CASE', 'PAY_NATIVE_SUITE'] as $name) putenv(isset($environment[$name]) ? $name . '=' . $environment[$name] : $name);
     $process = proc_open($command, [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
     if (!is_resource($process) || proc_close($process) !== 0) throw new RuntimeException('Native integration failed: ' . $label);
 }

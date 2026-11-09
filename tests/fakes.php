@@ -748,7 +748,6 @@ namespace Filament\View { class PanelsRenderHook { const PAGE_START = 'panels::p
 
 namespace {
     class ReceiptReturnQuery {
-        public static $beforeWrite = null;
         private $filters = [], $order = [], $limit = PHP_INT_MAX;
         public function where($key, $value) { return $this->whereIn($key, [$value]); }
         public function whereIn($key, $values) { $this->filters[$key] = $values; return $this; }
@@ -769,7 +768,6 @@ namespace {
             if (!\Illuminate\Support\Facades\DB::$userLocked) throw new RuntimeException('Return write needs owner lock');
             $row = $identity + $values;
             if (strlen($row['return_key']) > 74) throw new \Illuminate\Database\QueryException('Data too long for column return_key');
-            if (self::$beforeWrite) (self::$beforeWrite)($row);
             \Illuminate\Support\Facades\DB::$tables['ae_stripe_receipt_returns'][$row['payment_intent_id'] . ':' . $row['allocation_key']] = $row;
         }
         public function update($values) {
