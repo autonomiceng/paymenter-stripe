@@ -52,7 +52,8 @@ function loadStripe() {
 }
 // Pay and Save card stay off until the Payment Element is ready, and lock while one confirms.
 // The alert stays mounted so screen readers announce new text; an error stays until the
-// customer edits the form or submits again. Options cover what only one form needs:
+// customer edits the form or submits again. A load error stays until Try again, because
+// editing cannot fix it. Options cover what only one form needs:
 // locked keeps the form and its error in place after a decline that needs a refresh,
 // inertUntilReady keeps the fields closed until Stripe is ready, and onRetry runs Try again.
 function stripeFormControls(form, {onRetry, onLoading = () => {}, locked = () => false, isDisposed = () => false,
@@ -81,7 +82,7 @@ function stripeFormControls(form, {onRetry, onLoading = () => {}, locked = () =>
         if (scrollToMessage) alert.scrollIntoView({block: 'nearest', behavior: 'instant'});
     };
     controls.clearMessage = () => {
-        if (isDisposed() || locked()) return;
+        if (isDisposed() || locked() || !controls.ready) return;
         alert?.replaceChildren();
     };
     controls.setLoading = (isLoading) => {
@@ -102,4 +103,8 @@ function stripeFormControls(form, {onRetry, onLoading = () => {}, locked = () =>
         controls.showMessage('Could not load the payment form. Check your connection and try again.', onRetry);
     };
     return controls;
+}
+// Try again replaces the Elements; a released attempt's late events must not change the new form.
+function forAttempt(signal) {
+    return handler => (...args) => { if (!signal.aborted) return handler(...args); };
 }
