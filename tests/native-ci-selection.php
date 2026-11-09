@@ -75,14 +75,33 @@ foreach (['1' => [__DIR__ . '/run.php'], 'browser' => [__DIR__ . '/run.php'], ''
     check($status === 0 && $printed === 'PASS: ' . count($selected[$mode]) . " isolated native runs\n", 'Matrix mode ' . $mode . ' finishes every successful child and reports the count: ' . $printed);
 }
 check($selected['browser'] === $browser, 'The browser matrix runs final-browser, payment-errors.mjs and setup-modal.mjs with only their own selections and the release Livewire script');
-$native = $selected['1'];
-$checkout = array_slice($native, 0, count($native) - count($late));
-$cases = array_map(fn ($line) => explode("\t", $line)[1], $checkout);
-check(count($checkout) > 100 && array_slice($native, -count($late)) === $late && $checkout === array_map(fn ($case) => $row('php', [$case], $prepend . ' -d memory_limit=256M ' . __DIR__ . '/run.php'), $cases)
-    && count(array_unique($cases)) === count($cases) && !in_array('', $cases, true) && !in_array('stale', $cases, true) && !in_array('final-browser', $cases, true)
-    && array_intersect(['transaction', 'polish-paused-bundled-failure', 'followup-queue-outage-connection', 'final-render-pcre', 'final-method-connection'], $cases) === ['transaction', 'polish-paused-bundled-failure', 'followup-queue-outage-connection', 'final-render-pcre', 'final-method-connection'],
-    'The native matrix runs each checkout case once, then notice-native, binding-native, the standalone native files and every registered native suite, each with only its own selection');
-check($selected[''] === $native && $selected['unset'] === $native, 'Direct matrix runs with an unset or empty mode run the native cases');
+// Written out on purpose: a case dropped from or added to the matrix list must fail here.
+$expectedCases = [
+    'transaction', 'checkout', 'pending-retry', 'polish-staff', 'polish-staff-delayed', 'polish-staff-select', 'polish-staff-subscription',
+    'polish-owner', 'polish-owner-callback', 'polish-exhausted', 'polish-poll', 'polish-poll-many', 'polish-inflight-off', 'polish-inflight-clear',
+    'polish-select-service', 'polish-select-invoice', 'polish-select-account', 'polish-deferred', 'polish-deferred-first', 'polish-deferred-before',
+    'polish-deferred-first-before', 'polish-deferred-recovery', 'polish-deferred-first-recovery', 'polish-deferred-connection', 'polish-token',
+    'polish-legacy', 'polish-prune', 'polish-refused', 'followup-queue-missing', 'followup-queue-progress', 'followup-queue-storage',
+    'followup-queue-terminal', 'followup-queue-terminal-log-failure', 'followup-queue-local-budget', 'followup-queue-save-budget',
+    'followup-queue-notice-budget', 'followup-queue-save-outage', 'followup-queue-state-race', 'followup-queue-malformed', 'followup-queue-spaces',
+    'followup-after-commit-gateway', 'followup-after-commit-bundled', 'followup-after-commit-state', 'followup-after-commit-log',
+    'followup-retention', 'followup-contention', 'followup-stopped', 'followup-malformed', 'followup-transfer', 'followup-transfer-rollback',
+    'followup-prune-failure', 'followup-poll', 'followup-staff-race', 'followup-webhook-complete', 'followup-webhook-discard',
+    'followup-webhook-discard-log', 'followup-webhook-save-failure', 'polish-paused-disabled', 'polish-paused-disabled-off',
+    'polish-paused-disabled-removed', 'polish-paused-disabled-subscription', 'polish-paused-disabled-owner', 'polish-paused-disabled-failure',
+    'polish-paused-bundled', 'polish-paused-bundled-off', 'polish-paused-bundled-removed', 'polish-paused-bundled-subscription',
+    'polish-paused-bundled-owner', 'polish-paused-bundled-failure', 'followup-stopped-off', 'followup-stopped-removed', 'followup-stopped-cancelled',
+    'followup-stopped-plan', 'followup-queue-outage-401', 'followup-queue-outage-403', 'followup-queue-outage-429', 'followup-queue-outage-503',
+    'followup-queue-outage-connection', 'final-transfer-race', 'final-transfer-order', 'final-method-404', 'final-orphans', 'final-retention',
+    'final-rotation', 'final-row-400', 'final-row-402', 'final-row-409', 'final-backoff', 'final-diagnostics', 'final-late-notice',
+    'final-delay-notice', 'final-replacement', 'final-prune-isolation', 'final-terminal-status', 'final-diagnostics-account', 'final-method-row-400',
+    'final-method-row-402', 'final-method-row-409', 'final-logging', 'final-clean-log', 'final-backoff-fresh', 'final-render-pcre',
+    'final-method-401', 'final-method-403', 'final-method-429', 'final-method-503', 'final-method-connection'];
+$native = [...array_map(fn ($case) => $row('php', [$case], $prepend . ' -d memory_limit=256M ' . __DIR__ . '/run.php'), $expectedCases), ...$late];
+foreach (['1', '', 'unset'] as $mode) {
+    check($selected[$mode] === $native, 'Native matrix mode ' . ($mode === '' ? 'empty' : $mode) . ' runs every expected checkout case once in order, then notice-native, binding-native, '
+        . 'the standalone native files and every registered native suite, each with only its own selection');
+}
 // Unknown nonempty modes, including "0", stop before any child starts.
 foreach (['0', 'Browser', 'native', ' 1'] as $mode) {
     if (is_file($output)) unlink($output);
