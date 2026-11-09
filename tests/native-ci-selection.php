@@ -42,6 +42,14 @@ foreach (['other', 'missing'] as $conflict) {
     check(proc_close($process) !== 0 && str_contains($output, 'Native integration failed: transaction') && is_file($fixture . '/selected')
         && file_get_contents($fixture . '/selected') === $fixture . '/app', 'Every native matrix child uses the validated application despite conflicting ' . $conflict . ' inheritance');
 }
+// A file log keeps every child's output; CI and local runners read the last line.
+file_put_contents($fixture . '/quiet', '#!/bin/sh' . "\n" . "echo child\n");
+chmod($fixture . '/quiet', 0700);
+$environment = array_replace(getenv(), ['PAYMENTER_TEST_APP' => $fixture . '/app', 'PAYMENTER_TEST_PHP' => $fixture . '/quiet', 'PAY_PENDING_MATRIX' => '1']);
+$process = proc_open([PHP_BINARY, '-n', __DIR__ . '/native-pending-matrix.php'], [0 => ['pipe', 'r'], 1 => ['file', $fixture . '/log', 'w'], 2 => ['redirect', 1]], $pipes, null, $environment);
+fclose($pipes[0]); $status = proc_close($process); $lines = file($fixture . '/log', FILE_IGNORE_NEW_LINES);
+check($status === 0 && preg_match('/^PASS: ([0-9]+) isolated native runs$/', (string) end($lines), $runs) && $runs[1] > 1 && $lines === [...array_fill(0, (int) $runs[1], 'child'), $runs[0]],
+    'A file log keeps every native matrix child line and ends with the summary');
 $offline = file_get_contents(__DIR__ . '/run.php');
 foreach (require __DIR__ . '/native-suites.php' as $suite) {
     check(is_file(__DIR__ . '/' . $suite . '.php') && !str_contains($offline, "require __DIR__ . '/" . $suite . ".php'"), 'Native suite ' . $suite . ' runs only on the native harness');

@@ -43,7 +43,8 @@ if (getenv('PAY_PENDING_MATRIX') === 'browser') {
 putenv('PAY_PENDING_MATRIX');
 foreach ($runs as [$label, $environment, $command]) {
     foreach (['PAY_CHECKOUT_NATIVE', 'PAY_CLEANUP_CASE', 'PAY_BINDING_CASE', 'PAY_NATIVE_SUITE'] as $name) putenv(isset($environment[$name]) ? $name . '=' . $environment[$name] : $name);
-    $process = proc_open($command, [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
+    // Inherit the descriptors: passing STDOUT rewinds a file log, so each child would overwrite the last.
+    $process = proc_open($command, [], $pipes);
     if (!is_resource($process) || proc_close($process) !== 0) throw new RuntimeException('Native integration failed: ' . $label);
 }
 echo 'PASS: ' . count($runs) . " isolated native runs\n";
