@@ -34,13 +34,10 @@ Try again hides the earlier Link row and clears the pay form's saving choice; ev
 released Elements cannot change the new form.
 Browser-check both pay and setup views inside the theme's teleported modal (default theme `x-teleport="body"`).
 Offline browser coverage in `tests/setup-modal.mjs` (CI browser matrix) checks repeated setup opens,
-declines, consent failures, closing during Stripe.js loading and Try again while a stalled request stays
-pending; `tests/payment-errors.mjs` checks the pay form's load timeout, load error, Try again and reuse of
-an existing tag, and both forms' Payment Element load error, retry and late events.
+declines, consent failures and closing during Stripe.js loading; `tests/payment-errors.mjs`
+checks the pay form's load timeout, load error, Try again and reuse of an existing tag, and both
+forms' Payment Element load error, retry and late events, including a late Link confirmation.
 Fresh Stripe.js loads have a 30-second bound; timed-out owned tags are removed for retry.
-A browser joins a request for the same URL to one still pending, so each retry adds `?retry=<count>`
-to the Stripe.js URL to start its own request. Stripe.js accepts query parameters on its script URL,
-and a late original load keeps the first Stripe global.
 Reused tags keep a five-second wait and preserve the owner's tag.
 After a timeout, error event or load without the library, retry skips the foreign tag and loads its own.
 Each form releases

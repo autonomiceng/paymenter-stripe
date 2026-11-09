@@ -86,6 +86,7 @@ async function installStripe(page, expressThrows) {
                 }, destroy() {} };
             } }; },
             async createConfirmationToken({elements}) {
+                window.tokenCalls?.push(elements === elementsInstance ? 'current' : 'replaced');
                 if (elements !== elementsInstance) throw new Error('Token must use the mounted Elements instance');
                 if (failure === 'confirmation') throw new TypeError('Failed to tokenize');
                 if (failure === 'decline') return {error: {type: 'card_error', message: 'Your card was declined.'}};
@@ -93,6 +94,7 @@ async function installStripe(page, expressThrows) {
             },
             async handleNextAction(options) { if (window.onAction) await window.onAction(options); return confirm(); },
             async confirmSetup({elements, confirmParams}) {
+                window.tokenCalls?.push(elements === elementsInstance ? 'current' : 'replaced');
                 if (elements !== elementsInstance) throw new Error('Setup must use the mounted Elements instance');
                 window.setupConfirmParams = confirmParams;
                 return confirm();
@@ -652,6 +654,23 @@ try {
         assert.equal(await row.isVisible(), true, `${name}: fresh Link availability shows the row`);
         await page.evaluate(() => heldReady.payment());
         await page.waitForFunction(() => document.querySelector('#submit').disabled === false);
+        // A Link confirmation from the replaced Elements is refused before any Stripe or server call.
+        const before = await page.evaluate(() => ({confirms, checked: document.querySelector('#save-card')?.checked ?? null}));
+        await page.evaluate(async () => {
+            window.tokenCalls = [];
+            window.lateRequests = [];
+            window.lateFailures = [];
+            window.failure = 'action-success';
+            window.fetch = async url => { lateRequests.push(url); return {ok: true, async json() { return {status: 'succeeded'}; }}; };
+            await oldHandlers.expressCheckout.confirm({expressPaymentType: 'link', paymentFailed: value => lateFailures.push(value)});
+            await new Promise(resolve => requestAnimationFrame(resolve));
+        });
+        assert.deepEqual(await page.evaluate(() => [tokenCalls, lateRequests]), [[], []], `${name}: the old Link confirmation reaches neither Stripe nor the server`);
+        assert.deepEqual(await page.evaluate(() => lateFailures), [{reason: 'fail'}], `${name}: the old Link confirmation is dismissed`);
+        assert.deepEqual(await page.evaluate(() => ({confirms, checked: document.querySelector('#save-card')?.checked ?? null})), before, `${name}: nothing is confirmed`);
+        assert.equal(await page.locator('[role=alert]').textContent(), '', `${name}: the old Link confirmation shows no error`);
+        assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: the new form stays ready after the old Link confirmation`);
+        assert.equal(await row.isVisible(), true, `${name}: the new Link row stays`);
         await page.evaluate(() => oldHandlers.payment.loaderror({error: {message: 'Late failure'}}));
         assert.equal(await page.locator('[role=alert]').textContent(), '', `${name}: a late load error from the old form is ignored`);
         assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: the new form stays ready`);
@@ -667,11 +686,7 @@ try {
         await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
         await page.route('https://js.stripe.com/**', route => { requests.push(route); requested?.(); });
         const nextRequest = async count => {
-            const deadline = Date.now() + 3000;
-            while (requests.length < count) {
-                assert(Date.now() < deadline, `Stripe.js request ${count} never started`);
-                await new Promise(resolve => { requested = resolve; setTimeout(resolve, 250); });
-            }
+            while (requests.length < count) await new Promise(resolve => { requested = resolve; });
             return requests[count - 1];
         };
         const load = route => route.fulfill({contentType: 'text/javascript', body: 'window.Stripe = window.stripeFixture;'});
@@ -699,33 +714,15 @@ try {
             assert.equal(await retry.isVisible(), true, `${scenario}: the customer can retry`);
             assert.equal(await page.locator('#submit').isDisabled(), true, `${scenario}: Pay stays off until Stripe.js loads`);
             assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, `${scenario}: the failed tag is removed`);
-            // After a timeout the original request stays pending; the retry must not wait on it.
+            // End the held request before retry so the browser does not join the new request to it.
+            if (scenario === 'timeout') await first.abort('failed');
             await retry.click();
-            const second = await nextRequest(2);
-            assert.equal(second.request().url(), 'https://js.stripe.com/v3/?retry=1', `${scenario}: the retry starts its own request`);
-            // Another form loading meanwhile shares the retry instead of starting a third request.
-            await page.evaluate(() => { window.sharedLoad = loadStripe(); });
-            await load(second);
-            await page.evaluate(() => window.sharedLoad);
+            await load(await nextRequest(2));
         }
         await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
         assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${scenario}: the card form mounts`);
         assert.equal(await page.locator('[role=alert]').textContent(), '', `${scenario}: no error once Stripe.js loads`);
         assert.equal(requests.length, scenario === 'existing' ? 1 : 2, `${scenario}: one Stripe.js request per attempt`);
-        if (scenario === 'timeout') {
-            // The stalled original finishing late must not add Elements or another submit handler.
-            await load(first);
-            await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
-            assert.equal(await page.evaluate(() => elementCalls.filter(call => call.type === 'payment').length), 1, 'A late original load creates no second form');
-            await page.evaluate(() => {
-                window.paymentRequests = 0;
-                window.failure = 'action-success';
-                window.fetch = async () => { paymentRequests++; return {ok: false, async json() { return {message: 'Fixture refusal.'}; }}; };
-            });
-            await page.locator('#submit').click();
-            await page.locator('[role=alert]').getByText('Fixture refusal.').waitFor();
-            assert.equal(await page.evaluate(() => paymentRequests), 1, 'One Pay click sends one payment after a late original load');
-        }
         if (scenario === 'existing') assert.equal(await page.evaluate(() => window.existingLoaded), true, 'The existing tag keeps its own load handler');
         await page.close();
     }

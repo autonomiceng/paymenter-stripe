@@ -2,7 +2,7 @@
 // The load state lives on window, so every form and every reopen on the page shares one request.
 function loadStripe() {
     if (window.Stripe) return Promise.resolve();
-    const state = window.aeStripeLoader ??= {pending: null, timedOut: new WeakSet(), failures: 0};
+    const state = window.aeStripeLoader ??= {pending: null, timedOut: new WeakSet()};
     if (!state.pending) {
         state.pending = new Promise((resolve, reject) => {
             let existingScript = document.querySelector('script[src^="https://js.stripe.com/v3"]');
@@ -27,7 +27,6 @@ function loadStripe() {
             const failed = () => {
                 cleanup();
                 state.pending = null;
-                state.failures = (state.failures || 0) + 1;
                 if (existingScript && !window.Stripe) state.timedOut.add(existingScript);
                 if (!existingScript) script.remove();
                 reject(new Error('Could not load Stripe.js.'));
@@ -41,11 +40,7 @@ function loadStripe() {
                 script.addEventListener('load', loaded, {once: true});
                 script.addEventListener('error', failed, {once: true});
             } else {
-                // The browser joins a request for the same URL to one still pending, even after its tag
-                // is removed, so a retry after a stalled load would wait on it. Stripe.js accepts query
-                // parameters on its script URL; each retry adds its count to start its own request.
-                // A late original load then only repeats Stripe.js, which keeps the first Stripe global.
-                script.src = 'https://js.stripe.com/v3/' + (state.failures ? `?retry=${state.failures}` : '');
+                script.src = 'https://js.stripe.com/v3/';
                 script.async = true;
                 script.onload = loaded;
                 script.onerror = () => { failed(); };
