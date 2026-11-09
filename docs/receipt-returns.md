@@ -91,6 +91,61 @@ matching refund will be recovered automatically. A missing old refund requires
 Stripe request-log/support evidence before finance takes any external action.
 Never clear a reservation to retry.
 
+## Automatic overpayment returns
+
+A successful checkout or bound subscription charge on an already paid invoice is
+recorded in full. Each validated excess reserves one row in the extension-owned
+`ae_stripe_receipt_returns` table, in the settlement transaction. Install/upgrade
+creates the table; native profile properties contain no receipt history. After
+commit, AE Stripe returns the excess to the original method. The five-minute
+`ae-stripe:receipt-returns` task selects up to 100 indexed due allocations, including
+completed returns whose current notice has not been delivered, and stops on a
+connection or authentication failure. Refund read/write access is required.
+
+Each immutable allocation has a payment/allocation/amount-bound idempotency key.
+Recovery verifies customer, currency, dispute status and complete refund history
+before sending. A first-send marker commits before HTTP. Matching refund metadata
+recovers a lost response; unknown sends are not replayed after our 23-hour boundary
+because Stripe may expire keys after 24 hours. Pending refunds remain reserved.
+Only a proved failed/canceled refund on an undisputed receipt becomes account
+credit. `refund.failed`/`refund.updated` also recover a failure after a succeeded
+notice, keeping the same native adjustment identity. Saving gateway settings adds
+these subscriptions to an existing endpoint in place; verify this on upgrade.
+
+Ordinary receipts retain their full positive native transaction. Completion adds
+one keyed negative transaction, marked as a credit transaction only for credit
+fallback. Credit, adjustment and completion commit atomically. Audit entries and
+customer notices show progress, completion or a problem; notification retries
+compare against the current state/reason, so a prior pending notice cannot hide a
+missing completion notice. Exercise both pending-to-refunded and pending-to-credit
+with notice insertion interrupted after settlement, then recover by the sweep alone.
+
+A successful checkout or exactly bound subscription payment on a closed invoice
+returns the whole receipt automatically.
+Until completion it has no new succeeded native funding. Completion posts the
++receipt/-return pair atomically without native transaction events, preserving the
+closed invoice and preventing activation. Verify with native observers and the
+combined stale-form authentication/cancellation flow. Domains' late-money scan sees
+no new settled funding while pending and zero net funding afterward; AE Stripe's
+`excess` allocation owns the receipt. Check both Domains scans before and after the
+return, with duplicate webhook, return-page and scheduler deliveries.
+For subscriptions, omit checkout metadata from the PaymentIntent. Interrupt the
+first recovery, then run only the receipt sweep: it must re-read the stored Stripe
+invoice and its complete paid-payment list, verify binding/customer/currency/amount,
+and return the whole receipt once. Changed binding or unrelated payment membership
+must stop without a refund or credit. Retiring the checkout property must preserve
+the return allocation and its recovery markers.
+
+External refunds, disputes, incomplete history and expired unknown sends surface
+an invoice-linked problem and resolution path. Access problems keep retrying;
+neither unknown refunds nor a 409 allows another refund or independent credit.
+Customer/currency conflicts still use payment review because ownership cannot be
+proved. Historical excess is not inferred from today's balance. The
+shared receipt-return API above can adopt a verified historical
+native receipt for a caller's proved entitlement. Refunds created in the Stripe
+Dashboard are not coordinated with this flow; Dashboard actions are not serialized
+with API reads.
+
 ## Refund and dispute observations
 
 Dashboard refunds (`refund.created`, `refund.updated`, `refund.failed`) and disputes
