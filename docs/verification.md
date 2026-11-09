@@ -26,9 +26,13 @@ before it confirms, and no choice waits on a box or fails for a missing tick. Th
 see [Auto Pay integration](auto-pay.md) for the theme calls and dates.
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.
+Both forms load Stripe.js through `stripe-form.blade.php`, which shares one request per page.
+When Stripe.js or the Payment Element fails to load, the alert shows "Could not load the payment form.
+Check your connection and try again." with a Try again button that loads the form again.
 Browser-check both pay and setup views inside the theme's teleported modal (default theme `x-teleport="body"`).
 Offline browser coverage in `tests/setup-modal.mjs` (CI browser matrix) checks repeated setup opens,
-declines, consent failures and closing during Stripe.js loading.
+declines, consent failures and closing during Stripe.js loading; `tests/payment-errors.mjs`
+checks the pay form's load timeout, load error, Try again and reuse of an existing tag.
 Fresh Stripe.js loads have a 30-second bound; timed-out owned tags are removed for retry.
 Reused tags keep a five-second wait and preserve the owner's tag.
 After a timeout, error event or load without the library, retry skips the foreign tag and loads its own.

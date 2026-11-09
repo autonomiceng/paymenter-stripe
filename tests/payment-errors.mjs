@@ -11,6 +11,7 @@ function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hostin
     let source = readFileSync(new URL(`${name}.blade.php`, views), 'utf8')
         .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
         .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(new URL('stripe-elements.blade.php', views), 'utf8'))
+        .replace("@include('gateways.ae-stripe::stripe-form')", () => readFileSync(new URL('stripe-form.blade.php', views), 'utf8'))
         .replace(/@if\(config\('settings.tos'\)\)[\s\S]*?@endif/g, '')
         .replace(/@js\(route\('([^']+)'\)\)/g, (_, route) => JSON.stringify('/' + route))
         .replace("@js(route('invoices.show', $invoice) . '?checkPayment=true')", "'/return'")
@@ -121,8 +122,8 @@ try {
         await installStripe(page, expressThrows);
         await page.setContent(render(name, linkDisplay, businessName));
         if (name === 'pay') {
-            await page.waitForFunction(() => !!document.querySelector('script[src]'));
             await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
+            assert.equal(await page.locator('script[src]').count(), 0, 'Stripe.js already on the page needs no second request');
             const options = await page.evaluate(() => elementOptions);
             assert.equal(options.mode, 'payment');
             assert.equal(options.amount, 2000);
@@ -588,6 +589,56 @@ try {
         const expected = new URL(destination);
         expected.searchParams.set('checkPayment', 'true'); expected.searchParams.set('saved_notice', 'b'.repeat(32));
         await page.waitForURL(expected.toString());
+        await page.close();
+    }
+    // Stripe.js that fails or never loads shows the error with Try again; a Stripe.js tag already on the page is reused.
+    if (forms.includes('pay')) for (const scenario of ['timeout', 'error', 'existing']) {
+        const page = activePage = await browser.newPage({viewport: {width: 390, height: 844}});
+        page.setDefaultTimeout(5000);
+        await page.clock.install();
+        const requests = [];
+        let requested = null;
+        await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
+        await page.route('https://js.stripe.com/**', route => { requests.push(route); requested?.(); });
+        const nextRequest = async count => {
+            while (requests.length < count) await new Promise(resolve => { requested = resolve; });
+            return requests[count - 1];
+        };
+        const load = route => route.fulfill({contentType: 'text/javascript', body: 'window.Stripe = window.stripeFixture;'});
+        await page.setContent('<html><body></body></html>');
+        await installStripe(page, false);
+        await page.evaluate(() => { window.stripeFixture = window.Stripe; delete window.Stripe; });
+        const existing = scenario === 'existing'
+            ? '<script id="existing-stripe" src="https://js.stripe.com/v3/" async onload="window.existingLoaded = true"></script>' : '';
+        await page.setContent(existing + render('pay'), {waitUntil: 'domcontentloaded'});
+        const first = await nextRequest(1);
+        const alert = page.locator('[role=alert] p');
+        const retry = page.getByRole('button', {name: 'Try again'});
+        if (scenario === 'existing') {
+            assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'Pay reuses the Stripe.js tag already on the page');
+            await load(first);
+        } else {
+            if (scenario === 'timeout') {
+                await page.clock.fastForward(29000);
+                assert.equal(await page.locator('[role=alert]').textContent(), '', 'A slow Stripe.js load gets the full wait');
+                assert.equal(await page.locator('#submit').isDisabled(), true, 'Pay waits for Stripe.js');
+                await page.clock.fastForward(1000);
+            } else await first.abort('failed');
+            await alert.waitFor();
+            assert.equal(await alert.textContent(), 'Could not load the payment form. Check your connection and try again.', `${scenario}: the customer sees why`);
+            assert.equal(await retry.isVisible(), true, `${scenario}: the customer can retry`);
+            assert.equal(await page.locator('#submit').isDisabled(), true, `${scenario}: Pay stays off until Stripe.js loads`);
+            assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, `${scenario}: the failed tag is removed`);
+            // End the held request before retry so the browser does not join the new request to it.
+            if (scenario === 'timeout') await first.abort('failed');
+            await retry.click();
+            await load(await nextRequest(2));
+        }
+        await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
+        assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${scenario}: the card form mounts`);
+        assert.equal(await page.locator('[role=alert]').textContent(), '', `${scenario}: no error once Stripe.js loads`);
+        assert.equal(requests.length, scenario === 'existing' ? 1 : 2, `${scenario}: one Stripe.js request per attempt`);
+        if (scenario === 'existing') assert.equal(await page.evaluate(() => window.existingLoaded), true, 'The existing tag keeps its own load handler');
         await page.close();
     }
     console.log('Pay and setup network failures, retry and card declines passed.');

@@ -15,6 +15,7 @@ let view = readFileSync(`${root}extension/AeStripe/resources/views/billing-agree
     .replace(/\{\{--[\s\S]*?--\}\}/g, '')
     .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
     .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(`${root}extension/AeStripe/resources/views/stripe-elements.blade.php`, 'utf8'))
+    .replace("@include('gateways.ae-stripe::stripe-form')", () => readFileSync(`${root}extension/AeStripe/resources/views/stripe-form.blade.php`, 'utf8'))
     .replace('@js($linkDisplay)', "'above_card'")
     .replace('@js($businessName)', "'Fixture Hosting'")
     .replace(/@if\(config\('settings.tos'\)\)[\s\S]*?@endif/g, '')
