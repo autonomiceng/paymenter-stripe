@@ -56,3 +56,39 @@ jobs:
           PAY_PENDING_MATRIX: '1'
           TMPDIR: ${{ runner.temp }}
         run: php -d memory_limit=256M tests/run.php
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # v2.36.0
+        with:
+          php-version: '8.4.27'
+          extensions: bcmath, curl, dom, fileinfo, gd, intl, mbstring, pdo_mysql, pdo_sqlite, sqlite3, zip
+          tools: composer:v2
+          coverage: none
+      - name: Provision pinned public Paymenter 1.5.9
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 https://codeload.github.com/Paymenter/Paymenter/tar.gz/ee729f7d99ac18942625b79f3f93d8d8b21255e8 -o "$RUNNER_TEMP/paymenter.tar.gz"
+          echo "0b8e6c9f3b9c28aa69ee4c2978ec544814a70edb3e96a4ae3bc150a0acee6c1c  $RUNNER_TEMP/paymenter.tar.gz" | sha256sum --check
+          mkdir "$RUNNER_TEMP/paymenter"
+          tar -xzf "$RUNNER_TEMP/paymenter.tar.gz" --strip-components=1 -C "$RUNNER_TEMP/paymenter"
+          composer install --working-dir="$RUNNER_TEMP/paymenter" --no-interaction --prefer-dist --no-progress --no-scripts
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.22.1'
+      - name: Install pinned Playwright Chromium
+        run: |
+          npm install --prefix "$RUNNER_TEMP/stripe-browser" --ignore-scripts --no-audit --no-fund playwright@1.58.2
+          "$RUNNER_TEMP/stripe-browser/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Run browser checks (payment errors, setup modal, notice polling)
+        env:
+          PAYMENTER_TEST_APP: ${{ runner.temp }}/paymenter
+          PAY_PENDING_MATRIX: browser
+          PLAYWRIGHT_MODULE: ${{ runner.temp }}/stripe-browser/node_modules/playwright
+          TMPDIR: ${{ runner.temp }}
+        run: php -d memory_limit=256M tests/run.php

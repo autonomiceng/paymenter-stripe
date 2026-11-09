@@ -22,14 +22,19 @@ Use Conventional Commits and preserve contributor attribution; no generated-by t
 Describe changed behavior, validation and remaining limits in each pull request.
 Contributions use the project's [MIT license](LICENSE).
 
-Optional command-registration check against an installed Paymenter 1.5.9 vendor tree:
-`php -n tests/conversion-bootstrap.php /path/to/paymenter`. It uses local database
-fakes and never boots the referenced application or connects to its database.
+CI also runs two matrices against the pinned public Paymenter 1.5.9 (a pristine
+release with `vendor` installed and no `.env`). Run them locally the same way:
 
-The modal regression uses Playwright and an installed Paymenter Livewire script:
-`PLAYWRIGHT_MODULE=/path/to/playwright LIVEWIRE_SCRIPT=/path/to/paymenter/vendor/livewire/livewire/dist/livewire.js node tests/setup-modal.mjs`.
-It renders the setup view inside a teleported Livewire modal. Stripe.js, consent
-requests and Livewire responses are local fixtures; no server or Stripe account is needed.
+```sh
+PAYMENTER_TEST_APP=/path/to/paymenter PAY_PENDING_MATRIX=1 php tests/run.php
+PAYMENTER_TEST_APP=/path/to/paymenter PAY_PENDING_MATRIX=browser PLAYWRIGHT_MODULE=/path/to/playwright php tests/run.php
+```
 
-The payment error regression runs both production forms with offline Stripe and browser
-network failures: `PLAYWRIGHT_MODULE=/path/to/playwright node tests/payment-errors.mjs`.
+The native matrix boots each case in its own process on in-memory SQLite. It also runs
+the standalone native files and the command-registration check, which never boots the
+application or connects to its database. The browser matrix runs `tests/payment-errors.mjs`
+(both production forms with offline Stripe and network failures), `tests/setup-modal.mjs`
+(the setup view inside a teleported Livewire modal) and the native notice poll. Stripe.js,
+consent requests and Livewire responses are local fixtures; no server or Stripe account is
+needed. `LIVEWIRE_SCRIPT` defaults to the release's Livewire script. A new test file must be
+reached from one of these entry points; the offline run fails otherwise.

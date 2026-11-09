@@ -5,10 +5,6 @@ if (getenv('PAY_CLEANUP_CASE') === 'notice-native' || getenv('PAY_BINDING_CASE')
     require __DIR__ . '/native-saved-notices.php';
     return;
 }
-if (getenv('PAY_CHECKOUT_BROWSER')) {
-    $run = proc_open([getenv('PAYMENTER_TEST_NODE') ?: 'node', __DIR__ . '/payment-errors.mjs', 'pay'], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
-    exit(proc_close($run));
-}
 require __DIR__ . '/fakes.php';
 require __DIR__ . '/../extension/AeStripe/AeStripe.php';
 

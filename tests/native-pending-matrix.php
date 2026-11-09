@@ -19,10 +19,28 @@ foreach (['401', '403', '429', '503', 'connection'] as $error) $cases[] = 'follo
 foreach (['transfer-race', 'transfer-order', 'method-404', 'orphans', 'retention', 'rotation', 'row-400', 'row-402', 'row-409', 'backoff', 'diagnostics', 'late-notice', 'delay-notice',
     'replacement', 'prune-isolation', 'terminal-status', 'diagnostics-account', 'method-row-400', 'method-row-402', 'method-row-409', 'logging', 'clean-log', 'backoff-fresh', 'render-pcre'] as $suffix) $cases[] = 'final-' . $suffix;
 foreach (['401', '403', '429', '503', 'connection'] as $error) $cases[] = 'final-method-' . $error;
-putenv('PAY_PENDING_MATRIX');
-foreach ($cases as $case) {
-    putenv('PAY_CHECKOUT_NATIVE=' . $case);
-    $process = proc_open([getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY, '-d', 'memory_limit=256M', __DIR__ . '/run.php'], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
-    if (!is_resource($process) || proc_close($process) !== 0) throw new RuntimeException('Native integration failed: ' . $case);
+$php = getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY;
+$runner = [$php, '-d', 'memory_limit=256M', __DIR__ . '/run.php'];
+$runs = [];
+if (getenv('PAY_PENDING_MATRIX') === 'browser') {
+    // Playwright drives the production views; Stripe.js, Livewire responses and HTTP are local fixtures.
+    $node = getenv('PAYMENTER_TEST_NODE') ?: 'node';
+    putenv('LIVEWIRE_SCRIPT=' . (getenv('LIVEWIRE_SCRIPT') ?: $app . '/vendor/livewire/livewire/dist/livewire.js'));
+    $runs[] = ['final-browser', ['PAY_CHECKOUT_NATIVE' => 'final-browser'], $runner];
+    foreach (['payment-errors.mjs', 'setup-modal.mjs'] as $file) $runs[] = [$file, [], [$node, __DIR__ . '/' . $file]];
+} else {
+    foreach ($cases as $case) $runs[] = [$case, ['PAY_CHECKOUT_NATIVE' => $case], $runner];
+    $runs[] = ['notice-native', ['PAY_CLEANUP_CASE' => 'notice-native'], $runner];
+    $runs[] = ['binding-native', ['PAY_BINDING_CASE' => 'native'], $runner];
+    foreach (['native-transaction-method.php', 'native-receipt-returns.php', 'native-auto-pay-consent.php'] as $file) {
+        $runs[] = [$file, [], [$php, '-d', 'memory_limit=256M', __DIR__ . '/' . $file]];
+    }
+    $runs[] = ['conversion-bootstrap.php', [], [$php, '-n', __DIR__ . '/conversion-bootstrap.php', $app]];
 }
-echo 'PASS: ' . count($cases) . " isolated native pending cases\n";
+putenv('PAY_PENDING_MATRIX');
+foreach ($runs as [$label, $environment, $command]) {
+    foreach (['PAY_CHECKOUT_NATIVE', 'PAY_CLEANUP_CASE', 'PAY_BINDING_CASE'] as $name) putenv(isset($environment[$name]) ? $name . '=' . $environment[$name] : $name);
+    $process = proc_open($command, [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
+    if (!is_resource($process) || proc_close($process) !== 0) throw new RuntimeException('Native integration failed: ' . $label);
+}
+echo 'PASS: ' . count($runs) . " isolated native runs\n";
