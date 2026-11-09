@@ -1,5 +1,11 @@
 # Verification
 
+What the gateway guarantees and how each guarantee is checked. Topic details live in
+[Auto Pay](auto-pay.md), [saved cards](saved-cards.md), [receipt returns](receipt-returns.md)
+and [migrating from bundled Stripe](migrating-from-bundled.md).
+
+## Offline checks
+
 Offline, with PHP 8.3+ and Python 3:
 
 ```sh
@@ -10,6 +16,31 @@ python3 tools/build_release.py --output dist/AeStripe.zip
 ```
 
 Upgrade through the native admin upload over an installed copy; root PHP files must declare only classes for Paymenter 1.5.9 `getExtensionType()`.
+
+The CI native matrix (`PAY_PENDING_MATRIX=1`, see [contributing](../CONTRIBUTING.md)) runs the native
+suites against a pristine Paymenter release's dependencies. `tests/native-transaction-method.php`
+verifies migration, upgrade, unique key, foreign key and rollback on SQLite.
+`tests/native-receipt-returns.php` covers independent allocation rows beyond the old aggregate
+TEXT limit, due-work indexing, native closed-invoice event suppression and cash/credit
+classification. The matrix also runs every suite in `tests/native-suites.php`; the receipt
+return, reversal and review suite uses real Paymenter models, listeners and invoice transactions.
+Run it alone with `PAYMENTER_TEST_APP=/path/to/pristine-release php tests/run.php --receipt-returns`.
+These tests use disposable in-memory SQLite, never the installed application database.
+
+`tests/native-auto-pay-consent.php` verifies that the minimal `{"enabled":false}` request clears
+the account default with the gateway enabled or paused. This exercises the real Laravel request
+validator and native property deletion; the ordinary offline Request fake skips validation.
+
+Native pending integration is provisioned in public CI from Paymenter 1.5.9 commit
+`ee729f7d99ac18942625b79f3f93d8d8b21255e8` with its locked Composer dependencies, PHP 8.4.27
+and SQLite. Run `PAYMENTER_TEST_APP=/path/to/release PAY_PENDING_MATRIX=1 php tests/run.php`
+to select the same isolated cases locally. `PAYMENTER_TEST_PHP` can select a local PHP wrapper.
+Missing dependencies or an explicitly selected missing theme fail. The public job uses only the
+public default theme, synthetic credentials and fake HTTP with stray requests forbidden. An
+authorized private integration run can additionally set `PAY_NOTICE_THEME` to its pinned theme;
+private theme source and credentials never enter the public workflow.
+
+## Consent
 
 Account setup shows one consent line above both choices: “By saving with Link or a
 card, you agree to save it for future charges, including renewals.” The configured Terms link stays beside it.
@@ -24,6 +55,21 @@ The line appears before the Stripe controls, so the customer reads it before
 choosing. Choosing Link or Save card is the agreement: the form records consent
 before it confirms, and no choice waits on a box or fails for a missing tick. The separate account switch requires fresh `auto_pay_account_v1` consent;
 see [Auto Pay integration](auto-pay.md) for the theme calls and dates.
+
+Checkout's opt-in covers card and Link only. New-card token collection and confirmation
+use matching card and Link `setup_future_usage`: `off_session` when checked, `none` otherwise.
+Token collection waits for Stripe.js v3's `update-end` before submitting the updated Elements.
+The consent endpoint sets method-specific values to `none` when unchecked; confirmation clears top-level
+future usage left by earlier versions. Saving requires
+consent metadata and `off_session` for the actual method type. Bank debits are not saved by this checkout opt-in.
+Offline regressions cover $10.99 with saving on/off and a bank decline with a visible, clickable
+Refresh payment form action. Both method-specific options still need a live pinned-Basil check.
+
+Pending Auto Pay setup for new services is in
+[Auto Pay](auto-pay.md#pending-setup-for-new-services).
+
+## Checkout and Stripe.js
+
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.
 Both forms load Stripe.js through `stripe-form.blade.php`, which shares one request per page.
@@ -48,35 +94,6 @@ A stored intent that cannot be retrieved, including a 404 after changing API key
 also needs reconciliation in its original Stripe account. Lookup failures never
 start a replacement intent.
 
-Tests execute the gateway with PHP-only model, lock and HTTP fakes; unexpected
-HTTP requests fail. No Stripe or application server is contacted. They verify
-customer binding, consent, intent updates, agreement retry keys/locking, labels,
-signatures, disabled handling and monotonic successful payments. Amounts use
-integer minor units with half-up rounding and Stripe zero-decimal currencies
-(including the UGX/ISK whole-unit, two-decimal API compatibility representation);
-subscription price updates preserve service quantity. Setup subscriptions skip services
-already linked to Stripe, repair an interrupted listener marker write, and persist immutable schedule payloads and SetupIntent/service
-retry keys before remote creation. Completed schedule IDs survive local write failures;
-unresolved attempts older than 23 hours require reconciliation, not another schedule.
-Subscription invoice creation binds a single pending related invoice in Stripe metadata
-before finalizing/paying, recovering the current immutable binding on retries; ambiguous creation and unbound success events require manual
-reconciliation. Success requires that exact related invoice, the same owner and matching
-currency. A bound paid invoice retains a late successful payment; a bound closed
-invoice returns the whole receipt automatically. Unbound and mismatched receipts
-retain staff review. Split payments require manual reconciliation.
-Both delivery paths serialize settlement on the customer and use locking current
-reads to skip a successful transaction globally, so one PaymentIntent cannot settle two local invoices. A resumed
-3DS attempt shows and preserves its existing consent without changing payment preferences.
-
-Agreement saves use a locking current read by the globally unique payment method
-reference, including soft-deleted rows. Retries reuse only the same user's agreement
-on the same gateway, including after an insert race. Removed methods stay removed
-to preserve the deletion and service payment preferences. The setup return shows a
-clear refusal notification; webhooks log and acknowledge permanent ownership or
-deletion conflicts. Request and database failures remain retryable. Offline tests
-cover stale snapshots and insert conflicts with fakes; real MariaDB concurrency
-still needs the sandbox checks below.
-
 Saved-card Pay, checkout and cron share `ae_stripe_checkout_<invoice-id>` in native
 user properties. New records have `version: 2`. Creation reserves a key and immutable
 parameters before HTTP and never confirms or supplies a card. Elements attempts use default
@@ -87,9 +104,7 @@ plus manual payment-method creation. It offers only card and Link (`paymentMetho
 and new Elements intents explicitly use the same `payment_method_types`.
 Opening checkout retires an older mismatched form only after confirmed cancellation without funds;
 an already open mismatched form cannot confirm a token. Processing and partial payments stay protected.
-Ilya checked creation in Stripe test mode on 2026-10-30 at 12:00 PM PT (2025-07-30.basil): manual confirmation alone returned 200; adding automatic_payment_methods returned 400.
-The live pass on 2026-10-30 then proved Elements tokens are rejected on manual intents.
-Elements now uses the documented automatic flow; its real Stripe acceptance must be checked again.
+
 Payment Elements keep Link and its default-on sign-up box (see [Auto Pay](auto-pay.md#stripe-link));
 automated card tests untick `linkOptIn` in the Stripe frame.
 Submission sends a ConfirmationToken to the authenticated,
@@ -111,6 +126,64 @@ Native manual authentication and bank verification still reconfirm under the ser
 After a resumed payment declines, the form requires a refresh before accepting another card;
 the refreshed checkout retires the unfunded old payment before preparing a replacement. Card/Link saving consent remains explicit and method-specific.
 The GET payment return compares Stripe's redirect secret before any write. Missing or wrong secrets show read-only status with an invoice link; the webhook, recovery or authenticated payment form can still finish it.
+
+Customer setup failures stop checkout with a plain retry message. A rejected Customer
+Session request logs only the invoice ID and HTTP status; checkout still accepts a
+new payment method without saved-method redisplay. Permanent saved-method customer
+mismatches are logged and acknowledged after settlement. Transient request and local
+persistence failures remain retryable; retries preserve one payment and one agreement.
+Verify Customer Session failure and recovery in the sandbox as well as normal redisplay.
+
+Checkout references (read for the deferred integration):
+- https://docs.stripe.com/payments/finalize-payments-on-the-server?platform=web&type=payment
+- https://docs.stripe.com/js/elements_object/create_without_intent
+- https://docs.stripe.com/payments/payment-element/migration-ct
+- https://docs.stripe.com/api/payment_intents/confirm
+- https://docs.stripe.com/api/payment_intents/update
+- https://docs.stripe.com/api/payment_intents/cancel
+
+Offline Elements checks use local Stripe.js and HTTP fixtures. They do not prove Stripe accepts the new automatic token flow, CustomerSession tokens, saving options, 3DS completion or redirects. A fixture rejects the manual/Elements pairing using the observed live error; it is not provider acceptance evidence. Validate those combinations in test mode on the pinned API version before release.
+
+## Settlement and locking
+
+Tests execute the gateway with PHP-only model, lock and HTTP fakes; unexpected
+HTTP requests fail. No Stripe or application server is contacted. They verify
+customer binding, consent, intent updates, agreement retry keys/locking, labels,
+signatures, disabled handling and monotonic successful payments. Amounts use
+integer minor units with half-up rounding and Stripe zero-decimal currencies
+(including the UGX/ISK whole-unit, two-decimal API compatibility representation);
+subscription price updates preserve service quantity. Setup subscriptions skip services
+already linked to Stripe, repair an interrupted listener marker write, and persist immutable schedule payloads and SetupIntent/service
+retry keys before remote creation. Completed schedule IDs survive local write failures;
+unresolved attempts older than 23 hours require reconciliation, not another schedule.
+Subscription invoice creation binds a single pending related invoice in Stripe metadata
+before finalizing/paying, recovering the current immutable binding on retries; ambiguous creation and unbound success events require manual
+reconciliation. Success requires that exact related invoice, the same owner and matching
+currency. A bound paid invoice retains a late successful payment; a bound closed
+invoice returns the whole receipt automatically. Unbound and mismatched receipts
+retain staff review. Split payments require manual reconciliation.
+Both delivery paths serialize settlement on the customer and use locking current
+reads to skip a successful transaction globally, so one PaymentIntent cannot settle two local invoices. A resumed
+3DS attempt shows and preserves its existing consent without changing payment preferences.
+
+Successful transactions and review records use the PaymentIntent's `amount_received`,
+in its original currency. Subscription settlement retrieves the PaymentIntent before
+recording it; lookup failures leave the webhook retryable. Processing and failed
+transactions retain the intended `amount`. The extension does not request manual
+capture. Verify differing intended and received amounts in the sandbox as well.
+
+Unresolved subscription successes retain one `ae_stripe_subscription_review`
+entry per Stripe invoice in System > Audits. This covers
+missing services or bindings and incomplete or split payments. Review the Stripe
+invoice before applying money. Refund events for owned receipt allocations are handled; other refund and dispute reconciliation remains outside this flow.
+Offline concurrency tests interleave deliveries before lock acquisition; validate
+real database exclusion, migration upgrades, scheduler discovery and staff inbox
+delivery in the Paymenter sandbox before release.
+
+Overpayments and payments on closed invoices are returned automatically; see
+[receipt returns](receipt-returns.md#automatic-overpayment-returns).
+
+## Charge recovery
 
 A lost confirm response is recovered by intent ID, beyond key expiry. An unconfirmed
 creation can be abandoned after 23 hours because it cannot have taken money. No frozen
@@ -171,182 +244,10 @@ requires a known succeeded or canceled intent and records staff evidence that it
 were refunded or credited; late deliveries then cannot apply those funds again. Processing
 intents cannot be released this way. Stripe cannot choose how to account for these funds,
 so staff must verify that legacy reconciliation step. Known IDs keep retrying after access to the original
-Stripe account is restored. New, validated excess receipts use the automatic return flow below.
+Stripe account is restored. New, validated excess receipts use the
+[automatic return flow](receipt-returns.md#automatic-overpayment-returns).
 Reconcile `ae_stripe_subscription_<service-id>` separately before removing an unresolved
 schedule attempt; subscription behavior is unchanged by charge-attempt recovery.
-Fakes do not
-prove real database isolation, native uploader/route behavior or Stripe.js/API
-compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
-
-- Install beside bundled Stripe; ensure unique routes/views/config and no
-  duplicate subscription listeners even when bundled Stripe is disabled.
-- Check CustomerSession feature names on pinned Basil, restricted-key access,
-  `customerSessionClientSecret`, saved-card selection and Link email display.
-- Verify setup cannot save without recorded consent, the consent POST completes before `confirmSetup`, and its `off_session_v2` terms, authenticated user ID and acceptance time survive
-  redirect and webhook retries. Refused consent must prevent both Link and card confirmation at phone and desktop widths and permit retry.
-- Verify own-customer isolation, legacy unspecified-redisplay exclusions and
-  account setup redisplay. Test card, wallet and Link with saving checked/clear.
-- First verify ConfirmationTokens with deferred Elements (`mode`, amount, currency), Customer Sessions and automatic confirmation
-  on pinned Basil, including card, Link, SEPA/ACH mandates, declines, 3DS and bank redirects.
-  Check that the pay form and account setup offer only card and Link before release.
-  Check the bank/3DS error page and its invoice link. Check method-specific `setup_future_usage=none` when unchecked and preservation of consent after authentication.
-- Run concurrent success deliveries/setup redirects against the real database;
-  assert one agreement/transaction, preserved success after late failed/processing
-  events, no automatic service assignment from saving a method, and unchanged existing Auto Pay.
-- With fresh account-default consent, create a recurring service and verify it inherits
-  the chosen card. Turning it off must unlink every service, including ones linked before
-  the account switch, and stop any waiting renewal retry.
-- Reject bad/stale signatures; disable the fork and confirm 503/no effects.
-  Rehearse migration and legacy subscription billing/cancellation end to end.
-
-Customer setup failures stop checkout with a plain retry message. A rejected Customer
-Session request logs only the invoice ID and HTTP status; checkout still accepts a
-new payment method without saved-method redisplay. Permanent saved-method customer
-mismatches are logged and acknowledged after settlement. Transient request and local
-persistence failures remain retryable; retries preserve one payment and one agreement.
-Verify Customer Session failure and recovery in the sandbox as well as normal redisplay.
-
-Checkout's opt-in covers card and Link only. New-card token collection and confirmation
-use matching card and Link `setup_future_usage`: `off_session` when checked, `none` otherwise.
-Token collection waits for Stripe.js v3's `update-end` before submitting the updated Elements.
-The consent endpoint sets method-specific values to `none` when unchecked; confirmation clears top-level
-future usage left by earlier versions. Saving requires
-consent metadata and `off_session` for the actual method type. Bank debits are not saved by this checkout opt-in.
-Offline regressions cover $10.99 with saving on/off and a bank decline with a visible, clickable
-Refresh payment form action. Both method-specific options still need a live pinned-Basil check.
-
-A successful checkout or bound subscription charge on an already paid invoice is
-recorded in full. Each validated excess reserves one row in the extension-owned
-`ae_stripe_receipt_returns` table, in the settlement transaction. Install/upgrade
-creates the table; native profile properties contain no receipt history. After
-commit, AE Stripe returns the excess to the original method. The five-minute
-`ae-stripe:receipt-returns` task selects up to 100 indexed due allocations, including
-completed returns whose current notice has not been delivered, and stops on a
-connection or authentication failure. Refund read/write access is required.
-
-Each immutable allocation has a payment/allocation/amount-bound idempotency key.
-Recovery verifies customer, currency, dispute status and complete refund history
-before sending. A first-send marker commits before HTTP. Matching refund metadata
-recovers a lost response; unknown sends are not replayed after our 23-hour boundary
-because Stripe may expire keys after 24 hours. Pending refunds remain reserved.
-Only a proved failed/canceled refund on an undisputed receipt becomes account
-credit. `refund.failed`/`refund.updated` also recover a failure after a succeeded
-notice, keeping the same native adjustment identity. Saving gateway settings adds
-these subscriptions to an existing endpoint in place; verify this on upgrade.
-
-Ordinary receipts retain their full positive native transaction. Completion adds
-one keyed negative transaction, marked as a credit transaction only for credit
-fallback. Credit, adjustment and completion commit atomically. Audit entries and
-customer notices show progress, completion or a problem; notification retries
-compare against the current state/reason, so a prior pending notice cannot hide a
-missing completion notice. Exercise both pending-to-refunded and pending-to-credit
-with notice insertion interrupted after settlement, then recover by the sweep alone.
-
-A successful checkout or exactly bound subscription payment on a closed invoice
-returns the whole receipt automatically.
-Until completion it has no new succeeded native funding. Completion posts the
-+receipt/-return pair atomically without native transaction events, preserving the
-closed invoice and preventing activation. Verify with native observers and the
-combined stale-form authentication/cancellation flow. Domains' late-money scan sees
-no new settled funding while pending and zero net funding afterward; AE Stripe's
-`excess` allocation owns the receipt. Check both Domains scans before and after the
-return, with duplicate webhook, return-page and scheduler deliveries.
-For subscriptions, omit checkout metadata from the PaymentIntent. Interrupt the
-first recovery, then run only the receipt sweep: it must re-read the stored Stripe
-invoice and its complete paid-payment list, verify binding/customer/currency/amount,
-and return the whole receipt once. Changed binding or unrelated payment membership
-must stop without a refund or credit. Retiring the checkout property must preserve
-the return allocation and its recovery markers.
-
-External refunds, disputes, incomplete history and expired unknown sends surface
-an invoice-linked problem and resolution path. Access problems keep retrying;
-neither unknown refunds nor a 409 allows another refund or independent credit.
-Customer/currency conflicts still use payment review because ownership cannot be
-proved. Historical excess is not inferred from today's balance. The
-[shared receipt-return API](receipt-returns.md) can adopt a verified historical
-native receipt for a caller's proved entitlement. Refunds created in the Stripe
-Dashboard are not coordinated with this flow; Dashboard actions are not serialized
-with API reads.
-
-Successful transactions and review records use the PaymentIntent's `amount_received`,
-in its original currency. Subscription settlement retrieves the PaymentIntent before
-recording it; lookup failures leave the webhook retryable. Processing and failed
-transactions retain the intended `amount`. The extension does not request manual
-capture. Verify differing intended and received amounts in the sandbox as well.
-
-An existing Stripe customer is replaced only when Stripe returns `deleted: true`
-or HTTP 404 with `resource_missing`. Other lookup failures stop the operation and
-preserve `stripe_id`. Before confirmation, consent updates also clear legacy
-top-level `setup_future_usage` with an empty form value. During authentication,
-consent changes still return 409 and resuming performs no update. Include an
-unfinished intent from the earlier release in the sandbox consent checks.
-
-Fee recovery requires read access to Charges, PaymentIntents, Invoices, Invoice
-Payments and Balance Transactions. Check the full [Stripe API permissions](settings.md#stripe-api-permissions)
-with the configured restricted key in the sandbox.
-
-Fee recovery uses the `ae_stripe_payment_fees` extension table, created on install
-or upgrade, with a fallback on the first fee operation. Keep Paymenter's scheduler running every minute. The hourly
-recovery task checks pending fees in batches of 100, ordered by attempt count.
-A missing balance transaction, missing fee data or invalid conversion rate stays pending.
-Pending funds already have a final fee. No rate is estimated.
-Stripe lookups finish before user and invoice locks serialize webhook and task writes. Completed records remain
-as replay guards. After 24 attempts or 72 hours, the record moves to `review`.
-Staff receive one native inbox notice per recipient. The invoice Audit Log and
-System > Audits retain a `ae_stripe_fee_review` entry with the identifiers and error.
-Deleted payments also move to review without blocking the next fee.
-Resolve these records manually against Stripe; do not delete completed records.
-Existing webhook endpoints may keep `charge.updated`; new endpoints also include
-`charge.succeeded`. A charge belonging to this gateway and awaiting native settlement returns 409 for retry.
-Foreign charges, refused payments and subscriptions held for review are acknowledged.
-Only paid, successful charges create fee records. Fees skipped before this upgrade
-have no recovery record and require manual reconciliation.
-
-Unresolved subscription successes retain one `ae_stripe_subscription_review`
-entry per Stripe invoice in System > Audits. This covers
-missing services or bindings and incomplete or split payments. Review the Stripe
-invoice before applying money. Refund events for owned receipt allocations are handled; other refund and dispute reconciliation remains outside this flow.
-Offline concurrency tests interleave deliveries before lock acquisition; validate
-real database exclusion, migration upgrades, scheduler discovery and staff inbox
-delivery in the Paymenter sandbox before release.
-
-Confirmed and processing payments retain a display label in the extension-owned
-`ae_stripe_transaction_methods` table, keyed by native invoice transaction ID.
-The install and upgrade hooks run its migration. Expanded latest-charge details
-need no lookup; an unexpanded charge needs one retrieve. Missing details or a
-failed lookup leave the label blank without changing settlement. A failed attempt clears its
-label so a later retry can record its own method. First successful settlement
-replaces any processing label with its own charge, even if the prior failure
-webhook has not arrived. The first successful label
-survives replayed success and late failure events. Link labels mask the email local
-part. No card numbers, fingerprints or complete provider objects are stored.
-Rendering never contacts Stripe. Earlier transactions are not backfilled.
-
-The CI native matrix (`PAY_PENDING_MATRIX=1`, see [contributing](../CONTRIBUTING.md)) runs these
-against a pristine Paymenter release's dependencies. `tests/native-transaction-method.php`
-verifies migration, upgrade, unique key, foreign key and rollback on SQLite.
-`tests/native-receipt-returns.php` covers independent allocation rows beyond the old aggregate
-TEXT limit, due-work indexing, native closed-invoice event suppression and cash/credit
-classification. The matrix also runs every suite in `tests/native-suites.php`; the receipt
-return, reversal and review suite uses real Paymenter models, listeners and invoice transactions.
-Run it alone with `PAYMENTER_TEST_APP=/path/to/pristine-release php tests/run.php --receipt-returns`.
-These tests use disposable in-memory SQLite, never the installed application database.
-
-`tests/native-auto-pay-consent.php` verifies that the minimal `{"enabled":false}` request clears
-the account default with the gateway enabled or paused. This exercises the real Laravel request
-validator and native property deletion; the ordinary offline Request fake skips validation.
-
-Optional transaction-method charge retrieval runs before settlement locks. Subscription PaymentIntent reads expand `latest_charge` before acquiring those locks. The locked handler rechecks customer, currency, invoice state and settled-payment replay before storing the label.
-
-Checkout references (read for the deferred integration):
-- https://docs.stripe.com/payments/finalize-payments-on-the-server?platform=web&type=payment
-- https://docs.stripe.com/js/elements_object/create_without_intent
-- https://docs.stripe.com/payments/payment-element/migration-ct
-- https://docs.stripe.com/api/payment_intents/confirm
-- https://docs.stripe.com/api/payment_intents/update
-- https://docs.stripe.com/api/payment_intents/cancel
-
-Offline Elements checks use local Stripe.js and HTTP fixtures. They do not prove Stripe accepts the new automatic token flow, CustomerSession tokens, saving options, 3DS completion or redirects. A fixture rejects the manual/Elements pairing using the observed live error; it is not provider acceptance evidence. Validate those combinations in test mode on the pinned API version before release.
 
 ## Retire open payment forms before credit
 
@@ -428,116 +329,94 @@ Cutover still follows the paused-writer and missed-event reconciliation steps in
 [migration](migrating-from-bundled.md); this does not redirect the bundled core route
 or enable a disabled endpoint.
 
-Saving a card reuses the newest local agreement with the same Stripe fingerprint. Link saves match the full
-Stripe Link account email, ignoring case; billing email and masked labels never identify an account. Existing
-duplicates and attached Stripe methods remain intact for provider references and Auto Pay. Every verified copy
-receives the expiry and consent refresh, including verified receipt-only incoming copies that provider
-subscriptions may still charge. Card matching uses the provider fingerprint for every brand. Each copy has
-its own newer-consent check. A shared native cache lock
-serializes saves, removal and duplicate cleanup. Save, removal and cleanup HTTP run outside database owner transactions. Cleanup verifies provider
-identity outside locks, then rechecks the exact customer, agreement set, local details, receipt state and
-current service/account bindings before reserving its plan and after provider writes. A stale plan is retryable;
-its committed duplicate receipt permits recovery after an interrupted detach. Consent source receipts
-retain acceptance time and prevent a retried save from replacing a later expiry. The theme groups verified
-identities for display and keeps the original selected agreement IDs. Offline fakes do not prove distributed
-cache behavior or real database concurrency; check those in the test-mode sandbox before release. All workers must use the same database, Redis, Memcached
-or DynamoDB cache store and lock namespace. Array, file, null, failover and other stores are refused for saved-method
-changes; configure a central store (including its required lock table for database caching).
+## Saved methods
 
-Repeated Add card returns wait up to five seconds for the saved receipt, then reuse its result. A longer wait
-shows a retry notice. Removal verifies and detaches every matching local method and its receipt-linked incoming
-copies outside the owner lock. A confirmed missing candidate is skipped; a confirmed missing clicked method
-uses its server-verified identity index to find remaining copies. Without that identity it removes only its own
-local entry and warns that other copies could not be verified. Pending and completed save receipts are marked
-removed so a delayed setup or payment webhook cannot restore them. Cleanup redirects completed receipts to the
-verified surviving agreement, including retries after a detach. Unrelated receipt-only methods with a verified
-different identity are skipped before Stripe reads; unknown identities are still verified remotely. Other provider failures stop native local
-removal so it can finish on retry. Confirmed detached copies are reconciled immediately even if a later copy fails:
-their owned service/account links are cleared, their local entries retired and their receipts prevented from replaying.
+Agreement saves use a locking current read by the globally unique payment method
+reference, including soft-deleted rows. Retries reuse only the same user's agreement
+on the same gateway, including after an insert race. Removed methods stay removed
+to preserve the deletion and service payment preferences. The setup return shows a
+clear refusal notification; webhooks log and acknowledge permanent ownership or
+deletion conflicts. Request and database failures remain retryable. Offline tests
+cover stale snapshots and insert conflicts with fakes; real MariaDB concurrency
+still needs the sandbox checks below.
 
-Removal records its verified plan and per-copy detach progress in native user properties before final
-local cleanup. If the customer or an agreement changes during detach, reconciliation removes only the
-original agreements still owned by that user and gateway, unlinks their services, and preserves reassigned
-rows. Interrupted removal prevents delayed saves from restoring its references; provider failures keep
-local removal pending for retry. No schema or extension version change is required.
+An existing Stripe customer is replaced only when Stripe returns `deleted: true`
+or HTTP 404 with `resource_missing`. Other lookup failures stop the operation and
+preserve `stripe_id`. Before confirmation, consent updates also clear legacy
+top-level `setup_future_usage` with an empty form value. During authentication,
+consent changes still return 409 and resuming performs no update. Include an
+unfinished intent from the earlier release in the sandbox consent checks.
 
-Checkout first saves and duplicate saves retain the same success notice shape as Add card. Each checkout tab
-sends an opaque token through confirmation, bank authentication and the invoice return URL. The notice is stored
-in native user properties under `ae_stripe_notice_<token hash>`, scoped to that user and invoice. The matching
-native invoice component claims it under the user row lock; requests with stale sessions cannot deliver it twice.
-A consumed marker prevents repeated confirmation from restoring it. Requests without the token, other invoices/users
-and non-invoice components leave it untouched. A failed delivery transaction can retry. Notice state is independent
-of cleanup snapshots and the payment-attempt recovery namespace.
+Confirmed and processing payments retain a display label in the extension-owned
+`ae_stripe_transaction_methods` table, keyed by native invoice transaction ID.
+The install and upgrade hooks run its migration. Expanded latest-charge details
+need no lookup; an unexpanded charge needs one retrieve. Missing details or a
+failed lookup leave the label blank without changing settlement. A failed attempt clears its
+label so a later retry can record its own method. First successful settlement
+replaces any processing label with its own charge, even if the prior failure
+webhook has not arrived. The first successful label
+survives replayed success and late failure events. Link labels mask the email local
+part. No card numbers, fingerprints or complete provider objects are stored.
+Rendering never contacts Stripe. Earlier transactions are not backfilled.
 
-Account card selection, the Auto Pay switch, new-service inheritance after checkout commits, and the native service/invoice
-recurring-default actions use the same shared per-user lock as cleanup. Binding a reserved or removing
-reference returns a retry message before any preference or consent changes. Turning Auto Pay off remains
-available. Cleanup verifies the survivor again after detachment, then moves remaining owned service and
-account links to that same-card survivor under the owner lock, preserving consent and other settings.
-Interrupted detached plans resume reconciliation even when bound; unresolved ownership, customer or
-identity conflicts remain reported with a nonzero exit on every rerun, including a read-only dry run.
+Optional transaction-method charge retrieval runs before settlement locks. Subscription PaymentIntent reads expand `latest_charge` before acquiring those locks. The locked handler rechecks customer, currency, invoice state and settled-payment replay before storing the label.
 
-Removal marks a reference in progress before HTTP and permanently removed only after its detach is
-confirmed. A fresh Add card save of the same physical card may create a new provider reference while a
-failed removal is pending, without reusing or refreshing its uncertain references. Retrying Remove still
-verifies all matching copies, including the newly saved one. Confirmed removed references remain removed.
+Matching copies, removal, cleanup and checkout save notices are in
+[saved cards](saved-cards.md#copies-removal-and-cleanup).
 
-Service Created persists the exact account consent in the new service's `ae_stripe_auto_pay_pending` property
-with the order. The after-commit attempt uses the shared card lock before opening its own user/service transaction.
-A busy lock never fails the order. Pending work survives a lost callback and the once-per-minute scheduler retries it.
-The service and its invoice show a warning explaining pending setup, automatic retry and manual invoice payment.
-Every attempt rechecks current account consent, service ownership, subscription state, plan and card eligibility.
-Revocation, removal, reassignment, explicit service opt-out or a newer selection cancels old work; it cannot re-enable Auto Pay.
-Stripe subscriptions retain their own billing method and reject local-only service card changes. Invoice defaults skip
-subscription services while ordinary invoice payment continues. No schema or extension version change is required.
+## Fees
 
-Pending Auto Pay retains valid work while AE Stripe is paused or bundled Stripe is active. Ten genuine failed
-binding attempts (excluding ordinary shared-lock contention) stop automatic setup and explain manual service selection or invoice payment. Explicit
-account Off, customer clear, staff opt-out, a changed service selection and each ownership transfer cancel
-pending work immediately. The native staff Billing Agreement field offers Turn off Auto Pay because an
-already empty field cannot record a deliberate None selection separately from an unrelated save.
-Pending warnings appear once per page and state, including a pause or exhausted retries.
+Fee recovery requires read access to Charges, PaymentIntents, Invoices, Invoice
+Payments and Balance Transactions. Check the full [Stripe API permissions](settings.md#stripe-api-permissions)
+with the configured restricted key in the sandbox.
 
-Checkout confirmation records include the payment intent and original tab token before saving starts.
-A successful webhook or the scheduled recovery completes a deferred confirmation, and the original
-invoice can receive it on a later poll. Refused saving produces no success. Reusing a token for another
-intent allocates a distinct stable token. Abandoned pending, ready and consumed notices expire after 30 days; existing saved
-method receipts preserve delivery history. Missing intents back off independently, and irrecoverable
-confirmations stop scheduled recovery after 20 attempts. A later successful webhook can still finish
-a retained confirmation. Access errors, rate limits, connection, unreadable responses and local failures only back off;
-they never consume the confirmation attempt budget. A succeeded intent whose notice completion is
-still pending also keeps its budget. Only missing, mismatched or non-succeeded intent outcomes
-consume attempts. A payment-method 404 during saving is ambiguous and keeps the succeeded intent's
-budget; a definite removed-method receipt still refuses replay. A true intent `resource_missing`
-waits a day and uses the intent budget. Exhaustion distinguishes a missing intent from an intent
-that did not succeed or match. Earlier access warnings include a sample invoice/intent and stage,
-aggregated per configured key and reason to at most once an hour, without keys or response bodies.
-401/403, rate limits, server and connection outages stop each recovery pass; per-row 400/402/409
-and saving-stage 404 back off while allowing unrelated rows to proceed. Non-consuming failures
-grow an independent bounded backoff and never create a terminal state.
-Notice-only maintenance failures do not fail settlement or unrelated inheritance.
-The invoice keeps a notice-specific poll until completion/refusal/expiry, including after payment polling stops. Confirmations for intents older than 30 days are not recreated.
-The original tab explains delayed saving once and reduces its notice poll to once a minute.
-Failed notices stop polling but can deliver a later webhook success on an explicit refresh.
-Recovery and retention skip missing users before limiting a batch and rotate by property ID in
-shared cache. Young and future-due records need no owner lock or metadata rewrite. Retention
-uses property timestamps for malformed dates; an entirely unknown age starts one safe retention
-period. Exact row identity and value are rechecked under the owner lock before any mutation.
-Legacy notices keep their original delivery state; new confirmations use a separate intent-bound token.
-These changes use existing properties and require no schema or extension version change.
+Fee recovery uses the `ae_stripe_payment_fees` extension table, created on install
+or upgrade, with a fallback on the first fee operation. Keep Paymenter's scheduler running every minute. The hourly
+recovery task checks pending fees in batches of 100, ordered by attempt count.
+A missing balance transaction, missing fee data or invalid conversion rate stays pending.
+Pending funds already have a final fee. No rate is estimated.
+Stripe lookups finish before user and invoice locks serialize webhook and task writes. Completed records remain
+as replay guards. After 24 attempts or 72 hours, the record moves to `review`.
+Staff receive one native inbox notice per recipient. The invoice Audit Log and
+System > Audits retain a `ae_stripe_fee_review` entry with the identifiers and error.
+Deleted payments also move to review without blocking the next fee.
+Resolve these records manually against Stripe; do not delete completed records.
+Existing webhook endpoints may keep `charge.updated`; new endpoints also include
+`charge.succeeded`. A charge belonging to this gateway and awaiting native settlement returns 409 for retry.
+Foreign charges, refused payments and subscriptions held for review are acknowledged.
+Only paid, successful charges create fee records. Fees skipped before this upgrade
+have no recovery record and require manual reconciliation.
 
-Native pending integration is provisioned in public CI from Paymenter 1.5.9 commit
-`ee729f7d99ac18942625b79f3f93d8d8b21255e8` with its locked Composer dependencies, PHP 8.4.27
-and SQLite. Run `PAYMENTER_TEST_APP=/path/to/release PAY_PENDING_MATRIX=1 php tests/run.php`
-to select the same isolated cases locally. `PAYMENTER_TEST_PHP` can select a local PHP wrapper.
-Missing dependencies or an explicitly selected missing theme fail. The public job uses only the
-public default theme, synthetic credentials and fake HTTP with stray requests forbidden. An
-authorized private integration run can additionally set `PAY_NOTICE_THEME` to its pinned theme;
-private theme source and credentials never enter the public workflow.
+## Manual sandbox checks
 
-Owner/selection changes revoke old pending setup before the service SQL. An enclosing native
-transaction rolls both changes back together. An autocommit interruption after SQL cannot revive
-old consent on an ownership round trip; an autocommit write that fails after revocation conservatively
-requires fresh setup. Staff opt-out rechecks the current gateway under the owner/service locks.
-Cancellation locks user, service and pending property in that order. A missed conditional
-deletion refuses the ownership write and asks for a refresh instead of retaining old work.
+Fakes do not prove real database isolation, native uploader/route behavior or
+Stripe.js/API compatibility. Validate these in a separate Paymenter/Stripe test-mode sandbox:
+
+- Install beside bundled Stripe; ensure unique routes/views/config and no
+  duplicate subscription listeners even when bundled Stripe is disabled.
+- Check CustomerSession feature names on pinned Basil, restricted-key access,
+  `customerSessionClientSecret`, saved-card selection and Link email display.
+- Verify setup cannot save without recorded consent, the consent POST completes before `confirmSetup`, and its `off_session_v2` terms, authenticated user ID and acceptance time survive
+  redirect and webhook retries. Refused consent must prevent both Link and card confirmation at phone and desktop widths and permit retry.
+- Verify own-customer isolation, legacy unspecified-redisplay exclusions and
+  account setup redisplay. Test card, wallet and Link with saving checked/clear.
+- First verify ConfirmationTokens with deferred Elements (`mode`, amount, currency), Customer Sessions and automatic confirmation
+  on pinned Basil, including card, Link, SEPA/ACH mandates, declines, 3DS and bank redirects.
+  Check that the pay form and account setup offer only card and Link before release.
+  Check the bank/3DS error page and its invoice link. Check method-specific `setup_future_usage=none` when unchecked and preservation of consent after authentication.
+- Run concurrent success deliveries/setup redirects against the real database;
+  assert one agreement/transaction, preserved success after late failed/processing
+  events, no automatic service assignment from saving a method, and unchanged existing Auto Pay.
+- With fresh account-default consent, create a recurring service and verify it inherits
+  the chosen card. Turning it off must unlink every service, including ones linked before
+  the account switch, and stop any waiting renewal retry.
+- Reject bad/stale signatures; disable the fork and confirm 503/no effects.
+  Rehearse migration and legacy subscription billing/cancellation end to end.
+
+## Checks run
+
+Dated Stripe test-mode and live results:
+
+- Ilya checked creation in Stripe test mode on 2026-10-30 at 12:00 PM PT (2025-07-30.basil): manual confirmation alone returned 200; adding automatic_payment_methods returned 400.
+- The live pass on 2026-10-30 then proved Elements tokens are rejected on manual intents.
+- Elements now uses the documented automatic flow; its real Stripe acceptance must be checked again.
