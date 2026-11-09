@@ -47,8 +47,16 @@ Schema::create('extensions', function ($t) {
 Schema::create('properties', function ($t) {
     $t->id(); $t->morphs('model'); $t->string('key'); $t->text('value'); $t->timestamps();
 });
+// Off also releases the saved card and every linked service, so their native tables exist.
+Schema::create('billing_agreements', function ($t) {
+    $t->id(); $t->foreignId('user_id'); $t->foreignId('gateway_id'); $t->timestamps(); $t->softDeletes();
+});
+Schema::create('services', function ($t) {
+    $t->id(); $t->foreignId('user_id'); $t->string('subscription_id')->nullable(); $t->foreignId('billing_agreement_id')->nullable(); $t->timestamps();
+});
 DB::table('users')->insert(['id' => 7]);
 DB::table('extensions')->insert(['extension' => 'AeStripe', 'type' => 'gateway', 'enabled' => true]);
+DB::table('billing_agreements')->insert(['id' => 91, 'user_id' => 7, 'gateway_id' => 1]);
 $gateway = new AeStripe([]);
 $key = 'ae_stripe_auto_pay_default';
 $record = json_encode(['version' => AeStripe::AUTO_PAY_CONSENT, 'user_id' => 7,
