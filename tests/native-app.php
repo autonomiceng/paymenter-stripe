@@ -24,6 +24,8 @@ foreach (['APP_ENV' => 'testing', 'APP_KEY' => 'base64:' . base64_encode(str_rep
 require $release . '/vendor/autoload.php';
 $app = require $root . '/bootstrap/app.php';
 $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+// The console bootstrap renders uncaught errors and exits 0; a failed check must fail the run.
+set_exception_handler(function (Throwable $e) { fwrite(STDERR, $e . "\n"); exit(1); });
 require_once $release . '/app/Classes/helpers.php';
 config(['hashing.bcrypt.rounds' => 4, 'audit.enabled' => false, 'settings.mail_disabled' => true, 'settings.default_currency' => 'USD',
     'settings.tax_enabled' => false, 'app.version' => 'development']);
