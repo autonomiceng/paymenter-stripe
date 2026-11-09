@@ -2,7 +2,7 @@
 // The load state lives on window, so every form and every reopen on the page shares one request.
 function loadStripe() {
     if (window.Stripe) return Promise.resolve();
-    const state = window.aeStripeLoader ??= {pending: null, timedOut: new WeakSet()};
+    const state = window.aeStripeLoader ??= {pending: null, timedOut: new WeakSet(), failures: 0};
     if (!state.pending) {
         state.pending = new Promise((resolve, reject) => {
             let existingScript = document.querySelector('script[src^="https://js.stripe.com/v3"]');
@@ -27,6 +27,7 @@ function loadStripe() {
             const failed = () => {
                 cleanup();
                 state.pending = null;
+                state.failures = (state.failures || 0) + 1;
                 if (existingScript && !window.Stripe) state.timedOut.add(existingScript);
                 if (!existingScript) script.remove();
                 reject(new Error('Could not load Stripe.js.'));
@@ -40,7 +41,11 @@ function loadStripe() {
                 script.addEventListener('load', loaded, {once: true});
                 script.addEventListener('error', failed, {once: true});
             } else {
-                script.src = 'https://js.stripe.com/v3/';
+                // The browser joins a request for the same URL to one still pending, even after its tag
+                // is removed, so a retry after a stalled load would wait on it. Stripe.js accepts query
+                // parameters on its script URL; each retry adds its count to start its own request.
+                // A late original load then only repeats Stripe.js, which keeps the first Stripe global.
+                script.src = 'https://js.stripe.com/v3/' + (state.failures ? `?retry=${state.failures}` : '');
                 script.async = true;
                 script.onload = loaded;
                 script.onerror = () => { failed(); };
@@ -52,7 +57,8 @@ function loadStripe() {
 }
 // Pay and Save card stay off until the Payment Element is ready, and lock while one confirms.
 // The alert stays mounted so screen readers announce new text; an error stays until the
-// customer edits the form or submits again. Options cover what only one form needs:
+// customer edits the form or submits again. A load error stays until Try again, because
+// editing cannot fix it. Options cover what only one form needs:
 // locked keeps the form and its error in place after a decline that needs a refresh,
 // inertUntilReady keeps the fields closed until Stripe is ready, and onRetry runs Try again.
 function stripeFormControls(form, {onRetry, onLoading = () => {}, locked = () => false, isDisposed = () => false,
@@ -81,7 +87,7 @@ function stripeFormControls(form, {onRetry, onLoading = () => {}, locked = () =>
         if (scrollToMessage) alert.scrollIntoView({block: 'nearest', behavior: 'instant'});
     };
     controls.clearMessage = () => {
-        if (isDisposed() || locked()) return;
+        if (isDisposed() || locked() || !controls.ready) return;
         alert?.replaceChildren();
     };
     controls.setLoading = (isLoading) => {
@@ -102,4 +108,8 @@ function stripeFormControls(form, {onRetry, onLoading = () => {}, locked = () =>
         controls.showMessage('Could not load the payment form. Check your connection and try again.', onRetry);
     };
     return controls;
+}
+// Try again replaces the Elements; a released attempt's late events must not change the new form.
+function forAttempt(signal) {
+    return handler => (...args) => { if (!signal.aborted) return handler(...args); };
 }

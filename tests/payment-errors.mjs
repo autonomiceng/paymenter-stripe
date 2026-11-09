@@ -71,7 +71,10 @@ async function installStripe(page, expressThrows) {
                     (typeof selector === 'string' ? document.querySelector(selector) : selector).textContent =
                         type === 'payment' ? 'Card form' : 'Pay with Link';
                     // No available methods also models Link being disabled on the account.
-                    handlers.ready?.({availablePaymentMethods: expressThrows === 'unavailable' ? null : {link: true}});
+                    const ready = () => handlers.ready?.({availablePaymentMethods: expressThrows === 'unavailable' ? null : {link: true}});
+                    // A held Element reports ready only when the check calls heldReady[type]().
+                    if (window.holdReady?.includes(type)) (window.heldReady ??= {})[type] = ready;
+                    else ready();
                 }, clear() {
                     if (type !== 'payment') return;
                     clears++;
@@ -591,6 +594,69 @@ try {
         await page.waitForURL(expected.toString());
         await page.close();
     }
+    // A Payment Element load error keeps its Try again through edits; the retry starts without the old Link state
+    // and ignores late events from the released Elements.
+    for (const name of forms) {
+        const page = activePage = await browser.newPage({viewport: {width: 390, height: 844}});
+        page.setDefaultTimeout(5000);
+        await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
+        await page.setContent('<html><body></body></html>');
+        await installStripe(page, false);
+        await page.setContent(render(name));
+        if (name === 'pay') await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
+        else await page.evaluate(async () => {
+            window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf', name: 'Fixture', email: 'Fixture', linkDisplay: 'above_card', businessName: 'Fixture Hosting' });
+            component.$el = document.querySelector('form');
+            await component.init();
+        });
+        const row = page.locator('#express-checkout');
+        const alert = page.locator('[role=alert] p');
+        const retry = page.getByRole('button', {name: 'Try again'});
+        const loadError = 'Could not load the payment form. Check your connection and try again.';
+        assert.equal(await row.isVisible(), true, `${name}: Link reports available first`);
+        if (name === 'pay') assert.equal(await page.locator('#save-card').isEnabled(), true, 'Available Link enables Save this card');
+        await page.evaluate(() => { window.oldHandlers = {...elementHandlers}; oldHandlers.payment.loaderror({error: {message: 'Element failed'}}); });
+        assert.equal(await alert.textContent(), loadError, `${name}: the Payment Element load error is shown`);
+        assert.equal(await page.locator('#submit').isDisabled(), true, `${name}: submission stays off`);
+        if (name === 'pay') await page.locator('#save-card').setChecked(true);
+        await page.evaluate(() => elementHandlers.payment.change({empty: false, complete: false, value: {type: 'card'}}));
+        assert.equal(await alert.textContent(), loadError, `${name}: editing keeps the load error`);
+        assert.equal(await retry.isVisible(), true, `${name}: editing keeps Try again`);
+        await page.evaluate(() => { window.holdReady = ['payment', 'expressCheckout']; });
+        await retry.click();
+        await page.waitForFunction(() => elementCalls.filter(call => call.type === 'payment').length === 2);
+        const assertWaiting = async when => {
+            assert.equal(await row.isVisible(), false, `${name}: ${when}: the old Link row is hidden`);
+            assert.equal(await page.locator('#submit').isDisabled(), true, `${name}: ${when}: submission waits for the new form`);
+            assert.equal(await page.locator('[role=alert]').textContent(), '', `${name}: ${when}: no error`);
+            if (name === 'pay') {
+                assert.equal(await page.locator('#save-card').isDisabled(), true, `${when}: Save this card waits for a fresh choice`);
+                assert.equal(await page.locator('#save-card').isChecked(), false, `${when}: the old saving choice is cleared`);
+            }
+        };
+        await assertWaiting('after Try again');
+        await page.evaluate(() => {
+            oldHandlers.expressCheckout.availablepaymentmethodschange({paymentMethods: {link: {available: true}}});
+            oldHandlers.expressCheckout.ready({availablePaymentMethods: {link: true}});
+            oldHandlers.payment.change({empty: false, complete: true, value: {type: 'card'}});
+            oldHandlers.payment.ready();
+        });
+        await assertWaiting('after late events from the old form');
+        if (name === 'pay') {
+            await page.evaluate(() => elementHandlers.payment.change({empty: false, complete: false, value: {type: 'card'}}));
+            assert.equal(await page.locator('#save-card').isEnabled(), true, 'A fresh card selection enables Save this card');
+            assert.equal(await row.isVisible(), false, 'A card selection does not report Link');
+            assert.equal(await page.locator('#submit').isDisabled(), true, 'Pay still waits for the new form');
+        }
+        await page.evaluate(() => heldReady.expressCheckout());
+        assert.equal(await row.isVisible(), true, `${name}: fresh Link availability shows the row`);
+        await page.evaluate(() => heldReady.payment());
+        await page.waitForFunction(() => document.querySelector('#submit').disabled === false);
+        await page.evaluate(() => oldHandlers.payment.loaderror({error: {message: 'Late failure'}}));
+        assert.equal(await page.locator('[role=alert]').textContent(), '', `${name}: a late load error from the old form is ignored`);
+        assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: the new form stays ready`);
+        await page.close();
+    }
     // Stripe.js that fails or never loads shows the error with Try again; a Stripe.js tag already on the page is reused.
     if (forms.includes('pay')) for (const scenario of ['timeout', 'error', 'existing']) {
         const page = activePage = await browser.newPage({viewport: {width: 390, height: 844}});
@@ -601,7 +667,11 @@ try {
         await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
         await page.route('https://js.stripe.com/**', route => { requests.push(route); requested?.(); });
         const nextRequest = async count => {
-            while (requests.length < count) await new Promise(resolve => { requested = resolve; });
+            const deadline = Date.now() + 3000;
+            while (requests.length < count) {
+                assert(Date.now() < deadline, `Stripe.js request ${count} never started`);
+                await new Promise(resolve => { requested = resolve; setTimeout(resolve, 250); });
+            }
             return requests[count - 1];
         };
         const load = route => route.fulfill({contentType: 'text/javascript', body: 'window.Stripe = window.stripeFixture;'});
@@ -629,15 +699,33 @@ try {
             assert.equal(await retry.isVisible(), true, `${scenario}: the customer can retry`);
             assert.equal(await page.locator('#submit').isDisabled(), true, `${scenario}: Pay stays off until Stripe.js loads`);
             assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 0, `${scenario}: the failed tag is removed`);
-            // End the held request before retry so the browser does not join the new request to it.
-            if (scenario === 'timeout') await first.abort('failed');
+            // After a timeout the original request stays pending; the retry must not wait on it.
             await retry.click();
-            await load(await nextRequest(2));
+            const second = await nextRequest(2);
+            assert.equal(second.request().url(), 'https://js.stripe.com/v3/?retry=1', `${scenario}: the retry starts its own request`);
+            // Another form loading meanwhile shares the retry instead of starting a third request.
+            await page.evaluate(() => { window.sharedLoad = loadStripe(); });
+            await load(second);
+            await page.evaluate(() => window.sharedLoad);
         }
         await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
         assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${scenario}: the card form mounts`);
         assert.equal(await page.locator('[role=alert]').textContent(), '', `${scenario}: no error once Stripe.js loads`);
         assert.equal(requests.length, scenario === 'existing' ? 1 : 2, `${scenario}: one Stripe.js request per attempt`);
+        if (scenario === 'timeout') {
+            // The stalled original finishing late must not add Elements or another submit handler.
+            await load(first);
+            await page.evaluate(() => new Promise(resolve => requestAnimationFrame(resolve)));
+            assert.equal(await page.evaluate(() => elementCalls.filter(call => call.type === 'payment').length), 1, 'A late original load creates no second form');
+            await page.evaluate(() => {
+                window.paymentRequests = 0;
+                window.failure = 'action-success';
+                window.fetch = async () => { paymentRequests++; return {ok: false, async json() { return {message: 'Fixture refusal.'}; }}; };
+            });
+            await page.locator('#submit').click();
+            await page.locator('[role=alert]').getByText('Fixture refusal.').waitFor();
+            assert.equal(await page.evaluate(() => paymentRequests), 1, 'One Pay click sends one payment after a late original load');
+        }
         if (scenario === 'existing') assert.equal(await page.evaluate(() => window.existingLoaded), true, 'The existing tag keeps its own load handler');
         await page.close();
     }

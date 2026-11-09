@@ -61,13 +61,15 @@ async function initializePaymentForm() {
     const refreshPayment = document.getElementById('refresh-payment');
     refreshPayment.addEventListener('click', () => window.location.reload());
     const saveCard = document.getElementById('save-card');
+    // A reference, so releasing after the modal closes still works.
+    const expressRow = form.querySelector('#express-checkout');
     function updateSaveCard() {
         saveCard.disabled = resuming || controls.loading || !(canSave || linkAvailable);
         if (!(canSave || linkAvailable)) saveCard.checked = false;
     }
     function updateLinkAvailability(available) {
         linkAvailable = available;
-        document.getElementById('express-checkout').hidden = !linkAvailable;
+        expressRow.hidden = !linkAvailable;
         updateSaveCard();
     }
     saveCard.addEventListener('change', clearMessage);
@@ -89,7 +91,11 @@ async function initializePaymentForm() {
             paymentElement = null;
             expressCheckout = null;
             stopThemeSync = () => {};
+            // Link and the card choice belong to this attempt; the next one starts without them.
+            canSave = resuming && savedConsent;
+            updateLinkAvailability(false);
         };
+        const current = forAttempt(attempt.signal);
         try {
             await loadStripe();
             if (attempt.signal.aborted || !form.isConnected) return;
@@ -111,7 +117,6 @@ async function initializePaymentForm() {
             const customerSessionSecret = @js($customerSessionSecret);
             if (customerSessionSecret) options.customerSessionClientSecret = customerSessionSecret;
 
-            canSave = resuming && savedConsent;
             // The server still checks the invoice balance before confirming.
             const created = createStripeElements(stripe, options, {
                 linkDisplay: @js($linkDisplay),
@@ -119,7 +124,7 @@ async function initializePaymentForm() {
                 email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }},
                 businessName: @js($businessName),
                 allowExpress: !resuming,
-                onLinkAvailability: updateLinkAvailability,
+                onLinkAvailability: current(updateLinkAvailability),
             });
             const {elements, mountExpress} = created;
             paymentElement = created.paymentElement;
@@ -134,12 +139,12 @@ async function initializePaymentForm() {
                 }
             }
             // https://docs.stripe.com/js/element/events/on_change?type=paymentElement
-            paymentElement.on('change', (event) => {
+            paymentElement.on('change', current((event) => {
                 // clear() also reports an empty form after submission has finished.
                 if (!controls.loading && event.empty !== true) clearMessage();
                 canSave = resuming ? savedConsent : ['card', 'link'].includes(event.value?.type);
                 updateSaveCard();
-            });
+            }));
 
             stopThemeSync = syncStripeTheme(form, elements);
 
@@ -150,7 +155,7 @@ async function initializePaymentForm() {
             expressCheckout?.on('confirm', (event) => confirmPayment(event));
 
             async function confirmPayment(expressEvent = null) {
-                if (!controls.ready || controls.loading || refreshRequired) {
+                if (attempt.signal.aborted || !controls.ready || controls.loading || refreshRequired) {
                     expressEvent?.paymentFailed({reason: 'fail'});
                     return;
                 }
@@ -241,8 +246,8 @@ async function initializePaymentForm() {
                 }
             }
 
-            paymentElement.on('ready', () => { controls.ready = true; setLoading(false); });
-            paymentElement.on('loaderror', initializationError);
+            paymentElement.on('ready', current(() => { controls.ready = true; setLoading(false); }));
+            paymentElement.on('loaderror', current(initializationError));
             paymentElement.mount('#payment-element');
             mountExpress('#express-checkout-element');
         } catch (error) {

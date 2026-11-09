@@ -62,11 +62,15 @@ foreach (['pay', 'billing-agreement'] as $name) {
     $view = file_get_contents($views . $name . '.blade.php');
     check(str_contains($view, 'Js::from(auth()->user()->name)') && str_contains($view, 'Js::from(auth()->user()->email)'), "$name: customer details use script-safe values");
     check(str_contains($view, '<button id="submit" disabled'), "$name: submission starts disabled");
-    check(str_contains($view, "paymentElement.on('ready', () => { controls.ready = true; setLoading(false); });")
-        && str_contains($view, "paymentElement.on('loaderror', initializationError);")
+    check(str_contains($view, "paymentElement.on('ready', current(() => { controls.ready = true; setLoading(false); }));")
+        && str_contains($view, "paymentElement.on('loaderror', current(initializationError));")
         && preg_match('/await loadStripe\(\);.*\} catch \(error\) \{\s+release\(\);\s+initializationError\(\);/s', $view) === 1
         && str_contains($view, 'onRetry: start') && !str_contains($view, "createElement('script')"),
         "$name: readiness gates submission, and a Stripe.js or Element failure shows the error with Try again");
+    check(str_contains($view, 'const current = forAttempt(attempt.signal);')
+        && str_contains($view, 'onLinkAvailability: current(') && str_contains($view, "paymentElement.on('change', current(")
+        && str_contains($view, 'attempt.signal.aborted || '),
+        "$name: events from a released attempt cannot change Link, readiness, errors or confirmation");
     $handlerPosition = strpos($view, "form.addEventListener('submit'");
     $mountPosition = strpos($view, "paymentElement.mount(");
     check($handlerPosition !== false && $mountPosition !== false && $handlerPosition < $mountPosition, "$name: submit handler is installed before mounting");
@@ -84,7 +88,7 @@ check(str_contains($setupView, '<p id="setup-terms">By saving with Link or a car
 check(!str_contains($setupView, 'id="setup-consent"') && !str_contains($setupView, 'Tick the box'),
     'Setup has no box to tick, so neither choice can fail for a missing tick');
 check(str_contains($formView, "document.querySelector('script[src^=\"https://js.stripe.com/v3\"]')"), 'Both forms reuse an existing Stripe.js script');
-check(str_contains($formView, 'const state = window.aeStripeLoader ??= {pending: null, timedOut: new WeakSet()};'),
+check(str_contains($formView, 'const state = window.aeStripeLoader ??= {pending: null, timedOut: new WeakSet(), failures: 0};'),
     'Every form and reopen on the page shares one Stripe.js request');
 check(str_contains($formView, 'if (window.Stripe) {')
     && str_contains($formView, 'state.pending = null;')
@@ -92,6 +96,10 @@ check(str_contains($formView, 'if (window.Stripe) {')
 check(str_contains($formView, '}, existingScript ? 5000 : 30000)')
     && str_contains($formView, 'clearTimeout(timeout)'), 'Both forms allow fresh requests thirty seconds, bound reused waits at five seconds and clear the timer');
 check(str_contains($formView, 'if (!existingScript) script.remove();'), 'Both forms remove failed scripts only when they own them');
+check(str_contains($formView, "script.src = 'https://js.stripe.com/v3/' + (state.failures ? `?retry=\${state.failures}` : '');"),
+    'A retry requests its own Stripe.js URL, so a stalled earlier request cannot hold it');
+check(str_contains($formView, 'if (isDisposed() || locked() || !controls.ready) return;'),
+    'Editing the form keeps a load error and its Try again until the form is ready');
 check(str_contains($formView, "controls.showMessage('Could not load the payment form. Check your connection and try again.', onRetry);")
     && str_contains($formView, "button.type = 'button';") && str_contains($formView, "button.textContent = 'Try again';"),
     'A failed load says so and offers Try again, so the form never stays silently disabled');

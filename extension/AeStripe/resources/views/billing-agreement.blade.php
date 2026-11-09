@@ -70,27 +70,30 @@ Alpine.data('aeStripeSetup', (config) => {
                     expressCheckout = null;
                     paymentElement = null;
                     stopThemeSync = () => {};
+                    // The Link row belongs to this attempt; the next one shows it after its own Link reports.
+                    if (!disposed) expressContainer.hidden = true;
                 };
+                const current = forAttempt(attempt.signal);
                 try {
                     await loadStripe();
                     if (disposed || attempt.signal.aborted || !form.isConnected) return;
                     const stripe = Stripe(config.publishableKey);
                     const created = createStripeElements(stripe, {clientSecret: config.clientSecret, appearance: stripeAppearance(form)}, {
                         linkDisplay: config.linkDisplay, name: config.name, email: config.email, businessName: config.businessName, ownTerms: true,
-                        onLinkAvailability: available => { if (!disposed) expressContainer.hidden = !available; },
+                        onLinkAvailability: current(available => { if (!disposed) expressContainer.hidden = !available; }),
                     });
                     const {elements} = created;
                     paymentElement = created.paymentElement;
                     expressCheckout = created.expressCheckout;
                     stopThemeSync = syncStripeTheme(form, elements);
-                    paymentElement.on('change', () => { if (!controls.loading) clearMessage(); });
+                    paymentElement.on('change', current(() => { if (!controls.loading) clearMessage(); }));
                     form.addEventListener('submit', (event) => {
                         event.preventDefault();
                         confirmSetup();
                     }, {signal: attempt.signal});
                     expressCheckout?.on('confirm', event => confirmSetup(event));
                     async function confirmSetup(expressEvent = null) {
-                        if (disposed || controls.loading || !controls.ready) {
+                        if (disposed || attempt.signal.aborted || controls.loading || !controls.ready) {
                             expressEvent?.paymentFailed({reason: 'fail'});
                             return;
                         }
@@ -122,8 +125,8 @@ Alpine.data('aeStripeSetup', (config) => {
                             setLoading(false);
                         }
                     }
-                    paymentElement.on('ready', () => { controls.ready = true; setLoading(false); });
-                    paymentElement.on('loaderror', initializationError);
+                    paymentElement.on('ready', current(() => { controls.ready = true; setLoading(false); }));
+                    paymentElement.on('loaderror', current(initializationError));
                     paymentElement.mount(form.querySelector('#payment-element'));
                     created.mountExpress(form.querySelector('#express-checkout-element'));
                 } catch (error) {
