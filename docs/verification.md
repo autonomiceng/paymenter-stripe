@@ -27,7 +27,7 @@ see [Auto Pay integration](auto-pay.md) for the theme calls and dates.
 Both payment forms stay disabled until Stripe.js, Payment Element and submit handler are
 ready; initialization and confirmation errors remain in the alert for retry.
 Browser-check both pay and setup views inside the theme's teleported modal (default theme `x-teleport="body"`).
-Offline browser coverage in `tests/setup-modal.mjs` checks repeated setup opens,
+Offline browser coverage in `tests/setup-modal.mjs` (CI browser matrix) checks repeated setup opens,
 declines, consent failures and closing during Stripe.js loading.
 Fresh Stripe.js loads have a 30-second bound; timed-out owned tags are removed for retry.
 Reused tags keep a five-second wait and preserve the owner's tag.
@@ -318,18 +318,16 @@ survives replayed success and late failure events. Link labels mask the email lo
 part. No card numbers, fingerprints or complete provider objects are stored.
 Rendering never contacts Stripe. Earlier transactions are not backfilled.
 
-With a pristine Paymenter release's dependencies available, also run
-`PAYMENTER_TEST_APP=/path/to/pristine-release php tests/native-transaction-method.php`
-to verify migration, upgrade, unique key, foreign key and rollback on SQLite. Run
-`PAYMENTER_TEST_APP=/path/to/pristine-release php tests/native-receipt-returns.php`
-for independent allocation rows beyond the old aggregate TEXT limit, due-work
-indexing, native closed-invoice event suppression and cash/credit classification.
-These tests use disposable in-memory SQLite, never the installed application database.
+The CI native matrix (`PAY_PENDING_MATRIX=1`, see [contributing](../CONTRIBUTING.md)) runs these
+against a pristine Paymenter release's dependencies. `tests/native-transaction-method.php`
+verifies migration, upgrade, unique key, foreign key and rollback on SQLite.
+`tests/native-receipt-returns.php` covers independent allocation rows beyond the old aggregate
+TEXT limit, due-work indexing, native closed-invoice event suppression and cash/credit
+classification. These tests use disposable in-memory SQLite, never the installed application database.
 
-Run `PAYMENTER_TEST_APP=/path/to/pristine-release php tests/native-auto-pay-consent.php`
-to verify that the minimal `{"enabled":false}` request clears the account default
-with the gateway enabled or paused. This exercises the real Laravel request validator
-and native property deletion; the ordinary offline Request fake skips validation.
+`tests/native-auto-pay-consent.php` verifies that the minimal `{"enabled":false}` request clears
+the account default with the gateway enabled or paused. This exercises the real Laravel request
+validator and native property deletion; the ordinary offline Request fake skips validation.
 
 Optional transaction-method charge retrieval runs before settlement locks. Subscription PaymentIntent reads expand `latest_charge` before acquiring those locks. The locked handler rechecks customer, currency, invoice state and settled-payment replay before storing the label.
 
