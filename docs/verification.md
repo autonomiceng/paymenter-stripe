@@ -327,7 +327,10 @@ against a pristine Paymenter release's dependencies. `tests/native-transaction-m
 verifies migration, upgrade, unique key, foreign key and rollback on SQLite.
 `tests/native-receipt-returns.php` covers independent allocation rows beyond the old aggregate
 TEXT limit, due-work indexing, native closed-invoice event suppression and cash/credit
-classification. These tests use disposable in-memory SQLite, never the installed application database.
+classification. The matrix also runs every suite in `tests/native-suites.php`; the receipt
+return, reversal and review suite uses real Paymenter models, listeners and invoice transactions.
+Run it alone with `PAYMENTER_TEST_APP=/path/to/pristine-release php tests/run.php --receipt-returns`.
+These tests use disposable in-memory SQLite, never the installed application database.
 
 `tests/native-auto-pay-consent.php` verifies that the minimal `{"enabled":false}` request clears
 the account default with the gateway enabled or paused. This exercises the real Laravel request

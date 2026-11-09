@@ -1,6 +1,12 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 if (getenv('PAY_PENDING_MATRIX')) { require __DIR__ . '/native-pending-matrix.php'; return; }
+if (in_array('--receipt-returns', $argv, true)) putenv('PAY_NATIVE_SUITE=receipt-returns');
+if (getenv('PAY_NATIVE_SUITE')) {
+    // A separate process: the native suite declares its own helpers on real Paymenter classes.
+    $run = proc_open([getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY, '-d', 'memory_limit=512M', __DIR__ . '/native-suite.php'], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
+    exit(proc_close($run));
+}
 if (getenv('PAY_CLEANUP_CASE') === 'notice-native' || getenv('PAY_BINDING_CASE') === 'native' || getenv('PAY_CHECKOUT_NATIVE')) {
     require __DIR__ . '/native-saved-notices.php';
     return;
@@ -103,12 +109,6 @@ if (in_array('--payment-fees', $argv, true)) {
     require __DIR__ . '/fee-recovery.php';
     require __DIR__ . '/fee-recovery-review.php';
     echo "PASS: $count payment fee assertions\n";
-    return;
-}
-
-if (in_array('--receipt-returns', $argv, true)) {
-    require __DIR__ . '/receipt-returns.php';
-    echo "PASS: $count receipt return assertions\n";
     return;
 }
 
@@ -287,7 +287,6 @@ $before = count(Http::$calls);
 rejects(fn () => $gateway->setupConsent(new Request(['intent' => $disabledSetupId, 'consent' => true])), 'HTTP 409');
 check(count(Http::$calls) === $before, 'Disabled setup consent makes no HTTP requests');
 Http::$handler = $oldHandler;
-require __DIR__ . '/receipt-returns.php';
 require __DIR__ . '/charge-attempts.php';
 require __DIR__ . '/gateway-lifecycle.php';
 require __DIR__ . '/webhook-continuity.php';

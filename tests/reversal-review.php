@@ -1,7 +1,6 @@
 <?php
-use App\Helpers\ExtensionHelper;
-use App\Models\{Audit, Credit};
-use Illuminate\Support\Facades\{DB, Http};
+use App\Models\{Credit, Role};
+use Illuminate\Support\Facades\DB;
 
 // Review decisions must never become money decisions.
 [$i, $s] = $setup(1099, 10.99); $deliver($s);
@@ -10,49 +9,51 @@ $gateway->webhook($request);
 $work = $gateway->receiptReversals($i, 'pi_return')[0];
 check(!$work['needs_review'] && $work['review_status'] === 'cleared',
     'A completed external refund with no credit, pending return or dispute clears itself');
-$calls = count(Http::$calls);
+$calls = count($GLOBALS['stripeCalls']);
 check($gateway->invoiceReversalReviews($i)['refund:'.$work['id']] === array_intersect_key($work,
-    array_flip(['needs_review', 'review_status', 'review_key'])) && count(Http::$calls) === $calls,
+    array_flip(['needs_review', 'review_status', 'review_key'])) && count($GLOBALS['stripeCalls']) === $calls,
     'The unlocked invoice display agrees with current review state without a provider call');
 
 [$i, $s] = $setup(1200, 2); $s->status = 'failed'; $deliver($s);
-Credit::$rows['7:usd']->amount = 0; // Spent fallback credit is still a conflict.
+Credit::where('user_id', 7)->update(['amount' => 0]); // Spent fallback credit is still a conflict.
 $s->refunds['foreign'] = clone $foreign; $s->refunds['foreign']->status = 'succeeded';
 $gateway->webhook($request);
 $work = $gateway->receiptReversals($i, 'pi_return')[0];
 check($work['needs_review'], 'A zero pooled balance does not clear a refund against spent receipt credit');
-$actor = \App\Models\User::$row;
-$actor->role_id = 1; $actor->permissions = ['admin.invoices.view'];
-$rejectedAudits = Audit::$rows;
+$actor = $owner;
+$actorRole = Role::create(['name' => 'Invoice reviewer', 'permissions' => ['admin.invoices.view']]);
+$actor->forceFill(['role_id' => $actorRole->id])->save(); $actor->unsetRelation('role');
+$rejectedAudits = audits();
 rejects(fn () => $gateway->resolveReceiptReversal($i, 'pi_return', $work['id'], $work['kind'], $work['review_key'], 'Checked in Stripe.'), 'HTTP 403');
-$actor->permissions[] = 'admin.invoices.update';
+$actorRole->update(['permissions' => ['admin.invoices.view', 'admin.invoices.update']]); $actor->unsetRelation('role');
 rejects(fn () => $gateway->resolveReceiptReversal($i, 'pi_return', $work['id'], $work['kind'], $work['review_key'], '  '), 'HTTP 422');
 rejects(fn () => $gateway->resolveReceiptReversal($i, 'pi_return', $work['id'], $work['kind'], str_repeat('0', 64), 'Checked in Stripe.'), 'HTTP 409');
 // Same owner and currency: the payment must still belong to this exact invoice.
-$otherInvoice = clone $i; $otherInvoice->id = 811; \App\Models\Invoice::$rows[811] = $otherInvoice;
+$otherInvoice = nativeInvoice(811, 2);
 rejects(fn () => $gateway->resolveReceiptReversal($otherInvoice, 'pi_return', $work['id'], $work['kind'], $work['review_key'], 'Checked in Stripe.'), 'HTTP 409');
-check(Audit::$rows === $rejectedAudits, 'Rejected permission, note, stale-key and wrong-invoice requests leave no audit row');
-$moneyBefore = serialize([DB::$tables, Credit::$rows, ExtensionHelper::$payments, $s->posts]);
-$auditsBefore = count(Audit::$rows);
+check(audits() === $rejectedAudits, 'Rejected permission, note, stale-key and wrong-invoice requests leave no audit row');
+$money = fn () => serialize([$returns(), credits(), payments(), $s->posts]);
+$moneyBefore = $money();
+$auditsBefore = count(audits());
 $resolve = fn () => $gateway->resolveReceiptReversal($i, 'pi_return', $work['id'], $work['kind'], $work['review_key'], 'Checked spent credit and settled recovery in Stripe.');
 $resolve(); $resolve();
 $resolved = $gateway->receiptReversals($i, 'pi_return')[0];
-$audit = end(Audit::$rows);
+$audits = audits(); $audit = end($audits);
 check(!$resolved['needs_review'] && $resolved['review_status'] === 'resolved' && $resolved['status'] === 'refunded'
     && $gateway->invoiceReversalReviews($i)['refund:'.$work['id']]['review_status'] === 'resolved'
-    && count(Audit::$rows) === $auditsBefore + 1 && $audit['event'] === 'ae_stripe_reversal_resolved'
+    && count($audits) === $auditsBefore + 1 && $audit['event'] === 'ae_stripe_reversal_resolved'
     && $audit['user_id'] === $actor->id && $audit['new_values']['stripe_id'] === $work['id']
     && str_contains($audit['new_values']['note'], 'spent credit')
-    && serialize([DB::$tables, Credit::$rows, ExtensionHelper::$payments, $s->posts]) === $moneyBefore,
+    && $money() === $moneyBefore,
     'One required-note audit resolves review without changing canonical state, credit, ledger or provider sends');
-DB::$tables['ae_stripe_receipt_returns']['pi_return:excess']['updated_at'] += 300;
+$setReturn('pi_return:excess', ['updated_at' => $returns()['pi_return:excess']['updated_at'] + 300]);
 check(!$gateway->receiptReversals($i, 'pi_return')[0]['needs_review'],
     'Refreshing an allocation retry or notification timestamp does not reopen unchanged financial facts');
 $resolve();
 $blocked = $gateway->allocateReceiptReturn($i, 'pi_return', 'domains:after-resolution', 1);
 check($blocked['state'] === 'review', 'Staff resolution cannot release the money-return hold');
 // Changed local evidence invalidates the old decision, including changes outside the reversal itself.
-DB::$tables['ae_stripe_receipt_returns']['pi_return:excess']['amount_minor'] = 999;
+$setReturn('pi_return:excess', ['amount_minor' => 999]);
 check($gateway->receiptReversals($i, 'pi_return')[0]['needs_review'], 'New allocation evidence reopens a manually resolved case');
 rejects($resolve, 'HTTP 409');
 
