@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 // Real Livewire timers and native rendered responses; all browser HTTP is intercepted.
+import './entered.mjs';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {createRequire} from 'node:module';
