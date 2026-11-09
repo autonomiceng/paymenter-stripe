@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 // Exercise the production submit handlers with offline browser/Stripe boundaries.
+import './entered.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';

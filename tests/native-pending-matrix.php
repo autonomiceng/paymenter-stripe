@@ -1,6 +1,10 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 // Separate native processes keep observers, authentication and SQL fixtures isolated.
+require_once __DIR__ . '/entered.php';
+// Modes: unset, empty or 1 runs the native cases; browser runs the browser checks.
+$mode = getenv('PAY_PENDING_MATRIX');
+if (!in_array($mode, [false, '', '1', 'browser'], true)) throw new RuntimeException('Unknown PAY_PENDING_MATRIX mode "' . $mode . '"; use 1 for native cases or browser.');
 $app = getenv('PAYMENTER_TEST_APP');
 if (!$app || !is_file($app . '/vendor/autoload.php')) throw new RuntimeException('Native CI requires provisioned Paymenter dependencies (PAYMENTER_TEST_APP).');
 if (getenv('PAY_NOTICE_THEME') && !is_file(getenv('PAY_NOTICE_THEME') . '/views/invoices/show.blade.php')) throw new RuntimeException('The selected private integration theme is unavailable.');
@@ -19,10 +23,12 @@ foreach (['401', '403', '429', '503', 'connection'] as $error) $cases[] = 'follo
 foreach (['transfer-race', 'transfer-order', 'method-404', 'orphans', 'retention', 'rotation', 'row-400', 'row-402', 'row-409', 'backoff', 'diagnostics', 'late-notice', 'delay-notice',
     'replacement', 'prune-isolation', 'terminal-status', 'diagnostics-account', 'method-row-400', 'method-row-402', 'method-row-409', 'logging', 'clean-log', 'backoff-fresh', 'render-pcre'] as $suffix) $cases[] = 'final-' . $suffix;
 foreach (['401', '403', '429', '503', 'connection'] as $error) $cases[] = 'final-method-' . $error;
+// Every PHP child records the test files it loads (tests/entered.php) when CI asks for the evidence.
 $php = getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY;
-$runner = [$php, '-d', 'memory_limit=256M', __DIR__ . '/run.php'];
+$record = ['-d', 'auto_prepend_file=' . __DIR__ . '/entered.php'];
+$runner = [$php, ...$record, '-d', 'memory_limit=256M', __DIR__ . '/run.php'];
 $runs = [];
-if (getenv('PAY_PENDING_MATRIX') === 'browser') {
+if ($mode === 'browser') {
     // Playwright drives the production views; Stripe.js, Livewire responses and HTTP are local fixtures.
     $node = getenv('PAYMENTER_TEST_NODE') ?: 'node';
     putenv('LIVEWIRE_SCRIPT=' . (getenv('LIVEWIRE_SCRIPT') ?: $app . '/vendor/livewire/livewire/dist/livewire.js'));
@@ -33,11 +39,11 @@ if (getenv('PAY_PENDING_MATRIX') === 'browser') {
     $runs[] = ['notice-native', ['PAY_CLEANUP_CASE' => 'notice-native'], $runner];
     $runs[] = ['binding-native', ['PAY_BINDING_CASE' => 'native'], $runner];
     foreach (['native-transaction-method.php', 'native-receipt-returns.php', 'native-auto-pay-consent.php'] as $file) {
-        $runs[] = [$file, [], [$php, '-d', 'memory_limit=256M', __DIR__ . '/' . $file]];
+        $runs[] = [$file, [], [$php, ...$record, '-d', 'memory_limit=256M', __DIR__ . '/' . $file]];
     }
-    $runs[] = ['conversion-bootstrap.php', [], [$php, '-n', __DIR__ . '/conversion-bootstrap.php', $app]];
+    $runs[] = ['conversion-bootstrap.php', [], [$php, '-n', ...$record, __DIR__ . '/conversion-bootstrap.php', $app]];
     foreach (require __DIR__ . '/native-suites.php' as $suite) {
-        $runs[] = [$suite, ['PAY_NATIVE_SUITE' => $suite], [$php, '-d', 'memory_limit=512M', __DIR__ . '/native-suite.php']];
+        $runs[] = [$suite, ['PAY_NATIVE_SUITE' => $suite], [$php, ...$record, '-d', 'memory_limit=512M', __DIR__ . '/native-suite.php']];
     }
 }
 putenv('PAY_PENDING_MATRIX');

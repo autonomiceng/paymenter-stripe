@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 // Run against Paymenter's installed Livewire runtime, with all network I/O stubbed.
+import './entered.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';

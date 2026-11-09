@@ -327,7 +327,8 @@ part. No card numbers, fingerprints or complete provider objects are stored.
 Rendering never contacts Stripe. Earlier transactions are not backfilled.
 
 The CI native matrix (`PAY_PENDING_MATRIX=1`, see [contributing](../CONTRIBUTING.md)) runs these
-against a pristine Paymenter release's dependencies. `tests/native-transaction-method.php`
+against a pristine Paymenter release's dependencies. A final CI job fails if any test file was
+not loaded by the offline, native or browser job. `tests/native-transaction-method.php`
 verifies migration, upgrade, unique key, foreign key and rollback on SQLite.
 `tests/native-receipt-returns.php` covers independent allocation rows beyond the old aggregate
 TEXT limit, due-work indexing, native closed-invoice event suppression and cash/credit

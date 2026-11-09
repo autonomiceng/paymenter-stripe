@@ -53,7 +53,7 @@ try {
             'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])',
             $uploadDirectory . '/AeStripe.zip', $candidate]);
         check($status === 0, 'Each upload has a fresh extraction: ' . $output);
-        [$status, $output] = $uploadProcess([PHP_BINARY, '-n', __DIR__ . '/native-upload-probe.php',
+        [$status, $output] = $uploadProcess([PHP_BINARY, '-n', '-d', 'auto_prepend_file=' . __DIR__ . '/entered.php', __DIR__ . '/native-upload-probe.php',
             $uploadDirectory . '/' . $installedCopy, $candidate . '/AeStripe']);
         check($status === 0 && trim($output) === 'PASS: native upload detected gateway AeStripe',
             'Native upload detects gateway with ' . $installedCopy . ': ' . $output);

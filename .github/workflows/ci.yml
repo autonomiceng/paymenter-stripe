@@ -20,7 +20,16 @@ jobs:
           tools: none
           coverage: none
       - name: Run offline behavior tests
+        env:
+          PAY_TEST_ENTERED: ${{ runner.temp }}/entered/offline.txt
         run: php -n tests/run.php
+      - name: Keep the loaded test file list for the coverage job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: entered-offline
+          path: ${{ runner.temp }}/entered/offline.txt
+          if-no-files-found: error
+          retention-days: 1
       - name: Lint PHP files
         shell: bash
         run: |
@@ -54,8 +63,16 @@ jobs:
         env:
           PAYMENTER_TEST_APP: ${{ runner.temp }}/paymenter
           PAY_PENDING_MATRIX: '1'
+          PAY_TEST_ENTERED: ${{ runner.temp }}/entered/native.txt
           TMPDIR: ${{ runner.temp }}
         run: php -d memory_limit=256M tests/run.php
+      - name: Keep the loaded test file list for the coverage job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: entered-native
+          path: ${{ runner.temp }}/entered/native.txt
+          if-no-files-found: error
+          retention-days: 1
   browser:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -90,5 +107,34 @@ jobs:
           PAYMENTER_TEST_APP: ${{ runner.temp }}/paymenter
           PAY_PENDING_MATRIX: browser
           PLAYWRIGHT_MODULE: ${{ runner.temp }}/stripe-browser/node_modules/playwright
+          PAY_TEST_ENTERED: ${{ runner.temp }}/entered/browser.txt
           TMPDIR: ${{ runner.temp }}
         run: php -d memory_limit=256M tests/run.php
+      - name: Keep the loaded test file list for the coverage job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: entered-browser
+          path: ${{ runner.temp }}/entered/browser.txt
+          if-no-files-found: error
+          retention-days: 1
+  coverage:
+    # Fails when a test file was named but never loaded by any job above.
+    needs: [php, native-pending, browser]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # v2.36.0
+        with:
+          php-version: '8.3'
+          tools: none
+          coverage: none
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: entered-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/entered
+      - name: Require every test file to be loaded by a CI job
+        run: php -n tests/ci-coverage.php "$RUNNER_TEMP/entered"

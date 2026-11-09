@@ -1,10 +1,12 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-if (getenv('PAY_PENDING_MATRIX')) { require __DIR__ . '/native-pending-matrix.php'; return; }
+require_once __DIR__ . '/entered.php';
+// Any nonempty mode, even "0", goes to the matrix, which rejects unknown modes before starting a child.
+if (!in_array(getenv('PAY_PENDING_MATRIX'), [false, ''], true)) { require __DIR__ . '/native-pending-matrix.php'; return; }
 if (in_array('--receipt-returns', $argv, true)) putenv('PAY_NATIVE_SUITE=receipt-returns');
 if (getenv('PAY_NATIVE_SUITE')) {
     // A separate process: the native suite declares its own helpers on real Paymenter classes.
-    $run = proc_open([getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY, '-d', 'memory_limit=512M', __DIR__ . '/native-suite.php'], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
+    $run = proc_open([getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY, '-d', 'auto_prepend_file=' . __DIR__ . '/entered.php', '-d', 'memory_limit=512M', __DIR__ . '/native-suite.php'], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
     exit(proc_close($run));
 }
 if (getenv('PAY_CLEANUP_CASE') === 'notice-native' || getenv('PAY_BINDING_CASE') === 'native' || getenv('PAY_CHECKOUT_NATIVE')) {

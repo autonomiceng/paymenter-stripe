@@ -39,5 +39,14 @@ application or connects to its database. The browser matrix runs `tests/payment-
 (both production forms with offline Stripe and network failures), `tests/setup-modal.mjs`
 (the setup view inside a teleported Livewire modal) and the native notice poll. Stripe.js,
 consent requests and Livewire responses are local fixtures; no server or Stripe account is
-needed. `LIVEWIRE_SCRIPT` defaults to the release's Livewire script. A new test file must be
-reached from one of these entry points; the offline run fails otherwise.
+needed. `LIVEWIRE_SCRIPT` defaults to the release's Livewire script. `PAY_PENDING_MATRIX`
+accepts only `1` and `browser`; any other nonempty value stops before a child starts.
+
+Every test file must run in CI. Each job sets `PAY_TEST_ENTERED`, and every PHP process
+(`tests/entered.php`) and Node check (`tests/entered.mjs`) appends the test files it loaded.
+A final job runs `php -n tests/ci-coverage.php DIRECTORY` on the three lists and fails on any
+`tests/*.php` or `tests/*.mjs` file no job loaded. Naming a file in source, a comment or an
+unused branch does not count. Support files that load, launch or record suites are listed in
+`tests/ci-coverage.php`; they must be loaded too, and loading one never counts for its suites.
+Start a new PHP child with `-d auto_prepend_file=tests/entered.php` and import
+`./entered.mjs` in a new Node check.
