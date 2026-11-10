@@ -122,6 +122,7 @@ class AeStripe extends Gateway
     public function boot()
     {
         $this->configureStaffAutoPay();
+        $this->configureSecretSettings();
         if (app()->runningInConsole()) {
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryAutoPayInheritance())
                 ->name('ae-stripe:auto-pay-inheritance')->everyMinute()->onOneServer()->withoutOverlapping(5));
@@ -163,6 +164,7 @@ class AeStripe extends Gateway
                 };
             });
             app(\Livewire\EventBus::class)->before('dehydrate', function ($component, $context) {
+                $this->hideInternalSettings($component);
                 $this->deliverSavedMethodNotice($component, $context);
                 $this->deliverAutoPayPendingNotice($component, $context);
             });
@@ -269,15 +271,18 @@ class AeStripe extends Gateway
         if (\App\Models\Gateway::where('extension', 'AeStripe')->first()?->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'retry') {
             $webhookDescription .= ' Webhook events could not be verified. Check the Stripe endpoint and API permissions, then save AE Stripe; automatic checks will retry.';
         }
+        $savedKey = $this->savedSecretSetting('stripe_secret_key');
+        $savedWebhookSecret = $this->savedSecretSetting('stripe_webhook_secret');
         return [
             [
                 'name' => 'stripe_secret_key',
                 'label' => 'Stripe restricted API key',
-                'placeholder' => 'Enter your restricted API key',
-                'type' => 'text',
+                'placeholder' => $savedKey === '' ? 'Enter your restricted API key' : $this->savedSecretPlaceholder($savedKey),
+                'type' => 'password',
                 'encrypted' => true,
                 'description' => 'Find your API keys at https://dashboard.stripe.com/apikeys',
-                'required' => true,
+                // A saved key stays when the field is left blank.
+                'required' => $savedKey === '',
             ],
             [
                 'name' => 'stripe_publishable_key',
@@ -308,7 +313,8 @@ class AeStripe extends Gateway
             [
                 'name' => 'stripe_webhook_secret',
                 'label' => 'Stripe webhook signing secret',
-                'type' => 'text',
+                'placeholder' => $savedWebhookSecret === '' ? null : $this->savedSecretPlaceholder($savedWebhookSecret),
+                'type' => 'password',
                 'encrypted' => true,
                 'description' => $webhookDescription,
                 'required' => false,
@@ -321,6 +327,42 @@ class AeStripe extends Gateway
                 'required' => false,
             ],
         ];
+    }
+
+    private const SECRET_SETTINGS = ['stripe_secret_key', 'stripe_webhook_secret'];
+
+    private function savedSecretSetting(string $name): string
+    {
+        return (string) (\App\Models\Gateway::where('extension', 'AeStripe')->first()?->settings()->where('key', $name)->first()?->value ?? '');
+    }
+
+    private function savedSecretPlaceholder(string $value): string
+    {
+        return 'Saved, ends in ' . substr($value, -4) . '. Leave blank to keep it.';
+    }
+
+    // The native gateway editor fills every saved setting into the page and saves blank fields as empty.
+    // Keep saved secrets out of the page, and keep the saved value when the field is left blank.
+    private function configureSecretSettings(): void
+    {
+        if (!class_exists(\Filament\Forms\Components\TextInput::class)) return;
+        \Filament\Forms\Components\TextInput::configureUsing(function ($field) {
+            $name = preg_replace('/^settings\./', '', $field->getName(), 1, $count);
+            if (!$count || !in_array($name, self::SECRET_SETTINGS, true)) return;
+            $saved = fn ($record) => $record instanceof \App\Models\Gateway && $record->extension === 'AeStripe'
+                ? $record->settings()->where('key', $name)->first()?->value : null;
+            $field->formatStateUsing(fn ($state, $record) => filled($saved($record)) ? null : $state)
+                ->dehydrateStateUsing(fn ($state, $record) => filled($state) ? $state : $saved($record));
+        });
+    }
+
+    // The native gateway editor also fills internal settings into the page, such as the webhook
+    // state with every credential. Send only the editor's own fields.
+    private function hideInternalSettings($component): void
+    {
+        if (!$component instanceof \App\Admin\Resources\GatewayResource\Pages\EditGateway || !is_array($component->data['settings'] ?? null)
+            || $component->getRecord()?->extension !== 'AeStripe') return;
+        $component->data['settings'] = array_intersect_key($component->data['settings'], array_flip(array_column($this->getConfig(), 'name')));
     }
 
     public function enabled(Extension $gateway)

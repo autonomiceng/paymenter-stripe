@@ -250,10 +250,14 @@ check(array_keys($gateway->invoiceAutoPayDates($invoiceDates)) === [41], 'Invoic
 $payer = new class(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']) extends AeStripe {
     public array $charges = [];
     public ?string $decline = null;
+    public ?string $declineAutoPay = null;
+    public bool $pending = false;
     public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $agreement, bool $requireAutoPay = false)
     {
         $this->charges[] = [$invoice->id, $amount, $agreement->id, $requireAutoPay];
         if ($this->decline) throw new \Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException($this->decline);
+        if ($this->pending && !$requireAutoPay) throw new \Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException('Processing.');
+        if ($this->declineAutoPay && $requireAutoPay) throw new \Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException($this->declineAutoPay);
         $invoice->status = 'paid';
         return true;
     }
@@ -290,6 +294,30 @@ check($result['enabled'] === true && $result['message'] === null && $result['inv
     'A paid first invoice turns Auto Pay on and pays the rest');
 check(($payer->autoPayDefault($user)['agreement_id'] ?? null) === 94 && $existing->billing_agreement_id === 94
     && $payer->charges === [[31, '20.00', 94, false], [32, '15.00', 94, true]], 'Only invoices after the first are charged as Auto Pay payments');
+$turnOn = function (int $id) use ($payer, $gateway, $user, $card, $existing) {
+    $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+    $existing->billing_agreement_id = 55; $payer->charges = [];
+    $first = new Invoice($user); $first->id = $id; $second = new Invoice($user); $second->id = $id + 1;
+    return $payer->turnOnAutoPayAndPay($user, $card, [[$first, '20.00'], [$second, '15.00']], AeStripe::AUTO_PAY_CONSENT);
+};
+$payer->pending = true;
+$result = $turnOn(40);
+$payer->pending = false;
+check($result['enabled'] === true && $result['message'] === null && $result['invoices'] === [['id' => 40, 'status' => 'processing'], ['id' => 41, 'status' => 'paid']]
+    && ($payer->autoPayDefault($user)['agreement_id'] ?? null) === 94, 'A first payment still processing turns Auto Pay on and pays the rest');
+\Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-' . $user->id] = true;
+$result = $turnOn(42);
+unset(\Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-' . $user->id]);
+check($result['enabled'] === false && $result['message'] === 'The payment went through, but Auto Pay was not turned on. Try turning it on again.'
+    && $result['invoices'] === [['id' => 42, 'status' => 'paid']] && $payer->charges === [[42, '20.00', 94, false]]
+    && $payer->autoPayDefault($user) === null && $existing->billing_agreement_id === 55,
+    'A paid first invoice that cannot turn Auto Pay on says so and charges nothing more');
+$payer->declineAutoPay = 'Insufficient funds. Try a different card, or contact your bank.';
+$result = $turnOn(44);
+$payer->declineAutoPay = null;
+check($result['enabled'] === true && $result['message'] === null
+    && $result['invoices'] === [['id' => 44, 'status' => 'paid'], ['id' => 45, 'status' => 'pending', 'message' => 'Insufficient funds. Try a different card, or contact your bank.']]
+    && ($payer->autoPayDefault($user)['agreement_id'] ?? null) === 94, 'A later invoice that declines keeps Auto Pay on and returns its own reason');
 // The invoice page says when Auto Pay will not pay an open invoice.
 $open = new Invoice($user); $open->id = 33;
 check($payer->autoPayCoversInvoice($open) === false, 'With Auto Pay on, an open invoice with no planned renewal charge is not covered');

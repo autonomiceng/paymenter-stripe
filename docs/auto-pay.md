@@ -40,7 +40,7 @@ card that saves but declines leaves Auto Pay off. Once that payment succeeds or 
 processing, it turns Auto Pay on with the card and pays the rest with
 `chargeAutoPayAccepted()`. It returns `enabled`, each invoice's `id` and `status`, and a
 customer `message` when the first payment or the switch failed; keep the dialog open and
-show that message. Themes must require `turnOnAutoPayAndPay()` before offering to pay
+show that message. A later invoice that was not paid also carries its own `message`. Themes must require `turnOnAutoPayAndPay()` before offering to pay
 open invoices from the Turn on dialog.
 
 Read `autoPayCoversInvoice($invoice)` before saying whether Auto Pay pays an open

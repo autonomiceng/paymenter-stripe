@@ -52,7 +52,7 @@ try {
     const pendingConsent = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.addInitScript(() => {
-        window.probe = { created: 0, destroyed: 0, active: 0, confirms: 0, consent: 0, scripts: 0, expressCreated: 0, expressDestroyed: 0, failConsent: false, themeListeners: 0 };
+        window.probe = { created: 0, destroyed: 0, active: 0, confirms: 0, consent: 0, scripts: 0, expressCreated: 0, expressDestroyed: 0, failConsent: false, themeListeners: 0, submits: 0, submitError: null };
         const add = MediaQueryList.prototype.addEventListener;
         const remove = MediaQueryList.prototype.removeEventListener;
         MediaQueryList.prototype.addEventListener = function (type, ...args) { if (type === 'change') probe.themeListeners++; return add.call(this, type, ...args); };
@@ -62,7 +62,7 @@ try {
                 probe.created++;
                 probe.active++;
                 const group = {};
-                return { update() {}, async submit() { return {}; }, create(type, options) {
+                return { update() {}, async submit() { probe.submits++; return probe.submitError ? { error: probe.submitError } : {}; }, create(type, options) {
                     // Like Stripe.js, reject unknown Elements and invalid wallet values.
                     if (!['payment', 'expressCheckout'].includes(type)) throw new Error(`Unknown Element: ${type}`);
                     if (!['auto', 'never', undefined].includes(options.wallets?.link)) throw new Error('Invalid wallets.link');
@@ -146,6 +146,21 @@ try {
             holdConsent = false;
             pendingConsent.splice(0).forEach((resolve) => resolve());
         } else {
+            if (cycle === 2) {
+                // An unfinished card stops at Stripe's own field check: no agreement is recorded and our alert stays empty.
+                const consent = await page.evaluate(() => { probe.submitError = { type: 'validation_error', message: 'Your card number is incomplete.' }; return probe.consent; });
+                const submits = await page.evaluate(() => probe.submits);
+                await page.getByRole('button', { name: 'Save card' }).click();
+                await page.waitForFunction((count) => probe.submits > count && !document.getElementById('submit').disabled, submits);
+                assert.equal(await page.evaluate(() => probe.consent), consent, 'A validation error sends no setup agreement');
+                assert.equal(await page.getByRole('alert').first().textContent(), '', 'Stripe shows the validation error beside its field, not in our alert');
+                // Any other check error is shown, still before any agreement is recorded.
+                await page.evaluate(() => { probe.submitError = { type: 'api_error', message: 'Raw Stripe detail' }; });
+                await page.getByRole('button', { name: 'Save card' }).click();
+                await page.getByRole('alert').filter({ hasText: 'Could not save your payment method. Try again.' }).waitFor();
+                assert.equal(await page.evaluate(() => probe.consent), consent, 'A failed card check sends no setup agreement');
+                await page.evaluate(() => { probe.submitError = null; });
+            }
             await page.getByRole('button', { name: 'Save card' }).click();
         }
         await page.getByRole('alert').filter({ hasText: 'Test decline' }).waitFor();
