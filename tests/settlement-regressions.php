@@ -353,3 +353,46 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
         $guarding = false;
     }
 })();
+
+// Subscription settlement must lock the customer before any plain read. MariaDB REPEATABLE READ takes a transaction's
+// read view at its first plain read, so a plain read before the user lock hides an attempt another process commits while
+// settlement waits for that lock: the completed attempt would then never be retired.
+(function () use ($gateway, $reset, $owner, &$applications) {
+    $reset();
+    $invoice = nativeInvoice(421, 20, 'USD');
+    nativeService('sub_adopted', [$invoice]);
+    $intent = (object) ['id' => 'pi_adopted_processing', 'status' => 'succeeded', 'amount' => 2000,
+        'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner'];
+    $stripeInvoice = (object) ['id' => 'in_adopted', 'currency' => 'usd', 'amount_paid' => 2000,
+        'metadata' => (object) ['ae_stripe_invoice_id' => 421],
+        'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) ['subscription' => 'sub_adopted']]];
+    $GLOBALS['stripeHandler'] = function ($verb, $path) use ($intent) {
+        if ($verb === 'get' && $path === '/invoice_payments') return ['data' => [
+            ['status' => 'paid', 'amount_paid' => 2000, 'payment' => ['type' => 'payment_intent', 'payment_intent' => $intent->id]]]];
+        if ($verb === 'get' && $path === '/payment_intents/' . $intent->id) return $intent;
+        throw new RuntimeException('Unexpected adopted attempt request: ' . $verb . ' ' . $path);
+    };
+    // The bank debit was recorded as processing; Pay adopts it into the invoice's attempt.
+    App\Helpers\ExtensionHelper::addProcessingPayment($invoice, 'AeStripe', 20, null, $intent->id);
+    $first = null; $tracing = true; $concurrent = false;
+    DB::connection()->beforeExecuting(function ($sql) use (&$first, &$tracing, &$concurrent) {
+        if ($tracing && !$concurrent && $first === null && DB::transactionLevel() > 0) $first = $sql;
+    });
+    beforeLock('users', function () use ($owner, $intent, &$concurrent) {
+        $concurrent = true;
+        $owner->properties()->create(['key' => 'ae_stripe_checkout_421', 'value' => json_encode(['version' => 2,
+            'key' => 'adopt_' . $intent->id, 'created' => time(), 'intent' => $intent->id, 'retry' => true, 'funds_pending' => true])]);
+        $concurrent = false;
+    });
+    $before = $applications;
+    try { invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice); } finally { $tracing = false; }
+    check(is_string($first) && str_starts_with($first, 'select * from "users"') && str_ends_with($first, '/* for update */'),
+        'Subscription settlement locks the customer before its first read, so it sees an attempt committed while it waited');
+    check(!$owner->properties()->where('key', 'ae_stripe_checkout_421')->exists()
+        && payments()['421:' . $intent->id]['status'] === 'succeeded' && moneyRows()['payments'] === ['421:' . $intent->id => 1]
+        && $applications === $before + 1,
+        'Subscription settlement pays the adopted processing debit once and retires its completed attempt');
+    invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice);
+    check($applications === $before + 1 && moneyRows()['payments'] === ['421:' . $intent->id => 1],
+        'A repeated subscription delivery records nothing more');
+})();

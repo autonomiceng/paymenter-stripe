@@ -78,9 +78,11 @@ trait SubscriptionPayments
         $intent = $this->request('get', '/payment_intents/' . $paymentId, ['expand' => ['latest_charge']]);
         abort_unless($intent->id === $paymentId && $intent->status === 'succeeded', 409);
         $this->ensureReceiptReturnSchema();
-        DB::transaction(function () use ($stripeInvoice, $subscriptionId, $paymentId, $intent) {
-            $ownerId = Service::where('subscription_id', $subscriptionId)->first()?->user_id;
-            if (!$ownerId) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
+        // Read the owner before the transaction. MariaDB takes a transaction's read view at its first plain read, so
+        // the user lock must come first: plain reads after it then see attempts committed while settlement waited.
+        $ownerId = Service::where('subscription_id', $subscriptionId)->first()?->user_id;
+        if (!$ownerId) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
+        DB::transaction(function () use ($stripeInvoice, $subscriptionId, $paymentId, $intent, $ownerId) {
             // Match PaymentIntent settlement: serialize on the customer before other rows.
             User::where('id', $ownerId)->lockForUpdate()->firstOrFail();
             $service = Service::where('subscription_id', $subscriptionId)->lockForUpdate()->first();
