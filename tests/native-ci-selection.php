@@ -22,6 +22,43 @@ require_once __DIR__ . '/temporary-root.php';
 $fixture = TemporaryRoot::create('ae-stripe-matrix-');
 mkdir($fixture . '/app/vendor', 0700, true); mkdir($fixture . '/other/vendor', 0700, true);
 file_put_contents($fixture . '/app/vendor/autoload.php', '<?php'); file_put_contents($fixture . '/other/vendor/autoload.php', '<?php');
+// Execute each job's real verification commands with local tar fixtures, without downloads or Composer.
+$source = $fixture . '/source';
+mkdir($source);
+file_put_contents($source . '/composer.lock', 'locked public dependencies');
+[$status, $printed] = $launch(['tar', '-cf', $fixture . '/source.tar', '-C', $source, 'composer.lock'], $inherited);
+check($status === 0, 'Create the source archive fixture: ' . $printed);
+$tar = file_get_contents($fixture . '/source.tar');
+$archives = [];
+foreach (['-1', '-9'] as $level) {
+    [$status, $compressed] = $launch(['gzip', $level, '-c', $fixture . '/source.tar'], $inherited);
+    check($status === 0, 'Compress the same source with ' . $level);
+    $archives[$level] = $compressed;
+}
+check($archives['-1'] !== $archives['-9'], 'Source fixtures have different gzip bytes');
+foreach (['native-pending', 'browser'] as $job) {
+    preg_match('/^  ' . $job . ':\n(.*?)(?=^  [a-z][a-z-]*:|\z)/ms', $workflow, $jobMatch);
+    preg_match('/^          curl [^\n]+\n(.*?)^          mkdir /ms', $jobMatch[1] ?? '', $verification);
+    $command = preg_replace('/^          /m', '', $verification[1] ?? '');
+    check($command !== '' && preg_match('/[a-f0-9]{64}/', $command, $digest), $job . ' has an explicit source digest before extraction');
+    check($digest[0] === '1bcb9f30a6061cc15aae187c7a269f5ee109bae4a5fe705a6923723995c6e3d7'
+        && str_contains($jobMatch[1], 'https://codeload.github.com/Paymenter/Paymenter/tar.gz/ee729f7d99ac18942625b79f3f93d8d8b21255e8')
+        && str_contains($jobMatch[1], 'tar -xf "$RUNNER_TEMP/paymenter.tar" --strip-components=1 -C "$RUNNER_TEMP/paymenter"'), $job . ' keeps the exact public source pin and extracts the verified tar');
+    // Only substitute the trusted digest and archive location; execute the workflow's verification unchanged.
+    $command = str_replace($digest[0], hash('sha256', $tar), $command);
+    $directory = $fixture . '/' . $job;
+    mkdir($directory);
+    $verify = function (string $bytes, string $script) use ($directory, $inherited, $launch): int {
+        file_put_contents($directory . '/paymenter.tar.gz', $bytes);
+        return $launch(['bash', '-euo', 'pipefail', '-c', $script], array_replace($inherited, ['RUNNER_TEMP' => $directory]))[0];
+    };
+    foreach ($archives as $level => $compressed) check($verify($compressed, $command) === 0, $job . ' accepts identical source under gzip ' . $level);
+    file_put_contents($fixture . '/altered.tar', str_replace('locked public dependencies', 'edited public dependencies', $tar));
+    [$status, $altered] = $launch(['gzip', '-c', $fixture . '/altered.tar'], $inherited);
+    check($status === 0 && $verify($altered, $command) !== 0, $job . ' rejects changed source content');
+    check($verify($archives['-1'], str_replace(hash('sha256', $tar), str_repeat('0', 64), $command)) !== 0, $job . ' rejects a bad source digest');
+    check($verify(substr($archives['-1'], 0, -8), $command) !== 0, $job . ' rejects truncated gzip even when decompressed bytes match');
+}
 $evidence = $fixture . '/evidence/offline.txt';
 for ($run = 1; $run <= 2; ++$run) {
     [$status] = $launch([PHP_BINARY, '-n', '-d', 'auto_prepend_file=' . __DIR__ . '/entered.php', __DIR__ . '/native-suites.php'], array_replace($inherited, ['PAY_TEST_ENTERED' => $evidence]));
