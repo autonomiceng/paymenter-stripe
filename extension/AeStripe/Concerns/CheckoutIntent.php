@@ -343,8 +343,20 @@ trait CheckoutIntent
 
     private function readPaymentAttempt($user, $invoice): ?array
     {
-        $stored = $user->properties()->where('key', 'ae_stripe_checkout_' . $invoice->id)->lockForUpdate()->first()?->value;
+        $stored = $this->lockedUserProperty($user, 'ae_stripe_checkout_' . $invoice->id)?->value;
         return $stored ? $this->clearFinishedPaymentConstraints(json_decode($stored, true, flags: JSON_THROW_ON_ERROR)) : null;
+    }
+
+    /**
+     * One of the user's properties, read under the user row lock. Every writer of these keys holds that lock, so a
+     * plain read sees the latest row, and only a row that exists is then locked. A locking read of a missing key would
+     * lock a gap of the properties index shared with other customers: two customers whose Pay each locks that gap and
+     * then inserts its own key deadlock (SQLSTATE 40001).
+     */
+    private function lockedUserProperty($user, string $key)
+    {
+        if (!$user->properties()->where('key', $key)->first()) return null;
+        return $user->properties()->where('key', $key)->lockForUpdate()->first();
     }
 
     private function clearFinishedPaymentConstraints(array $attempt): array
