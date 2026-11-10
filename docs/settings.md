@@ -9,6 +9,9 @@
 - **Stripe webhook signing secret**: encrypted endpoint signing secret; never expose it
   in browser markup. CustomerSession and intent client secrets are user-scoped
   capabilities supplied only to the invoice owner.
+- The gateway editor never sends a saved API key or signing secret to the page. Both fields
+  are masked and show only the last four characters of the saved value. Leave a field blank
+  to keep its saved value; type a new value to replace it.
 
 ## Stripe API permissions
 
