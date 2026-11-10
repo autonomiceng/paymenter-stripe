@@ -132,7 +132,7 @@ trait AutoPay
      * customer's own, open, and at the amount the dialog showed.
      *
      * @param  array<int, array{0: Invoice, 1: string}>  $invoices  invoice and accepted amount, oldest first
-     * @return array{enabled: bool, invoices: array<int, array{id: int, status: string}>, message: ?string}
+     * @return array{enabled: bool, invoices: array<int, array{id: int, status: string, message?: string}>, message: ?string}
      */
     public function turnOnAutoPayAndPay(User $user, BillingAgreement $agreement, array $invoices, string $version): array
     {
@@ -174,8 +174,8 @@ trait AutoPay
         }
         $result['enabled'] = true;
         foreach (array_slice($invoices, 1) as [$invoice, $amount]) {
-            $paid = $pay($invoice, $amount, true);
-            $result['invoices'][] = ['id' => $paid['id'], 'status' => $paid['status']];
+            // A later invoice that is not paid keeps its own reason.
+            $result['invoices'][] = array_intersect_key($pay($invoice, $amount, true), array_flip(['id', 'status', 'message']));
         }
         return $result;
     }
