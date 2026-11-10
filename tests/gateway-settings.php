@@ -58,3 +58,18 @@ check($fresh->get('data.settings.stripe_webhook_secret') === null && !str_contai
     && !str_contains($fresh->html(), 'whsec_savedsecret')
     && $fresh->instance()->form->getComponentByStatePath('settings.stripe_webhook_secret')->getPlaceholder() === 'Saved, ends in aced. Leave blank to keep it.',
     'The replaced secret is masked when the editor opens again');
+
+// Other gateways can use the same names. Their fields keep native formatting and dehydration.
+$bundled = App\Models\Gateway::create(['name' => 'Bundled Stripe', 'extension' => 'Stripe', 'type' => 'gateway', 'enabled' => false]);
+foreach ($credentials as $key => $value) $bundled->settings()->create(['key' => $key, 'value' => $value, 'encrypted' => $key !== 'stripe_publishable_key']);
+$other = Livewire::test(EditGateway::class, ['record' => $bundled->id]);
+foreach (['stripe_secret_key', 'stripe_webhook_secret'] as $key) {
+    $field = $other->instance()->form->getComponentByStatePath('settings.' . $key);
+    check($other->get('data.settings.' . $key) === $credentials[$key], "Another gateway's saved $key still shows");
+    foreach ([null, '', '  ', 'other-secret', '0'] as $value) {
+        $field->state($value)->callAfterStateHydrated();
+        check(data_get($other->instance(), $field->getStatePath()) === $value, "Another gateway's $key keeps its hydrated value");
+        check($field->getStateToDehydrate($value) === [$field->getStatePath() => $value === '' ? null : $value],
+            "Another gateway's $key keeps native blank and populated submission values");
+    }
+}
