@@ -57,7 +57,10 @@ card, under the user lock; off unlinks every service and keeps the card choice i
 billing either way. Native Service Created records pending inheritance with each new recurring service
 without a selected agreement or subscription. Binding runs after the order commits. A busy card lock leaves
 the order intact; the once-per-minute scheduler retries durable pending work with current ownership and consent checks.
-The invoice and service show pending setup and manual-payment guidance. Turning Auto Pay off, clearing a service
+The invoice and service show pending setup and manual-payment guidance. A service ordered while AE Stripe is paused
+or bundled Stripe is active records the same pending work. Its invoice and service say setup is paused and will
+retry when card payments resume. The first scheduler pass after AE Stripe takes card payments again links it once,
+after the same checks, and charges nothing. Turning Auto Pay off, clearing a service
 selection or choosing another card cancels old pending work. Service Updated never reapplies account consent.
 Linking charges nothing: native renewal charges happen when an invoice is issued, so open
 invoices stay for the customer to pay. On and Off both stop a renewal retry waiting on an

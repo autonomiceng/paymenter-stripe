@@ -30,9 +30,10 @@ trait AutoPayInheritance
     }
 
     // Persist with the new service, before checkout commits. No card lock or binding belongs here.
+    // A pause or active bundled Stripe still records the work; binding waits until AE Stripe takes card payments again.
     private function applyNewServiceAutoPay(Service $service): void
     {
-        if (!$this->gatewayEnabled() || !$this->bundledInactive() || $service->billing_agreement_id || $service->subscription_id
+        if ($service->billing_agreement_id || $service->subscription_id
             || ($service->plan?->type ?? null) !== 'recurring' || $service->status === Service::STATUS_CANCELLED) return;
         $owner = User::where('id', $service->user_id)->firstOrFail();
         if (!$record = $this->autoPayDefault($owner)) return;
