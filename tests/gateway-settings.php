@@ -14,6 +14,21 @@ foreach (['vendor', 'vendor/composer'] as $dir) foreach (array_diff(scandir($rel
 $classmap = (require $release . '/vendor/composer/autoload_classmap.php') + ['Paymenter\\Extensions\\Gateways\\AeStripe\\AeStripe' => realpath(__DIR__ . '/../extension/AeStripe/AeStripe.php')];
 file_put_contents($root . '/vendor/composer/autoload_classmap.php', '<?php return ' . var_export($classmap, true) . ';');
 
+auth()->login($staff);
+Filament\Facades\Filament::setCurrentPanel(Filament\Facades\Filament::getPanel('admin'));
+
+// Before any credentials are seeded, a blank restricted key must fail native validation without HTTP.
+check(!$nativeGateway->settings()->where('key', 'stripe_secret_key')->exists(), 'No restricted key is saved for the required-field case');
+$calls = count($GLOBALS['stripeCalls']);
+$unconfigured = Livewire::test(EditGateway::class, ['record' => $nativeGateway->id]);
+$unconfigured->set('data.settings.stripe_publishable_key', 'pk_test_publishable')
+    ->set('data.settings.stripe_secret_key', '')->call('save');
+check($unconfigured->failedRules() === ['data.settings.stripe_secret_key' => ['Required' => []]]
+    && $unconfigured->instance()->getErrorBag()->has('data.settings.stripe_secret_key'),
+    'A blank restricted key with no saved key has the required validation error');
+check(!$nativeGateway->settings()->where('key', 'stripe_secret_key')->exists(), 'The rejected save does not store an empty restricted key');
+check(count($GLOBALS['stripeCalls']) === $calls, 'The missing-key validation makes no Stripe verification request');
+
 $credentials = ['stripe_secret_key' => 'rk_test_savedkey', 'stripe_publishable_key' => 'pk_test_publishable',
     'stripe_webhook_secret' => 'whsec_savedsecret'];
 foreach ($credentials as $key => $value) $nativeGateway->settings()->create(['key' => $key, 'value' => $value, 'encrypted' => $key !== 'stripe_publishable_key']);
@@ -22,8 +37,6 @@ $nativeGateway->settings()->create(['key' => 'ae_stripe_webhook_continuity', 'va
     'endpoint' => 'we_fixture', 'delivery' => 'endpoint', 'credentials' => $credentials, 'previous' => []], JSON_PRETTY_PRINT), 'encrypted' => true]);
 $saved = fn (string $key) => $nativeGateway->settings()->where('key', $key)->first()?->value;
 
-auth()->login($staff);
-Filament\Facades\Filament::setCurrentPanel(Filament\Facades\Filament::getPanel('admin'));
 $page = Livewire::test(EditGateway::class, ['record' => $nativeGateway->id]);
 $html = $page->html();
 check(!array_diff(array_keys($page->get('data.settings')), array_column($gateway->getConfig(), 'name')) && !str_contains($html, 'acct_fixture'),
