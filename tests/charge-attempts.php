@@ -920,6 +920,24 @@ use Illuminate\Support\Facades\{DB, Http};
             $stripe->failure = null;
             check($gateway->charge($invoice, 20, new BillingAgreement) === true, 'Recovery decline leaves the invoice payable');
         });
+        $run('saved-decline-kept', function ($invoice, $stripe) use ($gateway) {
+            // An Auto Pay or saved-card refusal leaves the intent open, and the next saved-card Pay confirms that same intent.
+            $stripe->failure = function ($verb, $path) use ($stripe) {
+                if (!str_ends_with($path, '/confirm')) return;
+                $intent = $stripe->intents['pi_test1']; $intent->latest_charge = 'ch_refused';
+                $intent->last_payment_error = (object) ['code' => 'card_declined', 'decline_code' => 'generic_decline'];
+                throw new RequestException(402, ['error' => ['type' => 'card_error', 'code' => 'card_declined']]);
+            };
+            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            check((ExtensionHelper::$payments['920:pi_test1']['status'] ?? null) === 'failed', 'A saved-card refusal records a Failed payment');
+            $stripe->failure = null;
+            check($gateway->charge($invoice, 20, new BillingAgreement) === true && count($stripe->intents) === 1, 'The next saved-card Pay confirms the same intent');
+            $statuses = array_count_values(array_column(ExtensionHelper::$payments, 'status'));
+            check(($statuses['failed'] ?? 0) === 1 && ($statuses['succeeded'] ?? 0) === 1
+                && (ExtensionHelper::$payments['920:pi_test1']['status'] ?? null) === 'succeeded'
+                && isset(ExtensionHelper::$payments['920:pi_test1:ch_refused']),
+                'A later payment on the same intent keeps the earlier Failed attempt on the invoice');
+        });
         $run('confirm-processing-refusal', function ($invoice, $stripe) use ($gateway) {
             $stripe->failure = function ($verb, $path) use ($stripe) {
                 if (str_ends_with($path, '/confirm')) { $stripe->intents['pi_test1']->status = 'processing'; throw new RequestException(400, ['error' => ['code' => 'payment_intent_unexpected_state']]); }

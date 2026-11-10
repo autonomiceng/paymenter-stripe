@@ -268,6 +268,16 @@ trait CheckoutIntent
         return $this->storePaymentAttempt($invoice, $attempt, $values);
     }
 
+    /**
+     * Native payments are keyed by transaction ID, so confirming a refused intent again would overwrite its Failed row
+     * with the new outcome. Re-key the earlier refusal by its charge first, so every attempt stays on the invoice.
+     */
+    private function keepFailedAttempt($intent): void
+    {
+        $charge = is_string($intent->latest_charge ?? null) && $intent->latest_charge !== '' ? $intent->latest_charge : 'failed_' . bin2hex(random_bytes(6));
+        InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->update(['transaction_id' => $intent->id . ':' . $charge]);
+    }
+
     private function paymentAttemptFailed(array $attempt, $intent): bool
     {
         if ($intent->status !== 'requires_payment_method') return false;
@@ -466,6 +476,7 @@ trait CheckoutIntent
                 foreach (['metadata', 'setup_future_usage'] as $field) {
                     if (array_key_exists($field, $params)) { $updates[$field] = $params[$field]; unset($params[$field]); }
                 }
+                $this->keepFailedAttempt($intent);
                 $writeStarted = true;
                 $this->request('post', '/payment_intents/' . $intentId, $updates);
                 $result = $this->request('post', '/payment_intents/' . $intentId . '/confirm', $params, $attempt['confirmation']['key']);
