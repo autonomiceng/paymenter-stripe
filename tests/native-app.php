@@ -106,6 +106,28 @@ function holdsLock(string $table): bool { return DB::transactionLevel() > 0 && i
 /** Run once after the next committed transaction, as if its acknowledgement were lost. */
 function afterNextCommit(callable $hook): void { $GLOBALS['nativeAfterCommit'] = $hook; }
 
+// Row lock order and interleavings. Each locking read is logged by table before it runs. A hook set with
+// beforeLock() runs once, just before the next locking read of its table, as another process that commits first.
+$GLOBALS['nativeLockLog'] = [];
+$GLOBALS['nativeBeforeLock'] = [];
+$connection->beforeExecuting(function ($sql) {
+    if (!str_contains($sql, '/* for update */') || !preg_match('/^select .*? from "([a-z_]+)"/', $sql, $table)) return;
+    if ($hook = $GLOBALS['nativeBeforeLock'][$table[1]] ?? null) { unset($GLOBALS['nativeBeforeLock'][$table[1]]); $hook(); }
+    $GLOBALS['nativeLockLog'][] = $table[1];
+});
+/** Tables locked for update, in statement order, since the process started. */
+function lockLog(): array { return $GLOBALS['nativeLockLog']; }
+/** Run a hook once, just before the next row lock on this table. */
+function beforeLock(string $table, callable $hook): void { $GLOBALS['nativeBeforeLock'][$table] = $hook; }
+// Log entries as [level, message, context]; the null log channel still dispatches each entry.
+$GLOBALS['nativeLog'] = [];
+Illuminate\Support\Facades\Event::listen(Illuminate\Log\Events\MessageLogged::class, function ($entry) { $GLOBALS['nativeLog'][] = [$entry->level, $entry->message, $entry->context]; });
+/** Warnings logged since the process started, as [message, context]. */
+function warnings(): array
+{
+    return array_values(array_map(fn ($entry) => [$entry[1], $entry[2]], array_filter($GLOBALS['nativeLog'], fn ($entry) => $entry[0] === 'warning')));
+}
+
 $count = 0;
 function check($value, $label) {
     global $count;
@@ -229,4 +251,19 @@ function nativeInvoice(int $id, float $total = 20, string $currency = 'USD', ?st
         'status' => 'pending', 'due_at' => now()->addWeek()]);
     $invoice->items()->create(['quantity' => 1, 'price' => $total, 'description' => 'Fixture']);
     return $invoice->fresh();
+}
+/** An active service of the owner for a Stripe subscription, billed by the given invoices. */
+function nativeService(string $subscriptionId, array $invoices = []): App\Models\Service
+{
+    static $plan;
+    if (!$plan) {
+        $category = App\Models\Category::create(['slug' => 'native-fixture', 'name' => 'Fixture']);
+        $product = App\Models\Product::create(['category_id' => $category->id, 'name' => 'Fixture', 'slug' => 'native-fixture']);
+        $plan = $product->plans()->create(['name' => 'Monthly', 'type' => 'recurring', 'billing_unit' => 'month', 'billing_period' => 1]);
+        $plan->prices()->create(['currency_code' => 'USD', 'price' => 20]);
+    }
+    $service = App\Models\Service::create(['user_id' => 7, 'product_id' => $plan->priceable_id, 'plan_id' => $plan->id, 'price' => 20,
+        'currency_code' => 'USD', 'quantity' => 1, 'status' => 'active', 'subscription_id' => $subscriptionId]);
+    foreach ($invoices as $invoice) $invoice->items()->update(['reference_type' => App\Models\Service::class, 'reference_id' => $service->id]);
+    return $service;
 }

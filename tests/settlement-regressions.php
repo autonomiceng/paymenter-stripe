@@ -1,20 +1,28 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-use App\Helpers\ExtensionHelper;
-use App\Models\{Audit, Gateway, Invoice, InvoiceTransaction, Service, User};
+// Native suite: runs on tests/native-app.php (real Paymenter models, listeners and SQLite).
+use App\Models\{Invoice, InvoiceTransaction};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
-use Illuminate\Support\Facades\{DB, Http, Log};
+use Illuminate\Support\Facades\DB;
+
+// Each native payment write, as ExtensionHelper::addPayment saves one transaction per call.
+$applications = 0;
+InvoiceTransaction::saved(function () use (&$applications) { ++$applications; });
+// Invoices that native listeners mark paid.
+$activations = 0;
+Invoice::updated(function ($invoice) use (&$activations) { if ($invoice->wasChanged('status') && $invoice->status === 'paid') ++$activations; });
+$reset = function () use ($owner) {
+    foreach (['invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices', 'services'] as $table) DB::table($table)->delete();
+    $owner->properties()->where('key', '!=', 'stripe_id')->delete();
+};
+$lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
 
 // Subscription PaymentIntents have no checkout binding; the subscription invoice owns it.
-(function () use ($gateway) {
-    $saved = [Gateway::$enabled, Http::$handler, Service::$row, Invoice::$rows, ExtensionHelper::$payments,
-        DB::$tables['ae_stripe_receipt_returns'] ?? [], \App\Models\Credit::$rows, Audit::$rows, \App\Models\Notification::$rows];
-    Gateway::$enabled = true;
-    $invoice = clone Invoice::$row; $invoice->id = 113; $invoice->status = 'cancelled'; $invoice->currency_code = 'usd';
-    Invoice::$rows[113] = $invoice; ExtensionHelper::$payments = []; DB::$tables['ae_stripe_receipt_returns'] = [];
-    \App\Models\Credit::$rows = [];
-    $service = Service::$row = new Service; $service->subscription_id = 'sub_closed';
-    $service->invoiceRows = [(object) ['invoice' => $invoice]];
+(function () use ($gateway, $reset, &$applications, &$activations) {
+    $reset();
+    $invoice = nativeInvoice(113, 20, 'USD');
+    $invoice->forceFill(['status' => 'cancelled'])->save();
+    nativeService('sub_closed', [$invoice]);
     $intent = (object) ['id' => 'pi_closed_subscription', 'status' => 'succeeded', 'amount_received' => 1250,
         'currency' => 'usd', 'customer' => 'cus_owner', 'metadata' => (object) [],
         'latest_charge' => (object) ['id' => 'ch_closed', 'disputed' => false]];
@@ -23,8 +31,8 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) [
             'subscription' => 'sub_closed', 'metadata' => (object) ['ae_stripe_gateway' => '1']]]];
     $available = false; $member = $intent->id; $refunds = []; $posts = 0;
-    Http::$handler = function ($verb, $path, $data) use ($intent, $remote, &$available, &$member, &$refunds, &$posts) {
-        if ($path === '/payment_intents/' . $intent->id) return clone $intent;
+    $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($intent, $remote, &$available, &$member, &$refunds, &$posts) {
+        if ($path === '/payment_intents/' . $intent->id) return $intent;
         if ($path === '/invoice_payments') return ['has_more' => false, 'data' => [
             ['status' => 'paid', 'amount_paid' => 1250, 'payment' => ['type' => 'payment_intent', 'payment_intent' => $member]]]];
         if ($path === '/invoices/in_closed') {
@@ -34,55 +42,40 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         if ($path === '/refunds' && $verb === 'get') return ['has_more' => false, 'data' => array_values($refunds)];
         if ($path === '/refunds' && $verb === 'post') {
             ++$posts;
-            $key = end(Http::$calls)[3]['Idempotency-Key'];
-            return $refunds[$key] ??= (object) ['id' => 're_closed', 'payment_intent' => $intent->id, 'amount' => $data['amount'],
+            return $refunds[idempotencyKey($request)] ??= (object) ['id' => 're_closed', 'payment_intent' => $intent->id, 'amount' => $data['amount'],
                 'currency' => 'usd', 'metadata' => (object) $data['metadata'], 'status' => 'succeeded'];
         }
         throw new RuntimeException('Unexpected closed subscription request: ' . $path);
     };
     $deliver = fn () => $gateway->webhook(eventRequest($remote, type: 'invoice.payment_succeeded'));
-    $status = fn () => $gateway->receiptReturnStatus($invoice, $intent->id, 'excess');
-    ExtensionHelper::$simulateNativeListeners = true; $activations = ExtensionHelper::$activations;
-    try {
-        $deliver(); $deliver();
-        check($status() !== null && $status()['amount_minor'] === 1250 && !ExtensionHelper::$payments && !$posts,
-            'Bound closed subscription reserves its whole receipt before interrupted recovery, without native funding');
-        $available = true; $remote->metadata->ae_stripe_invoice_id = 999;
-        $gateway->retryReceiptReturns();
-        check($status()['state'] === 'review' && !$posts && !\App\Models\Credit::$rows,
-            'Closed subscription recovery refuses a changed remote invoice binding');
-        $remote->metadata->ae_stripe_invoice_id = 113; $member = 'pi_unrelated';
-        $gateway->retryReceiptReturns();
-        check($status()['state'] === 'review' && !$posts, 'Closed subscription recovery verifies exact current invoice payment membership');
-        $member = $intent->id; $gateway->retryReceiptReturns();
-        $deliver(); $gateway->webhook(eventRequest($intent)); $gateway->retryReceiptReturns();
-        check($status()['state'] === 'refunded' && $posts === 1 && count($refunds) === 1
-            && count(ExtensionHelper::$payments) === 2 && array_sum(array_column(ExtensionHelper::$payments, 'amount')) === 0.0,
-            'Duplicate subscription and metadata-free intent deliveries plus sweep return the whole receipt once');
-        check($invoice->status === 'cancelled' && ExtensionHelper::$activations === $activations
-            && !\App\Models\Credit::$rows && !isset($intent->metadata->invoice_id),
-            'Closed subscription return preserves closure, no activation or Domains funding, and needs no checkout metadata');
-    } finally {
-        ExtensionHelper::$simulateNativeListeners = false;
-        [Gateway::$enabled, Http::$handler, Service::$row, Invoice::$rows, ExtensionHelper::$payments,
-            DB::$tables['ae_stripe_receipt_returns'], \App\Models\Credit::$rows, Audit::$rows, \App\Models\Notification::$rows] = $saved;
-    }
+    $returnStatus = fn () => $gateway->receiptReturnStatus($invoice, $intent->id, 'excess');
+    $activated = $activations;
+    $deliver(); $deliver();
+    check($returnStatus() !== null && $returnStatus()['amount_minor'] === 1250 && !payments() && !$posts,
+        'Bound closed subscription reserves its whole receipt before interrupted recovery, without native funding');
+    $available = true; $remote->metadata->ae_stripe_invoice_id = 999;
+    $gateway->retryReceiptReturns();
+    check($returnStatus()['state'] === 'review' && !$posts && !credits(),
+        'Closed subscription recovery refuses a changed remote invoice binding');
+    $remote->metadata->ae_stripe_invoice_id = 113; $member = 'pi_unrelated';
+    $gateway->retryReceiptReturns();
+    check($returnStatus()['state'] === 'review' && !$posts, 'Closed subscription recovery verifies exact current invoice payment membership');
+    $member = $intent->id; $gateway->retryReceiptReturns();
+    $deliver(); $gateway->webhook(eventRequest($intent)); $gateway->retryReceiptReturns();
+    check($returnStatus()['state'] === 'refunded' && $posts === 1 && count($refunds) === 1
+        && count(payments()) === 2 && array_sum(array_column(payments(), 'amount')) === 0.0,
+        'Duplicate subscription and metadata-free intent deliveries plus sweep return the whole receipt once');
+    check($invoice->fresh()->status === 'cancelled' && $activations === $activated
+        && !credits() && !isset($intent->metadata->invoice_id),
+        'Closed subscription return preserves closure, no activation or Domains funding, and needs no checkout metadata');
 })();
 
-(function () use ($gateway) {
-    $oldHandler = Http::$handler;
-    $oldEnabled = Gateway::$enabled;
-    $oldService = Service::$row;
-    $oldRows = Invoice::$rows;
-    $invoice = clone Invoice::$row;
-    $invoice->id = 112;
-    $invoice->currency_code = 'usd';
-    $invoice->status = 'pending';
-    Invoice::$rows[$invoice->id] = $invoice;
-    Gateway::$enabled = true;
-    $service = Service::$row = new Service;
-    $service->subscription_id = 'sub_settlement';
-    $service->invoiceRows = [(object) ['invoice' => $invoice]];
+(function () use ($gateway, $reset, $lastAudit, &$applications) {
+    $reset();
+    nativeInvoice(12, 20, 'USD', 'INV-12');
+    $invoice = nativeInvoice(112, 20, 'USD');
+    $service = nativeService('sub_settlement', [$invoice]);
+    $setStatus = fn ($value) => $invoice->forceFill(['status' => $value])->save();
     $intent = (object) ['id' => 'pi_received', 'status' => 'succeeded', 'amount' => 2000,
         'amount_received' => 1250, 'currency' => 'usd', 'customer' => 'cus_owner',
         'metadata' => (object) ['invoice_id' => $invoice->id, 'ae_stripe_gateway' => '1']];
@@ -90,13 +83,13 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         'metadata' => (object) ['ae_stripe_invoice_id' => $invoice->id],
         'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) [
             'subscription' => $service->subscription_id, 'metadata' => (object) ['ae_stripe_gateway' => '1']]]];
-    Http::$handler = function ($verb, $path) use ($intent) {
+    $GLOBALS['stripeHandler'] = function ($verb, $path) use ($intent) {
         if ($verb === 'get' && $path === '/invoices/in_settlement') return ['metadata' => ['ae_stripe_invoice_id' => 112]];
         if ($verb === 'get' && $path === '/invoice_payments') return ['data' => [
             ['status' => 'paid', 'amount_paid' => 1250,
                 'payment' => ['type' => 'payment_intent', 'payment_intent' => $intent->id]]]];
         if ($verb === 'get' && $path === '/payment_intents/' . $intent->id) {
-            check(!DB::$locked || DB::$userLocked, 'Return verification also serializes on the receipt owner');
+            check(DB::transactionLevel() === 0 || holdsLock('users'), 'Return verification also serializes on the receipt owner');
             return $intent;
         }
         throw new RuntimeException('Unexpected settlement request: ' . $path);
@@ -104,266 +97,259 @@ use Illuminate\Support\Facades\{DB, Http, Log};
     $deliver = fn () => $gateway->webhook(eventRequest($stripeInvoice, type: 'invoice.payment_succeeded'));
 
     $gateway->webhook(eventRequest($intent));
-    check(ExtensionHelper::$payments['112:pi_received']['amount'] === 12.5,
+    check(payments()['112:pi_received']['amount'] === 12.5,
         'Successful payment records received amount instead of intended amount');
     $intent->id = 'pi_processing_received';
     $intent->amount_received = 0;
     $gateway->webhook(eventRequest($intent, type: 'payment_intent.processing'));
-    check(ExtensionHelper::$payments['112:pi_processing_received']['amount'] === 20.0,
+    check(payments()['112:pi_processing_received']['amount'] === 20.0,
         'Processing payment keeps its intended amount before settlement');
     $gateway->webhook(eventRequest($intent, type: 'payment_intent.payment_failed'));
-    check(ExtensionHelper::$payments['112:pi_processing_received']['amount'] === 20.0,
+    check(payments()['112:pi_processing_received']['amount'] === 20.0,
         'Failed payment keeps its intended amount before settlement');
     $intent->amount_received = 1250;
     $gateway->webhook(eventRequest($intent));
-    check(ExtensionHelper::$payments['112:pi_processing_received']['amount'] === 12.5,
+    check(payments()['112:pi_processing_received']['amount'] === 12.5,
         'Processing payment updates to the actual received amount on success');
     $intent->id = 'pi_zero_received';
     $intent->amount_received = 0;
     $gateway->webhook(eventRequest($intent));
-    check(ExtensionHelper::$payments['112:pi_zero_received']['amount'] === 0.0,
+    check(payments()['112:pi_zero_received']['amount'] === 0.0,
         'A zero received amount never falls back to the intended amount');
     $intent->amount_received = 1250;
 
-    $invoice->status = 'paid';
+    $setStatus('paid');
     $intent->id = 'pi_subscription_paid';
     $intent->metadata->invoice_id = 12;
-    $before = ExtensionHelper::$applications;
-    $warnings = count(Log::$warnings);
-    $locks = count(DB::$modelLocks);
-    $calls = count(Http::$calls);
+    $before = $applications;
+    $warnings = count(warnings());
+    $locks = count(lockLog());
+    $calls = count($GLOBALS['stripeCalls']);
     $deliver();
     $deliver();
-    check(count(array_filter(array_slice(Http::$calls, $calls), fn ($call) => $call[0] === 'get'
+    check(count(array_filter(array_slice($GLOBALS['stripeCalls'], $calls), fn ($call) => $call[0] === 'get'
         && $call[1] === '/payment_intents/pi_subscription_paid')) === 3,
         'Subscription deliveries fetch the settled intent, and the first delivery also attempts return verification');
-    check(ExtensionHelper::$applications === $before + 1 && $invoice->status === 'paid'
-        && ExtensionHelper::$payments['112:pi_subscription_paid']['amount'] === 12.5,
+    check($applications === $before + 1 && $invoice->fresh()->status === 'paid'
+        && payments()['112:pi_subscription_paid']['amount'] === 12.5,
         'Paid bound subscription invoice retains one successful charge with received units');
     $intent->metadata->invoice_id = $invoice->id;
     $gateway->webhook(eventRequest($intent));
-    check(ExtensionHelper::$applications === $before + 1,
+    check($applications === $before + 1,
         'Subscription then PaymentIntent success cannot duplicate the late charge');
-    check(count(Log::$warnings) === $warnings + 1 && end(Log::$warnings) === [
+    $logged = warnings();
+    check(count($logged) === $warnings + 1 && end($logged) === [
         'AeStripe payment received for paid invoice', ['invoice_id' => $invoice->id]],
         'Late subscription payment logs only the invoice ID');
-    check(array_slice(DB::$modelLocks, $locks, 4) === [User::class, Service::class, InvoiceTransaction::class, Invoice::class],
+    check(array_slice(lockLog(), $locks, 4) === ['users', 'services', 'invoice_transactions', 'invoices'],
         'Subscription success keeps user-first settlement lock order');
-    check(count(array_filter(array_slice(Http::$calls, $calls), fn ($call) => $call[0] !== 'get')) === 0,
+    check(count(array_filter(array_slice($GLOBALS['stripeCalls'], $calls), fn ($call) => $call[0] !== 'get')) === 0,
         'Late subscription success makes no remote changes');
     check(!invoke($gateway, 'bindSubscriptionInvoice', $stripeInvoice, $service),
         'Invoice creation still refuses an already paid binding');
 
     foreach (['currency mismatch', 'invoice currency mismatch', 'intent currency mismatch', 'customer mismatch', 'closed currency mismatch', 'closed customer mismatch', 'paid currency mismatch'] as $reason) {
-        $invoice->status = str_starts_with($reason, 'closed ') ? 'cancelled' : ($reason === 'paid currency mismatch' ? 'paid' : 'pending');
+        $setStatus(str_starts_with($reason, 'closed ') ? 'cancelled' : ($reason === 'paid currency mismatch' ? 'paid' : 'pending'));
         $intent->id = 'pi_subscription_review_' . str_replace(' ', '_', $reason);
         $intent->currency = $stripeInvoice->currency = str_contains($reason, 'currency') ? 'jpy' : 'usd';
         if ($reason === 'intent currency mismatch') $stripeInvoice->currency = 'usd';
         if ($reason === 'invoice currency mismatch') $intent->currency = 'usd';
         $intent->customer = str_contains($reason, 'customer') ? 'cus_foreign' : 'cus_owner';
-        $records = count(Audit::$rows);
-        $before = ExtensionHelper::$applications;
-        $locks = count(DB::$modelLocks);
+        $records = count(audits());
+        $before = $applications;
+        $locks = count(lockLog());
         $deliver();
         $deliver();
-        check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records + 1,
+        check($applications === $before && count(audits()) === $records + 1,
             'Refused subscription success leaves one durable staff record: ' . $reason);
-        $record = end(Audit::$rows);
-        check($record['auditable_type'] === Invoice::class && $record['auditable_id'] === 112
-            && $record['new_values']['payment_intent_id'] === $intent->id
-            && $record['new_values']['amount_minor'] === 1250
-            && $record['new_values']['currency'] === $intent->currency
-            && $record['new_values']['reason'] === (str_contains($reason, 'currency') ? 'currency mismatch' : 'customer mismatch'),
+        $record = $lastAudit();
+        check($record->auditable_type === Invoice::class && $record->auditable_id === 112
+            && $record->new_values['payment_intent_id'] === $intent->id
+            && $record->new_values['amount_minor'] === 1250
+            && $record->new_values['currency'] === $intent->currency
+            && $record->new_values['reason'] === (str_contains($reason, 'currency') ? 'currency mismatch' : 'customer mismatch'),
             'Subscription staff record preserves binding, received units and refusal reason: ' . $reason);
-        check(array_slice(DB::$modelLocks, $locks, 4) === [User::class, Service::class, InvoiceTransaction::class, Invoice::class]
-            && in_array(Audit::class, array_slice(DB::$modelLocks, $locks), true),
+        check(array_slice(lockLog(), $locks, 4) === ['users', 'services', 'invoice_transactions', 'invoices']
+            && in_array('audits', array_slice(lockLog(), $locks), true),
             'Subscription refusal locks owner and bound invoice before the shared audit guard');
-        check(!str_contains(json_encode($record), 'cus_foreign') && !str_contains(json_encode($record), $invoice->user->email),
+        check(!str_contains(json_encode($record->toArray()), 'cus_foreign') && !str_contains(json_encode($record->toArray()), $invoice->user->email),
             'Subscription review excludes customer details');
     }
     // Both delivery paths share the same PaymentIntent review key.
-    $records = count(Audit::$rows);
+    $records = count(audits());
     $gateway->webhook(eventRequest($intent));
-    check(count(Audit::$rows) === $records, 'Subscription then PaymentIntent refusal reuses the staff record');
+    check(count(audits()) === $records, 'Subscription then PaymentIntent refusal reuses the staff record');
     $intent->id = 'pi_review_intent_first';
     $gateway->webhook(eventRequest($intent));
-    $records = count(Audit::$rows);
+    $records = count(audits());
     $deliver();
-    check(count(Audit::$rows) === $records, 'PaymentIntent then subscription refusal reuses the staff record');
+    check(count(audits()) === $records, 'PaymentIntent then subscription refusal reuses the staff record');
 
     $intent->id = 'pi_subscription_review_retry';
-    Audit::$fail = true;
+    beforeWrite('audits', function () { beforeWrite('audits', null); throw new RuntimeException('Review record unavailable'); });
     rejects($deliver, 'Review record unavailable');
-    $records = count(Audit::$rows);
+    $records = count(audits());
     $deliver();
     $deliver();
-    check(count(Audit::$rows) === $records + 1, 'Subscription audit failure stays retryable and recovers once');
-    $invoice->status = 'pending';
+    check(count(audits()) === $records + 1, 'Subscription audit failure stays retryable and recovers once');
+    $setStatus('pending');
     $intent->currency = $stripeInvoice->currency = 'usd';
     $intent->id = 'pi_subscription_next_cycle';
-    $before = ExtensionHelper::$applications;
+    $before = $applications;
     $deliver();
     $deliver();
-    check(ExtensionHelper::$applications === $before + 1
-        && ExtensionHelper::$payments['112:pi_subscription_next_cycle']['amount'] === 12.5,
+    check($applications === $before + 1
+        && payments()['112:pi_subscription_next_cycle']['amount'] === 12.5,
         'A refused subscription charge does not block the next settlement');
     $intent->id = 'pi_subscription_intent_first';
     $gateway->webhook(eventRequest($intent));
-    $before = ExtensionHelper::$applications;
+    $before = $applications;
     $deliver();
-    check(ExtensionHelper::$applications === $before, 'PaymentIntent then subscription success remains deduplicated');
+    check($applications === $before, 'PaymentIntent then subscription success remains deduplicated');
 
     $intent->id = 'pi_subscription_not_settled';
-    $handler = Http::$handler;
-    Http::$handler = function ($verb, $path) use ($handler) {
-        $result = $handler($verb, $path);
-        if (str_starts_with($path, '/payment_intents/')) { $result = clone $result; $result->id = 'pi_different'; }
+    $handler = $GLOBALS['stripeHandler'];
+    $GLOBALS['stripeHandler'] = function (...$request) use ($handler) {
+        $result = $handler(...$request);
+        if (str_starts_with($request[1], '/payment_intents/')) { $result = clone $result; $result->id = 'pi_different'; }
         return $result;
     };
-    $payments = ExtensionHelper::$payments;
-    $records = Audit::$rows;
-    $locks = count(DB::$modelLocks);
+    $payments = payments();
+    $records = audits();
+    $locks = count(lockLog());
     rejects($deliver, 'HTTP 409');
-    check(ExtensionHelper::$payments === $payments && Audit::$rows === $records
-        && count(DB::$modelLocks) === $locks,
+    check(payments() === $payments && audits() === $records
+        && count(lockLog()) === $locks,
         'A mismatched subscription intent is refused before row locks without payment or audit rows');
-    Http::$handler = $handler;
-    foreach (['requires_payment_method', 'requires_confirmation', 'processing', 'requires_action', 'requires_capture', 'canceled'] as $status) {
-        $intent->status = $status;
-        $before = ExtensionHelper::$applications;
-        $records = count(Audit::$rows);
-        $locks = count(DB::$modelLocks);
+    $GLOBALS['stripeHandler'] = $handler;
+    foreach (['requires_payment_method', 'requires_confirmation', 'processing', 'requires_action', 'requires_capture', 'canceled'] as $intentStatus) {
+        $intent->status = $intentStatus;
+        $before = $applications;
+        $records = count(audits());
+        $locks = count(lockLog());
         rejects($deliver, 'HTTP 409');
-        check(ExtensionHelper::$payments === $payments && count(DB::$modelLocks) === $locks
-            && ExtensionHelper::$applications === $before && count(Audit::$rows) === $records,
-            'An unsettled subscription intent cannot be recorded as success: ' . $status);
+        check(payments() === $payments && count(lockLog()) === $locks
+            && $applications === $before && count(audits()) === $records,
+            'An unsettled subscription intent cannot be recorded as success: ' . $intentStatus);
     }
     $intent->status = 'succeeded';
-    foreach ([new ConnectionException('connection'), new ConnectionException('timeout'), new RequestException(503),
-        new RuntimeException('decode failure')] as $failure) {
-        $handler = Http::$handler;
-        Http::$handler = function ($verb, $path) use ($handler, $failure) {
-            if (str_starts_with($path, '/payment_intents/')) throw $failure;
-            return $handler($verb, $path);
+    // The client raises its own exception for a refused connection or an error status; any other failure is rethrown as is.
+    $decode = new RuntimeException('decode failure');
+    foreach ([
+        'connection' => [new ConnectionException('connection'), fn ($e) => $e instanceof ConnectionException && $e->getMessage() === 'connection'],
+        'timeout' => [new ConnectionException('timeout'), fn ($e) => $e instanceof ConnectionException && $e->getMessage() === 'timeout'],
+        'status 503' => [new StripeFixtureError(503), fn ($e) => $e instanceof RequestException && $e->response->status() === 503],
+        'decode' => [$decode, fn ($e) => $e === $decode],
+    ] as $label => [$failure, $expected]) {
+        $handler = $GLOBALS['stripeHandler'];
+        $GLOBALS['stripeHandler'] = function (...$request) use ($handler, $failure) {
+            if (str_starts_with($request[1], '/payment_intents/')) throw $failure;
+            return $handler(...$request);
         };
         $caught = null;
         try { $deliver(); } catch (Throwable $e) { $caught = $e; }
-        check($caught === $failure, 'Subscription intent lookup failure remains retryable: ' . get_class($failure));
-        check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records,
+        check($caught && $expected($caught), 'Subscription intent lookup failure remains retryable: ' . $label);
+        check($applications === $before && count(audits()) === $records,
             'A failed intent lookup cannot apply or audit a payment');
-        Http::$handler = $handler;
+        $GLOBALS['stripeHandler'] = $handler;
     }
     $deliver();
     $deliver();
-    check(ExtensionHelper::$applications === $before + 1,
+    check($applications === $before + 1,
         'Subscription intent lookup recovers without duplicating the payment');
     $intent->id = 'pi_subscription_invalid_binding';
-    $records = count(Audit::$rows);
-    $before = ExtensionHelper::$applications;
+    $records = count(audits());
+    $before = $applications;
     foreach ([null, 999] as $binding) {
         $stripeInvoice->metadata->ae_stripe_invoice_id = $binding;
         $deliver();
-        check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records + 1,
+        check($applications === $before && count(audits()) === $records + 1,
             'An unbound or unrelated subscription payment retains one gateway review record');
     }
     $stripeInvoice->metadata->ae_stripe_invoice_id = $invoice->id;
-    $records = count(Audit::$rows);
-    $invoice->user_id = 99;
+    $records = count(audits());
+    $invoice->forceFill(['user_id' => 99])->save();
     rejects($deliver, 'HTTP 409');
-    check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records,
+    check($applications === $before && count(audits()) === $records,
         'Subscription binding cannot apply money or write audits to another owner');
 
-    $invoice->user_id = 7;
+    $invoice->forceFill(['user_id' => 7])->save();
+    $serviceRow = (array) DB::table('services')->where('id', $service->id)->first();
+    $removeService = fn () => DB::table('services')->where('id', $service->id)->delete();
     foreach (['empty', 'split', 'amount', 'service', 'subscription', 'service race', 'invoice race'] as $case) {
         $stripeInvoice->id = 'in_review_' . $case;
-        $records = count(Audit::$rows);
-        $savedHandler = Http::$handler;
-        Http::$handler = function ($verb, $path) use ($savedHandler, $case) {
-            if ($path === '/invoice_payments' && in_array($case, ['empty', 'split', 'amount'])) {
+        $records = count(audits());
+        $savedHandler = $GLOBALS['stripeHandler'];
+        $GLOBALS['stripeHandler'] = function (...$request) use ($savedHandler, $case) {
+            if ($request[1] === '/invoice_payments' && in_array($case, ['empty', 'split', 'amount'])) {
                 $entry = ['status' => 'paid', 'amount_paid' => $case === 'amount' ? 1200 : 1250,
                     'payment' => ['type' => 'payment_intent', 'payment_intent' => 'pi_unbound']];
                 return ['data' => $case === 'empty' ? [] : ($case === 'split' ? [$entry, $entry] : [$entry])];
             }
-            return $savedHandler($verb, $path);
+            return $savedHandler(...$request);
         };
-        if ($case === 'service') Service::$row = null;
-        if ($case === 'service race') DB::$beforeUserLock = function () { Service::$row = null; };
-        if ($case === 'invoice race') DB::$beforeUserLock = function () use ($invoice) { unset(Invoice::$rows[$invoice->id]); };
+        if ($case === 'service') $removeService();
+        // Another process removes the row after the unlocked read and commits before this transaction locks it.
+        if ($case === 'service race') beforeLock('users', $removeService);
+        if ($case === 'invoice race') beforeLock('invoices', fn () => DB::table('invoices')->where('id', $invoice->id)->delete());
         if ($case === 'subscription') $stripeInvoice->parent->subscription_details->subscription = null;
         $deliver();
-        check(count(Audit::$rows) === $records + 1, 'First unresolved subscription delivery persists review: ' . $case);
+        check(count(audits()) === $records + 1, 'First unresolved subscription delivery persists review: ' . $case);
         $deliver();
-        check(count(Audit::$rows) === $records + 1 && end(Audit::$rows)['new_values']['stripe_invoice_id'] === $stripeInvoice->id,
+        check(count(audits()) === $records + 1 && $lastAudit()->new_values['stripe_invoice_id'] === $stripeInvoice->id,
             'Unresolved subscription success retains one durable gateway review: ' . $case);
-        Invoice::$rows[$invoice->id] = $invoice;
-        Service::$row = $service; Http::$handler = $savedHandler;
+        if (!DB::table('services')->where('id', $service->id)->exists()) DB::table('services')->insert($serviceRow);
+        $GLOBALS['stripeHandler'] = $savedHandler;
         $stripeInvoice->parent->subscription_details->subscription = $service->subscription_id;
     }
-    Http::$handler = $oldHandler;
-    Gateway::$enabled = $oldEnabled;
-    Service::$row = $oldService;
-    Invoice::$rows = $oldRows;
 })();
 
-(function () use ($gateway) {
-    $oldHandler = Http::$handler;
-    $oldEnabled = Gateway::$enabled;
-    $oldService = Service::$row;
-    $oldRows = Invoice::$rows;
+(function () use ($gateway, $reset, $lastAudit, &$applications) {
+    $reset();
+    $invoice = nativeInvoice(412, 20, 'USD');
+    $unrelatedHistory = nativeInvoice(411, 20, 'USD');
+    nativeInvoice(999, 20, 'USD');
+    $service = nativeService('sub_bound_query', [$unrelatedHistory, $invoice]);
+    // Settlement may read only the bound invoice item, never the rest of the service's billing history.
+    $guard = function ($model) { if (($model->invoice_id ?? $model->id) === 411) throw new RuntimeException('Bound settlement must not load unrelated invoice history'); };
+    $guarding = true;
+    App\Models\InvoiceItem::retrieved(function ($item) use ($guard, &$guarding) { if ($guarding) $guard($item); });
+    $intent = (object) ['id' => 'pi_bound_query', 'status' => 'succeeded', 'amount' => 2000,
+        'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner'];
+    $stripeInvoice = (object) ['id' => 'in_bound_query', 'currency' => 'usd', 'amount_paid' => 2000,
+        'metadata' => (object) ['ae_stripe_invoice_id' => 412],
+        'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) [
+            'subscription' => $service->subscription_id]]];
+    $GLOBALS['stripeHandler'] = function ($verb, $path) use ($intent) {
+        if ($verb === 'get' && $path === '/invoice_payments') return ['data' => [
+            ['status' => 'paid', 'amount_paid' => 2000,
+                'payment' => ['type' => 'payment_intent', 'payment_intent' => $intent->id]]]];
+        if ($verb === 'get' && $path === '/payment_intents/' . $intent->id) return $intent;
+        throw new RuntimeException('Unexpected bound query request: ' . $path);
+    };
     try {
-        Gateway::$enabled = true;
-        $invoice = clone Invoice::$row;
-        $invoice->id = 412;
-        $invoice->currency_code = 'usd';
-        Invoice::$rows[$invoice->id] = $invoice;
-        $unrelatedInvoice = clone $invoice;
-        $unrelatedInvoice->id = 999;
-        Invoice::$rows[$unrelatedInvoice->id] = $unrelatedInvoice;
-        $service = Service::$row = new Service;
-        $service->subscription_id = 'sub_bound_query';
-        $unrelatedItem = new class {
-            public $invoice_id = 411;
-            public function __get($key) { throw new RuntimeException('Bound settlement must not load unrelated invoice history'); }
-        };
-        $service->invoiceRows = [$unrelatedItem, (object) ['invoice_id' => 412, 'invoice' => $invoice]];
-        $intent = (object) ['id' => 'pi_bound_query', 'status' => 'succeeded', 'amount' => 2000,
-            'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner'];
-        $stripeInvoice = (object) ['id' => 'in_bound_query', 'currency' => 'usd', 'amount_paid' => 2000,
-            'metadata' => (object) ['ae_stripe_invoice_id' => 412],
-            'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) [
-                'subscription' => $service->subscription_id]]];
-        Http::$handler = function ($verb, $path) use ($intent) {
-            if ($verb === 'get' && $path === '/invoice_payments') return ['data' => [
-                ['status' => 'paid', 'amount_paid' => 2000,
-                    'payment' => ['type' => 'payment_intent', 'payment_intent' => $intent->id]]]];
-            if ($verb === 'get' && $path === '/payment_intents/' . $intent->id) return $intent;
-            throw new RuntimeException('Unexpected bound query request: ' . $path);
-        };
-        foreach (['pending', 'paid'] as $status) {
-            $invoice->status = $status;
-            $intent->id = 'pi_bound_query_' . $status;
-            $before = ExtensionHelper::$applications;
+        foreach (['pending', 'paid'] as $invoiceStatus) {
+            $invoice->forceFill(['status' => $invoiceStatus])->save();
+            $intent->id = 'pi_bound_query_' . $invoiceStatus;
+            $before = $applications;
             invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice);
             invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice);
-            check(ExtensionHelper::$applications === $before + 1
-                && ExtensionHelper::$payments['412:' . $intent->id]['amount'] === 20.0,
-                'Bound settlement loads only the requested related invoice: ' . $status);
+            check($applications === $before + 1
+                && payments()['412:' . $intent->id]['amount'] === 20.0,
+                'Bound settlement loads only the requested related invoice: ' . $invoiceStatus);
         }
         $intent->id = 'pi_bound_query_absent';
-        $before = ExtensionHelper::$applications;
-        $records = count(Audit::$rows);
+        $before = $applications;
+        $records = count(audits());
         foreach ([null, 999] as $binding) {
             $stripeInvoice->metadata->ae_stripe_invoice_id = $binding;
             invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice);
-            check(ExtensionHelper::$applications === $before && count(Audit::$rows) === $records + 1
-                && end(Audit::$rows)['new_values']['stripe_invoice_id'] === $stripeInvoice->id
-                && end(Audit::$rows)['new_values']['reason'] === 'Invoice binding missing or unrelated',
+            check($applications === $before && count(audits()) === $records + 1
+                && $lastAudit()->new_values['stripe_invoice_id'] === $stripeInvoice->id
+                && $lastAudit()->new_values['reason'] === 'Invoice binding missing or unrelated',
                 'Absent or unrelated binding cannot settle and retains one review through the filtered relation');
         }
     } finally {
-        Http::$handler = $oldHandler;
-        Gateway::$enabled = $oldEnabled;
-        Service::$row = $oldService;
-        Invoice::$rows = $oldRows;
+        $guarding = false;
     }
 })();
