@@ -32,7 +32,7 @@ rejects(fn () => $gateway->resolveReceiptReversal($i, 'pi_return', $work['id'], 
 $otherInvoice = nativeInvoice(811, 2);
 rejects(fn () => $gateway->resolveReceiptReversal($otherInvoice, 'pi_return', $work['id'], $work['kind'], $work['review_key'], 'Checked in Stripe.'), 'HTTP 409');
 check(audits() === $rejectedAudits, 'Rejected permission, note, stale-key and wrong-invoice requests leave no audit row');
-$money = fn () => serialize([$returns(), credits(), payments(), $s->posts]);
+$money = fn () => serialize([$returns(), credits(), payments(), moneyRows(), $s->posts]);
 $moneyBefore = $money();
 $auditsBefore = count(audits());
 $resolve = fn () => $gateway->resolveReceiptReversal($i, 'pi_return', $work['id'], $work['kind'], $work['review_key'], 'Checked spent credit and settled recovery in Stripe.');

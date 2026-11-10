@@ -24,6 +24,8 @@ foreach (['APP_ENV' => 'testing', 'APP_KEY' => 'base64:' . base64_encode(str_rep
 require $release . '/vendor/autoload.php';
 $app = require $root . '/bootstrap/app.php';
 $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+// The console bootstrap renders uncaught errors and exits 0; a failed check must fail the run.
+set_exception_handler(function (Throwable $e) { fwrite(STDERR, $e . "\n"); exit(1); });
 require_once $release . '/app/Classes/helpers.php';
 config(['hashing.bcrypt.rounds' => 4, 'audit.enabled' => false, 'settings.mail_disabled' => true, 'settings.default_currency' => 'USD',
     'settings.tax_enabled' => false, 'app.version' => 'development']);
@@ -174,6 +176,20 @@ function credits(): array
 {
     $rows = [];
     foreach (App\Models\Credit::orderBy('id')->get() as $row) $rows[$row->user_id . ':' . strtolower($row->currency_code)] = (float) $row->amount;
+    return $rows;
+}
+/** Raw row counts per ledger (invoice:transaction) and credit (user:currency) identity; the projections above keep one row per key. */
+function moneyRows(): array
+{
+    $rows = ['payments' => [], 'credits' => []];
+    foreach (DB::table('invoice_transactions')->orderBy('id')->get(['invoice_id', 'transaction_id']) as $row) {
+        $key = $row->invoice_id . ':' . $row->transaction_id;
+        $rows['payments'][$key] = ($rows['payments'][$key] ?? 0) + 1;
+    }
+    foreach (DB::table('credits')->orderBy('id')->get(['user_id', 'currency_code']) as $row) {
+        $key = $row->user_id . ':' . strtolower($row->currency_code);
+        $rows['credits'][$key] = ($rows['credits'][$key] ?? 0) + 1;
+    }
     return $rows;
 }
 /** In-app notifications in creation order. */

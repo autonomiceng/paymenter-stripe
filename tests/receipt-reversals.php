@@ -24,11 +24,12 @@ check($notice['body'] === '$1.00 refunded on invoice INV-12.'
 $storedKey = 'pi_return:stripe:refund:'.$foreign->id;
 check($returns()[$storedKey]['provider_created_at'] === 1793400000,
     'External refund stores the canonical Stripe creation date');
-$setReturn($storedKey, ['provider_created_at' => null]);
-$recorded = $returns()[$storedKey]['updated_at'];
+// A fixed old recorded time: a rewrite with time() in the same second would otherwise match.
+$setReturn($storedKey, ['provider_created_at' => null, 'updated_at' => 1700000000]);
+check($returns()[$storedKey]['updated_at'] === 1700000000, 'Replay fixture starts from a fixed recorded time');
 $gateway->webhook($updated);
 check($returns()[$storedKey]['provider_created_at'] === 1793400000
-    && $returns()[$storedKey]['updated_at'] === $recorded
+    && $returns()[$storedKey]['updated_at'] === 1700000000
     && count(audits()) === 1 && count(notices()) === 1,
     'Same-state replay fills an old row date without moving recorded time or repeating audit/notice');
 $return = $gateway->allocateReceiptReturn($i, 'pi_return', 'domains:foreign', 500);
@@ -51,7 +52,7 @@ $s->dispute = (object) ['id' => 'du_123456789012345678901234', 'object' => 'disp
     'status' => 'needs_response', 'created' => 1793400001, 'evidence_details' => (object) ['due_by' => 1794182399], 'metadata' => (object) []];
 unset($s->dispute->payment_intent); // Stripe can identify a dispute through its charge alone.
 $event = eventRequest($s->dispute, type: 'charge.dispute.created');
-$before = [count(audits()), count(notices()), count($s->posts), payments(), $i->refresh()->status];
+$before = [count(audits()), count(notices()), count($s->posts), payments(), $i->refresh()->status, moneyRows()];
 $callCount = count($GLOBALS['stripeCalls']);
 $gateway->webhook($event); $gateway->webhook($event);
 check(!array_filter(array_slice($GLOBALS['stripeCalls'], $callCount), fn ($call) => $call[0] !== 'get'),
@@ -76,7 +77,7 @@ foreach (['charge.dispute.updated', 'charge.dispute.closed'] as $type) {
 }
 check($gateway->receiptReversals($i, 'pi_return')[0]['status'] === 'lost' && credits()['7:usd'] === 0.0
     && count(audits()) === $before[0] + 2 && count(notices()) === $before[1] + 2
-    && count($s->posts) === $before[2] && payments() === $before[3] && $i->refresh()->status === $before[4],
+    && count($s->posts) === $before[2] && payments() === $before[3] && $i->refresh()->status === $before[4] && moneyRows() === $before[5],
     'Losing a chargeback retains finance work without debiting spent credit, refunding again or changing invoice status');
 check($returns()['pi_return:stripe:dispute:'.$s->dispute->id]['provider_created_at'] === 1793400001,
     'Dispute provider creation date survives a later loss');
@@ -128,10 +129,10 @@ check(!$gateway->receiptReversals($i, 'pi_return')[0]['needs_review'] && count(a
 
 [$i, $s] = $setup(2000, 20); $deliver($s);
 $s->refunds['foreign'] = clone $foreign; $s->refunds['foreign']->status = 'succeeded';
-$settled = payments(); $inboxDown();
+$settled = [payments(), moneyRows()]; $inboxDown();
 rejects(fn () => $gateway->webhook($request), 'Inbox unavailable');
 $inboxUp();
-check(!$gateway->receiptReversals($i, 'pi_return') && !audits() && payments() === $settled,
+check(!$gateway->receiptReversals($i, 'pi_return') && !audits() && [payments(), moneyRows()] === $settled,
     'Failed staff delivery escapes for Stripe to retry, rolling back the observation without losing the original payment');
 $gateway->webhook($request);
 check(count(audits()) === 1 && count(notices()) === 1, 'Stripe replay completes the rolled-back observation and alert');
