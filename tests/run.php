@@ -320,11 +320,7 @@ require __DIR__ . '/native-upgrade.php';
 require __DIR__ . '/agreement-persistence.php';
 require __DIR__ . '/saved-method-dedupe.php';
 require __DIR__ . '/card-expiry.php';
-require __DIR__ . '/card-dedupe.php';
-require __DIR__ . '/card-dedupe-races.php';
 require __DIR__ . '/converted-card-dedupe.php';
-require __DIR__ . '/card-dedupe-failures.php';
-require __DIR__ . '/card-dedupe-candidates.php';
 foreach (['pending', 'removed-replay', 'version', 'cleanup-replay', 'cleanup-removal', 'missing', 'warning', 'index', 'cleanup-lock', 'cleanup-setup', 'cleanup-checkout', 'cache', 'link', 'terms', 'notices'] as $followupCase) {
     (function () use ($followupCase) { require __DIR__ . '/saved-method-followups.php'; })();
 }

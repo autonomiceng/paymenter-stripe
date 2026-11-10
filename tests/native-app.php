@@ -252,8 +252,8 @@ function nativeInvoice(int $id, float $total = 20, string $currency = 'USD', ?st
     $invoice->items()->create(['quantity' => 1, 'price' => $total, 'description' => 'Fixture']);
     return $invoice->fresh();
 }
-/** An active service of the owner for a Stripe subscription, billed by the given invoices. */
-function nativeService(string $subscriptionId, array $invoices = []): App\Models\Service
+/** An active service of the owner, for a Stripe subscription when one is named, billed by the given invoices. */
+function nativeService(?string $subscriptionId, array $invoices = []): App\Models\Service
 {
     static $plan;
     if (!$plan) {
@@ -266,4 +266,80 @@ function nativeService(string $subscriptionId, array $invoices = []): App\Models
         'currency_code' => 'USD', 'quantity' => 1, 'status' => 'active', 'subscription_id' => $subscriptionId]);
     foreach ($invoices as $invoice) $invoice->items()->update(['reference_type' => App\Models\Service::class, 'reference_id' => $service->id]);
     return $service;
+}
+
+/** Saved method locks need a shared cache store; use the database store. */
+function nativeSharedCache(): void
+{
+    config(['cache.default' => 'database']);
+    foreach (['cache' => false, 'cache_locks' => true] as $table => $locks) if (!Schema::hasTable($table)) Schema::create($table, function ($schema) use ($locks) {
+        $schema->string('key')->primary();
+        if ($locks) $schema->string('owner'); else $schema->text('value');
+        $schema->integer('expiration');
+    });
+}
+/** A Stripe card of the owner's customer. */
+function nativeCard(string $id, string $fingerprint = 'fp_same', int $month = 5): object
+{
+    return (object) ['id' => $id, 'customer' => 'cus_owner', 'type' => 'card', 'allow_redisplay' => 'unspecified',
+        'card' => (object) ['fingerprint' => $fingerprint, 'brand' => 'visa', 'last4' => '4242', 'exp_month' => $month, 'exp_year' => 2030]];
+}
+/** A saved Visa agreement of the owner on AeStripe. A fixed creation time keeps ordering by ID. */
+function nativeAgreement(int $id, string $reference, array $extra = []): App\Models\BillingAgreement
+{
+    return App\Models\BillingAgreement::forceCreate($extra + ['id' => $id, 'external_reference' => $reference, 'user_id' => 7,
+        'gateway_id' => $GLOBALS['nativeGateway']->id, 'name' => 'Visa **** 4242', 'type' => 'visa', 'expiry' => '2030-05-31',
+        'created_at' => '2026-10-01 12:00:00', 'updated_at' => '2026-10-01 12:00:00']);
+}
+/** Saved agreements, removed ones included, as reference => row. */
+function agreements(): array { return tableRows('billing_agreements', ['external_reference']); }
+/** A succeeded off-session setup of the given method, with the owner's consent. */
+function nativeSetupIntent(string $name, string $method = 'pm_new'): object
+{
+    return (object) ['id' => 'seti_' . str_pad($name, 24, '0'), 'status' => 'succeeded', 'customer' => 'cus_owner', 'payment_method' => $method,
+        'latest_attempt' => null, 'metadata' => (object) ['user_id' => '7', 'ae_stripe_gateway' => '1', 'is_billing_agreement' => '1',
+            'ae_stripe_setup_consent' => 'off_session_v1', 'ae_stripe_setup_consent_user' => '7', 'ae_stripe_setup_consent_at' => '1700000000']];
+}
+/** Stripe fixture for the setup and the given methods: posts update redisplay, detach clears the customer. */
+function nativeMethodHandler(array &$methods, ?object $setup = null): Closure
+{
+    return function ($verb, $path, $data) use (&$methods, $setup) {
+        if ($setup && $path === '/setup_intents/' . $setup->id) return $setup;
+        foreach ($methods as $id => $method) {
+            if ($path === '/payment_methods/' . $id . '/detach') { $method->customer = null; return $method; }
+            if ($path !== '/payment_methods/' . $id) continue;
+            if ($verb === 'post') $method->allow_redisplay = $data['allow_redisplay'];
+            return $method;
+        }
+        throw new RuntimeException('Unexpected saved method request: ' . $verb . ' ' . $path);
+    };
+}
+/** Finish a saved method return; the notification it flashed. */
+function setupReturn($gateway, object $setup): array
+{
+    $response = $gateway->setupAgreement(Illuminate\Http\Request::create('/extensions/ae-stripe/setup-agreement', 'GET', ['setup_intent' => $setup->id]));
+    return $response->getSession()->pull('notification');
+}
+/** Run the duplicate card command as the console does: [exit code, output lines]. */
+function dedupeCommand(bool $apply): array
+{
+    require_once __DIR__ . '/../extension/AeStripe/DeduplicateCardsCommand.php';
+    $command = new Paymenter\Extensions\Gateways\AeStripe\DeduplicateCardsCommand;
+    $command->setLaravel(app());
+    $output = new Symfony\Component\Console\Output\BufferedOutput;
+    $code = $command->run(new Symfony\Component\Console\Input\ArrayInput($apply ? ['--apply' => true] : []), $output);
+    return [$code, array_values(array_filter(explode("\n", $output->fetch()), 'strlen'))];
+}
+/** The owner's properties other than the Stripe customer, as key => value. */
+function ownerProperties(): array
+{
+    return App\Models\Property::where('model_type', App\Models\User::class)->where('model_id', 7)->where('key', '!=', 'stripe_id')
+        ->orderBy('id')->pluck('value', 'key')->all();
+}
+/** Clear saved methods, services and the owner's properties other than the Stripe customer. */
+function resetSavedMethods(): void
+{
+    DB::table('services')->delete();
+    App\Models\BillingAgreement::withTrashed()->forceDelete();
+    App\Models\Property::where('model_type', App\Models\User::class)->where('model_id', 7)->where('key', '!=', 'stripe_id')->delete();
 }
