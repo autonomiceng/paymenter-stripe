@@ -162,6 +162,31 @@ from the invoice issue date (Domains issues renewals ahead of expiry). A future
 adapter can attach that context to the same shared attempt and retry policy; Stripe
 must not inspect or update Domains tables. No Domains files change here.
 
+## Pending setup for new services
+
+Service Created persists the exact account consent in the new service's `ae_stripe_auto_pay_pending` property
+with the order. The after-commit attempt uses the shared card lock before opening its own user/service transaction.
+A busy lock never fails the order. Pending work survives a lost callback and the once-per-minute scheduler retries it.
+The service and its invoice show a warning explaining pending setup, automatic retry and manual invoice payment.
+Every attempt rechecks current account consent, service ownership, subscription state, plan and card eligibility.
+Revocation, removal, reassignment, explicit service opt-out or a newer selection cancels old work; it cannot re-enable Auto Pay.
+Stripe subscriptions retain their own billing method and reject local-only service card changes. Invoice defaults skip
+subscription services while ordinary invoice payment continues. No schema or extension version change is required.
+
+Pending Auto Pay retains valid work while AE Stripe is paused or bundled Stripe is active. Ten genuine failed
+binding attempts (excluding ordinary shared-lock contention) stop automatic setup and explain manual service selection or invoice payment. Explicit
+account Off, customer clear, staff opt-out, a changed service selection and each ownership transfer cancel
+pending work immediately. The native staff Billing Agreement field offers Turn off Auto Pay because an
+already empty field cannot record a deliberate None selection separately from an unrelated save.
+Pending warnings appear once per page and state, including a pause or exhausted retries.
+
+Owner/selection changes revoke old pending setup before the service SQL. An enclosing native
+transaction rolls both changes back together. An autocommit interruption after SQL cannot revive
+old consent on an ownership round trip; an autocommit write that fails after revocation conservatively
+requires fresh setup. Staff opt-out rechecks the current gateway under the owner/service locks.
+Cancellation locks user, service and pending property in that order. A missed conditional
+deletion refuses the ownership write and asks for a refresh instead of retaining old work.
+
 ## Stripe Link
 
 Both Payment Elements leave Link on (no `wallets` option), so customers can pay
