@@ -1,133 +1,110 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-use App\Helpers\ExtensionHelper;
-use App\Models\{BillingAgreement, Gateway, Properties, User};
-use Illuminate\Http\Client\RequestException;
-use Illuminate\Support\Facades\{DB, Http, Log};
-use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
-use Paymenter\Extensions\Gateways\AeStripe\DeduplicateCardsCommand;
+// Native suite: runs on tests/native-app.php (real Paymenter models, listeners and SQLite).
+use App\Models\BillingAgreement;
+use Illuminate\Http\Client\{ConnectionException, RequestException};
+use Illuminate\Support\Facades\DB;
 
-if (!function_exists('check')) {
-    require __DIR__ . '/fakes.php';
-    require __DIR__ . '/../extension/AeStripe/AeStripe.php';
-    $count = 0;
-    function check($value, $label) { global $count; if (!$value) throw new RuntimeException($label); ++$count; }
-}
-$user = User::$row = new User(new Properties('cus_owner'));
-Gateway::$rows = null;
-Gateway::$enabled = Gateway::$present = true;
-Gateway::$deleted = false;
-BillingAgreement::$snapshot = null;
-DB::$tables['services'] = [];
-$gateway = new AeStripe(['stripe_secret_key' => 'fake-secret']);
-$row = fn ($id, $pm) => ['id' => $id, 'external_reference' => $pm, 'user_id' => 7, 'gateway_id' => 2,
-    'name' => 'Visa **** 4242', 'type' => 'visa', 'expiry' => '2030-05-31', 'deleted_at' => null];
-ExtensionHelper::$agreements = ['pm_cancel' => $row(19, 'pm_cancel')];
+nativeSharedCache();
+$calls = fn (int $start) => array_slice($GLOBALS['stripeCalls'], $start);
+$clicked = fn () => BillingAgreement::find(19);
+$lastWarning = fn () => array_slice(warnings(), -1)[0] ?? null;
+resetSavedMethods();
+nativeAgreement(19, 'pm_cancel');
 foreach ([404, 503] as $status) {
-    if ($status === 404 && getenv('PAY_REMOVE_MISSING_CASE') === 'candidate') continue;
-    Http::$handler = function ($verb, $path) use ($status) {
-        if ($verb === 'get' && $path === '/payment_methods/pm_cancel') throw new RequestException($status, ['error' => ['code' => 'resource_missing']]);
+    $GLOBALS['stripeHandler'] = function ($verb, $path) use ($status) {
+        if ($verb === 'get' && $path === '/payment_methods/pm_cancel') throw new StripeFixtureError($status, ['error' => ['code' => 'resource_missing']]);
         throw new RuntimeException('Unexpected cancellation request');
     };
-    $start = count(Http::$calls);
-    $warnings = count(Log::$warnings);
+    $start = count($GLOBALS['stripeCalls']);
+    $warnings = count(warnings());
     $proceeds = $status === 404;
-    check($gateway->cancelBillingAgreement(new BillingAgreement($row(19, 'pm_cancel'))) === $proceeds,
+    check($gateway->cancelBillingAgreement($clicked()) === $proceeds,
         $proceeds ? 'Cancellation proceeds locally when the clicked method is missing at Stripe'
             : "Cancellation stops before local removal after a Stripe $status read failure");
-    check(count(Http::$calls) === $start + 1 && Http::$calls[$start][0] === 'get',
-        "Cancellation never detaches after a Stripe $status read failure");
-    check($proceeds ? count(Log::$warnings) === $warnings : count(Log::$warnings) === $warnings + 1 && end(Log::$warnings) === [
+    check(count($calls($start)) === 1 && $calls($start)[0][0] === 'get', "Cancellation never detaches after a Stripe $status read failure");
+    check($proceeds ? count(warnings()) === $warnings : count(warnings()) === $warnings + 1 && $lastWarning() === [
         'ae_stripe_cancel_method_read_failed', ['error' => RequestException::class],
     ], 'Only uncertain cancellation read failures warn, with a fixed code and exception class');
 }
-Http::$handler = function ($verb, $path) {
-    if ($verb === 'get' && $path === '/payment_methods/pm_cancel') return ['customer' => 'cus_other'];
+$GLOBALS['stripeHandler'] = function ($verb, $path) {
+    if ($verb === 'get' && $path === '/payment_methods/pm_cancel') return ['id' => 'pm_cancel', 'customer' => 'cus_other'];
     throw new RuntimeException('Unexpected cancellation request');
 };
-$start = count(Http::$calls);
-check($gateway->cancelBillingAgreement(new BillingAgreement($row(19, 'pm_cancel'))) === false,
-    'Cancellation refuses a method belonging to another customer');
-check(count(Http::$calls) === $start + 1 && Http::$calls[$start][0] === 'get',
-    'Cancellation never detaches a method belonging to another customer');
-if (getenv('PAY_REMOVE_MISSING_CASE') !== 'candidate') {
-    ExtensionHelper::$agreements = ['pm_cancel' => $row(19, 'pm_cancel'), 'pm_live' => $row(20, 'pm_live')];
-    $otherBefore = ExtensionHelper::$agreements['pm_live'];
-    $user->props->values['ae_stripe_auto_pay_default'] = json_encode(['agreement_id' => 19]);
-    Http::$handler = function ($verb, $path) {
-        check(!DB::$userLocked, 'A missing clicked method is read outside the owner lock');
-        if ($verb === 'get' && $path === '/payment_methods/pm_cancel') throw new RequestException(404, ['error' => ['code' => 'resource_missing']]);
-        throw new RuntimeException('A missing clicked method cannot authorize reading or detaching other methods');
-    };
-    check($gateway->cancelBillingAgreement(new BillingAgreement($row(19, 'pm_cancel')))
-        && !isset($user->props->values['ae_stripe_auto_pay_default']), 'A missing clicked method proceeds locally and clears its Auto Pay choice');
-    check(ExtensionHelper::$agreements['pm_live'] === $otherBefore, 'A missing clicked method leaves other agreements alone');
-}
+$start = count($GLOBALS['stripeCalls']);
+check($gateway->cancelBillingAgreement($clicked()) === false, 'Cancellation refuses a method belonging to another customer');
+check(count($calls($start)) === 1 && $calls($start)[0][0] === 'get', 'Cancellation never detaches a method belonging to another customer');
+
+resetSavedMethods();
+nativeAgreement(19, 'pm_cancel');
+nativeAgreement(20, 'pm_live');
+$otherBefore = agreements()['pm_live'];
+$owner->properties()->create(['key' => 'ae_stripe_auto_pay_default', 'value' => json_encode(['agreement_id' => 19])]);
+$GLOBALS['stripeHandler'] = function ($verb, $path) {
+    check(!holdsLock('users'), 'A missing clicked method is read outside the owner lock');
+    if ($verb === 'get' && $path === '/payment_methods/pm_cancel') throw new StripeFixtureError(404, ['error' => ['code' => 'resource_missing']]);
+    throw new RuntimeException('A missing clicked method cannot authorize reading or detaching other methods');
+};
+check($gateway->cancelBillingAgreement($clicked()) && !isset(ownerProperties()['ae_stripe_auto_pay_default']),
+    'A missing clicked method proceeds locally and clears its Auto Pay choice');
+check(agreements()['pm_live'] === $otherBefore, 'A missing clicked method leaves other agreements alone');
+
 // A dead row must not stop removal of a live card, even if its saved details look identical.
 foreach (['row', 'receipt'] as $source) foreach (['missing', 'server', 'connection', 'unconfirmed 404'] as $failure) {
-    $user->props->values = [];
-    ExtensionHelper::$agreements = ['pm_cancel' => $row(19, 'pm_cancel')];
-    if ($source === 'row') ExtensionHelper::$agreements['pm_dead'] = $row(20, 'pm_dead');
-    else $user->props->values['ae_stripe_saved_fixture'] = json_encode(['incoming' => 'pm_dead', 'reference' => 'pm_cancel', 'consent' => ['user_id' => 7]]);
-    $deadBefore = ExtensionHelper::$agreements['pm_dead'] ?? null;
+    resetSavedMethods();
+    nativeAgreement(19, 'pm_cancel');
+    if ($source === 'row') nativeAgreement(20, 'pm_dead');
+    else $owner->properties()->create(['key' => 'ae_stripe_saved_fixture', 'value' => json_encode(['incoming' => 'pm_dead', 'reference' => 'pm_cancel', 'consent' => ['user_id' => 7]])]);
+    $deadBefore = agreements()['pm_dead'] ?? null;
     $detached = [];
     $ownerLocks = [];
-    Http::$handler = function ($verb, $path) use ($failure, &$detached, &$ownerLocks) {
-        $ownerLocks[] = DB::$userLocked;
+    $GLOBALS['stripeHandler'] = function ($verb, $path) use ($failure, &$detached, &$ownerLocks) {
+        $ownerLocks[] = holdsLock('users');
         if ($verb === 'get' && $path === '/payment_methods/pm_dead') {
-            if ($failure === 'connection') throw new \Illuminate\Http\Client\ConnectionException('Synthetic outage');
-            throw new RequestException($failure === 'server' ? 503 : 404,
-                ['error' => ['code' => $failure === 'missing' ? 'resource_missing' : 'unknown']]);
+            if ($failure === 'connection') throw new ConnectionException('Synthetic outage');
+            throw new StripeFixtureError($failure === 'server' ? 503 : 404, ['error' => ['code' => $failure === 'missing' ? 'resource_missing' : 'unknown']]);
         }
-        if ($verb === 'get' && $path === '/payment_methods/pm_cancel') return (object) ['id' => 'pm_cancel', 'type' => 'card', 'customer' => 'cus_owner',
-            'card' => (object) ['fingerprint' => 'fp_live', 'brand' => 'visa', 'last4' => '4242', 'exp_month' => 5, 'exp_year' => 2030]];
-        if ($verb === 'post' && $path === '/payment_methods/pm_cancel/detach') { $detached[] = 'pm_cancel'; return (object) ['id' => 'pm_cancel', 'customer' => null]; }
+        if ($verb === 'get' && $path === '/payment_methods/pm_cancel') return nativeCard('pm_cancel', 'fp_live');
+        if ($verb === 'post' && $path === '/payment_methods/pm_cancel/detach') { $detached[] = 'pm_cancel'; return ['id' => 'pm_cancel', 'customer' => null]; }
         throw new RuntimeException('Unexpected missing-copy removal request');
     };
     $proceeds = $failure === 'missing';
-    check($gateway->cancelBillingAgreement(new BillingAgreement($row(19, 'pm_cancel'))) === $proceeds,
+    check($gateway->cancelBillingAgreement($clicked()) === $proceeds,
         $proceeds ? 'Another missing copy does not block removing the live card' : 'An uncertain candidate read still stops removal: ' . $failure);
     check($detached === ($proceeds ? ['pm_cancel'] : []), 'Only the verified live card is detached after a confirmed missing candidate');
-    check((ExtensionHelper::$agreements['pm_dead'] ?? null) === $deadBefore, 'Skipping a missing candidate never changes its local row');
-    check(!in_array(true, $ownerLocks, true), 'Missing-method handling keeps all Stripe HTTP outside the owner lock');
+    check((agreements()['pm_dead'] ?? null) === $deadBefore, 'Skipping a missing candidate never changes its local row');
+    check($ownerLocks && !in_array(true, $ownerLocks, true), 'Missing-method handling keeps all Stripe HTTP outside the owner lock');
 }
-ExtensionHelper::$agreements = ['pm_cancel' => $row(19, 'pm_cancel')];
-echo "PASS: cancellation read failures and customer binding\n";
 
-require_once __DIR__ . '/../extension/AeStripe/DeduplicateCardsCommand.php';
-Gateway::$rows = ['AeStripe' => [new \App\Models\Extension(['id' => 2, 'settings' => ['stripe_secret_key' => 'fake-secret']])]];
-DB::$tables['extensions'] = [['id' => 2, 'deleted_at' => null]];
-$card = fn ($id) => (object) ['id' => $id, 'customer' => 'cus_owner', 'type' => 'card',
-    'allow_redisplay' => 'unspecified', 'card' => (object) ['fingerprint' => 'fp_same', 'brand' => 'visa',
-        'last4' => '4242', 'exp_month' => 5, 'exp_year' => 2030]];
+$nativeGateway->settings()->create(['key' => 'stripe_secret_key', 'value' => 'fake-secret']);
 foreach (['read 404', 'read 503', 'retained read', 'finalize read', 'removed receipt', 'detach'] as $case) {
     foreach ([false, true] as $apply) {
         if (!$apply && in_array($case, ['finalize read', 'detach'])) continue;
-        $user->props->values = [];
-        ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_before' => $row(20, 'pm_before'),
-            'pm_failed' => $row(21, 'pm_failed'), 'pm_after' => $row(22, 'pm_after')];
-        $methods = array_map($card, array_combine(array_keys(ExtensionHelper::$agreements), array_keys(ExtensionHelper::$agreements)));
+        resetSavedMethods();
+        foreach (['pm_old' => 19, 'pm_before' => 20, 'pm_failed' => 21, 'pm_after' => 22] as $reference => $id) nativeAgreement($id, $reference);
+        $methods = [];
+        foreach (array_keys(agreements()) as $reference) $methods[$reference] = nativeCard($reference);
         if ($case === 'removed receipt') {
             $methods['pm_failed']->customer = null;
-            $user->props->values['ae_stripe_duplicate_pm_failed'] = json_encode([
-                'customer' => 'cus_owner', 'gateway' => 2, 'kept' => 'pm_removed',
-            ]);
+            $owner->properties()->create(['key' => 'ae_stripe_duplicate_pm_failed', 'value' => json_encode([
+                'customer' => 'cus_owner', 'gateway' => $nativeGateway->id, 'kept' => 'pm_removed',
+            ])]);
         }
-        $failedBefore = serialize(ExtensionHelper::$agreements['pm_failed']);
+        $failedBefore = agreements()['pm_failed'];
         $current = null;
         $failedReads = 0;
-        Http::$handler = function ($verb, $path, $data) use (&$methods, &$current, &$failedReads, $case) {
+        $GLOBALS['stripeHandler'] = function ($verb, $path, $data) use (&$methods, &$current, &$failedReads, $case) {
             foreach ($methods as $id => $method) {
                 if ($path === '/payment_methods/' . $id . '/detach') {
-                    if ($id === 'pm_failed' && $case === 'detach') throw new RequestException(503);
+                    if ($id === 'pm_failed' && $case === 'detach') throw new StripeFixtureError(503);
                     $method->customer = null;
                     return $method;
                 }
                 if ($path !== '/payment_methods/' . $id) continue;
                 if ($verb === 'get') {
-                    if ($id === 'pm_failed' && str_starts_with($case, 'read ')) throw new RequestException((int) substr($case, 5));
-                    if ($id === 'pm_failed' && $case === 'finalize read' && ++$failedReads === 2) throw new RequestException(503);
-                    if ($id === 'pm_old' && $current === 'pm_failed' && $case === 'retained read') throw new RequestException(503);
+                    if ($id === 'pm_failed' && str_starts_with($case, 'read ')) throw new StripeFixtureError((int) substr($case, 5));
+                    if ($id === 'pm_failed' && $case === 'finalize read' && ++$failedReads === 2) throw new StripeFixtureError(503);
+                    if ($id === 'pm_old' && $current === 'pm_failed' && $case === 'retained read') throw new StripeFixtureError(503);
                     $current = $id;
                 } else {
                     $method->allow_redisplay = $data['allow_redisplay'];
@@ -136,96 +113,83 @@ foreach (['read 404', 'read 503', 'retained read', 'finalize read', 'removed rec
             }
             throw new RuntimeException('Unexpected cleanup request');
         };
-        $warnings = count(Log::$warnings);
-        $command = new DeduplicateCardsCommand;
-        $command->options = ['apply' => $apply];
-        check($command->handle() === 1, "Cleanup reports failure after isolating $case");
-        $output = implode(' ', $command->output);
+        $warnings = count(warnings());
+        [$code, $lines] = dedupeCommand($apply);
+        check($code === 1, "Cleanup reports failure after isolating $case");
+        $output = implode(' ', $lines);
         check(str_contains($output, 'Saved card #21 skipped. Review it manually.')
             && str_contains($output, '1 saved card(s) skipped.'), 'Cleanup identifies the skipped row and total');
         check(str_contains($output, '#20 duplicates #19') && str_contains($output, '#22 duplicates #19'),
             'Cleanup processes healthy rows before and after the failing row');
-        check(serialize(ExtensionHelper::$agreements['pm_failed']) === $failedBefore,
-            'Cleanup preserves the failed agreement');
-        check($apply ? ExtensionHelper::$agreements['pm_after']['deleted_at'] !== null
-            : ExtensionHelper::$agreements['pm_after']['deleted_at'] === null, 'Cleanup honors apply after a failed row');
-        check(count(Log::$warnings) === $warnings + 1 && end(Log::$warnings) === [
+        check(agreements()['pm_failed'] === $failedBefore, 'Cleanup preserves the failed agreement');
+        check($apply ? agreements()['pm_after']['deleted_at'] !== null : agreements()['pm_after']['deleted_at'] === null,
+            'Cleanup honors apply after a failed row');
+        check(count(warnings()) === $warnings + 1 && $lastWarning() === [
             'ae_stripe_deduplicate_agreement_skipped', ['agreement_id' => 21,
-                'error' => $case === 'removed receipt' ? \App\Exceptions\DisplayException::class : RequestException::class],
+                'error' => $case === 'removed receipt' ? App\Exceptions\DisplayException::class : RequestException::class],
         ], 'Cleanup warnings contain only a fixed code, agreement ID and exception class');
     }
 }
-Gateway::$rows = null;
-echo "PASS: cleanup isolates failed agreements and reports a nonzero command result\n";
 
-$user->props->values = [];
-ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_failed' => $row(21, 'pm_failed'),
-    'pm_after' => $row(22, 'pm_after')];
-$methods = ['pm_old' => $card('pm_old'), 'pm_failed' => $card('pm_failed'), 'pm_after' => $card('pm_after')];
-Http::$handler = function ($verb, $path) use (&$methods) {
+resetSavedMethods();
+foreach (['pm_old' => 19, 'pm_failed' => 21, 'pm_after' => 22] as $reference => $id) nativeAgreement($id, $reference);
+$methods = ['pm_old' => nativeCard('pm_old'), 'pm_failed' => nativeCard('pm_failed'), 'pm_after' => nativeCard('pm_after')];
+$GLOBALS['stripeHandler'] = function ($verb, $path) use (&$methods) {
     foreach ($methods as $id => $method) {
         if ($path === '/payment_methods/' . $id) return $method;
         if ($path === '/payment_methods/' . $id . '/detach') { $method->customer = null; return $method; }
     }
     throw new RuntimeException('Unexpected rollback request');
 };
-$failedBefore = ExtensionHelper::$agreements['pm_failed'];
+$failedBefore = agreements()['pm_failed'];
 $lines = [];
 $skipped = $gateway->deduplicateCards(true, function ($line) use (&$lines) {
     $lines[] = $line;
     if ($line === 'Removed duplicate saved card #21.') throw new RuntimeException('Synthetic report failure');
 });
-check($skipped === 1 && ExtensionHelper::$agreements['pm_failed'] === $failedBefore,
-    'An exception after local removal rolls back the entire agreement transaction');
-check(ExtensionHelper::$agreements['pm_after']['deleted_at'] !== null
-    && in_array('Saved card #21 skipped. Review it manually.', $lines), 'Cleanup continues after a transaction rollback');
-check(isset($user->props->values['ae_stripe_duplicate_pm_failed']) && $gateway->deduplicateCards(true, fn ($line) => null) === 0
-    && ExtensionHelper::$agreements['pm_failed']['deleted_at'] !== null,
-    'The committed receipt lets a skipped detached card finish safely on retry');
+check($skipped === 1 && agreements()['pm_failed'] === $failedBefore, 'An exception after local removal rolls back the entire agreement transaction');
+check(agreements()['pm_after']['deleted_at'] !== null && in_array('Saved card #21 skipped. Review it manually.', $lines),
+    'Cleanup continues after a transaction rollback');
+check(isset(ownerProperties()['ae_stripe_duplicate_pm_failed']) && $gateway->deduplicateCards(true, fn ($line) => null) === 0
+    && agreements()['pm_failed']['deleted_at'] !== null, 'The committed receipt lets a skipped detached card finish safely on retry');
 
-ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_failed' => $row(21, 'pm_failed')];
-Http::$handler = fn () => throw new RequestException(503);
-Gateway::$rows = ['AeStripe' => [new \App\Models\Extension(['id' => 2, 'settings' => ['stripe_secret_key' => 'fake-secret']])]];
-$command = new DeduplicateCardsCommand;
-check($command->handle() === 1 && in_array('2 saved card(s) skipped. See the per-card reasons above.', $command->output),
-    'Cleanup reports the total when more than one agreement is skipped');
-Gateway::$rows = null;
+resetSavedMethods();
+nativeAgreement(19, 'pm_old');
+nativeAgreement(21, 'pm_failed');
+$GLOBALS['stripeHandler'] = fn () => throw new StripeFixtureError(503);
+[$code, $lines] = dedupeCommand(false);
+check($code === 1 && in_array('2 saved card(s) skipped. See the per-card reasons above.', $lines), 'Cleanup reports the total when more than one agreement is skipped');
 
 // A deleted comparison card must not prevent saving a new, customer-verified card.
-ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
-$user->props->values = [];
-$new = $card('pm_new');
-$setup = (object) ['id' => 'seti_missing_candidate', 'status' => 'succeeded', 'customer' => 'cus_owner',
-    'payment_method' => 'pm_new', 'latest_attempt' => null, 'metadata' => (object) [
-        'user_id' => '7', 'is_billing_agreement' => '1', 'ae_stripe_setup_consent' => 'off_session_v1',
-        'ae_stripe_setup_consent_user' => '7', 'ae_stripe_setup_consent_at' => '1700000000',
-    ]];
-Http::$handler = function ($verb, $path, $data) use ($setup, $new) {
-    if ($path === '/setup_intents/seti_missing_candidate') return $setup;
-    if ($verb === 'get' && $path === '/payment_methods/pm_old') throw new RequestException(404, ['error' => ['code' => 'resource_missing']]);
+resetSavedMethods();
+nativeAgreement(19, 'pm_old');
+$new = nativeCard('pm_new');
+$setup = nativeSetupIntent('missingcandidate');
+$GLOBALS['stripeHandler'] = function ($verb, $path, $data) use ($setup, $new) {
+    if ($path === '/setup_intents/' . $setup->id) return $setup;
+    if ($verb === 'get' && $path === '/payment_methods/pm_old') throw new StripeFixtureError(404, ['error' => ['code' => 'resource_missing']]);
     if ($path === '/payment_methods/pm_new') return $new;
     throw new RuntimeException('Unexpected setup request');
 };
-$start = count(Http::$calls);
-$result = $gateway->setupAgreement(new \Illuminate\Http\Request(['setup_intent' => $setup->id]));
-check($result['message'] === 'Payment method added successfully.' && isset(ExtensionHelper::$agreements['pm_new']),
+$start = count($GLOBALS['stripeCalls']);
+$result = setupReturn($gateway, $setup);
+check($result['message'] === 'Payment method added successfully.' && isset(agreements()['pm_new']),
     'A deleted comparison card does not prevent saving a valid new card');
-check(!array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach')),
-    'A missing comparison card never authorizes a detach');
+check(!array_filter($calls($start), fn ($call) => str_ends_with($call[1], '/detach')), 'A missing comparison card never authorizes a detach');
 
 foreach ([404, 503] as $status) {
-    ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
-    Http::$handler = function ($verb, $path) use ($setup, $new, $status) {
-        if ($path === '/setup_intents/seti_missing_candidate') return $setup;
-        if ($verb === 'get' && $path === '/payment_methods/pm_old') throw new RequestException($status);
+    resetSavedMethods();
+    nativeAgreement(19, 'pm_old');
+    $GLOBALS['stripeHandler'] = function ($verb, $path) use ($setup, $new, $status) {
+        if ($path === '/setup_intents/' . $setup->id) return $setup;
+        if ($verb === 'get' && $path === '/payment_methods/pm_old') throw new StripeFixtureError($status);
         if ($path === '/payment_methods/pm_new') return $new;
         throw new RuntimeException('Unexpected setup request');
     };
     try {
-        $gateway->setupAgreement(new \Illuminate\Http\Request(['setup_intent' => $setup->id]));
+        setupReturn($gateway, $setup);
         throw new RuntimeException('Unconfirmed comparison failures must remain retryable');
     } catch (RequestException $e) {
-        check(!isset(ExtensionHelper::$agreements['pm_new']), 'Unconfirmed comparison failures preserve the existing agreements');
+        check(!isset(agreements()['pm_new']), 'Unconfirmed comparison failures preserve the existing agreements');
     }
 }
-echo "PASS: cleanup rollback, skipped totals and missing comparison cards\n";

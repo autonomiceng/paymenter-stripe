@@ -1,232 +1,209 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-use App\Helpers\ExtensionHelper;
-use App\Models\{BillingAgreement, Gateway, Invoice, Properties, User};
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\{DB, Http};
+// Native suite: runs on tests/native-app.php (real Paymenter models, listeners and SQLite).
+use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Support\Facades\DB;
 use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
 
-$user = User::$row = new User(new Properties('cus_owner'));
-Invoice::$row = new Invoice($user);
-Gateway::$rows = null;
-Gateway::$enabled = Gateway::$present = true;
-Gateway::$deleted = false;
-BillingAgreement::$snapshot = [];
-DB::$tables['services'] = [];
-$gateway = new AeStripe(['stripe_secret_key' => 'fake-secret']);
-$card = fn ($id, $fingerprint = 'fp_same', $month = 5) => (object) ['id' => $id, 'customer' => 'cus_owner', 'type' => 'card',
-    'allow_redisplay' => 'unspecified', 'card' => (object) ['fingerprint' => $fingerprint, 'brand' => 'visa',
-        'last4' => '4242', 'exp_month' => $month, 'exp_year' => 2030]];
-$methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
-$setup = (object) ['id' => 'seti_dedupe', 'status' => 'succeeded', 'customer' => 'cus_owner', 'payment_method' => 'pm_new',
-    'latest_attempt' => null, 'metadata' => (object) ['user_id' => '7', 'ae_stripe_gateway' => '1', 'is_billing_agreement' => '1',
-        'ae_stripe_setup_consent' => 'off_session_v1', 'ae_stripe_setup_consent_user' => '7', 'ae_stripe_setup_consent_at' => '1700000000']];
-Http::$handler = function ($verb, $path, $data) use (&$methods, $setup) {
-    if ($path === '/setup_intents/seti_dedupe') return $setup;
-    foreach ($methods as $id => $method) {
-        if ($path === '/payment_methods/' . $id . '/detach') { $method->customer = null; return $method; }
-        if ($path !== '/payment_methods/' . $id) continue;
-        if ($verb === 'post') $method->allow_redisplay = $data['allow_redisplay'];
-        return $method;
-    }
-    throw new RuntimeException('Unexpected dedupe request: ' . $path);
-};
-$row = fn ($id, $pm, $extra = []) => $extra + ['id' => $id, 'external_reference' => $pm, 'user_id' => 7, 'gateway_id' => 2,
-    'name' => 'Visa **** 4242', 'type' => 'visa', 'expiry' => '2030-05-31', 'deleted_at' => null];
-ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
-$result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check($result['message'] === 'This card is already saved. We updated its expiry to 05/2030.' && count(ExtensionHelper::$agreements) === 1,
+nativeSharedCache();
+$otherGateway = App\Models\Gateway::create(['name' => 'Other', 'extension' => 'Other', 'type' => 'gateway', 'enabled' => true]);
+$methods = ['pm_old' => nativeCard('pm_old'), 'pm_new' => nativeCard('pm_new')];
+$setup = nativeSetupIntent('dedupe');
+$handler = nativeMethodHandler($methods, $setup);
+$GLOBALS['stripeHandler'] = $handler;
+$serviceRows = fn () => tableRows('services', ['id']);
+$bind = fn (int $agreement) => nativeService(null)->forceFill(['billing_agreement_id' => $agreement])->save();
+$calls = fn (int $start) => array_slice($GLOBALS['stripeCalls'], $start);
+
+// Agreement reads inside a saving transaction must be current reads, not a REPEATABLE READ snapshot.
+resetSavedMethods();
+nativeAgreement(19, 'pm_old');
+$snapshotReads = [];
+DB::listen(function (QueryExecuted $query) use (&$snapshotReads) {
+    if (DB::transactionLevel() > 0 && preg_match('/^select .* from "billing_agreements"/', $query->sql) && !str_contains($query->sql, '/* for update */')) $snapshotReads[] = $query->sql;
+});
+$result = setupReturn($gateway, $setup);
+check($result['message'] === 'This card is already saved. We updated its expiry to 05/2030.' && count(agreements()) === 1 && !$snapshotReads,
     'A confirmed duplicate setup retains one saved card and shows one notice');
 check($methods['pm_new']->customer === 'cus_owner' && $methods['pm_old']->allow_redisplay === 'always',
     'Duplicate setup retains referenced methods and broadens redisplay on the retained method');
-$result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check($result['message'] === 'This card is already saved. We updated its expiry to 05/2030.' && count(ExtensionHelper::$agreements) === 1,
+$result = setupReturn($gateway, $setup);
+check($result['message'] === 'This card is already saved. We updated its expiry to 05/2030.' && count(agreements()) === 1 && !$snapshotReads,
     'Webhook or redirect retries recognize the detached duplicate without another agreement');
-BillingAgreement::$snapshot = null;
 
-// Exercise the public command using configured gateway settings, like Paymenter's console lifecycle.
-Gateway::$rows = ['AeStripe' => [new \App\Models\Extension(['id' => 2, 'settings' => ['stripe_secret_key' => 'fake-secret']])]];
-DB::$tables['extensions'] = [['id' => 2, 'deleted_at' => null]];
-$methods['pm_new'] = $card('pm_new');
+// Exercise the public command using the installed gateway settings, like Paymenter's console lifecycle.
+$nativeGateway->settings()->create(['key' => 'stripe_secret_key', 'value' => 'installed-secret']);
+$methods['pm_new'] = nativeCard('pm_new');
 $methods['pm_old']->allow_redisplay = 'limited';
 $methods['pm_new']->allow_redisplay = 'always';
-$user->props->values = [];
-ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
-$before = serialize([ExtensionHelper::$agreements, $user->props->values, $methods]);
-$start = count(Http::$calls);
-$command = new \Paymenter\Extensions\Gateways\AeStripe\DeduplicateCardsCommand;
-check($command->handle() === 0 && str_contains(implode(' ', $command->output), '#20 duplicates #19'),
-    'Cleanup dry run lists duplicate agreement IDs');
-check(serialize([ExtensionHelper::$agreements, $user->props->values, $methods]) === $before
-    && !array_filter(array_slice(Http::$calls, $start), fn ($call) => $call[0] !== 'get'), 'Cleanup defaults to read-only dry run');
-check(Http::$calls[$start][3]['Authorization'] === 'Bearer fake-secret', 'Cleanup uses the installed gateway credentials');
-$command->options = ['apply' => true];
-check($command->handle() === 0 && ExtensionHelper::$agreements['pm_new']['deleted_at'] !== null
+resetSavedMethods();
+nativeAgreement(19, 'pm_old');
+nativeAgreement(20, 'pm_new');
+$before = serialize([agreements(), ownerProperties(), $methods]);
+$start = count($GLOBALS['stripeCalls']);
+[$code, $output] = dedupeCommand(false);
+check($code === 0 && str_contains(implode(' ', $output), '#20 duplicates #19'), 'Cleanup dry run lists duplicate agreement IDs');
+check(serialize([agreements(), ownerProperties(), $methods]) === $before
+    && !array_filter($calls($start), fn ($call) => $call[0] !== 'get'), 'Cleanup defaults to read-only dry run');
+check($GLOBALS['stripeCalls'][$start][3]['Authorization'] === 'Bearer installed-secret', 'Cleanup uses the installed gateway credentials');
+check(dedupeCommand(true)[0] === 0 && agreements()['pm_new']['deleted_at'] !== null
     && $methods['pm_new']->customer === null && $methods['pm_old']->allow_redisplay === 'always',
     'Cleanup apply removes only the unbound duplicate and preserves broader redisplay');
-check($command->handle() === 0, 'Cleanup apply can be repeated');
-Gateway::$rows = null;
+check(dedupeCommand(true)[0] === 0, 'Cleanup apply can be repeated');
 
 // Imported duplicates with service bindings must be visible in the dry run and retained on apply.
-$methods['pm_new'] = $card('pm_new');
-$user->props->values = [];
-ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
-DB::$tables['services'] = [['id' => 41, 'billing_agreement_id' => 20, 'auto_pay' => false]];
-$serviceBefore = DB::$tables['services'];
+$methods['pm_new'] = nativeCard('pm_new');
+resetSavedMethods();
+nativeAgreement(19, 'pm_old');
+nativeAgreement(20, 'pm_new');
+$bind(20);
+$serviceBefore = $serviceRows();
 $lines = [];
 $gateway->deduplicateCards(false, function ($line) use (&$lines) { $lines[] = $line; });
 check(str_contains(implode(' ', $lines), 'linked to a service'), 'Cleanup lists service-bound duplicates with the reason they stay');
 $gateway->deduplicateCards(true, fn ($line) => null);
-check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner'
-    && DB::$tables['services'] === $serviceBefore, 'Cleanup preserves bound duplicates and every service preference');
+check(agreements()['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner'
+    && $serviceRows() === $serviceBefore, 'Cleanup preserves bound duplicates and every service preference');
 
 // The account card can have no services, including duplicates saved before expiry matching changed.
 foreach (['on', 'off'] as $state) {
-$accountProperty = $state === 'on' ? 'ae_stripe_auto_pay_default' : 'ae_stripe_auto_pay_card';
-$accountChoice = json_encode(['version' => AeStripe::AUTO_PAY_CONSENT, 'user_id' => 7,
-    'accepted_at' => 1700000000, 'agreement_id' => 20], JSON_THROW_ON_ERROR);
-$accountGateway = new AeStripe(['stripe_secret_key' => 'fake-secret', 'stripe_webhook_secret' => 'whsec_test']);
-foreach (['return', 'webhook', 'selected before detach', 'cleanup'] as $entry) {
-    $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new', month: $entry === 'cleanup' ? 5 : 6)];
-    ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'),
-        'pm_new' => $row(20, 'pm_new', ['expiry' => $entry === 'cleanup' ? '2030-05-31' : '2030-06-30'])];
-    DB::$tables['services'] = [];
-    $tablesBefore = DB::$tables;
-    $user->props->values = $entry === 'selected before detach' ? [] : [$accountProperty => $accountChoice];
-    $selectedBetweenPhases = false;
-    if ($entry === 'selected before detach') {
-        DB::$afterTransaction = function () use ($user, $accountProperty, $accountChoice, &$selectedBetweenPhases) {
-            check(!DB::$userLocked, 'The account choice commits after the first duplicate transaction');
-            $user->props->values[$accountProperty] = $accountChoice;
-            $selectedBetweenPhases = true;
-        };
-    }
-    $start = count(Http::$calls);
-    for ($attempt = 0; $attempt < 2; $attempt++) {
-        if ($entry === 'webhook') {
-            check($accountGateway->webhook(eventRequest($setup, type: 'setup_intent.succeeded'))['status'] === 200,
-                'Delayed setup success is acknowledged for the account card');
-        } elseif ($entry === 'cleanup') {
-            check($accountGateway->deduplicateCards(true, fn ($line) => null) === 0, 'Cleanup preserves the account card without an error');
-        } else {
-            $accountGateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
+    $accountProperty = $state === 'on' ? 'ae_stripe_auto_pay_default' : 'ae_stripe_auto_pay_card';
+    $accountChoice = json_encode(['version' => AeStripe::AUTO_PAY_CONSENT, 'user_id' => 7,
+        'accepted_at' => 1700000000, 'agreement_id' => 20], JSON_THROW_ON_ERROR);
+    $accountGateway = new AeStripe(['stripe_secret_key' => 'fake-secret', 'stripe_webhook_secret' => 'whsec_test']);
+    foreach (['return', 'webhook', 'selected before detach', 'cleanup'] as $entry) {
+        $methods = ['pm_old' => nativeCard('pm_old'), 'pm_new' => nativeCard('pm_new', month: $entry === 'cleanup' ? 5 : 6)];
+        resetSavedMethods();
+        nativeAgreement(19, 'pm_old');
+        nativeAgreement(20, 'pm_new', ['expiry' => $entry === 'cleanup' ? '2030-05-31' : '2030-06-30']);
+        $tablesBefore = [$serviceRows(), tableRows('invoice_transactions', ['id'])];
+        if ($entry !== 'selected before detach') $owner->properties()->create(['key' => $accountProperty, 'value' => $accountChoice]);
+        $selectedBetweenPhases = false;
+        if ($entry === 'selected before detach') {
+            afterNextCommit(function () use ($owner, $accountProperty, $accountChoice, &$selectedBetweenPhases) {
+                check(!holdsLock('users'), 'The account choice commits after the first duplicate transaction');
+                $owner->properties()->create(['key' => $accountProperty, 'value' => $accountChoice]);
+                $selectedBetweenPhases = true;
+            });
         }
-        check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner',
-            "$entry keeps the newer account Auto Pay agreement attached and active");
-        check($accountGateway->autoPayCard($user) === 20
-            && ($accountGateway->autoPayDefault($user) !== null) === ($state === 'on')
-            && $user->props->values[$accountProperty] === $accountChoice,
-            "$entry preserves the exact account choice and Auto Pay still resolves");
+        $start = count($GLOBALS['stripeCalls']);
+        for ($attempt = 0; $attempt < 2; $attempt++) {
+            if ($entry === 'webhook') {
+                check($accountGateway->webhook(eventRequest($setup, type: 'setup_intent.succeeded'))->getStatusCode() === 200,
+                    'Delayed setup success is acknowledged for the account card');
+            } elseif ($entry === 'cleanup') {
+                check($accountGateway->deduplicateCards(true, fn ($line) => null) === 0, 'Cleanup preserves the account card without an error');
+            } else {
+                setupReturn($accountGateway, $setup);
+            }
+            check(agreements()['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner',
+                "$entry keeps the newer account Auto Pay agreement attached and active");
+            check($accountGateway->autoPayCard($owner) === 20
+                && ($accountGateway->autoPayDefault($owner) !== null) === ($state === 'on')
+                && ownerProperties()[$accountProperty] === $accountChoice,
+                "$entry preserves the exact account choice and Auto Pay still resolves");
+        }
+        check(count(agreements()) === 2 && [$serviceRows(), tableRows('invoice_transactions', ['id'])] === $tablesBefore,
+            "$entry preserves both existing agreements, service settings and charge history");
+        check(!array_filter($calls($start), fn ($call) => str_ends_with($call[1], '/detach')),
+            "$entry sends no detach for the account card");
+        if ($entry === 'selected before detach') check($selectedBetweenPhases, 'The pre-detach recheck scenario ran');
     }
-    check(count(ExtensionHelper::$agreements) === 2 && DB::$tables === $tablesBefore,
-        "$entry preserves both existing agreements, service settings and charge history");
-    check(!array_filter(array_slice(Http::$calls, $start), fn ($call) => str_ends_with($call[1], '/detach')),
-        "$entry sends no detach for the account card");
-    if ($entry === 'selected before detach') check($selectedBetweenPhases, 'The pre-detach recheck scenario ran');
 }
-}
-$user->props->values = [];
 
-DB::$tables['services'] = [];
 foreach (['fingerprint', 'missing fingerprint', 'other user', 'other gateway', 'removed', 'other customer'] as $case) {
-    $methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
-    $user->props->values = [];
-    $old = $row(19, 'pm_old');
+    $methods = ['pm_old' => nativeCard('pm_old'), 'pm_new' => nativeCard('pm_new')];
+    resetSavedMethods();
+    $old = [];
     switch ($case) {
         case 'fingerprint': $methods['pm_new']->card->fingerprint = 'fp_other'; break;
         case 'missing fingerprint': unset($methods['pm_new']->card->fingerprint); break;
         case 'other user': $old['user_id'] = 99; break;
-        case 'other gateway': $old['gateway_id'] = 1; break;
-        case 'removed': $old['deleted_at'] = '2026-10-22'; break;
+        case 'other gateway': $old['gateway_id'] = $otherGateway->id; break;
+        case 'removed': $old['deleted_at'] = '2026-10-22 00:00:00'; break;
         case 'other customer': $methods['pm_old']->customer = 'cus_other'; break;
     }
-    ExtensionHelper::$agreements = ['pm_old' => $old];
-    $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-    check(count(ExtensionHelper::$agreements) === 2 && $methods['pm_new']->customer === 'cus_owner',
-        "Setup keeps separate methods for $case");
+    nativeAgreement(19, 'pm_old', $old);
+    setupReturn($gateway, $setup);
+    check(count(agreements()) === 2 && $methods['pm_new']->customer === 'cus_owner', "Setup keeps separate methods for $case");
 }
 // A service using the retained card keeps its agreement ID and Auto Pay state.
-$methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
-$user->props->values = [];
-ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
-DB::$tables['services'] = [['id' => 41, 'billing_agreement_id' => 19, 'auto_pay' => true]];
-$serviceBefore = DB::$tables['services'];
-$handler = Http::$handler;
-$result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check(str_contains($result['message'], 'already saved') && DB::$tables['services'] === $serviceBefore,
+$methods = ['pm_old' => nativeCard('pm_old'), 'pm_new' => nativeCard('pm_new')];
+resetSavedMethods();
+nativeAgreement(19, 'pm_old');
+$bind(19);
+$serviceBefore = $serviceRows();
+$result = setupReturn($gateway, $setup);
+check(str_contains($result['message'], 'already saved') && $serviceRows() === $serviceBefore,
     'A repeated save preserves the retained agreement and its service settings');
 
 // Receipts cannot authorize detaching a method that has moved to another customer.
-DB::$tables['services'] = [];
-ExtensionHelper::$agreements['pm_new'] = $row(20, 'pm_new');
+DB::table('services')->delete();
+nativeAgreement(20, 'pm_new');
 $methods['pm_new']->customer = 'cus_other';
 $gateway->deduplicateCards(true, fn ($line) => null);
-check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_other',
+check(agreements()['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_other',
     'Cleanup refuses a receipt when the duplicate now belongs to another customer');
 
 // A setup retry must keep an imported duplicate that already has a service.
-$methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
-$user->props->values = [];
-ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
-DB::$tables['services'] = [['id' => 41, 'billing_agreement_id' => 20, 'auto_pay' => false]];
-$beforeLogs = count(\Illuminate\Support\Facades\Log::$lines);
-$gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check(count(ExtensionHelper::$agreements) === 2 && ExtensionHelper::$agreements['pm_new']['deleted_at'] === null
-    && $methods['pm_new']->customer === 'cus_owner',
+$methods = ['pm_old' => nativeCard('pm_old'), 'pm_new' => nativeCard('pm_new')];
+resetSavedMethods();
+nativeAgreement(19, 'pm_old');
+nativeAgreement(20, 'pm_new');
+$bind(20);
+setupReturn($gateway, $setup);
+check(count(agreements()) === 2 && agreements()['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner',
     'Setup retains a duplicate already bound to a service');
 
 // Cleanup resumes after Stripe detaches a card but the response is lost.
-DB::$tables['services'] = [];
+DB::table('services')->delete();
 $methods['pm_old']->allow_redisplay = 'always';
-$user->props->values = [];
 $lostDetach = true;
-Http::$handler = function ($verb, $path, $data) use ($handler, &$lostDetach) {
+$GLOBALS['stripeHandler'] = function ($verb, $path, $data) use ($handler, &$lostDetach) {
     $result = $handler($verb, $path, $data);
     if (str_ends_with($path, '/detach') && $lostDetach) {
         $lostDetach = false;
-        throw new \Illuminate\Http\Client\ConnectionException('Synthetic lost detach response');
+        throw new ConnectionException('Synthetic lost detach response');
     }
     return $result;
 };
-check($gateway->deduplicateCards(true, fn ($line) => null) === 1,
-    'Cleanup reports an agreement skipped after an uncertain detach');
-check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null, 'Cleanup rolls back local removal on an uncertain detach');
+check($gateway->deduplicateCards(true, fn ($line) => null) === 1, 'Cleanup reports an agreement skipped after an uncertain detach');
+check(agreements()['pm_new']['deleted_at'] === null, 'Cleanup rolls back local removal on an uncertain detach');
 $gateway->deduplicateCards(true, fn ($line) => null);
-check(ExtensionHelper::$agreements['pm_new']['deleted_at'] !== null && $methods['pm_old']->allow_redisplay === 'always',
+check(agreements()['pm_new']['deleted_at'] !== null && $methods['pm_old']->allow_redisplay === 'always',
     'Cleanup resumes a detached method without reducing the retained consent');
-Http::$handler = $handler;
+$GLOBALS['stripeHandler'] = $handler;
 
 // Validate agreement ownership again if a service is linked between cleanup phases.
-$methods['pm_new'] = $card('pm_new');
-$user->props->values = [];
-ExtensionHelper::$agreements['pm_new'] = $row(20, 'pm_new');
-$gateway->deduplicateCards(true, function ($line) {
+$methods['pm_new'] = nativeCard('pm_new');
+resetSavedMethods();
+nativeAgreement(19, 'pm_old');
+nativeAgreement(20, 'pm_new');
+$gateway->deduplicateCards(true, function ($line) use ($bind) {
     if (!str_contains($line, 'duplicates')) return;
-    DB::$beforeUserLock = function () { DB::$tables['services'] = [['id' => 41, 'billing_agreement_id' => 20]]; };
+    beforeLock('users', fn () => $bind(20));
 });
-check(ExtensionHelper::$agreements['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner',
+check(agreements()['pm_new']['deleted_at'] === null && $methods['pm_new']->customer === 'cus_owner',
     'Cleanup rechecks a service binding added before apply');
-BillingAgreement::$snapshot = null;
 
-$methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
-$user->props->values = [];
-DB::$tables['services'] = [];
-ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old'), 'pm_new' => $row(20, 'pm_new')];
+$methods = ['pm_old' => nativeCard('pm_old'), 'pm_new' => nativeCard('pm_new')];
+resetSavedMethods();
+nativeAgreement(19, 'pm_old');
+nativeAgreement(20, 'pm_new');
 $setup->payment_method = 'pm_old';
-$gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-check(ExtensionHelper::$agreements['pm_old']['deleted_at'] === null && $methods['pm_old']->customer === 'cus_owner',
+setupReturn($gateway, $setup);
+check(agreements()['pm_old']['deleted_at'] === null && $methods['pm_old']->customer === 'cus_owner',
     'Retrying the oldest saved method never replaces it with a newer duplicate');
 $setup->payment_method = 'pm_new';
 
 // A previous duplicate receipt never revives a removed retained agreement.
-$methods = ['pm_old' => $card('pm_old'), 'pm_new' => $card('pm_new')];
-$user->props->values = [];
-ExtensionHelper::$agreements = ['pm_old' => $row(19, 'pm_old')];
-$user->props->values = [];
-$gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
-ExtensionHelper::$agreements['pm_old']['deleted_at'] = '2026-10-23 13:00:00';
-$result = $gateway->setupAgreement(new Request(['setup_intent' => 'seti_dedupe']));
+$methods = ['pm_old' => nativeCard('pm_old'), 'pm_new' => nativeCard('pm_new')];
+resetSavedMethods();
+nativeAgreement(19, 'pm_old');
+setupReturn($gateway, $setup);
+DB::table('billing_agreements')->where('id', 19)->update(['deleted_at' => '2026-10-23 13:00:00']);
+$result = setupReturn($gateway, $setup);
 check($result['type'] === 'danger' && str_contains($result['message'], 'removed')
-    && count(ExtensionHelper::$agreements) === 1 && ExtensionHelper::$agreements['pm_old']['deleted_at'] !== null,
+    && count(agreements()) === 1 && agreements()['pm_old']['deleted_at'] !== null,
     'Duplicate setup receipts preserve removal of the retained agreement');
-echo "PASS: saved-card scope, service bindings, cleanup and retry recovery\n";
