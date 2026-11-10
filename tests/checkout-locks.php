@@ -88,6 +88,21 @@ $customer(8, 'cus_second');
 $first = $invoiceFor(301, 7);
 $second = $invoiceFor(302, 8);
 $GLOBALS['gapIndex'] = DB::table('properties')->get(['key', 'model_id', 'model_type'])->map(fn ($row) => [$row->key, $row->model_id, $row->model_type])->all();
+// Positive control for the trace: the native grammar renders the lock as a trailing comment, and a locking read of a
+// missing property is recorded as a lock on its gap, while a locking read of an existing row is not. Two Stripe
+// customer IDs are indexed; a checkout key sorts before both (gap 0) and a third customer's stripe_id after both (gap 2).
+check(count($GLOBALS['gapIndex']) === 2 && !array_diff(array_column($GLOBALS['gapIndex'], 0), ['stripe_id']), 'The control index holds only two Stripe customer IDs');
+$GLOBALS['gapTrace'] = [];
+$unsaved = new User;
+$unsaved->id = 30;
+DB::transaction(function () use ($unsaved) {
+    User::findOrFail(8)->properties()->where('key', 'ae_stripe_checkout_301')->lockForUpdate()->first();
+    User::findOrFail(8)->properties()->where('key', 'stripe_id')->lockForUpdate()->first();
+    $unsaved->properties()->where('key', 'stripe_id')->lockForUpdate()->first();
+});
+check(array_map(fn ($event) => array_slice($event, 1), $GLOBALS['gapTrace']) === [['lock', 0, 'ae_stripe_checkout_301'], ['lock', 2, 'stripe_id']],
+    'The trace records a locking read of a missing property as a lock on its index gap, and none for an existing row');
+$GLOBALS['gapTrace'] = null;
 [$firstView, $firstTrace] = $open($gateway, $first);
 [$secondView, $secondTrace] = $open($gateway, $second);
 $inserted = fn ($trace, $key) => (bool) array_filter($trace, fn ($event) => $event[1] === 'insert' && $event[3] === $key);
