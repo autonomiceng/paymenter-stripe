@@ -2,7 +2,69 @@
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 // Configuration coverage: a passing offline job alone must not hide missing native CI.
 $workflow = file_get_contents(__DIR__ . '/../.github/workflows/ci.yml');
-check(str_contains($workflow, 'PAY_PENDING_MATRIX:') && str_contains($workflow, 'PAYMENTER_TEST_APP:') && str_contains($workflow, 'composer install') && str_contains($workflow, "php-version: '8.4.27'"), 'CI provisions and selects the native pending integration matrix');
+// Read the literal job/step layout used here. Unsupported YAML forms fail the contract explicitly.
+$nativeJobValid = static function (string $workflow): bool {
+    if (!preg_match('/^  native-pending:\n(.*?)(?=^  [a-z][a-z-]*:|\z)/ms', $workflow, $job)
+        || preg_match('/^    (?:if|continue-on-error):/m', $job[1])) return false;
+    $field = static function (string $step, string $key): ?string {
+        if (preg_match_all('/^        ' . preg_quote($key, '/') . ': ([^\n]*)$/m', $step, $matches) !== 1) return null;
+        if ($matches[1][0] !== '|') return trim($matches[1][0], "'\"");
+        preg_match('/^        ' . preg_quote($key, '/') . ': \|\n((?:          [^\n]*\n|\n)*)/m', $step, $body);
+        return trim(preg_replace('/^          /m', '', $body[1] ?? ''));
+    };
+    $ready = static fn (string $step): bool => !preg_match('/^        (?:if|continue-on-error|env):/m', $step);
+    $setup = $provision = false;
+    foreach (preg_split('/(?=^      - )/m', $job[1]) as $step) {
+        if (preg_match('/^      - uses: shivammathur\/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1(?: #.*)?$/m', $step)) {
+            $setup = $ready($step) && preg_match("/^          php-version: '8\\.4\\.27'$/m", $step)
+                && preg_match('/^          tools: composer:v2$/m', $step)
+                && preg_match('/^          extensions: ([^\n]+)$/m', $step, $extensions)
+                && !array_diff(['bcmath', 'curl', 'dom', 'fileinfo', 'gd', 'intl', 'mbstring', 'pdo_mysql', 'pdo_sqlite', 'sqlite3', 'zip'], explode(', ', $extensions[1]));
+        }
+        $run = $field($step, 'run');
+        if ($run !== null && str_contains($run, 'composer install')) {
+            $provision = $setup && $ready($step) && $field($step, 'shell') === 'bash'
+                && str_contains($run, "\ncomposer install --working-dir=\"\$RUNNER_TEMP/paymenter\" --no-interaction --prefer-dist --no-progress --no-scripts");
+        }
+        if ($run !== 'php -d memory_limit=256M tests/run.php') continue;
+        if (!$provision || preg_match('/^        (?:if|continue-on-error):/m', $step)
+            || !preg_match('/^        env:\n((?:          [^\n]+\n)+)/m', $step, $environment)) return false;
+        $values = [];
+        foreach (explode("\n", trim($environment[1])) as $line) {
+            if (!preg_match('/^\s*([A-Z_]+): (.+)$/', $line, $entry) || isset($values[$entry[1]])) return false;
+            $values[$entry[1]] = trim($entry[2], "'\"");
+        }
+        return ($values['PAY_PENDING_MATRIX'] ?? null) === '1'
+            && ($values['PAYMENTER_TEST_APP'] ?? null) === '${{ runner.temp }}/paymenter'
+            && ($values['TMPDIR'] ?? null) === '${{ runner.temp }}';
+    }
+    return false;
+};
+check($nativeJobValid($workflow), 'CI provisions and selects the native pending integration matrix');
+preg_match('/^  native-pending:\n(.*?)(?=^  [a-z][a-z-]*:|\z)/ms', $workflow, $nativeJob);
+$nativeBlock = $nativeJob[0];
+preg_match('/^        env:\n(?:          [^\n]+\n)+/m', $nativeBlock, $nativeEnvironment);
+$nativeCommand = '        run: php -d memory_limit=256M tests/run.php';
+$invalidNative = [
+    'wrong command' => str_replace($nativeCommand, '        run: php tests/not-the-matrix.php', $nativeBlock),
+    'missing selector' => str_replace("          PAY_PENDING_MATRIX: '1'\n", '', $nativeBlock),
+    'wrong selector' => str_replace("PAY_PENDING_MATRIX: '1'", 'PAY_PENDING_MATRIX: browser', $nativeBlock),
+    'missing app' => str_replace('          PAYMENTER_TEST_APP: ${{ runner.temp }}/paymenter' . "\n", '', $nativeBlock),
+    'missing dependencies' => preg_replace('/^          composer install[^\n]+\n/m', '', $nativeBlock),
+    'wrong PHP' => str_replace("php-version: '8.4.27'", "php-version: '8.3'", $nativeBlock),
+    'missing setup' => str_replace('uses: shivammathur/setup-php@', 'uses: missing/setup-php@', $nativeBlock),
+    'conditional provision' => str_replace('        shell: bash', "        if: false\n        shell: bash", $nativeBlock),
+    'missing SQLite' => str_replace(', pdo_sqlite', '', $nativeBlock),
+    'conditional run' => str_replace($nativeCommand, "        if: false\n" . $nativeCommand, $nativeBlock),
+    'ignored failure' => str_replace($nativeCommand, "        continue-on-error: true\n" . $nativeCommand, $nativeBlock),
+];
+$withoutEnvironment = str_replace($nativeEnvironment[0], '', $nativeBlock);
+$invalidNative['environment on another step'] = str_replace('      - name: Keep the loaded test file list for the coverage job',
+    "      - name: Unrelated command\n" . $nativeEnvironment[0] . "        run: echo unrelated\n      - name: Keep the loaded test file list for the coverage job", $withoutEnvironment);
+foreach ($invalidNative as $reason => $invalid) {
+    check(!$nativeJobValid(str_replace($nativeBlock, $invalid, $workflow)), 'Native job rejects ' . $reason . ' even when another job has valid settings');
+}
+
 check(str_contains($workflow, 'php -n tests/run.php') && !str_contains($workflow, 'PAY_NOTICE_THEME:') && !str_contains($workflow, 'secrets.'), 'Public integration keeps stripped offline CI and never provisions private themes or credentials');
 check(str_contains($workflow, 'PAY_PENDING_MATRIX: browser') && str_contains($workflow, 'PLAYWRIGHT_MODULE:') && str_contains($workflow, 'playwright@1.58.2') && str_contains($workflow, 'install --with-deps chromium'), 'CI provisions Playwright and selects the browser matrix');
 // A matrix child that reaches the offline suite would start these checks again; stop it at one level.
