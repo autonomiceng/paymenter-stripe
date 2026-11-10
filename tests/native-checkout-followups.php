@@ -82,6 +82,41 @@ if (in_array($case, ['transaction', 'checkout', 'pending-retry'], true)) {
     $user->properties()->where('key', 'ae_stripe_duplicate_pm_old')->delete();
     $gateway->retryAutoPayInheritance();
     $assert(!$pending($service) && $service->fresh()->billing_agreement_id === $old->id, 'Resolved reservation lets pending inheritance finish.');
+} elseif (str_starts_with($case, 'paused-create-')) {
+    // A service ordered during a pause or while bundled Stripe is active waits for AE Stripe card payments.
+    $missing = preg_match('/-(noconsent|nocard)$/', $case, $match) ? $match[1] : null;
+    if ($missing !== 'noconsent') $setDefault();
+    if ($missing === 'nocard') $old->delete();
+    $bundled = str_contains($case, 'bundled') ? App\Models\Gateway::create(['name' => 'Stripe', 'extension' => 'Stripe', 'type' => 'gateway', 'enabled' => false]) : null;
+    $pause = fn () => $bundled ? $bundled->update(['enabled' => true]) : $native->update(['enabled' => false]);
+    $resume = fn () => $bundled ? $bundled->update(['enabled' => false]) : $native->update(['enabled' => true]);
+    $binds = 0;
+    Service::updated(function ($service) use (&$binds) { if ($service->wasChanged('billing_agreement_id') && $service->billing_agreement_id) ++$binds; });
+    $notices = fn ($page) => array_filter($delivered($page), fn ($e) => str_contains($e['params'][0]['message'] ?? '', 'Auto Pay setup'));
+    $pause();
+    $service = DB::transaction(fn () => $create());
+    $gateway->retryAutoPayInheritance(); $gateway->retryAutoPayInheritance();
+    $assert($service->fresh()->billing_agreement_id === null, 'Nothing is linked while card payments are paused.');
+    if ($missing) {
+        $assert(!$pending($service), 'Without consent or a card no pending setup is recorded.');
+        $resume(); $gateway->retryAutoPayInheritance();
+        $assert($service->fresh()->billing_agreement_id === null && $binds === 0, 'Resume links nothing without consent or a card.');
+    } else {
+        $assert($pending($service), 'A service ordered while paused keeps pending Auto Pay setup.');
+        $invoice->items()->first()->update(['reference_type' => Service::class, 'reference_id' => $service->id]);
+        foreach ([Livewire::test(App\Livewire\Services\Show::class, ['service' => $service->fresh()]), Livewire::test(App\Livewire\Invoices\Show::class, ['invoice' => $invoice->fresh()])] as $page) {
+            $shown = array_values($notices($page));
+            $assert(count($shown) === 1 && str_contains($shown[0]['params'][0]['message'], 'paused. We will retry when card payments resume'), 'Service and invoice explain the paused setup: ' . json_encode($shown));
+        }
+        $resume();
+        $gateway->retryAutoPayInheritance(); $gateway->retryAutoPayInheritance();
+        $assert($service->fresh()->billing_agreement_id === $old->id && !$pending($service) && $binds === 1, 'Resume links the service exactly once: ' . $binds);
+        $assert(!$notices(Livewire::test(App\Livewire\Services\Show::class, ['service' => $service->fresh()])), 'The notice ends once Auto Pay is linked.');
+        $pause(); $gateway->retryAutoPayInheritance(); $resume();
+        $gateway->retryAutoPayInheritance(); $gateway->retryAutoPayInheritance();
+        $assert($service->fresh()->billing_agreement_id === $old->id && $binds === 1, 'A repeated resume does not link again.');
+    }
+    $assert(Http::recorded()->isEmpty() && App\Models\InvoiceTransaction::count() === 0, 'Linking makes no provider request and no charge.');
 } elseif (str_starts_with($case, 'pending-')) {
     $setDefault();
     $lock = Cache::lock('ae-stripe-save-method-' . $user->id, 600); $lock->get();

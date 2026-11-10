@@ -18,6 +18,7 @@ $cases = ['transaction', 'checkout', 'pending-retry', 'polish-staff', 'polish-st
     'followup-retention', 'followup-contention', 'followup-stopped', 'followup-malformed', 'followup-transfer', 'followup-transfer-rollback', 'followup-prune-failure',
     'followup-poll', 'followup-staff-race', 'followup-webhook-complete', 'followup-webhook-discard', 'followup-webhook-discard-log', 'followup-webhook-save-failure'];
 foreach (['disabled', 'bundled'] as $state) foreach (['', '-off', '-removed', '-subscription', '-owner', '-failure'] as $suffix) $cases[] = 'polish-paused-' . $state . $suffix;
+foreach (['disabled', 'bundled'] as $state) foreach (['', '-noconsent', '-nocard'] as $suffix) $cases[] = 'paused-create-' . $state . $suffix;
 foreach (['off', 'removed', 'cancelled', 'plan'] as $state) $cases[] = 'followup-stopped-' . $state;
 foreach (['401', '403', '429', '503', 'connection'] as $error) $cases[] = 'followup-queue-outage-' . $error;
 foreach (['transfer-race', 'transfer-order', 'method-404', 'orphans', 'retention', 'rotation', 'row-400', 'row-402', 'row-409', 'backoff', 'diagnostics', 'late-notice', 'delay-notice',
