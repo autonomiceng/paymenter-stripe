@@ -110,6 +110,6 @@ trait SubscriptionPayments
             }
             // Use the same locked transaction path as PaymentIntent events, so either delivery order is safe.
             $this->recordIntentPayment($intent, 'succeeded', false, $stripeInvoice->id);
-        });
+        }, self::SETTLEMENT_ATTEMPTS);
     }
 }

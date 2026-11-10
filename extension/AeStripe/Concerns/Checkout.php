@@ -22,6 +22,14 @@ trait Checkout
 {
     use ReceiptReturns;
 
+    /**
+     * Settlement reads the paid balance with a locking read, which also locks the invoice_transactions index gap shared
+     * with neighbouring invoices, and then inserts the payment into that gap. Staff can add a transaction without the
+     * invoice lock, so the locking read stays. A Pay or settlement of a neighbouring invoice can therefore make this
+     * transaction a deadlock victim; MariaDB rolls all of it back, so it runs again from the settled check.
+     */
+    private const SETTLEMENT_ATTEMPTS = 3;
+
     public function pay($invoice, $total)
     {
         abort_unless($this->gatewayEnabled(), 409);
@@ -356,7 +364,7 @@ trait Checkout
                         array_replace($attempt, ['agreement_id' => null, 'confirmation' => null, 'retry' => $status === 'processing', 'funds_pending' => $status === 'processing' || ($intent->amount_received ?? 0) > 0]));
                 }
             }
-        });
+        }, self::SETTLEMENT_ATTEMPTS);
     }
 
     private function recordPaymentReview($invoice, $intent, string $reason): void
