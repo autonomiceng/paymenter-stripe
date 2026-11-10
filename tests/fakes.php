@@ -433,7 +433,7 @@ namespace App\Helpers {
         public static $agreements = [];
         public static $agreementFailure = false;
         public static $payments = [];
-        public static $applications = 0, $simulateNativeListeners = false, $activations = 0;
+        public static $applications = 0, $simulateNativeListeners = false;
         public static $fees = [], $feeWrites = 0;
         public static function addPaymentFee($id, $fee) { ++self::$feeWrites; self::$fees[$id] = $fee; }
         public static function makeBillingAgreement($user, $gateway, $name, $id, $type, $expiry) {
@@ -458,7 +458,7 @@ namespace App\Helpers {
             self::$payments[$invoice->id . ':' . $id] = compact('gateway', 'amount', 'status') + ['is_credit_transaction' => $isCreditTransaction];
             if (self::$simulateNativeListeners && !\App\Models\InvoiceTransaction::$eventsSuppressed) {
                 $net = 0; foreach (self::$payments as $key => $row) if (str_starts_with($key, $invoice->id . ':') && $row['status'] === 'succeeded') $net += $row['amount'];
-                if ($invoice->total - $net <= 0 && $invoice->status !== 'paid') { $invoice->status = 'paid'; ++self::$activations; }
+                if ($invoice->total - $net <= 0 && $invoice->status !== 'paid') $invoice->status = 'paid';
             }
             return (object) ['id' => crc32($invoice->id . ':' . $id), 'invoice_id' => $invoice->id];
         }
