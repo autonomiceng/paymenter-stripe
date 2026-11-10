@@ -436,8 +436,9 @@ try {
                 if (requests.length === 1) return {ok: true, async json() {
                     return {intent: 'fixture-intent', status: 'requires_action', client_secret: 'fixture-secret'};
                 }};
+                // The failure webhook can retire the intent before this request, so the server reason may be generic.
                 return {ok: false, async json() { return {intent: 'fixture-intent', declined: true,
-                    message: 'Your bank did not confirm this payment. You were not charged. Try again or use a different card.'}; }};
+                    message: 'Your bank declined this card. Try a different card, or contact your bank.'}; }};
             };
             window.Stripe = () => ({
                 elements: () => ({on() {}, async update() {}, async submit() { return submitError ? {error: submitError} : {}; }, create(type) {

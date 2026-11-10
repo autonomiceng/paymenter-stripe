@@ -643,6 +643,19 @@ use Illuminate\Support\Facades\{DB, Http};
                 }
                 else $gateway->webhook(eventRequest($intent, type: 'payment_intent.payment_failed'));
                 check($intent->status === 'canceled', 'Failed Elements authentication is canceled on ' . $contact);
+                if ($contact === 'webhook') {
+                    // The failure webhook can retire the intent before the open dialog asks for the result.
+                    $payments = ExtensionHelper::$payments;
+                    $response = $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'amount' => 2000]));
+                    check($response['status'] === 409 && $response['data']['declined'] === true
+                        && $response['data']['message'] === 'Your bank did not confirm this payment. You were not charged. Try again or use a different card.'
+                        && ExtensionHelper::$payments === $payments,
+                        'A bank check the failure webhook already retired still reads as a decline in the dialog');
+                    unset($intent->last_payment_error);
+                    $response = $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'amount' => 2000]));
+                    check($response['status'] === 409 && $response['data']['declined'] === true,
+                        'A retired refusal without its Stripe error still reads as a decline, so the dialog clears the card');
+                }
                 $view = $gateway->pay($invoice, 20); $stripe->status = 'succeeded';
                 $result = $gateway->confirmPayment(new Request(['intent' => $view['data']['intent']->id, 'save' => false, 'confirmation_token' => 'ctoken_retry', 'amount' => 2000]));
                 check($view['data']['intent']->id !== $id && $result['data']['status'] === 'succeeded', 'After failed authentication a fresh attempt can pay on ' . $contact);

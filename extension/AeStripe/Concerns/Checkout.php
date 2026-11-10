@@ -177,10 +177,14 @@ trait Checkout
                 $intent = $this->checkoutIntent($invoice, $this->checkoutPaymentData($invoice, (int) $request->input('amount'), $customer), elements: true);
             }
             // A bank check that failed or was cancelled in Stripe.js leaves a definite zero-money refusal: record it
-            // now, so the dialog and the invoice say the same thing, and the next card starts a new attempt.
-            $refusal = !$request->input('confirmation_token') && $intent->status === 'requires_payment_method'
-                && !empty($intent->last_payment_error) && ($intent->amount_received ?? 0) === 0 ? $intent->last_payment_error : null;
-            if ($refusal) $this->recordIntentPayment($intent, 'failed');
+            // now, so the dialog and the invoice say the same thing, and the next card starts a new attempt. The
+            // failure webhook can record and retire it before the open dialog asks; the dialog still gets the decline.
+            $retired = $intent->status === 'canceled' && ($intent->amount_received ?? 0) === 0
+                && InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->exists();
+            $refusal = !$request->input('confirmation_token') && ($intent->amount_received ?? 0) === 0
+                && ($retired || $intent->status === 'requires_payment_method' && !empty($intent->last_payment_error))
+                ? ($intent->last_payment_error ?? (object) []) : null;
+            if ($refusal && !$retired) $this->recordIntentPayment($intent, 'failed');
             $intent = $this->retireFailedElementsPayment($invoice, $intent);
             if ($refusal) throw new \Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException(
                 $this->paymentFailureReason($refusal->code ?? null, $refusal->decline_code ?? null));

@@ -225,8 +225,10 @@ async function initializePaymentForm() {
                         if (result.intent) intentId = result.intent;
                         if (!response.ok) {
                             // A declined card number stays out of the form, so the customer types a different card.
+                            // After a failed bank check the reason is that check, even when Stripe no longer reports it.
                             if (result.declined) clearDeclinedPayment();
                             failPayment(refreshRequired ? 'This payment was declined. Refresh the payment form to try another card.'
+                                : authFailed && result.declined ? 'Your bank did not confirm this payment. You were not charged. Try again or use a different card.'
                                 : result.message || 'Could not confirm your payment. Refresh the invoice for its status.');
                             return;
                         }
