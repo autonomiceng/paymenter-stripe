@@ -51,7 +51,8 @@ Alpine.data('aeStripeSetup', (config) => {
                 release();
             };
             // Both choices open together once Stripe is ready, and lock together while one saves.
-            const controls = stripeFormControls(form, {inertUntilReady: true, isDisposed: () => disposed, onRetry: start});
+            const controls = stripeFormControls(form, {inertUntilReady: true, isDisposed: () => disposed, onRetry: start,
+                scrollToMessage: true, busyLabel: 'Saving...'});
             const {showMessage, clearMessage, setLoading, initializationError} = controls;
             // Block native submits even while Stripe.js is loading.
             form.addEventListener('submit', (event) => event.preventDefault(), {signal: controller.signal});
@@ -86,7 +87,11 @@ Alpine.data('aeStripeSetup', (config) => {
                     paymentElement = created.paymentElement;
                     expressCheckout = created.expressCheckout;
                     stopThemeSync = syncStripeTheme(form, elements);
-                    paymentElement.on('change', current(() => { if (!controls.loading) clearMessage(); }));
+                    let complete = false;
+                    paymentElement.on('change', current((event) => {
+                        if (!controls.loading) clearMessage();
+                        complete = event.complete === true;
+                    }));
                     form.addEventListener('submit', (event) => {
                         event.preventDefault();
                         confirmSetup();
@@ -104,6 +109,12 @@ Alpine.data('aeStripeSetup', (config) => {
                         clearMessage();
                         setLoading(true);
                         try {
+                            // An unfinished card shows its field errors from Stripe.js, before any agreement is recorded.
+                            if (!expressEvent && !complete) {
+                                const checked = await elements.submit();
+                                if (checked.error?.type === 'validation_error') return;
+                                if (checked.error) throw checked.error;
+                            }
                             const result = await fetch(config.consentUrl, {
                                 method: 'POST', signal: attempt.signal,
                                 headers: {'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': config.csrf},
@@ -119,6 +130,11 @@ Alpine.data('aeStripeSetup', (config) => {
                             if (error) throw error;
                         } catch (error) {
                             if (disposed) return;
+                            // Stripe.js already shows a validation error beside its field.
+                            if (error?.type === 'validation_error') {
+                                expressEvent?.paymentFailed({reason: 'fail'});
+                                return;
+                            }
                             failSetup(['card_error', 'validation_error'].includes(error?.type) && error.message
                                 ? error.message : 'Could not save your payment method. Try again.');
                         } finally {

@@ -176,7 +176,14 @@ trait Checkout
                 && InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->exists()) {
                 $intent = $this->checkoutIntent($invoice, $this->checkoutPaymentData($invoice, (int) $request->input('amount'), $customer), elements: true);
             }
+            // A bank check that failed or was cancelled in Stripe.js leaves a definite zero-money refusal: record it
+            // now, so the dialog and the invoice say the same thing, and the next card starts a new attempt.
+            $refusal = !$request->input('confirmation_token') && $intent->status === 'requires_payment_method'
+                && !empty($intent->last_payment_error) && ($intent->amount_received ?? 0) === 0 ? $intent->last_payment_error : null;
+            if ($refusal) $this->recordIntentPayment($intent, 'failed');
             $intent = $this->retireFailedElementsPayment($invoice, $intent);
+            if ($refusal) throw new \Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException(
+                $this->paymentFailureReason($refusal->code ?? null, $refusal->decline_code ?? null));
             if ($intent->status === 'canceled') throw new DisplayException('This payment was not completed. Refresh the invoice to try another payment.');
             $agreement = null;
             $noticeToken = $request->input('saved_notice');

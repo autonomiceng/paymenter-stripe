@@ -405,7 +405,9 @@ try {
             handlers.change({empty: false, value: {type: 'card'}});
             document.querySelector('form').dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
         });
-        const requestCount = decline === 'sdk-error' ? 1 : 2;
+        // A failed bank check still asks the server, which reads the refusal; it never opens the check again.
+        const requestCount = 2;
+        assert.equal(await page.evaluate(() => actions), 1, 'The bank check opens once');
         assert.equal(await page.evaluate(() => requests.length), requestCount, 'A second card cannot send another tokenless request');
         assert.equal(await page.evaluate(() => tokens), 0);
         assert.deepEqual((await page.evaluate(() => requests)).map(paymentFields), Array.from({length: requestCount}, () => ({
@@ -414,6 +416,58 @@ try {
         await page.route('https://example.com/resume', route => route.fulfill({contentType: 'text/html', body: 'Fresh payment checkout'}));
         await page.locator('#refresh-payment').click();
         await page.getByText('Fresh payment checkout').waitFor();
+        await page.close();
+    }
+    // A new card's failed or cancelled bank check reads as a decline from the server, never as an unknown outcome.
+    // While it runs, Pay stays in place reading Processing... An unfinished card shows field errors with no request.
+    {
+        const page = activePage = await browser.newPage();
+        page.setDefaultTimeout(5000);
+        await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
+        await page.route('https://example.com/bank', route => route.fulfill({contentType: 'text/html', body: '<html><body></body></html>'}));
+        await page.goto('https://example.com/bank');
+        await page.evaluate(() => {
+            window.requests = []; window.handlers = {}; window.actions = 0; window.clears = 0; window.failedEvents = 0;
+            window.submitError = null; window.labels = [];
+            window.$wire = {on() {}};
+            window.fetch = async (_, options) => {
+                requests.push(JSON.parse(options.body));
+                labels.push(document.querySelector('#submit').textContent.trim() + (document.querySelector('#submit').disabled ? ':disabled' : ''));
+                if (requests.length === 1) return {ok: true, async json() {
+                    return {intent: 'fixture-intent', status: 'requires_action', client_secret: 'fixture-secret'};
+                }};
+                return {ok: false, async json() { return {intent: 'fixture-intent', declined: true,
+                    message: 'Your bank did not confirm this payment. You were not charged. Try again or use a different card.'}; }};
+            };
+            window.Stripe = () => ({
+                elements: () => ({on() {}, async update() {}, async submit() { return submitError ? {error: submitError} : {}; }, create(type) {
+                    const own = type === 'payment' ? handlers : {};
+                    return {on(name, fn) {own[name] = fn;}, mount() {own.ready?.({availablePaymentMethods: null});},
+                        clear() {clears++; handlers.change?.({empty: true, complete: false});}, destroy() {}};
+                }}),
+                async handleNextAction() { actions++; return {error: {type: 'invalid_request_error', code: 'payment_intent_authentication_failure', message: 'Raw'}}; },
+                async createConfirmationToken() { return {confirmationToken: {id: 'ctoken_new'}}; },
+            });
+        });
+        await page.setContent(render('pay', 'above_card', 'Fixture Hosting'));
+        // Writing the page drops earlier listeners, so this one goes on after it.
+        await page.evaluate(() => window.addEventListener('ae-stripe:payment-failed', () => failedEvents++));
+        await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
+        await page.evaluate(() => { submitError = {type: 'validation_error', message: 'Your card number is incomplete.'}; });
+        await page.locator('#submit').click();
+        await page.waitForFunction(() => document.querySelector('#submit').disabled === false);
+        assert.equal(await page.evaluate(() => requests.length), 0, 'An unfinished card makes no server request');
+        assert.equal(await page.locator('[role=alert]').textContent(), '', 'Field errors are not repeated under the form');
+        await page.evaluate(() => { submitError = null; handlers.change({empty: false, complete: true, value: {type: 'card'}}); });
+        await page.locator('#submit').click();
+        await page.waitForFunction(() => document.querySelector('[role=alert]').textContent.length > 0);
+        assert.equal(await page.locator('[role=alert]').textContent(),
+            'Your bank did not confirm this payment. You were not charged. Try again or use a different card.', 'A failed bank check shows the decline');
+        assert.deepEqual(await page.evaluate(() => [requests.length, actions, clears, failedEvents]), [2, 1, 1, 1],
+            'The server reads the refusal once, the card is cleared and the page can show the failed row');
+        assert.deepEqual(await page.evaluate(() => labels), ['Processing...:disabled', 'Processing...:disabled'], 'Pay stays in place reading Processing...');
+        assert.equal((await page.locator('#submit').textContent()).trim(), "'Fixture'", 'Pay reads its amount again');
+        assert.equal(await page.locator('#submit').isEnabled(), true, 'The form is ready for another card');
         await page.close();
     }
     // Add card offers two choices under one consent line: the Link wallet, or a card. Each saves at once, phone and desktop.
@@ -508,7 +562,8 @@ try {
         }, scenario);
         await page.setContent(render('pay', 'above_card', 'Fixture Hosting', false, false, 1099));
         await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
-        await page.evaluate(() => handlers.payment.change({empty: false, value: {type: 'card'}}));
+        // A filled card reports complete, so Pay goes straight to the saving choice and the token.
+        await page.evaluate(() => handlers.payment.change({empty: false, complete: true, value: {type: 'card'}}));
         await page.locator('#save-card').setChecked(scenario.startsWith('save'));
         if (scenario.endsWith('link')) {
             await page.evaluate(() => handlers.expressCheckout.confirm({paymentFailed() {}}));
@@ -560,6 +615,7 @@ try {
         }, updateFailure);
         await page.setContent(render('pay'));
         await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
+        await page.evaluate(() => elementHandlers.payment.change({empty: false, complete: true, value: {type: 'card'}}));
         const submit = () => page.evaluate(choice => {
             if (choice === 'Link') elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)});
             else document.querySelector('form').dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));

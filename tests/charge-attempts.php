@@ -574,8 +574,8 @@ use Illuminate\Support\Facades\{DB, Http};
                 $response = $gateway->confirmPayment(new Request(['intent' => $original, 'save' => false,
                     'confirmation_token' => $token, 'amount' => 2000]));
                 check($response['status'] === 409, 'A declined payment returns a customer error');
-                check($response['data']['message'] === 'Your bank declined this card. Try a different card, or contact your bank.' && $response['data']['declined'] === true,
-                    'A decline says the bank declined the card and tells the form to clear the declined card');
+                check($response['data']['message'] === 'Insufficient funds. Try a different card, or contact your bank.' && $response['data']['declined'] === true,
+                    'A decline gives the same reason the invoice records and tells the form to clear the declined card');
                 check(count(ExtensionHelper::$payments) === $index + 1, 'Each submit from the same open form records its own decline');
             }
             foreach ($stripe->intents as $failed) {
@@ -616,11 +616,25 @@ use Illuminate\Support\Facades\{DB, Http};
                 'Automatic authentication is not reconfirmed; a later balance change reserves and attempts the excess return');
         });
         $run('elements-failed-authentication', function ($invoice, $stripe) use ($gateway) {
-            foreach (['page', 'return', 'webhook'] as $contact) {
+            foreach (['confirm', 'page', 'return', 'webhook'] as $contact) {
                 $view = $gateway->pay($invoice, 20); $id = $view['data']['intent']->id; $stripe->status = 'requires_action';
                 $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
                 $intent = $stripe->intents[$id]; $intent->status = 'requires_payment_method';
                 $intent->last_payment_error = (object) ['code' => 'payment_intent_authentication_failure'];
+                if ($contact === 'confirm') {
+                    // The open dialog asks right after a bank check fails or is cancelled in Stripe.js.
+                    $response = $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'amount' => 2000]));
+                    check($response['status'] === 409 && $response['data']['declined'] === true
+                        && $response['data']['message'] === 'Your bank did not confirm this payment. You were not charged. Try again or use a different card.'
+                        && (ExtensionHelper::$payments[$invoice->id . ':' . $id]['status'] ?? null) === 'failed',
+                        'A failed bank check reads as a decline in the dialog and is recorded at once');
+                    check($intent->status === 'canceled', 'Failed Elements authentication is canceled on confirm');
+                    $stripe->status = 'succeeded';
+                    $result = $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'confirmation_token' => 'ctoken_retry', 'amount' => 2000]));
+                    check($result['data']['intent'] !== $id && $result['data']['status'] === 'succeeded', 'The same open form pays with the next card after a failed bank check');
+                    $invoice->id++; Invoice::$rows[$invoice->id] = $invoice;
+                    continue;
+                }
                 if ($contact === 'page') $gateway->pay($invoice, 20);
                 elseif ($contact === 'return') {
                     $gateway->finishPayment(new Request(['payment_intent' => $id]));

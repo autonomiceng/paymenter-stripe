@@ -30,8 +30,22 @@ For the account Auto Pay open-invoice offer, use
 Auto Pay card while reserving and confirming the payment. Both transactions lock
 the user first, as does changing or disabling Auto Pay.
 `charge()` keeps confirming today's balance for renewals and recovery instructions
-that have no accepted amount. Themes must require `chargeAutoPayAccepted()` before
-offering account Auto Pay invoice payments.
+that have no accepted amount.
+
+When the Turn on dialog also pays open invoices, call
+`turnOnAutoPayAndPay($user, $agreement, [[$invoice, $amount], ...], $version)` once, with
+the invoices oldest first, after checking they are the customer's own at the amounts
+shown. It charges the first invoice with `chargeAccepted()` before anything turns on, so a
+card that saves but declines leaves Auto Pay off. Once that payment succeeds or is
+processing, it turns Auto Pay on with the card and pays the rest with
+`chargeAutoPayAccepted()`. It returns `enabled`, each invoice's `id` and `status`, and a
+customer `message` when the first payment or the switch failed; keep the dialog open and
+show that message. Themes must require `turnOnAutoPayAndPay()` before offering to pay
+open invoices from the Turn on dialog.
+
+Read `autoPayCoversInvoice($invoice)` before saying whether Auto Pay pays an open
+invoice: null while Auto Pay is off, true while a renewal charge or retry is planned for
+it, false otherwise (a new order's first invoice, or a renewal whose retries stopped).
 
 POST JSON to `route('extensions.gateways.ae-stripe.auto-pay-default')` with the normal
 session, Accept application/json and X-CSRF-TOKEN:

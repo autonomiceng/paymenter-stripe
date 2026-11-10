@@ -162,6 +162,7 @@ namespace App\Models {
         public function __construct(public User $user) {}
         public function items() { return new NativeModelQuery($this->items); }
         public function getMorphClass() { return self::class; }
+        public function fresh() { return $this; }
         public static function where($key, $id) { return new Query(self::$rows[$id] ?? (self::$row && self::$row->id == $id ? self::$row : null), Invoice::class); }
         public function transactions() { return new class($this->id) {
             private $id, $status;

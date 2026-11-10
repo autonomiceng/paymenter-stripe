@@ -90,23 +90,7 @@ trait AutoPay
                 return response()->json(['ok' => true, 'enabled' => false]);
             }
             abort_unless($request->boolean('consent') && $request->input('version') === self::AUTO_PAY_CONSENT, 422);
-            $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
-            $agreement = BillingAgreement::where('id', $request->input('agreement_id'))
-                ->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
-            abort_unless($agreement, 403);
-            $this->assertSavedMethodBindable($user, $agreement);
-            $this->stopWaitingRenewals($user);
-            $this->rememberAutoPayCard($user, (int) $agreement->id);
-            $record = ['version' => self::AUTO_PAY_CONSENT, 'user_id' => (int) $user->id,
-                'accepted_at' => time(), 'agreement_id' => (int) $agreement->id];
-            $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_PROPERTY], ['value' => json_encode($record, JSON_THROW_ON_ERROR)]);
-            $services = 0;
-            foreach ($this->autoPayServices($user) as $service) {
-                if (($service->plan?->type ?? null) !== 'recurring' || $service->status === Service::STATUS_CANCELLED) continue;
-                if ($service->billing_agreement_id != $agreement->id) $service->update(['billing_agreement_id' => (int) $agreement->id]);
-                $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
-                $services++;
-            }
+            $services = $this->enableAutoPay($user, (int) $request->input('agreement_id'));
             return response()->json(['ok' => true, 'enabled' => true, 'services' => $services]);
         });
         if ($request->input('enabled') !== null && !$request->boolean('enabled')) return $change();
@@ -115,6 +99,85 @@ trait AutoPay
         } catch (\Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException $e) {
             return response()->json(['message' => $e->getMessage()], 409);
         }
+    }
+
+    /** On with the chosen card: links every recurring service to it. The caller holds the user row lock. */
+    private function enableAutoPay(User $user, int $agreementId): int
+    {
+        $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
+        $agreement = BillingAgreement::where('id', $agreementId)
+            ->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
+        abort_unless($agreement, 403);
+        $this->assertSavedMethodBindable($user, $agreement);
+        $this->stopWaitingRenewals($user);
+        $this->rememberAutoPayCard($user, (int) $agreement->id);
+        $record = ['version' => self::AUTO_PAY_CONSENT, 'user_id' => (int) $user->id,
+            'accepted_at' => time(), 'agreement_id' => (int) $agreement->id];
+        $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_PROPERTY], ['value' => json_encode($record, JSON_THROW_ON_ERROR)]);
+        $services = 0;
+        foreach ($this->autoPayServices($user) as $service) {
+            if (($service->plan?->type ?? null) !== 'recurring' || $service->status === Service::STATUS_CANCELLED) continue;
+            if ($service->billing_agreement_id != $agreement->id) $service->update(['billing_agreement_id' => (int) $agreement->id]);
+            $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
+            $services++;
+        }
+        return $services;
+    }
+
+    /**
+     * Turn on and pay, from the one consent in the Turn on dialog. The first ticked invoice is charged before anything
+     * is turned on, so a card that declines leaves Auto Pay exactly as it was and the reason goes back to the dialog.
+     * Once that payment succeeds or is processing, Auto Pay turns on with the card and the other invoices are paid as
+     * Auto Pay payments, each under the gateway's Auto Pay card check. The caller checks that each invoice is the
+     * customer's own, open, and at the amount the dialog showed.
+     *
+     * @param  array<int, array{0: Invoice, 1: string}>  $invoices  invoice and accepted amount, oldest first
+     * @return array{enabled: bool, invoices: array<int, array{id: int, status: string}>, message: ?string}
+     */
+    public function turnOnAutoPayAndPay(User $user, BillingAgreement $agreement, array $invoices, string $version): array
+    {
+        $result = ['enabled' => false, 'invoices' => [], 'message' => null];
+        if ($version !== self::AUTO_PAY_CONSENT || !$invoices) {
+            return ['message' => 'Refresh the page and try again.'] + $result;
+        }
+        if (!$this->gatewayEnabled() || !$this->bundledInactive()) {
+            return ['message' => 'Payments are paused. Please check back later.'] + $result;
+        }
+        $pay = function (Invoice $invoice, string $amount, bool $autoPay) use ($agreement): array {
+            try {
+                $autoPay ? $this->chargeAutoPayAccepted($invoice, $amount, $agreement) : $this->chargeAccepted($invoice, $amount, $agreement);
+            } catch (\Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException $e) {
+                return ['id' => (int) $invoice->id, 'status' => 'processing'];
+            } catch (\App\Exceptions\DisplayException $e) {
+                return ['id' => (int) $invoice->id, 'status' => $invoice->fresh()->status, 'message' => $e->getMessage()];
+            } catch (\Throwable $e) {
+                report($e);
+                return ['id' => (int) $invoice->id, 'status' => $invoice->fresh()->status, 'message' => 'Could not take this payment. Try again or contact support.'];
+            }
+            return ['id' => (int) $invoice->id, 'status' => $invoice->fresh()->status];
+        };
+        [$first, $amount] = $invoices[0];
+        $paid = $pay($first, $amount, false);
+        $result['invoices'][] = ['id' => $paid['id'], 'status' => $paid['status']];
+        if (!in_array($paid['status'], ['paid', 'processing'], true)) {
+            return ['message' => $paid['message'] ?? 'This payment was not completed.'] + $result;
+        }
+        try {
+            $this->withSavedMethodBindingLock((int) $user->id, fn () => DB::transaction(function () use ($user, $agreement) {
+                $locked = User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+                return $this->enableAutoPay($locked, (int) $agreement->id);
+            }));
+        } catch (\Throwable $e) {
+            if (!$e instanceof \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException
+                && !$e instanceof \Symfony\Component\HttpKernel\Exception\HttpExceptionInterface) report($e);
+            return ['message' => 'The payment went through, but Auto Pay was not turned on. Try turning it on again.'] + $result;
+        }
+        $result['enabled'] = true;
+        foreach (array_slice($invoices, 1) as [$invoice, $amount]) {
+            $paid = $pay($invoice, $amount, true);
+            $result['invoices'][] = ['id' => $paid['id'], 'status' => $paid['status']];
+        }
+        return $result;
     }
 
     /** The user's services under lock, without Stripe subscriptions. Callers hold the user row lock. */
@@ -191,6 +254,20 @@ trait AutoPay
         $today = now()->format('Y-m-d');
         return array_replace($dates, ['invoice_on' => $issue, 'charge_on' => $issue > $today ? $issue : null,
             'state' => $issue <= $today ? 'next_billing_run' : 'scheduled']);
+    }
+
+    /**
+     * Whether Auto Pay will pay this open invoice: null while account Auto Pay is off (nothing to say), true while a
+     * renewal charge or retry is still planned for it, false otherwise. Auto Pay charges renewal invoices when they
+     * are issued, so a new order's first invoice, or a renewal whose retries stopped, is paid by hand. Read only.
+     */
+    public function autoPayCoversInvoice(Invoice $invoice): ?bool
+    {
+        $user = $invoice->user;
+        if (!$user || !$this->autoPayDefault($user)) return null;
+        $value = $user->properties()->where('key', 'ae_stripe_checkout_' . $invoice->id)->first()?->value;
+        $attempt = $value ? json_decode((string) $value, true) : null;
+        return in_array($attempt['renewal']['state'] ?? null, ['active', 'waiting'], true);
     }
 
     public function invoiceAutoPayDates(Invoice $invoice): array
