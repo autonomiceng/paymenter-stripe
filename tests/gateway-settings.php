@@ -19,7 +19,7 @@ $credentials = ['stripe_secret_key' => 'rk_test_savedkey', 'stripe_publishable_k
 foreach ($credentials as $key => $value) $nativeGateway->settings()->create(['key' => $key, 'value' => $value, 'encrypted' => $key !== 'stripe_publishable_key']);
 // Verified state for these credentials, so a save that keeps them makes no Stripe calls.
 $nativeGateway->settings()->create(['key' => 'ae_stripe_webhook_continuity', 'value' => json_encode(['account' => 'acct_fixture', 'mode' => 'test',
-    'endpoint' => 'we_fixture', 'delivery' => 'endpoint', 'credentials' => $credentials, 'previous' => []]), 'encrypted' => true]);
+    'endpoint' => 'we_fixture', 'delivery' => 'endpoint', 'credentials' => $credentials, 'previous' => []], JSON_PRETTY_PRINT), 'encrypted' => true]);
 $saved = fn (string $key) => $nativeGateway->settings()->where('key', $key)->first()?->value;
 
 auth()->login($staff);
@@ -38,9 +38,12 @@ foreach (['stripe_secret_key', 'stripe_webhook_secret'] as $key) {
 check($page->get('data.settings.stripe_publishable_key') === $credentials['stripe_publishable_key'], 'The publishable key still shows');
 
 $calls = count($GLOBALS['stripeCalls']);
+$continuity = $saved('ae_stripe_webhook_continuity');
+check(is_string($continuity) && $continuity !== '', 'The saved webhook continuity is present before the blank save');
 $page->call('save');
 check(!$page->instance()->getErrorBag()->any(), 'A save with blank secret fields passes validation: ' . json_encode($page->instance()->getErrorBag()->toArray()));
 foreach ($credentials as $key => $value) check($saved($key) === $value, "A blank save keeps the saved $key");
+check($saved('ae_stripe_webhook_continuity') === $continuity, 'A blank save keeps webhook continuity byte-for-byte');
 check(count($GLOBALS['stripeCalls']) === $calls, 'Keeping the saved credentials needs no Stripe verification');
 
 // A new signing secret still replaces the saved one after the usual verification.
