@@ -349,10 +349,11 @@ class AeStripe extends Gateway
         \Filament\Forms\Components\TextInput::configureUsing(function ($field) {
             $name = preg_replace('/^settings\./', '', $field->getName(), 1, $count);
             if (!$count || !in_array($name, self::SECRET_SETTINGS, true)) return;
-            $saved = fn ($record) => $record instanceof \App\Models\Gateway && $record->extension === 'AeStripe'
-                ? $record->settings()->where('key', $name)->first()?->value : null;
-            $field->formatStateUsing(fn ($state, $record) => filled($saved($record)) ? null : $state)
-                ->dehydrateStateUsing(fn ($state, $record) => filled($state) ? $state : $saved($record));
+            $isAeStripe = fn ($record) => $record instanceof \App\Models\Gateway && $record->extension === 'AeStripe';
+            $saved = fn ($record) => $record->settings()->where('key', $name)->first()?->value;
+            $field->afterStateHydrated(function ($component, $record) use ($isAeStripe, $saved) {
+                if ($isAeStripe($record) && filled($saved($record))) $component->state(null);
+            })->dehydrateStateUsing(fn ($state, $record) => $isAeStripe($record) && blank($state) ? $saved($record) : $state);
         });
     }
 
