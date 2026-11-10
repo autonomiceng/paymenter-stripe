@@ -168,7 +168,7 @@ trait SavedMethods
                     $row = BillingAgreement::withTrashed()->where('external_reference', $match->external_reference)->lockForUpdate()->first();
                     if (!$row || $row->id != $match->id) return false;
                 }
-                $old = json_decode($user->properties()->where('key', $journalKey)->lockForUpdate()->first()?->value ?? 'null', true);
+                $old = json_decode($this->lockedUserProperty($user, $journalKey)?->value ?? 'null', true);
                 $journal = ['user_id' => $user->id, 'gateway_id' => $gateway->id, 'customer' => $customer,
                     'identity' => $identity, 'copies' => [], 'detached' => []];
                 if (($old['customer'] ?? null) === $customer && ($old['gateway_id'] ?? null) == $gateway->id) {

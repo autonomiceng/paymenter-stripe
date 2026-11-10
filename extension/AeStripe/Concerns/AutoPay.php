@@ -16,8 +16,8 @@ trait AutoPay
     /** A saved card or v1 consent alone never grants this scope. */
     public function autoPayDefault(User $user, bool $lock = false): ?array
     {
-        $property = $user->properties()->where('key', self::AUTO_PAY_PROPERTY);
-        $value = ($lock ? $property->lockForUpdate() : $property)->first()?->value;
+        $key = self::AUTO_PAY_PROPERTY;
+        $value = ($lock ? $this->lockedUserProperty($user, $key) : $user->properties()->where('key', $key)->first())?->value;
         $record = $value ? json_decode($value, true) : null;
         if (!is_array($record) || ($record['version'] ?? null) !== self::AUTO_PAY_CONSENT
             || ($record['user_id'] ?? null) != $user->id || empty($record['accepted_at'])
@@ -33,8 +33,8 @@ trait AutoPay
     public function autoPayCard(User $user, bool $lock = false): ?int
     {
         if ($default = $this->autoPayDefault($user, $lock)) return $default['agreement_id'];
-        $property = $user->properties()->where('key', self::AUTO_PAY_CARD);
-        $value = ($lock ? $property->lockForUpdate() : $property)->first()?->value;
+        $key = self::AUTO_PAY_CARD;
+        $value = ($lock ? $this->lockedUserProperty($user, $key) : $user->properties()->where('key', $key)->first())?->value;
         $record = $value ? json_decode($value, true) : null;
         if (!is_array($record)) return null;
         if (($record['user_id'] ?? null) != $user->id || !is_int($record['agreement_id'] ?? null)) return null;

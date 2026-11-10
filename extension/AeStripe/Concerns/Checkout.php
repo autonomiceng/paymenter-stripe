@@ -382,7 +382,7 @@ trait Checkout
             ],
         ]);
         $key = 'ae_stripe_payment_alert_' . $invoice->id . '_' . $intent->id;
-        if (!$invoice->user->properties()->where('key', $key)->lockForUpdate()->first()) {
+        if (!$this->lockedUserProperty($invoice->user, $key)) {
             $invoice->user->properties()->updateOrCreate(['key' => $key],
                 ['value' => json_encode(['reason' => $reason, 'sent' => false], JSON_THROW_ON_ERROR)]);
         }

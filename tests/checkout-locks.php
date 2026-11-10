@@ -140,3 +140,97 @@ check($inner && $inner->getData()['intent']->id === $outer->getData()['intent']-
     'Two opens of Pay on one invoice give both pages the same single intent');
 check(!array_filter($GLOBALS['stripeCalls'], fn ($call) => str_contains($call[1], '/confirm') || str_starts_with($call[1], '/charges')),
     'Opening Pay never confirms or charges');
+
+/** [locked gap, inserted gap] pairs: a transaction locked a missing property's gap and later inserted a property. */
+function gapWaits(array $trace): array
+{
+    $held = $pairs = [];
+    foreach ($trace as [$transaction, $kind, $gap]) {
+        if ($kind === 'lock') { $held[$transaction][$gap] = true; continue; }
+        foreach (array_keys($held[$transaction] ?? []) as $locked) $pairs[$locked . ':' . $gap] = [$locked, $gap];
+    }
+    return $pairs;
+}
+/** Two requests at once deadlock when each inserts into a gap the other locked before its own insert. A request
+ * with no gapWaits() pairs cannot be either side of such a cycle, whatever the other request does. */
+function gapDeadlock(array $first, array $second): bool
+{
+    $other = gapWaits($second);
+    foreach (gapWaits($first) as [$locked, $inserted]) if (isset($other[$inserted . ':' . $locked])) return true;
+    return false;
+}
+/** Run a request with the properties gap trace on. */
+function traced(callable $request): array
+{
+    $GLOBALS['gapTrace'] = [];
+    try { $request(); } finally { $trace = $GLOBALS['gapTrace']; $GLOBALS['gapTrace'] = null; }
+    return $trace;
+}
+$indexNow = function () { $GLOBALS['gapIndex'] = DB::table('properties')->get(['key', 'model_id', 'model_type'])->map(fn ($row) => [$row->key, $row->model_id, $row->model_type])->all(); };
+$insertedKey = fn ($trace, $prefix) => (bool) array_filter($trace, fn ($event) => $event[1] === 'insert' && str_starts_with($event[3], $prefix));
+$customer(11, 'cus_11');
+$customer(12, 'cus_12');
+
+// Two payments from the wrong Stripe customer settle at once: each records a staff review alert for its invoice.
+$GLOBALS['stripeHandler'] = fn ($verb, $path) => throw new RuntimeException('Unexpected review request: ' . $verb . ' ' . $path);
+$review = fn (int $invoiceId, int $userId) => (object) ['id' => 'pi_review_' . $invoiceId, 'status' => 'succeeded', 'amount' => 2000,
+    'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_wrong', 'metadata' => (object) ['invoice_id' => (string) $invoiceFor($invoiceId, $userId)->id]];
+$firstReview = $review(311, 11);
+$secondReview = $review(312, 12);
+$indexNow();
+$firstTrace = traced(fn () => invoke($gateway, 'recordIntentPayment', $firstReview, 'succeeded', false));
+$secondTrace = traced(fn () => invoke($gateway, 'recordIntentPayment', $secondReview, 'succeeded', false));
+check($insertedKey($firstTrace, 'ae_stripe_payment_alert_311_') && $insertedKey($secondTrace, 'ae_stripe_payment_alert_312_'),
+    'Each mismatched payment inserts its review alert');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
+    'Two mismatched payments settling at once never deadlock on their review alerts');
+check(App\Models\Audit::where('event', 'ae_stripe_payment_review')->whereIn('auditable_id', [311, 312])->count() === 2
+    && !App\Models\InvoiceTransaction::whereIn('invoice_id', [311, 312])->exists(), 'Each mismatched payment gets one staff review and no payment');
+
+// Two customers return from paying with "save card" at once: each reserves its saved card notice.
+$GLOBALS['stripeHandler'] = function ($verb, $path) {
+    if ($verb === 'get' && preg_match('#^/payment_methods/(pm_notice_[0-9]+)$#', $path, $id)) return ['id' => $id[1], 'type' => 'sepa_debit'];
+    throw new RuntimeException('Unexpected notice request: ' . $verb . ' ' . $path);
+};
+$notice = fn (int $invoiceId, int $userId) => (object) ['id' => 'pi_notice_' . $invoiceId, 'status' => 'succeeded', 'customer' => 'cus_' . $userId,
+    'payment_method' => 'pm_notice_' . $invoiceId, 'created' => time(), 'metadata' => (object) ['invoice_id' => (string) $invoiceFor($invoiceId, $userId)->id,
+        'ae_stripe_gateway' => '1', 'ae_stripe_consent' => '1']];
+$firstNotice = $notice(313, 11);
+$secondNotice = $notice(314, 12);
+$indexNow();
+// A SEPA method is not saved, so each notice is discarded after its reservation.
+$firstTrace = traced(function () use ($gateway, $firstNotice) { auth()->login(User::findOrFail(11)); invoke($gateway, 'saveConsentedMethod', $firstNotice, null); });
+$secondTrace = traced(function () use ($gateway, $secondNotice) { auth()->login(User::findOrFail(12)); invoke($gateway, 'saveConsentedMethod', $secondNotice, null); });
+check($insertedKey($firstTrace, 'ae_stripe_notice_') && $insertedKey($secondTrace, 'ae_stripe_notice_'),
+    'Each return reserves its saved card notice');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
+    'Two customers reserving saved card notices at once never deadlock');
+
+// Two customers remove a saved card at once: each records its removal journal before detaching.
+$removing = $methods = [];
+foreach ([11, 12] as $userId) {
+    $removing[$userId] = nativeAgreement(500 + $userId, 'pm_remove_' . $userId, ['user_id' => $userId]);
+    $methods['pm_remove_' . $userId] = (object) ['id' => 'pm_remove_' . $userId, 'customer' => 'cus_' . $userId, 'type' => 'card',
+        'card' => (object) ['fingerprint' => 'fp_remove_' . $userId, 'brand' => 'visa', 'last4' => '4242', 'exp_month' => 5, 'exp_year' => 2030]];
+}
+$GLOBALS['stripeHandler'] = nativeMethodHandler($methods);
+$indexNow();
+$firstTrace = traced(fn () => check(invoke($gateway, 'removeSavedMethodCopies', $removing[11]) === true, 'The first removal finishes'));
+$secondTrace = traced(fn () => check(invoke($gateway, 'removeSavedMethodCopies', $removing[12]) === true, 'The second removal finishes'));
+check($insertedKey($firstTrace, 'ae_stripe_removal_pm_remove_11') && $insertedKey($secondTrace, 'ae_stripe_removal_pm_remove_12'),
+    'Each removal inserts its journal');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
+    'Two customers removing a saved card at once never deadlock on the removal journal');
+
+// Card cleanup reserves a duplicate for a customer with no Auto Pay card. The reservation inserts a property, so it
+// must hold no missing-row gap lock, which the Auto Pay card check would otherwise take.
+foreach (['pm_keep_11' => 611, 'pm_dup_11' => 612] as $reference => $id) {
+    nativeAgreement($id, $reference, ['user_id' => 11]);
+    $methods[$reference] = (object) ['id' => $reference, 'customer' => 'cus_11', 'type' => 'card', 'allow_redisplay' => 'unspecified',
+        'card' => (object) ['fingerprint' => 'fp_dup_11', 'brand' => 'visa', 'last4' => '4242', 'exp_month' => 5, 'exp_year' => 2030]];
+}
+$indexNow();
+$cleanupTrace = traced(fn () => invoke($gateway, 'cleanupCard', App\Models\BillingAgreement::findOrFail(612), $nativeGateway, true, fn () => null));
+check($insertedKey($cleanupTrace, 'ae_stripe_duplicate_pm_dup_11') && App\Models\BillingAgreement::find(612) === null,
+    'Cleanup reserves and removes the duplicate card');
+check(!gapWaits($cleanupTrace), 'The duplicate card reservation takes no missing-row gap lock before inserting');

@@ -39,14 +39,14 @@ trait SavedMethodNotices
                         && ($existing['user_id'] ?? null) == $user->id && isset($existing['token'])
                         && preg_match('/\A[a-f0-9]{32}\z/', $existing['token']) && $property->key === $this->savedNoticeKey($existing['token'])) return $existing['token'];
                 }
-                while ($property = $user->properties()->where('key', $this->savedNoticeKey($token))->lockForUpdate()->first()) {
+                while ($property = $this->lockedUserProperty($user, $this->savedNoticeKey($token))) {
                     $existing = json_decode($property->value, true);
                     if (($existing['invoice_id'] ?? null) == $invoice->id && ($existing['intent_id'] ?? null) === $intent->id) return $token;
                     // Stable replacement for a reused token; another intent never overwrites its destination.
                     $token = substr(hash('sha256', $token . ':' . $intent->id . ':' . $invoice->id), 0, 32);
                 }
                 $receiptKey = $this->savedNoticeReceipt($intent);
-                $receipt = json_decode($user->properties()->where('key', $receiptKey)->lockForUpdate()->first()?->value ?? 'null', true);
+                $receipt = json_decode($this->lockedUserProperty($user, $receiptKey)?->value ?? 'null', true);
                 if ($receipt['notice_consumed'] ?? false) return null;
                 $user->properties()->updateOrCreate(['key' => $this->savedNoticeKey($token)], ['value' => json_encode([
                     'user_id' => (int) $user->id, 'invoice_id' => (int) $invoice->id, 'intent_id' => $intent->id,
