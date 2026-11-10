@@ -5,7 +5,7 @@
 // load, launch or record suites; they must be loaded too, and loading one never counts for the suites it names.
 // Usage: php -n tests/ci-coverage.php DIRECTORY (holding offline.txt, native.txt and browser.txt).
 $ciCoverage = static function (string $directory): array {
-    $support = ['run.php', 'native-pending-matrix.php', 'native-suite.php', 'native-suites.php', 'native-app.php', 'fakes.php', 'entered.php', 'entered.mjs', 'ci-coverage.php'];
+    $support = ['run.php', 'native-pending-matrix.php', 'native-suite.php', 'native-suites.php', 'native-app.php', 'temporary-root.php', 'fakes.php', 'entered.php', 'entered.mjs', 'ci-coverage.php'];
     $tests = array_map('basename', array_merge(glob(__DIR__ . '/*.php'), glob(__DIR__ . '/*.mjs')));
     $problems = [];
     foreach (array_diff($support, $tests) as $file) $problems[] = 'Listed support file is missing: ' . $file;

@@ -18,7 +18,8 @@ $launch = function (array $command, array $environment) {
     fclose($pipes[0]); $output = stream_get_contents($pipes[1]); fclose($pipes[1]);
     return [proc_close($process), $output];
 };
-$fixture = sys_get_temp_dir() . '/ae-stripe-matrix-' . bin2hex(random_bytes(6));
+require_once __DIR__ . '/temporary-root.php';
+$fixture = TemporaryRoot::create('ae-stripe-matrix-');
 mkdir($fixture . '/app/vendor', 0700, true); mkdir($fixture . '/other/vendor', 0700, true);
 file_put_contents($fixture . '/app/vendor/autoload.php', '<?php'); file_put_contents($fixture . '/other/vendor/autoload.php', '<?php');
 $evidence = $fixture . '/evidence/offline.txt';
@@ -40,7 +41,7 @@ $coverage = function (array $jobs) use ($fixture, $ciCoverage) {
     return $ciCoverage($directory);
 };
 [$problems, $suites, $support] = $coverage($jobs);
-check($problems === [] && $support === 9 && $suites + $support === count($tests), 'Coverage passes when CI jobs together loaded every test file');
+check($problems === [] && $support === 10 && $suites + $support === count($tests), 'Coverage passes when CI jobs together loaded every test file');
 $without = fn ($job, $file) => array_replace($jobs, [$job => array_values(array_diff($jobs[$job], [$file]))]);
 check($coverage($without('native', 'receipt-returns.php'))[0] === ['No CI job loaded these suites: receipt-returns.php'], 'A suite the native registry names but no job loaded fails coverage');
 check($coverage($without('browser', 'setup-modal.mjs'))[0] === ['No CI job loaded these suites: setup-modal.mjs'], 'A browser check the matrix names but no job loaded fails coverage');
