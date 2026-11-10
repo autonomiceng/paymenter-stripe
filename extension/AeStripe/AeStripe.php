@@ -656,7 +656,7 @@ class AeStripe extends Gateway
 
     private function lockedStripeCustomer($user, bool $includeDetails)
     {
-        $stripeCustomerId = $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first();
+        $stripeCustomerId = $this->lockedUserProperty($user, 'stripe_id');
 
         if ($stripeCustomerId) {
             try {
