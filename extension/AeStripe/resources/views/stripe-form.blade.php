@@ -57,8 +57,10 @@ function loadStripe() {
 // locked keeps the form and its error in place after a decline that needs a refresh,
 // inertUntilReady keeps the fields closed until Stripe is ready, and onRetry runs Try again.
 function stripeFormControls(form, {onRetry, onLoading = () => {}, locked = () => false, isDisposed = () => false,
-    inertUntilReady = false, scrollToMessage = false} = {}) {
+    inertUntilReady = false, scrollToMessage = false, busyLabel = 'Processing...'} = {}) {
     const submit = form.querySelector('#submit');
+    const submitLabel = submit?.textContent;
+    const express = form.querySelector('#express-checkout');
     const alert = form.querySelector('#error-message');
     const fields = ['#payment-element', '#express-checkout'].map(selector => form.querySelector(selector)).filter(Boolean);
     const controls = {ready: false, loading: false};
@@ -90,10 +92,15 @@ function stripeFormControls(form, {onRetry, onLoading = () => {}, locked = () =>
         if (isDisposed()) return;
         const closed = isLoading || locked() || (inertUntilReady && !controls.ready);
         for (const field of fields) field.inert = closed;
+        // While one confirms, the button stays in place and says so, Link is dimmed, and the page can lock its own
+        // close button from the ae-stripe:busy event.
         if (submit) {
             submit.disabled = isLoading || locked() || !controls.ready;
-            submit.classList.toggle('hidden', isLoading);
+            submit.textContent = isLoading ? busyLabel : submitLabel;
+            submit.setAttribute('aria-busy', isLoading ? 'true' : 'false');
         }
+        if (express) express.style.opacity = isLoading ? '0.5' : '';
+        form.dispatchEvent(new CustomEvent('ae-stripe:busy', {bubbles: true, detail: {busy: isLoading}}));
         onLoading(isLoading);
     };
     // Stripe.js or the Payment Element failed to load. The form stays off and Try again loads it again.

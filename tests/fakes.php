@@ -162,6 +162,7 @@ namespace App\Models {
         public function __construct(public User $user) {}
         public function items() { return new NativeModelQuery($this->items); }
         public function getMorphClass() { return self::class; }
+        public function fresh() { return $this; }
         public static function where($key, $id) { return new Query(self::$rows[$id] ?? (self::$row && self::$row->id == $id ? self::$row : null), Invoice::class); }
         public function transactions() { return new class($this->id) {
             private $id, $status;
@@ -411,6 +412,16 @@ namespace App\Models {
             public function exists() { foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
                 if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return true;
             } return false; }
+            public function update(array $values) {
+                $count = 0;
+                foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
+                    if (!str_ends_with($key, ':' . $this->id) || $this->status && $row['status'] !== $this->status) continue;
+                    unset(\App\Helpers\ExtensionHelper::$payments[$key]);
+                    \App\Helpers\ExtensionHelper::$payments[explode(':', $key)[0] . ':' . ($values['transaction_id'] ?? $this->id)] = $row;
+                    ++$count;
+                }
+                return $count;
+            }
         }; }
     }
 }

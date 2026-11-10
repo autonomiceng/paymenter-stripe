@@ -62,7 +62,7 @@ try {
                 probe.created++;
                 probe.active++;
                 const group = {};
-                return { update() {}, create(type, options) {
+                return { update() {}, async submit() { return {}; }, create(type, options) {
                     // Like Stripe.js, reject unknown Elements and invalid wallet values.
                     if (!['payment', 'expressCheckout'].includes(type)) throw new Error(`Unknown Element: ${type}`);
                     if (!['auto', 'never', undefined].includes(options.wallets?.link)) throw new Error('Invalid wallets.link');

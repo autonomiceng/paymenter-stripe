@@ -268,6 +268,16 @@ trait CheckoutIntent
         return $this->storePaymentAttempt($invoice, $attempt, $values);
     }
 
+    /**
+     * Native payments are keyed by transaction ID, so confirming a refused intent again would overwrite its Failed row
+     * with the new outcome. Re-key the earlier refusal by its charge first, so every attempt stays on the invoice.
+     */
+    private function keepFailedAttempt($intent): void
+    {
+        $charge = is_string($intent->latest_charge ?? null) && $intent->latest_charge !== '' ? $intent->latest_charge : 'failed_' . bin2hex(random_bytes(6));
+        InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->update(['transaction_id' => $intent->id . ':' . $charge]);
+    }
+
     private function paymentAttemptFailed(array $attempt, $intent): bool
     {
         if ($intent->status !== 'requires_payment_method') return false;
@@ -466,6 +476,7 @@ trait CheckoutIntent
                 foreach (['metadata', 'setup_future_usage'] as $field) {
                     if (array_key_exists($field, $params)) { $updates[$field] = $params[$field]; unset($params[$field]); }
                 }
+                $this->keepFailedAttempt($intent);
                 $writeStarted = true;
                 $this->request('post', '/payment_intents/' . $intentId, $updates);
                 $result = $this->request('post', '/payment_intents/' . $intentId . '/confirm', $params, $attempt['confirmation']['key']);
@@ -481,7 +492,7 @@ trait CheckoutIntent
                             $this->writePaymentAttempt($user, $current, array_replace($stored, ['retry' => false, 'confirmation' => null, 'agreement_id' => null]));
                             $declined = $fresh->status === 'requires_payment_method' && ($e->response->status() === 402 || !empty($fresh->last_payment_error));
                             if ($declined) $this->recordIntentPayment($fresh, 'failed');
-                            $reason = $this->paymentRefusalReason($e, $current, $fresh->last_payment_error->code ?? null);
+                            $reason = $this->paymentRefusalReason($e, $current, $fresh->last_payment_error->code ?? null, $fresh->last_payment_error->decline_code ?? null);
                             return $declined ? new PaymentDeclinedException($reason) : new DisplayException($reason);
                         }
                         return $fresh;
@@ -513,7 +524,7 @@ trait CheckoutIntent
         if ($result instanceof DisplayException) throw $result;
         if ($result->status === 'requires_payment_method' && !empty($result->last_payment_error)) {
             $this->recordIntentPayment($result, 'failed');
-            throw new PaymentDeclinedException($this->paymentFailureReason($result->last_payment_error->code ?? null));
+            throw new PaymentDeclinedException($this->paymentFailureReason($result->last_payment_error->code ?? null, $result->last_payment_error->decline_code ?? null));
         }
         return $result;
     }
@@ -523,15 +534,20 @@ trait CheckoutIntent
         return $e->response->status() >= 400 && $e->response->status() < 500 && !in_array($e->response->status(), [409, 429], true);
     }
 
-    private function paymentRefusalReason(RequestException $e, $invoice, ?string $fallbackCode = null): string
+    private function paymentRefusalReason(RequestException $e, $invoice, ?string $fallbackCode = null, ?string $fallbackDecline = null): string
     {
         if (str_contains($e->response->json('error.message') ?? '', 'The currency provided')) return "This card can't be charged in " . $invoice->currency_code . '. Use another payment method.';
         if (in_array($e->response->status(), [401, 403], true)) return 'Payments are paused. Please check back later or contact support.';
-        return $this->paymentFailureReason($e->response->json('error.code') ?? $fallbackCode);
+        return $this->paymentFailureReason($e->response->json('error.code') ?? $fallbackCode, $e->response->json('error.decline_code') ?? $fallbackDecline);
     }
 
-    private function paymentFailureReason(?string $code): string
+    /** The customer's words for a refusal. The decline code, when Stripe sends one, names the real reason. */
+    private function paymentFailureReason(?string $code, ?string $declineCode = null): string
     {
+        if ($declineCode === 'insufficient_funds') return 'Insufficient funds. Try a different card, or contact your bank.';
+        if ($code === 'payment_intent_authentication_failure' || $declineCode === 'authentication_required') {
+            return 'Your bank did not confirm this payment. You were not charged. Try again or use a different card.';
+        }
         return match ($code) {
             'amount_too_small' => "This balance is below Stripe's minimum. Use account credit or contact support to pay it.",
             'card_declined' => 'Your bank declined this card. Try a different card, or contact your bank.',
