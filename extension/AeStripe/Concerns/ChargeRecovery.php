@@ -210,8 +210,9 @@ trait ChargeRecovery
         // Only staff can restore Stripe access. One alert per configured key, across invoices.
         DB::afterCommit(function () {
             try {
-                DB::transaction(function () {
-                    $gateway = Gateway::where('extension', 'AeStripe')->lockForUpdate()->firstOrFail();
+                $id = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+                DB::transaction(function () use ($id) {
+                    $gateway = $this->gatewayRowForUpdate($id)->firstOrFail();
                     $fingerprint = hash('sha256', $this->config('stripe_secret_key'));
                     if (Audit::where('auditable_type', $gateway->getMorphClass())->where('auditable_id', $gateway->id)
                         ->where('event', 'ae_stripe_access_refused')->where('new_values->key_fingerprint', $fingerprint)->lockForUpdate()->first()) return;

@@ -132,6 +132,57 @@ $cases = [
             return 'recorded';
         }),
         'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_subscription_review')->count() === 1],
+    // Settings committed while the gateway lock was held must be current when the waiting job acquires that lock.
+    'gateway-state-current' => ['seed' => fn () => DB::table('settings')->where('key', 'ae_stripe_webhook_events')->update(['value' => 'retry']),
+        'waits' => true, 'pause' => '/^update `settings`/',
+        'a' => function () {
+            $owner = App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail();
+            return DB::transaction(function () use ($owner) {
+                App\Models\Gateway::where('id', $owner->id)->lockForUpdate()->firstOrFail();
+                $owner->settings()->where('key', 'ae_stripe_webhook_events')->update(['value' => 'ready']);
+                return 'updated';
+            });
+        },
+        'b' => function ($gateway) {
+            invoke($gateway, 'reconcileWebhookSubscriptions');
+            return count($GLOBALS['stripeCalls']);
+        },
+        'check' => fn ($results) => $results['b']['ok'] === 0
+            && DB::table('settings')->where('key', 'ae_stripe_webhook_events')->value('value') === 'ready'],
+    // The gateway owner lock must not block a different gateway's payment FK check. Other precedes AeStripe in the
+    // extensions scan (mariadb-app.php), so the old unindexed locking read also locks that other gateway's row.
+    'gateway-review' => ['seed' => fn () => customerInvoice(7, 811),
+        'pause' => '/^insert into `audits`/',
+        'a' => fn ($gateway) => invoke($gateway, 'recordSubscriptionReview', paidSubscription(811), 'Service missing') ?? 'recorded',
+        'b' => fn () => App\Helpers\ExtensionHelper::addPayment(811, 'Other', 20, null, 'other_811')->id,
+        'check' => fn () => $rows(811) === [[20.0, 'succeeded', false]] && Invoice::find(811)->status === 'paid'],
+    'gateway-access' => ['seed' => fn () => customerInvoice(7, 812),
+        'pause' => '/^insert into `audits`/',
+        'a' => fn ($gateway) => invoke($gateway, 'notifyPaymentAccessRefusal') ?? 'recorded',
+        'b' => fn () => App\Helpers\ExtensionHelper::addPayment(812, 'Other', 20, null, 'other_812')->id,
+        'check' => fn () => $rows(812) === [[20.0, 'succeeded', false]] && Invoice::find(812)->status === 'paid'],
+    'gateway-events' => ['seed' => fn () => customerInvoice(7, 813),
+        'pause' => '/^select .* from `settings`/',
+        'a' => fn ($gateway) => invoke($gateway, 'reconcileWebhookSubscriptions') ?? 'ready',
+        'b' => fn () => App\Helpers\ExtensionHelper::addPayment(813, 'Other', 20, null, 'other_813')->id,
+        'check' => fn () => $rows(813) === [[20.0, 'succeeded', false]] && Invoice::find(813)->status === 'paid'],
+    'gateway-signature' => ['seed' => function () {
+            customerInvoice(7, 814);
+            App\Models\Gateway::where('extension', 'AeStripe')->first()->settings()->create(['key' => 'ae_stripe_webhook_continuity',
+                'value' => json_encode(['credentials' => ['stripe_webhook_secret' => 'whsec_test'],
+                    'previous' => [['secret' => 'whsec_old', 'until' => null]]])]);
+        },
+        'pause' => '/^select .* from `settings`/',
+        'a' => function ($gateway) {
+            // Only pause after acquiring the gateway lock, past the initial unlocked state read.
+            $GLOBALS['pauses'] = [];
+            DB::listen(function ($query) { if (str_contains($query->sql, 'for update')) pauseBefore('/^select .* from `settings`/'); });
+            $time = time();
+            return invoke($gateway, 'validWebhookSignature', '{}', 't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.{}', 'whsec_test'));
+        },
+        'b' => fn () => App\Helpers\ExtensionHelper::addPayment(814, 'Other', 20, null, 'other_814')->id,
+        'check' => fn ($results) => $results['a']['ok'] === true && $rows(814) === [[20.0, 'succeeded', false]]
+            && Invoice::find(814)->status === 'paid'],
     // Two customers open Pay on invoices with no stored attempt; each reserves its attempt row in the properties index.
     'pay-pay' => ['seed' => function () { customerInvoice(7, 301); customerInvoice(8, 302); },
         'pause' => '/^insert into `properties`/',
@@ -288,6 +339,8 @@ foreach ($cases as $name => $case) {
     foreach (['invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
         'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users'] as $table) DB::table($table)->truncate();
     DB::statement('set foreign_key_checks = 1');
+    DB::table('settings')->where('key', 'ae_stripe_webhook_continuity')->delete();
+    DB::table('settings')->where('key', 'ae_stripe_webhook_events')->update(['value' => 'ready']);
     $case['seed']();
     $before = $deadlocks();
     $workers = [];

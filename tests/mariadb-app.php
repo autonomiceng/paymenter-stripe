@@ -46,6 +46,7 @@ if (!empty($install)) {
         App\Models\Setting::withoutEvents(fn () => App\Models\Setting::create(['key' => $key, 'value' => $value]));
     }
     App\Models\Currency::create(['code' => 'USD', 'name' => 'USD', 'format' => '1,000.00', 'prefix' => '$']);
+    App\Models\Gateway::create(['name' => 'Other', 'extension' => 'Other', 'type' => 'gateway', 'enabled' => true]);
     $installed = App\Models\Gateway::create(['name' => 'AE Stripe', 'extension' => 'AeStripe', 'type' => 'gateway', 'enabled' => true]);
     $installed->settings()->create(['key' => 'ae_stripe_webhook_events', 'value' => 'ready']);
 }
