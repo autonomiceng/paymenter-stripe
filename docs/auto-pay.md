@@ -152,6 +152,9 @@ An expired, proven-unconfirmed creation rotates atomically with its original aut
 and retry count. Automatic native collection without renewal context fails closed.
 A definite refusal and its waiting/stopped transition commit before confirmation locks
 are released; another automatic caller resumes the claimed confirmation identity.
+A database rerun never repeats the Stripe update or confirmation. If a lock conflict rolls
+back the recording after Stripe answered, that answer is recorded again in one transaction
+with the refusal and renewal policy; if every try conflicts, recovery reads it from Stripe.
 Retiring a refused intent before applying partial credit preserves the waiting schedule
 and count while a positive balance remains; the due retry rechecks consent and balance.
 Full payment, cancellation and explicit customer Pay end automatic collection. Native

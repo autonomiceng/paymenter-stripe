@@ -59,7 +59,13 @@ $setup = function ($amount = 2000, $total = 10, $currency = 'usd') use ($owner, 
 $deliver = fn ($s) => $gateway->webhook(eventRequest($s->intent));
 $status = fn ($i, $key = 'excess') => $gateway->receiptReturnStatus($i, 'pi_return', $key);
 $inboxDown = fn () => beforeWrite('notifications', fn () => throw new RuntimeException('Inbox unavailable'));
-$inboxUp = fn () => beforeWrite('notifications', null);
+$inboxUp = function () {
+    beforeWrite('notifications', null);
+    // Reach the next retry time without sleeping in these delivery recovery tests.
+    foreach (Audit::where('new_values->notice_sent', false)->get() as $audit) {
+        $audit->update(['new_values' => array_replace($audit->new_values, ['notice_retry_at' => 0])]);
+    }
+};
 
 [$i, $s] = $setup(); $deliver($s); $deliver($s); $gateway->retryReceiptReturns();
 $a = $status($i);
@@ -168,6 +174,7 @@ check($status($i)['state'] === 'refunded' && count($s->posts) === 1, 'Restoring 
 
 [$i, $s] = $setup(); $inboxDown(); $deliver($s); $inboxUp();
 $gateway->retryReceiptReturns();
+$gateway->retryChargeAttempts();
 check($status($i)['state'] === 'refunded' && count($s->posts) === 1 && count(notices()) === 1,
     'Notification failure retries the notice without repeating the completed return');
 
@@ -178,7 +185,7 @@ Schema::disableForeignKeyConstraints(); DB::table('invoices')->where('id', $i->i
 $gateway->retryReceiptReturns();
 $held = $returns()['pi_return:excess'];
 DB::table('invoices')->insert($invoiceRow); Schema::enableForeignKeyConstraints();
-$deliver($s); $gateway->retryReceiptReturns();
+$deliver($s); $gateway->retryReceiptReturns(); $gateway->retryChargeAttempts();
 check(credits()['7:usd'] === 10.0 && $held['state'] === 'credited' && !$held['retry']
     && $status($i)['state'] === 'credited' && count($s->posts) === 1 && count(notices()) === 1,
     'An unavailable invoice cannot erase completed credit or add it twice when its binding is restored');
@@ -188,6 +195,7 @@ foreach (['succeeded', 'failed'] as $later) {
     current($s->refunds)->status = $later; $inboxDown();
     $gateway->retryReceiptReturns(); $inboxUp();
     $gateway->retryReceiptReturns();
+    $gateway->retryChargeAttempts();
     $sent = notices();
     check(count($sent) === 2 && str_contains(end($sent)['body'], $later === 'failed' ? 'account credit' : 'original payment method'),
         'A pending notice cannot hide a completion notice after settlement crashes; sweep alone recovers it');

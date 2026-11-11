@@ -29,7 +29,7 @@ trait CardDuplicates
             $row->name, $row->type, (string) $row->expiry, (string) $row->created_at, (string) $row->updated_at];
         ksort($state);
         $properties = [];
-        foreach ($user->properties()->where('key', 'like', 'ae_stripe_%')->lockForUpdate()->get() as $property) {
+        foreach ($this->lockedUserProperties($user, 'ae_stripe_') as $property) {
             if (!str_starts_with($property->key, 'ae_stripe_notice_')) $properties[$property->key] = $property->value;
         }
         ksort($properties);

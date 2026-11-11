@@ -1,7 +1,6 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 // Native suite: runs on tests/native-app.php (real Paymenter models, listeners and SQLite).
-use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\DB;
 use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
@@ -16,20 +15,16 @@ $serviceRows = fn () => tableRows('services', ['id']);
 $bind = fn (int $agreement) => nativeService(null)->forceFill(['billing_agreement_id' => $agreement])->save();
 $calls = fn (int $start) => array_slice($GLOBALS['stripeCalls'], $start);
 
-// Agreement reads inside a saving transaction must be current reads, not a REPEATABLE READ snapshot.
+// Database read views and missing-key locks are exercised by mariadb-locks.php. These checks cover the saved result.
 resetSavedMethods();
 nativeAgreement(19, 'pm_old');
-$snapshotReads = [];
-DB::listen(function (QueryExecuted $query) use (&$snapshotReads) {
-    if (DB::transactionLevel() > 0 && preg_match('/^select .* from "billing_agreements"/', $query->sql) && !str_contains($query->sql, '/* for update */')) $snapshotReads[] = $query->sql;
-});
 $result = setupReturn($gateway, $setup);
-check($result['message'] === 'This card is already saved. We updated its expiry to 05/2030.' && count(agreements()) === 1 && !$snapshotReads,
+check($result['message'] === 'This card is already saved. We updated its expiry to 05/2030.' && count(agreements()) === 1,
     'A confirmed duplicate setup retains one saved card and shows one notice');
 check($methods['pm_new']->customer === 'cus_owner' && $methods['pm_old']->allow_redisplay === 'always',
     'Duplicate setup retains referenced methods and broadens redisplay on the retained method');
 $result = setupReturn($gateway, $setup);
-check($result['message'] === 'This card is already saved. We updated its expiry to 05/2030.' && count(agreements()) === 1 && !$snapshotReads,
+check($result['message'] === 'This card is already saved. We updated its expiry to 05/2030.' && count(agreements()) === 1,
     'Webhook or redirect retries recognize the detached duplicate without another agreement');
 
 // Exercise the public command using the installed gateway settings, like Paymenter's console lifecycle.

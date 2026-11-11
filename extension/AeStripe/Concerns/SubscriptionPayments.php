@@ -39,18 +39,24 @@ trait SubscriptionPayments
     private function recordSubscriptionReview($stripeInvoice, string $reason): void
     {
         // No invoice can be inferred safely. Keep a gateway audit entry for the Stripe invoice.
-        DB::transaction(function () use ($stripeInvoice, $reason) {
-            $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->lockForUpdate()->firstOrFail();
-            if (\App\Models\Audit::where('event', 'ae_stripe_subscription_review')
-                ->where('new_values->stripe_invoice_id', $stripeInvoice->id)->lockForUpdate()->first()) return;
-            \App\Models\Audit::create([
-                'event' => 'ae_stripe_subscription_review', 'auditable_type' => \App\Models\Gateway::class,
-                'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => [
-                    'stripe_invoice_id' => $stripeInvoice->id, 'amount_minor' => $stripeInvoice->amount_paid,
-                    'currency' => $stripeInvoice->currency, 'reason' => $reason,
-                    'subscription_id' => $stripeInvoice->parent->subscription_details->subscription ?? null,
-                ],
-            ]);
+        DB::afterCommit(function () use ($stripeInvoice, $reason) {
+            $id = \App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+            DB::transaction(function () use ($stripeInvoice, $reason, $id) {
+                // Lock the existing gateway before the first plain read. A fresh transaction after settlement avoids an
+                // older invoice snapshot; the gateway serializes dedupe without locking another customer's property audits.
+                $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->where('id', $id)->lockForUpdate()->firstOrFail();
+                if (\App\Models\Audit::where('auditable_type', \App\Models\Gateway::class)->where('auditable_id', $gateway->id)
+                    ->where('event', 'ae_stripe_subscription_review')
+                    ->where('new_values->stripe_invoice_id', $stripeInvoice->id)->first()) return;
+                \App\Models\Audit::create([
+                    'event' => 'ae_stripe_subscription_review', 'auditable_type' => \App\Models\Gateway::class,
+                    'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => [
+                        'stripe_invoice_id' => $stripeInvoice->id, 'amount_minor' => $stripeInvoice->amount_paid,
+                        'currency' => $stripeInvoice->currency, 'reason' => $reason,
+                        'subscription_id' => $stripeInvoice->parent->subscription_details->subscription ?? null,
+                    ],
+                ]);
+            });
         });
     }
 
@@ -78,15 +84,21 @@ trait SubscriptionPayments
         $intent = $this->request('get', '/payment_intents/' . $paymentId, ['expand' => ['latest_charge']]);
         abort_unless($intent->id === $paymentId && $intent->status === 'succeeded', 409);
         $this->ensureReceiptReturnSchema();
-        DB::transaction(function () use ($stripeInvoice, $subscriptionId, $paymentId, $intent) {
-            $ownerId = Service::where('subscription_id', $subscriptionId)->first()?->user_id;
-            if (!$ownerId) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
+        // Read the owner before the transaction. MariaDB takes a transaction's read view at its first plain read, so
+        // the user lock must come first: plain reads after it then see attempts committed while settlement waited.
+        $ownerId = Service::where('subscription_id', $subscriptionId)->first()?->user_id;
+        if (!$ownerId) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
+        DB::transaction(function () use ($stripeInvoice, $subscriptionId, $paymentId, $intent, $ownerId) {
             // Match PaymentIntent settlement: serialize on the customer before other rows.
             User::where('id', $ownerId)->lockForUpdate()->firstOrFail();
-            $service = Service::where('subscription_id', $subscriptionId)->lockForUpdate()->first();
+            // services has no subscription_id index, so a locking read by it locks every row it scans, other customers'
+            // services too. Find the row with a plain read under the owner lock, then lock only it by primary key.
+            $id = Service::where('subscription_id', $subscriptionId)->first()?->id;
+            $service = $id ? Service::where('id', $id)->lockForUpdate()->first() : null;
+            if ($service?->subscription_id !== $subscriptionId) $service = null;
             if ($service) abort_unless($service->user_id === $ownerId, 409);
             if (!$service) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
-            if ($settled = InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first()) {
+            if ($settled = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentId), 'succeeded')[0] ?? null) {
                 $this->schedulePaymentReviewAlert($settled->invoice, $paymentId);
                 return;
             }
@@ -108,6 +120,6 @@ trait SubscriptionPayments
             }
             // Use the same locked transaction path as PaymentIntent events, so either delivery order is safe.
             $this->recordIntentPayment($intent, 'succeeded', false, $stripeInvoice->id);
-        });
+        }, self::SETTLEMENT_ATTEMPTS);
     }
 }

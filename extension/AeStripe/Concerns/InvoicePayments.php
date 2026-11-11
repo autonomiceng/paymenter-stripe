@@ -13,7 +13,7 @@ trait InvoicePayments
             $attempt = $this->readPaymentAttempt($user, $current);
             if (!$attempt) {
                 // Older asynchronous debits may predate durable attempt properties.
-                foreach ($current->transactions()->where('status', 'processing')->lockForUpdate()->get() as $transaction) {
+                foreach ($this->lockedTransactions($current->transactions(), 'processing') as $transaction) {
                     if (($transaction->gateway->extension ?? null) === 'AeStripe') return false;
                 }
                 return true;

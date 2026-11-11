@@ -87,9 +87,12 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
         Notification::$fail = true;
         $attempts = $row()['attempts'];
         $gateway->retryPaymentFees();
-        check($row()['attempts'] === $attempts + 1, 'Failed notice advances the attempt outside rollback');
-        check($row()['state'] === 'pending' && count(Audit::$rows) === $audits, 'Notice failure rolls review transition back');
+        check($row()['attempts'] === $attempts + ($limit === 'attempts' ? 1 : 0), 'Notice failure does not add collection attempts after the review commits');
+        check($row()['state'] === 'review' && count(Audit::$rows) === $audits + 1 && !end(Audit::$rows)['new_values']['notice_sent'] && count(Notification::$rows) === $notices, 'Notice failure preserves the committed review and pending delivery');
         Notification::$fail = false;
+        foreach (Audit::$rows as &$audit) $audit['new_values']['notice_retry_at'] = 0;
+        unset($audit);
+        invoke($gateway, 'retryPaymentNotices');
         $gateway->retryPaymentFees(); $deliver(); $gateway->retryPaymentFees();
         check($row()['state'] === 'review' && count(Notification::$rows) === $notices + 1 && count(Audit::$rows) === $audits + 1,
             'Give up retains one audit and one staff inbox notice: ' . $limit);

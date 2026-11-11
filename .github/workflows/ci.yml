@@ -121,9 +121,59 @@ jobs:
           path: ${{ runner.temp }}/entered/browser.txt
           if-no-files-found: error
           retention-days: 1
+  mariadb-locks:
+    # Two payment requests at once on real MariaDB sessions; a missing database fails the job.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      mariadb:
+        image: mariadb:11.4.5@sha256:49117dcc565cf51aa57ac5fca59ab31213402ff0eae6ffc13c46a37b938f7e4b
+        env:
+          MARIADB_ROOT_PASSWORD: locks
+          MARIADB_DATABASE: paymenter_locks
+        ports:
+          - 127.0.0.1:3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 5s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1 # v2.36.0
+        with:
+          php-version: '8.4.27'
+          extensions: bcmath, curl, dom, fileinfo, gd, intl, mbstring, pdo_mysql, pdo_sqlite, sqlite3, zip
+          tools: composer:v2
+          coverage: none
+      - name: Provision pinned public Paymenter 1.5.9
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 https://codeload.github.com/Paymenter/Paymenter/tar.gz/ee729f7d99ac18942625b79f3f93d8d8b21255e8 -o "$RUNNER_TEMP/paymenter.tar.gz"
+          # Hash the source tar, independent of codeload gzip compression.
+          gzip -dc "$RUNNER_TEMP/paymenter.tar.gz" > "$RUNNER_TEMP/paymenter.tar"
+          echo "1bcb9f30a6061cc15aae187c7a269f5ee109bae4a5fe705a6923723995c6e3d7  $RUNNER_TEMP/paymenter.tar" | sha256sum --check
+          mkdir "$RUNNER_TEMP/paymenter"
+          tar -xf "$RUNNER_TEMP/paymenter.tar" --strip-components=1 -C "$RUNNER_TEMP/paymenter"
+          composer install --working-dir="$RUNNER_TEMP/paymenter" --no-interaction --prefer-dist --no-progress --no-scripts
+      - name: Run MariaDB lock tests
+        env:
+          PAYMENTER_TEST_APP: ${{ runner.temp }}/paymenter
+          PAY_MARIADB_PORT: '3306'
+          PAY_MARIADB_PASSWORD: locks
+          PAY_TEST_ENTERED: ${{ runner.temp }}/entered/mariadb.txt
+          TMPDIR: ${{ runner.temp }}
+        run: php -d memory_limit=256M -d auto_prepend_file=tests/entered.php tests/mariadb-locks.php
+      - name: Keep the loaded test file list for the coverage job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: entered-mariadb
+          path: ${{ runner.temp }}/entered/mariadb.txt
+          if-no-files-found: error
+          retention-days: 1
   coverage:
     # Fails when a test file was named but never loaded by any job above.
-    needs: [php, native-pending, browser]
+    needs: [php, native-pending, browser, mariadb-locks]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

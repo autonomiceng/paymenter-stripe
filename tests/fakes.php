@@ -140,6 +140,13 @@ namespace App\Models {
         public function getMorphClass() { return self::class; }
         public function __get($key) { return $this->props; }
         public static function where($key, $id) { return new Query(self::$row && self::$row->$key == $id ? self::$row : null, User::class); }
+        public static function whereIn($key, $ids) { return new class($key, $ids) {
+            public function __construct(private $key, private $ids) {}
+            public function get() {
+                return array_filter(array_merge(User::$row ? [User::$row] : [], User::whereNotNull('role_id')->get()),
+                    fn ($user) => in_array($user->{$this->key}, $this->ids));
+            }
+        }; }
         public static function findOrFail($id) { return self::$row; }
         public static function whereNotNull($key) { return new class { public function get() {
             if (User::$noticeStaff !== null) return User::$noticeStaff;
@@ -159,7 +166,7 @@ namespace App\Models {
         public $total = 20;
         public $due_at = null;
         public $items = [];
-        public function __construct(public User $user) {}
+        public function __construct(public ?User $user = null) {}
         public function items() { return new NativeModelQuery($this->items); }
         public function getMorphClass() { return self::class; }
         public function fresh() { return $this; }
@@ -169,10 +176,11 @@ namespace App\Models {
             public function __construct(private $invoiceId) {}
             public function where($key, $value) { if ($key === 'transaction_id') $this->id = $value; if ($key === 'status') $this->status = $value; return $this; }
             public function lockForUpdate() { return $this; }
+            public function pluck($field) { return new PluckedIds(array_map('crc32', array_keys($this->get()->rows))); }
             public function get() {
                 $rows = array_filter(\App\Helpers\ExtensionHelper::$payments, fn ($row, $key) => str_starts_with($key, $this->invoiceId . ':') && (!$this->status || $row['status'] === $this->status), ARRAY_FILTER_USE_BOTH);
                 return new class($rows) implements \IteratorAggregate {
-                    public function __construct(private $rows) {}
+                    public function __construct(public $rows) {}
                     public function getIterator(): \Traversable { foreach ($this->rows as $key => $row) yield (object) [...$row, "transaction_id" => substr($key, strpos($key, ":") + 1), "gateway" => (object) ["extension" => $row["gateway"] ?? "AeStripe"]]; }
                     public function sum($field) { return array_sum(array_column($this->rows, $field)); }
                 };
@@ -207,13 +215,13 @@ namespace App\Models {
                     }
                     return false;
                 });
-                return new NativeModelQuery($rows);
+                return new NativeModelQuery($rows, Gateway::class);
             }
             $bundled = $value === 'Stripe';
             $present = $bundled ? self::$bundled : self::$present;
             $deleted = $bundled ? self::$bundledDeleted : self::$deleted;
             return new NativeModelQuery($present && ($withTrashed || !$deleted)
-                ? [new Extension(['id' => $bundled ? 1 : 2, 'extension' => $value, 'enabled' => $bundled ? self::$bundledEnabled : self::$enabled])] : []);
+                ? [new Extension(['id' => $bundled ? 1 : 2, 'extension' => $value, 'enabled' => $bundled ? self::$bundledEnabled : self::$enabled])] : [], Gateway::class);
         }
     }
     class NativeServiceRow extends \stdClass {
@@ -224,8 +232,8 @@ namespace App\Models {
         }
     }
     class NativeModelQuery implements \IteratorAggregate {
-        public function __construct(private array $rows) {}
-        public static function table($table) { return new self(array_map(fn ($r) => $table === 'services' ? new NativeServiceRow($r) : (object) $r, \Illuminate\Support\Facades\DB::$tables[$table] ?? [])); }
+        public function __construct(private array $rows, private ?string $model = null) {}
+        public static function table($table) { return new self(array_map(fn ($r) => $table === 'services' ? new NativeServiceRow($r) : (object) $r, \Illuminate\Support\Facades\DB::$tables[$table] ?? []), $table === 'services' ? Service::class : null); }
         public function where($key, $value) { $this->rows = array_filter($this->rows, fn ($r) => ($r->$key ?? null) == $value); return $this; }
         public function whereIn($key, $values) { $this->rows = array_filter($this->rows, fn ($r) => in_array($r->$key ?? null, (array) $values)); return $this; }
         public function whereNull($key) { return $this->where($key, null); }
@@ -236,7 +244,7 @@ namespace App\Models {
                 $callback($query); return $query->exists();
             }); return $this;
         }
-        public function lockForUpdate() { \Illuminate\Support\Facades\DB::$locked = true; \Illuminate\Support\Facades\DB::$modelLocks[] = Gateway::class; return $this; }
+        public function lockForUpdate() { \Illuminate\Support\Facades\DB::$locked = true; if ($this->model === Gateway::class) \Illuminate\Support\Facades\DB::$gatewayLocked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
         public function get() { return $this; }
         public function first() { return reset($this->rows) ?: null; }
         public function firstOrFail() { return $this->first() ?? throw new \RuntimeException('Missing row'); }
@@ -350,29 +358,50 @@ namespace App\Models {
             if (Gateway::$rows === null && ($this->extension ?? '') === 'Stripe') Gateway::$bundledEnabled = $this->enabled;
         }
     }
-    class Audit {
+    class Audit extends \stdClass {
+        public function __construct(array $row) { foreach ($row as $key => $value) $this->$key = $value; }
+        public function update(array $values) {
+            foreach (self::$rows as $index => $row) if ($row['id'] === $this->id) self::$rows[$index] = array_replace($row, $values);
+            foreach ($values as $key => $value) $this->$key = $value;
+        }
         public static $rows = [], $fail = false;
+        public static function whereIn($key, $values) { return self::where($key, $values); }
         public static function where($key, $value) { return new class($key, $value) {
-            private $filters = [], $currentRead = false;
+            private $filters = [], $currentRead = false, $order = [], $maximum = null;
             public function __construct($key, $value) { $this->where($key, $value); }
             public function where($key, $value) { $this->filters[$key] = $value; return $this; }
-            public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = Audit::class; return $this; }
+            public function whereIn($key, $values) { return $this->where($key, $values); }
+            public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = isset($this->filters['id']) ? Audit::class . ':' . $this->filters['id'] : Audit::class; return $this; }
+            public function orderBy($key) { $this->order[] = $key; return $this; }
+            public function limit($n) { $this->maximum = $n; return $this; }
             public function first() {
-                if (!$this->currentRead && \Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Review guard must use a current read');
+                if (!$this->currentRead && \Illuminate\Support\Facades\DB::$locked && !\Illuminate\Support\Facades\DB::$userLocked && !\Illuminate\Support\Facades\DB::$gatewayLocked) throw new \RuntimeException('Review guard needs the owner lock');
+                return $this->get()[0] ?? null;
+            }
+            public function get() {
+                $rows = [];
                 foreach (Audit::$rows as $row) {
                     foreach ($this->filters as $key => $value) {
                         $actual = str_starts_with($key, 'new_values->') ? ($row['new_values'][substr($key, 12)] ?? null) : ($row[$key] ?? null);
-                        if ($actual !== $value) continue 2;
+                        if (is_array($value) ? !in_array($actual, $value, true) : $actual !== $value) continue 2;
                     }
-                    return (object) $row;
+                    $rows[] = new Audit($row);
                 }
-                return null;
+                $value = fn ($row, $key) => str_starts_with($key, 'new_values->') ? ($row->new_values[substr($key, 12)] ?? null) : ($row->$key ?? null);
+                usort($rows, function ($a, $b) use ($value) {
+                    foreach ($this->order as $key) if (($comparison = $value($a, $key) <=> $value($b, $key)) !== 0) return $comparison;
+                    return 0;
+                });
+                return $this->maximum === null ? $rows : array_slice($rows, 0, $this->maximum);
             }
+            public function firstOrFail() { return $this->first() ?? throw new \RuntimeException('Missing audit'); }
         }; }
         public static function create($row) {
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Review record lock missing');
             if (self::$fail) { self::$fail = false; throw new \RuntimeException('Review record unavailable'); }
+            $row['id'] = count(self::$rows) + 1;
             self::$rows[] = $row;
+            return new self($row);
         }
     }
     class Notification {
@@ -382,15 +411,18 @@ namespace App\Models {
     class Credit {
         public $id = 1;
         public static $rows = [];
+        public static function whereKey($id) { foreach (self::$rows as $row) if ($row->id === $id) return new Query($row, Credit::class); return new Query(null, Credit::class); }
         public function __construct(public $user_id, public $currency_code, public $amount) {}
         public static function where($key, $value) { return new class($value) {
             private $currency;
             public function __construct(private $user) {}
             public function where($key, $value) { $this->currency = $value; return $this; }
             public function lockForUpdate() { return $this; }
+            public function orderBy($key) { return $this; }
+            public function value($key) { return $this->first()?->$key; }
             public function first() { return Credit::$rows[$this->user . ':' . $this->currency] ?? null; }
         }; }
-        public static function create($row) { return self::$rows[$row['user_id'] . ':' . $row['currency_code']] = new self(...$row); }
+        public static function create($row) { $credit = new self(...$row); $credit->id = count(self::$rows) + 1; return self::$rows[$row['user_id'] . ':' . $row['currency_code']] = $credit; }
         public function update($row) { $this->amount = $row['amount']; }
     }
     class InvoiceTransaction {
@@ -409,6 +441,12 @@ namespace App\Models {
                 if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return (object) [...$row, 'id' => crc32($key), 'invoice' => Invoice::findOrFail(explode(':', $key)[0]), 'gateway' => (object) ['extension' => $row['gateway']]];
             } return null; }
             public function where($key, $value) { if ($key === 'status') $this->status = $value; return $this; }
+            public function pluck($field) {
+                // A plain settlement read sees every payment only under the owner lock that every payment writer holds.
+                if ($this->status && !\Illuminate\Support\Facades\DB::$userLocked) throw new \RuntimeException('Settlement guard needs the owner lock');
+                return new PluckedIds(array_map('crc32', array_keys(array_filter(\App\Helpers\ExtensionHelper::$payments,
+                    fn ($row, $key) => str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status), ARRAY_FILTER_USE_BOTH))));
+            }
             public function exists() { foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
                 if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return true;
             } return false; }
@@ -423,7 +461,24 @@ namespace App\Models {
                 return $count;
             }
         }; }
+        /** Payments by their fake ids (crc32 of invoice:transaction_id), in id order, for locking and updating by primary key. */
+        public static function whereKey(array $ids) { return new class($ids) {
+            public function __construct(private $ids) {}
+            public function orderBy($key) { return $this; }
+            public function lockForUpdate() { \Illuminate\Support\Facades\DB::$modelLocks[] = InvoiceTransaction::class; return $this; }
+            public function get() {
+                $rows = [];
+                foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) if (in_array(crc32($key), $this->ids, true)) $rows[crc32($key)] = (object) [...$row, 'id' => crc32($key),
+                    'transaction_id' => substr($key, strpos($key, ':') + 1), 'invoice' => Invoice::findOrFail(explode(':', $key)[0]), 'gateway' => (object) ['extension' => $row['gateway'] ?? 'AeStripe']];
+                ksort($rows);
+                return array_values($rows);
+            }
+            public function update(array $values) {
+                foreach ($this->get() as $row) InvoiceTransaction::where('transaction_id', $row->transaction_id)->update($values);
+            }
+        }; }
     }
+    class PluckedIds { public function __construct(private array $ids) {} public function all() { return $this->ids; } }
 }
 namespace App\Helpers {
     class NotificationHelper {
@@ -541,11 +596,15 @@ namespace Illuminate\Support\Facades {
         public static function transactionLevel() { return self::$locked ? 1 : 0; }
         private static $afterCommit = [];
         public static function afterCommit($callback) { if (!self::$locked) $callback(); else self::$afterCommit[] = $callback; }
-        public static $locked = false, $userLocked = false;
+        public static $locked = false, $userLocked = false, $gatewayLocked = false;
         public static $modelLocks = [];
         public static function transaction($callback) {
             $priorUserLock = self::$userLocked;
+            $priorGatewayLock = self::$gatewayLocked;
             $outerLocked = self::$locked;
+            // A completed transaction's read view cannot survive into a new save transaction.
+            $agreementSnapshot = \App\Models\BillingAgreement::$snapshot;
+            if (!$outerLocked) \App\Models\BillingAgreement::$snapshot = null;
             if (!$outerLocked) self::$concurrentPayments = [];
             $callbacks = count(self::$afterCommit);
             $properties = \App\Models\User::$row?->props->values;
@@ -558,7 +617,7 @@ namespace Illuminate\Support\Facades {
             $notifications = \App\Models\Notification::$rows;
             self::$locked = true;
             try { $result = $callback(); } catch (\Throwable $e) { self::$afterCommit = array_slice(self::$afterCommit, 0, $callbacks); if (\App\Models\User::$row && $properties !== null) \App\Models\User::$row->props->values = $properties; self::$tables = $before; \App\Helpers\ExtensionHelper::$payments = array_replace($payments, self::$concurrentPayments); \App\Models\Credit::$rows = $credits; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
-            finally { self::$locked = $outerLocked; self::$userLocked = $priorUserLock; }
+            finally { self::$locked = $outerLocked; self::$userLocked = $priorUserLock; self::$gatewayLocked = $priorGatewayLock; if (!$outerLocked) \App\Models\BillingAgreement::$snapshot = $agreementSnapshot; }
             if ($hook = self::$afterTransaction) { self::$afterTransaction = null; $hook(); }
             if (!$outerLocked) { $pending = self::$afterCommit; self::$afterCommit = []; foreach ($pending as $callback) $callback(); }
             return $result;
@@ -662,7 +721,8 @@ namespace {
         }
         public function first() {
             if ($hook = self::$beforeRead) { self::$beforeRead = null; $hook(); }
-            if (!$this->locked || !\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Fee current read lock missing');
+            // Under the owner lock a plain read finds the fee row; only a row it found is then locked.
+            if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Fee current read lock missing');
             return $this->get()[0] ?? null;
         }
         public function insert($row) {

@@ -42,6 +42,21 @@ $initialRefusal = function ($invoice) use ($gateway) {
 };
 $savedService = Service::$row;
 try {
+    $run('renewal-refusal-notices', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal) {
+        $renewalFixture($invoice, $stripe); $initialRefusal($invoice);
+        $first = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+        check(count(Notification::$rows) === 1, 'The initial renewal decline sends one notice');
+        $dueRetry(); $gateway->retryChargeAttempts();
+        $second = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+        check($first['key'] !== $second['key'] && $first['intent'] !== $second['intent'],
+            'A scheduled renewal retry reserves a new checkout attempt and Stripe payment');
+        check(count(Notification::$rows) === 2 && Notification::$rows[0]['body'] === Notification::$rows[1]['body'],
+            'Two scheduled renewal declines with the same reason send two notices');
+        $gateway->webhook(eventRequest($stripe->intents[$second['intent']], type: 'payment_intent.payment_failed'));
+        $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+        check(count(Notification::$rows) === 2 && count($stripe->confirms) === 2 && !$stripe->charges,
+            'Replaying a scheduled renewal decline sends no extra notice and cannot confirm another debit');
+    });
     foreach (['2026-10-31', '2026-10-30'] as $date) {
         foreach (['succeeded', 'requires_payment_method'] as $status) {
             $run('renewal-overdue-once-' . $date . '-' . $status, function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $date, $status) {

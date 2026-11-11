@@ -114,6 +114,30 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        $run('audit-lock-scope', function () {
+            $audit = fn () => Audit::where('event', 'ae_stripe_attempt_review')->first();
+            DB::transaction(function () use ($audit) {
+                Gateway::where('extension', 'AeStripe')->lockForUpdate()->firstOrFail();
+                check($audit() === null, 'A gateway lock allows its audit read in the same transaction');
+            });
+            rejects(fn () => DB::transaction($audit), 'Review guard needs the owner lock');
+            DB::transaction(function () use ($audit) {
+                User::where('id', 7)->lockForUpdate()->firstOrFail();
+                check($audit() === null, 'An owner lock allows its audit read');
+                DB::$userLocked = false; // Simulate a caller dropping its owner lock after the earlier gateway transaction.
+                rejects($audit, 'Review guard needs the owner lock');
+            });
+            rejects(fn () => DB::transaction(function () use ($audit) {
+                App\Models\Service::whereIn('id', [41])->lockForUpdate()->first();
+                $audit();
+            }), 'Review guard needs the owner lock');
+            DB::transaction(function () use ($audit) {
+                Gateway::where('extension', 'AeStripe')->lockForUpdate()->firstOrFail();
+                DB::transaction(fn () => null);
+                check($audit() === null, 'A nested transaction retains its outer gateway lock');
+            });
+            rejects(fn () => DB::transaction($audit), 'Review guard needs the owner lock');
+        });
         require __DIR__ . '/renewal-retries.php';
         foreach (['requires_payment_method', 'requires_action', 'processing', 'partial'] as $state) {
             $run('new-card-old-form-'.$state, function ($invoice, $stripe) use ($gateway, $state) {
@@ -417,13 +441,46 @@ use Illuminate\Support\Facades\{DB, Http};
             $gateway->finishPayment(new Request(['payment_intent' => $intent->id, 'payment_intent_client_secret' => $intent->client_secret]));
             check(count($stripe->charges) === 1 && isset(ExtensionHelper::$payments['920:' . $intent->id]), 'A bound bank return can finish its original manual payment');
         });
+        $run('recovery-refusal-saved-retry', function ($invoice, $stripe) use ($gateway) {
+            $stripe->status = 'requires_payment_method';
+            $stripe->beforeConfirm = fn ($intent) => $intent->last_payment_error = (object) ['code' => 'card_declined'];
+            $key = null;
+            foreach ([new BillingAgreement, new BillingAgreement(['id' => 5, 'external_reference' => 'pm_other'])] as $index => $agreement) {
+                $stripe->loseConfirm = true;
+                paymentStops(fn () => $gateway->charge($invoice, 20, $agreement));
+                $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                $key ??= $attempt['key'];
+                check($attempt['key'] === $key && $attempt['intent'] === 'pi_test1',
+                    'Another saved method confirms the same checkout attempt and Stripe payment');
+                $gateway->retryChargeAttempts();
+                check(count(Notification::$rows) === $index + 1
+                    && Notification::$rows[$index]['title'] === 'Payment not completed'
+                    && Notification::$rows[$index]['user_id'] === 7
+                    && !empty(Notification::$rows[$index]['url']),
+                    'Recovered decline ' . ($index + 1) . ' on the same checkout attempt sends its own linked customer notice');
+                $intent = $stripe->intents['pi_test1'];
+                $gateway->webhook(eventRequest($intent, type: 'payment_intent.payment_failed'));
+                $gateway->retryChargeAttempts();
+                $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                invoke($gateway, 'notifyRecoveryRefusal', $invoice, $attempt['failure_reason'], true);
+                check(count(Notification::$rows) === $index + 1,
+                    'Replayed decline, recovery and stored refusal deliver only one notice for that decline');
+            }
+            check(Notification::$rows[0]['body'] === Notification::$rows[1]['body']
+                && count(array_filter(Audit::$rows, fn ($audit) => $audit['event'] === 'ae_stripe_payment_refused')) === 2
+                && count($stripe->confirms) === 2 && !$stripe->charges,
+                'Identical refusal text has two durable notices for two confirmations without a debit replay');
+        });
         $run('recovery-refusals', function ($invoice, $stripe) use ($gateway) {
             $stripe->loseCreate = true; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
             $stripe->failure = fn ($verb, $path) => $path === '/payment_intents' ? throw new RequestException(400) : null;
             Notification::$fail = true; $gateway->retryChargeAttempts();
             $notice = json_decode(User::$row->props->values['ae_stripe_checkout_920'] ?? 'null', true);
-            check(!empty($notice['retry']) && !empty($notice['failure_reason']) && empty($notice['agreement_id']) && empty($notice['confirmation']) && !Notification::$rows, 'A failed refusal notice keeps a durable reminder without a saved debit instruction');
-            Notification::$fail = false; $stripe->failure = null; $calls = count(Http::$calls);
+            check(!$notice && !Notification::$rows && count(array_filter(Audit::$rows, fn ($a) => $a['event'] === 'ae_stripe_payment_refused' && !$a['new_values']['notice_sent'])) === 1, 'A failed refusal notice keeps its pending audit without a saved debit instruction');
+            Notification::$fail = false;
+            foreach (Audit::$rows as &$audit) $audit['new_values']['notice_retry_at'] = 0;
+            unset($audit);
+            $stripe->failure = null; $calls = count(Http::$calls);
             $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
             check(count(Notification::$rows) === 1 && Notification::$rows[0]['user_id'] === 7 && !empty(Notification::$rows[0]['url']) && !isset(User::$row->props->values['ae_stripe_checkout_920']) && !$stripe->charges && count(Http::$calls) === $calls, 'A later pass delivers the refused-create notice once, removes its reminder and never re-debits');
             $stripe->failure = null; $gateway->pay($invoice, 20);
@@ -698,9 +755,13 @@ use Illuminate\Support\Facades\{DB, Http};
             $gateway->pay($invoice, 20);
             $stripe->failure = fn ($verb, $path) => $verb === 'get' && $path === '/payment_intents/pi_test1' ? throw new RequestException(404) : null;
             paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $locks = count(DB::$modelLocks);
             $gateway->resolveChargeAttempt($invoice, null, 'Original Stripe account support case confirms no charge');
             check(!isset(User::$row->props->values['ae_stripe_checkout_920']), 'A permanently missing ID has an audited no-charge release');
-            check(end(Audit::$rows)['new_values']['payment_intent_id'] === 'pi_test1', 'Missing-ID release audits the original identity');
+            // A locking audits read would lock the gap after the invoice's records, shared with neighbouring invoices.
+            check(!in_array(Audit::class, array_slice(DB::$modelLocks, $locks), true), 'A no-charge release checks staff reviews without audit range locks');
+            $resolved = array_values(array_filter(Audit::$rows, fn ($a) => $a['event'] === 'ae_stripe_attempt_resolved'));
+            check(end($resolved)['new_values']['payment_intent_id'] === 'pi_test1', 'Missing-ID release audits the original identity');
         });
         $run('missing-release-money', function ($invoice, $stripe) use ($gateway) {
             $stripe->status = 'processing'; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
@@ -1093,7 +1154,7 @@ use Illuminate\Support\Facades\{DB, Http};
             paymentStops(fn () => $gateway->pay($invoice, 20));
             $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
             $gateway->resolveChargeAttempt($invoice, null, 'Original account request log confirms this key never reached Stripe', '', $attempt['confirmation']['key']);
-            check(!isset(User::$row->props->values['ae_stripe_checkout_920']) && end(Audit::$rows)['new_values']['checked_confirm_key'] === $attempt['confirmation']['key'], 'No-charge resolution audits the exact confirm key staff checked in the original account');
+            check(!isset(User::$row->props->values['ae_stripe_checkout_920']) && array_values(array_filter(Audit::$rows, fn ($a) => $a['event'] === 'ae_stripe_attempt_resolved'))[0]['new_values']['checked_confirm_key'] === $attempt['confirmation']['key'], 'No-charge resolution audits the exact confirm key staff checked in the original account');
             $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
             $notice = end(Notification::$rows);
             check(!$stripe->charges && $notice['user_id'] === 7 && $notice['title'] === 'Payment not completed' && !empty($notice['url']), 'A staff release ends the renewal without re-debiting and tells the customer how to pay');
@@ -1514,7 +1575,10 @@ use Illuminate\Support\Facades\{DB, Http};
             check($gateway->charge($invoice, 20, new BillingAgreement) === true && isset(ExtensionHelper::$payments['920:pi_test1']),
                 'Inbox failure after committed settlement cannot send cron payment-failed email');
             Notification::$fail = false;
+            foreach (Audit::$rows as &$audit) $audit['new_values']['notice_retry_at'] = 0;
+            unset($audit);
             $gateway->retryReceiptReturns();
+            $gateway->retryChargeAttempts();
             check(count(Notification::$rows) === 1 && count($stripe->refunds) === 1, 'Scheduled recovery retries the failed return notice without repeating its refund');
         });
         $run('overpay-alert', function ($invoice, $stripe) use ($gateway) {

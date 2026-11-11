@@ -71,8 +71,15 @@ check(str_contains($workflow, 'PAY_PENDING_MATRIX: browser') && str_contains($wo
 if (getenv('PAY_CI_SELECTION_PARENT')) throw new RuntimeException('A matrix child fell through to the offline suite');
 // Every test file runs in CI: each job records the files its processes load, and the coverage job fails on any
 // file no job loaded (tests/ci-coverage.php). Naming a file in source, a comment or an unused branch does not count.
-check(substr_count($workflow, 'PAY_TEST_ENTERED: ${{ runner.temp }}/entered/') === 3 && str_contains($workflow, 'needs: [php, native-pending, browser]')
+check(substr_count($workflow, 'PAY_TEST_ENTERED: ${{ runner.temp }}/entered/') === 4 && str_contains($workflow, 'needs: [php, native-pending, browser, mariadb-locks]')
     && str_contains($workflow, 'php -n tests/ci-coverage.php "$RUNNER_TEMP/entered"'), 'Each CI job records its loaded test files and the coverage job fails on a file no job loaded');
+// The MariaDB lock tests run against a real database service in CI, and fail rather than skip without one.
+check(preg_match('#image: mariadb:11\.4\.5@sha256:[0-9a-f]{64}#', $workflow) && str_contains($workflow, 'tests/mariadb-locks.php') && str_contains($workflow, 'PAY_MARIADB_PORT:'),
+    'CI runs the MariaDB lock tests against a pinned MariaDB service');
+$process = proc_open([PHP_BINARY, '-n', __DIR__ . '/mariadb-locks.php'], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['redirect', 1]], $pipes, null,
+    array_diff_key(getenv(), ['PAY_MARIADB_PORT' => true, 'PAY_TEST_ENTERED' => true]));
+fclose($pipes[0]); $printed = stream_get_contents($pipes[1]); fclose($pipes[1]);
+check(proc_close($process) !== 0 && str_contains($printed, 'The MariaDB lock tests need a database') && !str_contains($printed, 'PASS:'), 'The MariaDB lock tests fail without a database');
 // Fixture children never add to this job's evidence.
 $inherited = array_diff_key(getenv(), ['PAY_TEST_ENTERED' => true, 'PAY_PENDING_MATRIX' => true]);
 $launch = function (array $command, array $environment) {
@@ -132,7 +139,8 @@ for ($run = 1; $run <= 2; ++$run) {
 $ciCoverage = require __DIR__ . '/ci-coverage.php';
 $tests = array_map('basename', array_merge(glob(__DIR__ . '/*.php'), glob(__DIR__ . '/*.mjs')));
 $jobs = ['offline' => array_values(array_diff($tests, ['receipt-returns.php', 'native-suite.php', 'setup-modal.mjs'])),
-    'native' => ['run.php', 'native-pending-matrix.php', 'native-suites.php', 'native-suite.php', 'receipt-returns.php'], 'browser' => ['setup-modal.mjs', 'entered.mjs']];
+    'native' => ['run.php', 'native-pending-matrix.php', 'native-suites.php', 'native-suite.php', 'receipt-returns.php'], 'browser' => ['setup-modal.mjs', 'entered.mjs'],
+    'mariadb' => ['entered.php', 'mariadb-locks.php', 'mariadb-app.php', 'temporary-root.php']];
 $coverage = function (array $jobs) use ($fixture, $ciCoverage) {
     $directory = $fixture . '/coverage-' . bin2hex(random_bytes(4));
     mkdir($directory);
@@ -140,13 +148,14 @@ $coverage = function (array $jobs) use ($fixture, $ciCoverage) {
     return $ciCoverage($directory);
 };
 [$problems, $suites, $support] = $coverage($jobs);
-check($problems === [] && $support === 10 && $suites + $support === count($tests), 'Coverage passes when CI jobs together loaded every test file');
+check($problems === [] && $support === 11 && $suites + $support === count($tests), 'Coverage passes when CI jobs together loaded every test file');
 $without = fn ($job, $file) => array_replace($jobs, [$job => array_values(array_diff($jobs[$job], [$file]))]);
 check($coverage($without('native', 'receipt-returns.php'))[0] === ['No CI job loaded these suites: receipt-returns.php'], 'A suite the native registry names but no job loaded fails coverage');
 check($coverage($without('browser', 'setup-modal.mjs'))[0] === ['No CI job loaded these suites: setup-modal.mjs'], 'A browser check the matrix names but no job loaded fails coverage');
 check($coverage($without('native', 'native-suite.php'))[0] === ['No CI job loaded these support files: native-suite.php'], 'A support file no job loaded fails coverage');
 check($coverage(array_replace($jobs, ['browser' => []]))[0] === ['The browser job recorded no loaded test files', 'No CI job loaded these suites: setup-modal.mjs'],
     'A job without evidence fails coverage');
+check($coverage(array_replace($jobs, ['mariadb' => []]))[0] === ['The mariadb job recorded no loaded test files'], 'A MariaDB job without evidence fails coverage');
 // Successful children record their command and selections, in both modes, with stale selectors inherited.
 $output = $fixture . '/selected';
 foreach (['php', 'node'] as $stub) {

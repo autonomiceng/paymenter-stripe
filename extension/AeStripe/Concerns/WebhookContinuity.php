@@ -14,6 +14,13 @@ trait WebhookContinuity
     private const WEBHOOK_EVENTS = 'ae_stripe_webhook_events';
     private const WEBHOOK_OVERLAP = 72 * 3600;
 
+    private function gatewayRowForUpdate(?int $id)
+    {
+        // Resolve extension before the transaction, then lock by primary key so other gateways' foreign key checks proceed.
+        // The first plain settings read must follow this lock, with no older snapshot from the gateway lookup.
+        return \App\Models\Gateway::where('extension', 'AeStripe')->where('id', $id)->lockForUpdate();
+    }
+
     private function webhookEvents(array $existing = []): array
     {
         return in_array('*', $existing, true) ? $existing : array_values(array_unique(array_merge($existing, [
@@ -24,8 +31,9 @@ trait WebhookContinuity
 
     private function reconcileWebhookSubscriptions(): void
     {
-        DB::transaction(function () {
-            $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->lockForUpdate()->first();
+        $id = \App\Models\Gateway::where('extension', 'AeStripe')->first()?->id;
+        DB::transaction(function () use ($id) {
+            $gateway = $this->gatewayRowForUpdate($id)->first();
             if (!$gateway || $gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'ready') return;
             try {
                 $state = $this->savedContinuityState(); $key = $this->config('stripe_secret_key'); $mode = $this->stripeKeyMode($key);
@@ -79,8 +87,9 @@ trait WebhookContinuity
         if (!array_filter($state['previous'] ?? [], fn ($entry) => $entry['until'] === null)) return true;
 
         // Serialize proof with settings saves so an in-flight old request cannot retire a newer secret.
-        return DB::transaction(function () use ($payload, $header) {
-            $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->lockForUpdate()->first();
+        $id = \App\Models\Gateway::where('extension', 'AeStripe')->first()?->id;
+        return DB::transaction(function () use ($payload, $header, $id) {
+            $gateway = $this->gatewayRowForUpdate($id)->first();
             $stored = $gateway?->settings()->where('key', self::WEBHOOK_STATE)->first()?->value;
             $state = $stored ? json_decode($stored, true, flags: JSON_THROW_ON_ERROR) : $this->continuityState();
             $current = $state['credentials']['stripe_webhook_secret'] ?? parent::config('stripe_webhook_secret');

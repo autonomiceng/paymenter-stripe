@@ -10,7 +10,6 @@ use App\Models\BillingAgreement;
 use App\Models\Gateway;
 use App\Models\Invoice;
 use App\Models\InvoiceTransaction;
-use App\Models\Notification;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -21,6 +20,18 @@ require_once __DIR__ . '/ReceiptReturns.php';
 trait Checkout
 {
     use ReceiptReturns;
+
+    /**
+     * Settlement reads the paid balance under the user and invoice row locks and locks only the payment rows it found
+     * (lockedTransactions), so it holds no index gap that a neighbouring invoice's payment waits on. A transaction staff
+     * add in the admin panel takes no invoice lock, so a settlement at that moment may not count it. Core code can still
+     * make this transaction a deadlock victim; MariaDB rolls all of it back, so it runs again from the settled check.
+     * Pay and the other payment lock transactions (withPaymentLock) use the same count: a rerun locks the user and invoice
+     * again and rereads the attempt and balance. Laravel reruns only the outermost transaction. A Stripe cancel or amount
+     * update inside a payment lock is its last statement, so a rerun follows only a victim before it was sent. The
+     * confirmation never reruns once it sent its update; a later victim records Stripe's answer again (confirmAttempt).
+     */
+    private const SETTLEMENT_ATTEMPTS = 3;
 
     public function pay($invoice, $total)
     {
@@ -36,7 +47,14 @@ trait Checkout
             throw new DisplayException('Could not prepare your payment. Try again.');
         }
         $intentData = $this->checkoutPaymentData($invoice, $this->toMinorUnits($total, $invoice->currency_code), $customer->id);
-        $intent = $this->checkoutIntent($invoice, $intentData, elements: true);
+        try {
+            $intent = $this->checkoutIntent($invoice, $intentData, elements: true);
+        } catch (\Throwable $e) {
+            // Every attempt was a deadlock victim and was rolled back. Opening Pay never charges, so a new try is safe.
+            if (!$this->lockConflict($e)) throw $e;
+            \Illuminate\Support\Facades\Log::warning('AeStripe Pay lock conflict', ['invoice_id' => $invoice->id]);
+            throw new DisplayException('Could not prepare your payment. Try again.');
+        }
         if ($intent->status === 'succeeded') {
             $this->recordIntentPayment($intent, 'succeeded');
             if (!InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) {
@@ -303,7 +321,7 @@ trait Checkout
             $user = User::where('id', $userId)->lockForUpdate()->firstOrFail();
             $invoice = Invoice::where('id', $intent->metadata->invoice_id)->lockForUpdate()->firstOrFail();
             $this->bindWebhookAttempt($user, $invoice, $intent);
-            if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->lockForUpdate()->first()) {
+            if ($this->lockedTransactions(InvoiceTransaction::where('transaction_id', $intent->id), 'succeeded')) {
                 $this->schedulePaymentReviewAlert($invoice, $intent->id);
                 DB::afterCommit(fn () => $this->processReceiptReturns($invoice, $intent->id));
                 return;
@@ -356,7 +374,7 @@ trait Checkout
                         array_replace($attempt, ['agreement_id' => null, 'confirmation' => null, 'retry' => $status === 'processing', 'funds_pending' => $status === 'processing' || ($intent->amount_received ?? 0) > 0]));
                 }
             }
-        });
+        }, self::SETTLEMENT_ATTEMPTS);
     }
 
     private function recordPaymentReview($invoice, $intent, string $reason): void
@@ -367,10 +385,7 @@ trait Checkout
             if (($attempt['intent'] ?? null) === $intent->id) $this->writePaymentAttempt($invoice->user, $invoice,
                 array_replace($attempt, ['state' => 'reconcile', 'reason' => $reason, 'retry' => true, 'alert_sent' => true, 'funds_pending' => true]));
         }
-        $this->schedulePaymentReviewAlert($invoice, $intent->id);
-        $review = Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
-            ->where('event', 'ae_stripe_payment_review')->where('new_values->payment_intent_id', $intent->id)->lockForUpdate()->first();
-        if (!$review) Audit::create([
+        if (!$this->invoiceAuditExists($invoice, 'ae_stripe_payment_review', ['payment_intent_id' => $intent->id])) Audit::create([
             'event' => 'ae_stripe_payment_review',
             'auditable_type' => $invoice->getMorphClass(), 'auditable_id' => $invoice->id,
             'old_values' => [],
@@ -382,38 +397,41 @@ trait Checkout
             ],
         ]);
         $key = 'ae_stripe_payment_alert_' . $invoice->id . '_' . $intent->id;
-        if (!$invoice->user->properties()->where('key', $key)->lockForUpdate()->first()) {
+        if (!$this->lockedUserProperty($invoice->user, $key)) {
             $invoice->user->properties()->updateOrCreate(['key' => $key],
                 ['value' => json_encode(['reason' => $reason, 'sent' => false], JSON_THROW_ON_ERROR)]);
         }
+        $this->schedulePaymentReviewAlert($invoice, $intent->id);
+    }
+
+    // Writers hold the owner lock before their first read. A plain read sees their records without locking
+    // the shared index gap where neighbouring invoices insert their audits.
+    private function invoiceAuditExists($invoice, string $event, array $values): bool
+    {
+        $query = Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)->where('event', $event);
+        foreach ($values as $field => $value) $query = $query->where('new_values->' . $field, $value);
+        return (bool) $query->first();
     }
 
     private function schedulePaymentReviewAlert($invoice, string $intentId): void
     {
-        // Settlement commits before any notification event can reach staff. Retrying a delivery
-        // retries the durable pending notice, including after the payment is already recorded.
-        DB::afterCommit(function () use ($invoice, $intentId) {
-            DB::transaction(function () use ($invoice, $intentId) {
-                $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
-                $key = 'ae_stripe_payment_alert_' . $invoice->id . '_' . $intentId;
-                $stored = $user->properties()->where('key', $key)->lockForUpdate()->first()?->value;
-                if (!$stored) return;
-                $alert = json_decode($stored, true, flags: JSON_THROW_ON_ERROR);
-                if ($alert['sent']) return;
-                foreach ($this->noticeStaff('invoice') as $staff) {
-                    Notification::create([
-                        'user_id' => $staff->id, 'title' => 'Stripe payment needs review',
-                        'url' => $this->adminInvoiceUrl($invoice),
-                        'body' => $this->invoiceNoticeBody('payment',
-                            'Payment on invoice ' . $this->invoiceLabel($invoice) . '.',
-                            'Invoice ' . $this->invoiceLabel($invoice) . ', payment ' . $intentId . ': ' . $alert['reason']
-                                . '. Check Stripe and choose a refund or account credit; this needs your decision.'),
-                    ]);
-                }
-                $alert['sent'] = true;
-                $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($alert, JSON_THROW_ON_ERROR)]);
-            });
-        });
+        // The caller holds the owner lock. Existing sent markers also cover pre-upgrade delivery.
+        $key = 'ae_stripe_payment_alert_' . $invoice->id . '_' . $intentId;
+        $property = $invoice->user->properties()->where('key', $key)->first();
+        if (!$property) return;
+        $alert = json_decode($property->value, true, flags: JSON_THROW_ON_ERROR);
+        if ($alert['sent']) return;
+        $audit = Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
+            ->where('event', 'ae_stripe_payment_review')->where('new_values->payment_intent_id', $intentId)->firstOrFail();
+        $this->queuePaymentNotices($audit, $this->staffPaymentNotices('invoice', [
+            'title' => 'Stripe payment needs review', 'url' => $this->adminInvoiceUrl($invoice),
+            'body' => $this->invoiceNoticeBody('payment',
+                'Payment on invoice ' . $this->invoiceLabel($invoice) . '.',
+                'Invoice ' . $this->invoiceLabel($invoice) . ', payment ' . $intentId . ': ' . $alert['reason']
+                    . '. Check Stripe and choose a refund or account credit; this needs your decision.'),
+        ]));
+        $alert['sent'] = true; // Delivery is now owned by the durable audit marker, independently of this property.
+        $invoice->user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($alert, JSON_THROW_ON_ERROR)]);
     }
 
     private function savePaidMethod($intent, $recoveryNotice = null)

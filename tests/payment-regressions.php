@@ -106,8 +106,9 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         check(ExtensionHelper::$applications === $before && $invoice->status === 'pending',
             'Refused successful payment cannot settle the invoice: ' . $reason);
         check(count(Audit::$rows) === $records + 1, 'One durable staff record per refused success: ' . $reason);
-        check(array_slice(DB::$modelLocks, $locks, 4) === [\App\Models\User::class, Invoice::class, \App\Models\InvoiceTransaction::class, Audit::class],
-            'Refused success uses the settlement lock order and a current audit read');
+        check(array_slice(DB::$modelLocks, $locks, 2) === [\App\Models\User::class, Invoice::class]
+            && !in_array(Audit::class, array_slice(DB::$modelLocks, $locks), true),
+            'Refused success uses the settlement lock order and reads its staff review under the owner lock, without audit range locks');
         $record = end(Audit::$rows);
         check($record['event'] === 'ae_stripe_payment_review' && $record['new_values']['payment_intent_id'] === $settled->id
             && $record['auditable_type'] === Invoice::class && $record['auditable_id'] === $invoice->id
@@ -116,7 +117,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
             && $record['new_values']['reason'] === $reason,
             'Staff record preserves the payment ID, owner reference and original units: ' . $reason);
         foreach ([$settled->id, '123', $settled->currency, $reason, 'refund', 'credit'] as $needle) {
-            check(str_contains(implode(' ', $record['new_values']), $needle), 'Native invoice audit detail contains ' . $needle);
+            check(str_contains(json_encode($record['new_values']), $needle), 'Native invoice audit detail contains ' . $needle);
         }
         check(!str_contains(json_encode($record), 'cus_foreign') && !str_contains(json_encode($record), $user->email),
             'Staff record excludes customer details');

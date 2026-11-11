@@ -2,7 +2,7 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
-use App\Models\{Audit, Credit, Invoice, InvoiceTransaction, Notification, User};
+use App\Models\{Audit, Credit, Invoice, InvoiceTransaction, User};
 
 trait ReceiptReversals
 {
@@ -117,7 +117,7 @@ trait ReceiptReversals
     private function receiptReversalDetails($user, $invoice, array $receipt, $row): array
     {
         [, $kind, $id] = explode(':', $row->allocation_key, 3);
-        $credit = Credit::where('user_id', $user->id)->where('currency_code', $invoice->currency_code)->lockForUpdate()->first();
+        $credit = $this->lockedCredit($user, $invoice->currency_code);
         return ['kind' => $kind, 'id' => $id, 'status' => $row->state,
             'invoice_id' => $invoice->id, 'user_id' => $user->id, 'customer' => $receipt['customer'],
             'payment_intent_id' => $receipt['payment_intent_id'], 'currency' => $receipt['currency'],
@@ -154,7 +154,7 @@ trait ReceiptReversals
         $invoice = $payment?->invoice ?? Invoice::findOrFail($row->invoice_id);
         $this->withPaymentLock($invoice, function ($user, $current) use ($id, $kind, $paymentId) {
             $receipt = $this->readReceipt($user, $paymentId);
-            $payment = InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first();
+            $payment = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentId), 'succeeded')[0] ?? null;
             abort_unless($receipt || $payment, 409);
             if ($payment) abort_unless($payment->invoice->id === $current->id && ($payment->gateway->extension ?? null) === 'AeStripe', 409);
             $intent = $this->request('get', '/payment_intents/' . $paymentId);
@@ -181,7 +181,7 @@ trait ReceiptReversals
                 : match ($latest->status ?? '') { 'won' => 'won', 'lost' => 'lost', 'warning_closed' => 'cleared',
                     'warning_needs_response', 'warning_under_review' => 'inquiry', default => 'open' };
             $key = 'stripe:' . $kind . ':' . $id;
-            $previous = $this->receiptRows()->where('payment_intent_id', $paymentId)->where('allocation_key', $key)->lockForUpdate()->first();
+            $previous = $this->lockedReceiptRow($paymentId, $key);
             $created = !empty($previous->provider_created_at) ? (int) $previous->provider_created_at : $this->providerCreatedAt($latest);
             if ($previous) {
                 abort_unless((int) $previous->amount_minor === $latest->amount, 409);
@@ -217,12 +217,12 @@ trait ReceiptReversals
                 default => $amount . ' disputed on invoice ',
             }) . $this->invoiceLabel($current) . '.';
             $this->receiptRows()->updateOrInsert(['payment_intent_id' => $paymentId, 'allocation_key' => $key], $values);
-            Audit::create(['event' => 'ae_stripe_receipt_reversal', 'auditable_type' => $current->getMorphClass(), 'auditable_id' => $current->id,
+            $audit = Audit::create(['event' => 'ae_stripe_receipt_reversal', 'auditable_type' => $current->getMorphClass(), 'auditable_id' => $current->id,
                 'old_values' => $previous ? ['status' => $previous->state] : [],
                 'new_values' => array_diff_key($details, ['id' => true]) + ['stripe_id' => $id, 'next_step' => $auditStep]]);
-            foreach ($this->noticeStaff('invoice') as $staff) Notification::create(['user_id' => $staff->id,
+            $this->queuePaymentNotices($audit, $this->staffPaymentNotices('invoice', [
                 'title' => $details['needs_review'] ? 'Stripe reversal needs review' : 'Stripe reversal cleared',
-                'url' => $this->adminInvoiceUrl($current), 'body' => $this->invoiceNoticeBody('reversal', $bellText, $auditStep)]);
+                'url' => $this->adminInvoiceUrl($current), 'body' => $this->invoiceNoticeBody('reversal', $bellText, $auditStep)]));
         });
     }
 }

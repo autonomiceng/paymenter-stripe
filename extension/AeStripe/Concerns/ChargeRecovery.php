@@ -2,7 +2,7 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
-use App\Models\{Audit, BillingAgreement, Gateway, Invoice, Notification, Property, User};
+use App\Models\{Audit, BillingAgreement, Gateway, Invoice, Property, User};
 use Illuminate\Support\Facades\DB;
 use Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException;
 
@@ -39,39 +39,32 @@ trait ChargeRecovery
         $this->withPaymentLock($invoice, function ($user, $current) {
             $attempt = $this->readPaymentAttempt($user, $current);
             if (($attempt['state'] ?? null) !== 'reconcile' || ($attempt['alert_sent'] ?? false)) return;
-            if (!Audit::where('auditable_type', $current->getMorphClass())->where('auditable_id', $current->id)
-                ->where('event', 'ae_stripe_attempt_review')->where('new_values->attempt_key', $attempt['key'])->lockForUpdate()->first()) {
-                Audit::create(['event' => 'ae_stripe_attempt_review', 'auditable_type' => $current->getMorphClass(),
-                    'auditable_id' => $current->id, 'old_values' => [], 'new_values' => [
-                        'attempt_key' => $attempt['key'], 'reason' => $attempt['reason'],
-                        'confirm_key' => $attempt['confirmation']['key'] ?? null,
-                        'resolution' => 'Use ae-stripe:resolve-charge to link the verified payment or record proof that it did not charge.',
-                    ]]);
-            }
-            DB::afterCommit(function () use ($current) {
-                try {
-                    $this->withPaymentLock($current, function ($user, $invoice) {
-                        $attempt = $this->readPaymentAttempt($user, $invoice);
-                        if (($attempt['state'] ?? null) !== 'reconcile' || ($attempt['alert_sent'] ?? false)) return;
-                        foreach ($this->noticeStaff('invoice') as $staff) Notification::create([
-                            'user_id' => $staff->id, 'title' => 'Stripe payment needs review',
-                            'body' => $this->invoiceNoticeBody('payment',
-                                'Payment on invoice ' . $this->invoiceLabel($invoice) . '.',
-                                'Invoice ' . $this->invoiceLabel($invoice) . ': ' . $attempt['reason'] . ' Use ae-stripe:resolve-charge.'),
-                            'url' => $this->adminInvoiceUrl($invoice),
-                        ]);
-                        $attempt['alert_sent'] = true;
-                        $this->writePaymentAttempt($user, $invoice, $attempt);
-                    });
-                } catch (\Throwable $e) { report($e); } // The scheduler retries delivery; never fail a settled cron payment.
-            });
+            $audit = Audit::where('auditable_type', $current->getMorphClass())->where('auditable_id', $current->id)
+                ->where('event', 'ae_stripe_attempt_review')->where('new_values->attempt_key', $attempt['key'])->first();
+            $audit ??= Audit::create(['event' => 'ae_stripe_attempt_review', 'auditable_type' => $current->getMorphClass(),
+                'auditable_id' => $current->id, 'old_values' => [], 'new_values' => [
+                    'attempt_key' => $attempt['key'], 'reason' => $attempt['reason'],
+                    'confirm_key' => $attempt['confirmation']['key'] ?? null,
+                    'resolution' => 'Use ae-stripe:resolve-charge to link the verified payment or record proof that it did not charge.',
+                ]]);
+            $this->queuePaymentNotices($audit, $this->staffPaymentNotices('invoice', [
+                'title' => 'Stripe payment needs review',
+                'body' => $this->invoiceNoticeBody('payment',
+                    'Payment on invoice ' . $this->invoiceLabel($current) . '.',
+                    'Invoice ' . $this->invoiceLabel($current) . ': ' . $attempt['reason'] . ' Use ae-stripe:resolve-charge.'),
+                'url' => $this->adminInvoiceUrl($current),
+            ]));
+            $this->writePaymentAttempt($user, $current, array_replace($attempt, ['alert_sent' => true]));
         });
     }
 
     public function retryChargeAttempts(): void
     {
         $collect = $this->gatewayEnabled();
-        if ($collect) $this->retryPaymentReviewAlerts();
+        if ($collect) {
+            $this->retryPaymentNotices();
+            $this->retryPaymentReviewAlerts();
+        }
         $this->paymentStripeUnavailable = false;
         foreach (Property::where('key', 'like', 'ae_stripe_checkout_%')
             ->orderByRaw('CASE WHEN value LIKE ? OR value NOT LIKE ? OR (value LIKE ? AND value NOT LIKE ?) THEN 0 ELSE 1 END',
@@ -168,65 +161,63 @@ trait ChargeRecovery
 
     private function notifyRecoveryRefusal($invoice, string $reason, bool $storedRefusal = false): void
     {
-        $this->withPaymentLock($invoice, function ($user, $current) use ($reason, $storedRefusal) {
+        $eventKey = 'refusal_' . bin2hex(random_bytes(16));
+        $this->withPaymentLock($invoice, function ($user, $current) use ($reason, $storedRefusal, $eventKey) {
             $attempt = $this->readPaymentAttempt($user, $current);
             if ($storedRefusal && ($attempt['failure_reason'] ?? null) !== $reason) return;
             if (!$attempt) {
-                DB::afterCommit(fn () => $this->notifyUnpaidInvoice($current, $reason));
+                DB::afterCommit(fn () => $this->notifyUnpaidInvoice($current, $reason, $eventKey));
                 return;
             }
             if (!empty($attempt['failure_notified'])) return;
-            $this->writePaymentAttempt($user, $current, array_replace($attempt, [
-                'agreement_id' => null, 'confirmation' => null, 'retry' => true, 'failure_reason' => $reason,
+            $this->queueRefusalNotice($current, $reason, $attempt['refusal_key'] ?? $attempt['key'] ?? '');
+            if (!empty($attempt['notice_only'])) $user->properties()->where('key', 'ae_stripe_checkout_' . $current->id)->delete();
+            else $this->writePaymentAttempt($user, $current, array_replace($attempt, [
+                'agreement_id' => null, 'confirmation' => null, 'failure_reason' => $reason, 'failure_notified' => true, 'retry' => false,
             ]));
-            DB::afterCommit(function () use ($current, $reason) {
-                try {
-                    $this->withPaymentLock($current, function ($user, $invoice) use ($reason) {
-                        $attempt = $this->readPaymentAttempt($user, $invoice);
-                        if (!$attempt || ($attempt['failure_reason'] ?? null) !== $reason || !empty($attempt['failure_notified'])) return;
-                        Notification::create(['user_id' => $user->id, 'title' => 'Payment not completed',
-                            'body' => $reason, 'url' => route('invoices.show', $invoice)]);
-                        if (!empty($attempt['notice_only'])) $user->properties()->where('key', 'ae_stripe_checkout_' . $invoice->id)->delete();
-                        else $this->writePaymentAttempt($user, $invoice, array_replace($attempt, ['failure_notified' => true, 'retry' => false]));
-                    });
-                } catch (\Throwable $e) { report($e); }
-            });
         });
     }
 
-    private function notifyUnpaidInvoice($invoice, string $reason): void
+    private function notifyUnpaidInvoice($invoice, string $reason, string $eventKey): void
     {
         try {
-            $this->withPaymentLock($invoice, function ($user, $current) use ($reason) {
-                if ($current->status === 'pending' && $this->paymentBalance($current) > 0) Notification::create([
-                    'user_id' => $user->id, 'title' => 'Payment not completed',
-                    'body' => $reason, 'url' => route('invoices.show', $current),
-                ]);
+            $this->withPaymentLock($invoice, function ($user, $current) use ($reason, $eventKey) {
+                if ($current->status === 'pending' && $this->paymentBalance($current) > 0) $this->queueRefusalNotice($current, $reason, $eventKey);
             });
         } catch (\Throwable $e) { report($e); }
     }
 
+    private function queueRefusalNotice($invoice, string $reason, string $eventKey): void
+    {
+        $key = hash('sha256', $eventKey . ':' . $reason);
+        $audit = Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
+            ->where('event', 'ae_stripe_payment_refused')->where('new_values->notice_key', $key)->first();
+        $audit ??= Audit::create(['event' => 'ae_stripe_payment_refused', 'auditable_type' => $invoice->getMorphClass(),
+            'auditable_id' => $invoice->id, 'old_values' => [], 'new_values' => ['notice_key' => $key]]);
+        $this->queuePaymentNotices($audit, [['user_id' => $invoice->user_id, 'title' => 'Payment not completed',
+            'body' => $reason, 'url' => route('invoices.show', $invoice)]]);
+    }
+
     private function notifyPaymentAccessRefusal(): void
     {
-        // Only staff can restore Stripe access. One alert per configured key, across invoices.
         DB::afterCommit(function () {
             try {
-                DB::transaction(function () {
-                    $gateway = Gateway::where('extension', 'AeStripe')->lockForUpdate()->firstOrFail();
+                $id = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+                DB::transaction(function () use ($id) {
+                    $gateway = $this->gatewayRowForUpdate($id)->firstOrFail();
                     $fingerprint = hash('sha256', $this->config('stripe_secret_key'));
-                    if (Audit::where('auditable_type', $gateway->getMorphClass())->where('auditable_id', $gateway->id)
-                        ->where('event', 'ae_stripe_access_refused')->where('new_values->key_fingerprint', $fingerprint)->lockForUpdate()->first()) return;
-                    Audit::create(['event' => 'ae_stripe_access_refused', 'auditable_type' => $gateway->getMorphClass(),
-                        'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => ['key_fingerprint' => $fingerprint]]);
-                    foreach ($this->noticeStaff('gateway') as $staff) {
-                        Notification::create([
-                            'user_id' => $staff->id, 'title' => 'Stripe access needs attention',
-                            'body' => 'Stripe refused payment checks. Check the API key and its permissions.',
-                            'url' => url('/admin/gateways/' . $gateway->id . '/edit'),
-                        ]);
-                    }
+                    $audit = Audit::where('auditable_type', $gateway->getMorphClass())->where('auditable_id', $gateway->id)
+                        ->where('event', 'ae_stripe_access_refused')->where('new_values->key_fingerprint', $fingerprint)->first();
+                    $audit ??= Audit::create(['event' => 'ae_stripe_access_refused', 'auditable_type' => $gateway->getMorphClass(),
+                        'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => ['key_fingerprint' => $fingerprint, 'notice_sent' => false]]);
+                    if ($audit->new_values['notice_sent'] ?? true) return;
+                    $this->queuePaymentNotices($audit, $this->staffPaymentNotices('gateway', [
+                        'title' => 'Stripe access needs attention',
+                        'body' => 'Stripe refused payment checks. Check the API key and its permissions.',
+                        'url' => url('/admin/gateways/' . $gateway->id . '/edit'),
+                    ]));
                 });
-            } catch (\Throwable $e) { report($e); } // Failed delivery rolls back the marker; the next refused check retries.
+            } catch (\Throwable $e) { report($e); }
         });
     }
 
@@ -278,8 +269,7 @@ trait ChargeRecovery
                     throw new \App\Exceptions\DisplayException('A debit was sent for ' . ($attempt['intent'] ?? '(missing ID)') . '. In the original Stripe account, open it in Workbench Inspector > Logs and read request details for confirm key ' . ($attempt['confirmation']['key'] ?? '(missing)') . '. Logs must cover ' . gmdate('Y-m-d H:i', $attempt['created']) . ' UTC onward. If you cannot verify the key there, get Stripe support proof for that account, payment, key and dates. Use --checked-confirm-key only with proof it never reached Stripe.');
                 }
                 if (!empty($attempt['funds_pending'])
-                    || Audit::where('auditable_type', $current->getMorphClass())->where('auditable_id', $current->id)
-                        ->where('event', 'ae_stripe_payment_review')->where('new_values->payment_intent_id', $attempt['intent'] ?? '')->lockForUpdate()->first()
+                    || $this->invoiceAuditExists($current, 'ae_stripe_payment_review', ['payment_intent_id' => $attempt['intent'] ?? ''])
                     || \App\Models\InvoiceTransaction::where('transaction_id', $attempt['intent'] ?? '')->where('status', 'processing')->exists()
                     || \App\Models\InvoiceTransaction::where('transaction_id', $attempt['intent'] ?? '')->where('status', 'succeeded')->exists()) {
                     throw new \App\Exceptions\DisplayException('This payment may still hold money. Restore access to its Stripe account and account for the funds first.');
@@ -287,20 +277,19 @@ trait ChargeRecovery
                 if (isset($attempt['intent']) && $missingId !== $attempt['intent'] || strlen(trim($evidence)) < 12) throw new \App\Exceptions\DisplayException('Link the payment, or provide proof from the original Stripe account that no charge was made.');
                 $user->properties()->where('key', 'ae_stripe_checkout_' . $current->id)->delete();
             }
-            Audit::create(['event' => 'ae_stripe_attempt_resolved', 'auditable_type' => $current->getMorphClass(),
+            $resolution = Audit::create(['event' => 'ae_stripe_attempt_resolved', 'auditable_type' => $current->getMorphClass(),
                 'auditable_id' => $current->id, 'old_values' => [], 'new_values' => [
                     'attempt_key' => $attempt['key'], 'payment_intent_id' => $intent?->id ?? $missingId, 'evidence' => $accountedEvidence ?: $evidence,
                     'funds_accounted' => $accountedEvidence !== '', 'checked_confirm_key' => $checkedConfirmKey ?: null,
                 ]]);
-            if (!$intent || $accountedEvidence !== '') DB::afterCommit(fn () => $this->notifyUnpaidInvoice($current, 'Payment not completed. Open the invoice to pay the amount still due.'));
+            if (!$intent || $accountedEvidence !== '') DB::afterCommit(fn () => $this->notifyUnpaidInvoice($current,
+                'Payment not completed. Open the invoice to pay the amount still due.', 'resolution_' . $resolution->id));
         });
     }
 
     private function paymentManuallyAccounted($invoice, string $intentId): bool
     {
-        return (bool) Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
-            ->where('event', 'ae_stripe_attempt_resolved')->where('new_values->payment_intent_id', $intentId)
-            ->where('new_values->funds_accounted', true)->lockForUpdate()->first();
+        return $this->invoiceAuditExists($invoice, 'ae_stripe_attempt_resolved', ['payment_intent_id' => $intentId, 'funds_accounted' => true]);
     }
 
     private function bindWebhookAttempt($user, $invoice, $intent, ?string $requestKey = null): void

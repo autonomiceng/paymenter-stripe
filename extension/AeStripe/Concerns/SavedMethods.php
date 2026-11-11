@@ -168,7 +168,7 @@ trait SavedMethods
                     $row = BillingAgreement::withTrashed()->where('external_reference', $match->external_reference)->lockForUpdate()->first();
                     if (!$row || $row->id != $match->id) return false;
                 }
-                $old = json_decode($user->properties()->where('key', $journalKey)->lockForUpdate()->first()?->value ?? 'null', true);
+                $old = json_decode($this->lockedUserProperty($user, $journalKey)?->value ?? 'null', true);
                 $journal = ['user_id' => $user->id, 'gateway_id' => $gateway->id, 'customer' => $customer,
                     'identity' => $identity, 'copies' => [], 'detached' => []];
                 if (($old['customer'] ?? null) === $customer && ($old['gateway_id'] ?? null) == $gateway->id) {
@@ -292,7 +292,7 @@ trait SavedMethods
             User::where('id', $user->id)->lockForUpdate()->firstOrFail();
             if (!$receipt) {
                 $sequenceKey = 'ae_stripe_save_sequence';
-                $sequence = 1 + (int) ($user->properties()->where('key', $sequenceKey)->lockForUpdate()->first()?->value ?? 0);
+                $sequence = 1 + (int) ($this->lockedUserProperty($user, $sequenceKey)?->value ?? 0);
                 $user->properties()->updateOrCreate(['key' => $sequenceKey], ['value' => (string) $sequence]);
                 $receipt = ['incoming' => $incomingId, 'consent' => $consent + ['accepted_at' => time(), 'user_id' => $user->id, 'sequence' => $sequence]];
                 $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($receipt, JSON_THROW_ON_ERROR)]);
@@ -358,7 +358,11 @@ trait SavedMethods
         // Validate globally unique references before any provider writes, including removed or foreign rows.
         $validate = function (bool $checkRows = true, array $references = []) use ($user, $gateway, $customer, $incomingId, $rows) {
             foreach (array_unique([$incomingId, ...$references]) as $reference) {
-                $row = BillingAgreement::withTrashed()->where('external_reference', $reference)->lockForUpdate()->first();
+                // The owner lock precedes the first plain read in each validation transaction. Resolve the id without
+                // locking a missing reference's gap, then lock only an existing row and recheck its current identity.
+                $id = BillingAgreement::withTrashed()->where('external_reference', $reference)->first()?->id;
+                $row = $id ? BillingAgreement::withTrashed()->where('id', $id)->where('external_reference', $reference)->lockForUpdate()->first() : null;
+                if ($id && !$row) throw new SavedMethodRetryException('Saved payment methods changed. Try again.');
                 if ($row && ($row->user_id != $user->id || $row->gateway_id != $gateway->id)) {
                     throw new DisplayException('This payment method can\'t be used on this account. Add a new payment method.');
                 }
@@ -368,7 +372,14 @@ trait SavedMethods
                 }
             }
             if (!$checkRows) return;
-            $current = BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->get();
+            $current = [];
+            foreach (BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->get() as $candidate) {
+                $row = BillingAgreement::where('id', $candidate->id)->where('external_reference', $candidate->external_reference)->lockForUpdate()->first();
+                if (!$row || $row->user_id != $user->id || $row->gateway_id != $gateway->id) {
+                    throw new SavedMethodRetryException('Saved payment methods changed. Try again.');
+                }
+                $current[] = $row;
+            }
             $references = static function ($items) {
                 $result = [];
                 foreach ($items as $item) $result[$item->id] = $item->external_reference;
