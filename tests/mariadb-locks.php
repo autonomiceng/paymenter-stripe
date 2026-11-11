@@ -76,6 +76,8 @@ $GLOBALS['stripeHandler'] = function ($verb, $path, $data) {
         if (($id[2] ?? '') === '/confirm') throw new StripeFixtureError(402, ['error' => ['code' => 'card_declined', 'decline_code' => 'insufficient_funds']]);
         return $intent;
     }
+    if (preg_match('#^/payment_methods/(pm_(\\d+))$#', $path, $id)) return ['id' => $id[1], 'customer' => 'cus_' . $id[2],
+        'type' => 'card', 'card' => ['brand' => 'visa', 'last4' => '4242', 'fingerprint' => 'card_' . $id[2], 'exp_year' => 2030, 'exp_month' => 5]];
     if ($verb === 'get' && preg_match('#^/balance_transactions/(txn_\d+)$#', $path, $id)) return ['id' => $id[1], 'fee' => 50, 'currency' => 'usd'];
     if ($verb === 'get' && $path === '/refunds') return ['has_more' => false, 'data' => []];
     if ($verb === 'get' && preg_match('#^/refunds/re_(\d+)$#', $path, $id)) return ['id' => 're_' . $id[1], 'payment_intent' => 'pi_' . $id[1],
@@ -91,8 +93,50 @@ $GLOBALS['stripeHandler'] = function ($verb, $path, $data) {
 $attempt = fn (int $user, int $invoice) => json_decode(User::find($user)->properties()->where('key', 'ae_stripe_checkout_' . $invoice)->value('value') ?? 'null', true);
 $rows = fn (int $invoice) => DB::table('invoice_transactions')->where('invoice_id', $invoice)->orderBy('id')->get(['amount', 'status', 'is_credit_transaction'])
     ->map(fn ($row) => [(float) $row->amount, $row->status, (bool) $row->is_credit_transaction])->all();
+$payAndSave = function ($gateway, int $userId, int $invoiceId) {
+    config(['cache.default' => 'database']);
+    Illuminate\Support\Facades\Event::listen(Illuminate\Log\Events\MessageLogged::class, fn ($event) => fwrite(STDERR, $event->message . ' ' . json_encode($event->context) . "\n"));
+    auth()->login(User::find($userId));
+    $page = $gateway->finishPayment(Illuminate\Http\Request::create('/', 'GET', ['invoice' => $invoiceId,
+        'payment_intent' => 'pi_' . $invoiceId, 'payment_intent_client_secret' => 'pi_secret']));
+    return $page instanceof Illuminate\Http\RedirectResponse ? 'redirect' : $page->getData()['message'];
+};
+$defaultStripe = $GLOBALS['stripeHandler'];
+$GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($defaultStripe) {
+    if (preg_match('#^/payment_methods/pm_(80[12])$#', $path, $id)) return [
+        'id' => 'pm_' . $id[1], 'customer' => 'cus_' . ($id[1] === '801' ? 7 : 8), 'type' => 'card',
+        'card' => ['brand' => 'visa', 'last4' => '4242', 'exp_month' => 5, 'exp_year' => 2030, 'fingerprint' => 'fingerprint' . $id[1]],
+        'allow_redisplay' => 'always'];
+    $answer = $defaultStripe($verb, $path, $data, $request);
+    if ($verb === 'get' && preg_match('#^/payment_intents/pi_(80[12])$#', $path, $id)) {
+        $answer->metadata->ae_stripe_consent = '1';
+        $answer->metadata->ae_stripe_consent_at = (string) time();
+        $answer->payment_method = 'pm_' . $id[1];
+        $answer->payment_method_options = (object) ['card' => (object) ['setup_future_usage' => 'off_session']];
+    }
+    return $answer;
+};
 $cases = [
-    // Audited settlement and missing-subscription review, using the review fixture with normal web auditing.
+    // Both public Pay returns finish preparation before overlapping final card saves.
+    'pay-return-card-save' => ['audit' => true, 'prepared_b' => true, 'seed' => function () {
+            foreach (['cache' => false, 'cache_locks' => true] as $table => $locks) {
+                Illuminate\Support\Facades\Schema::create($table, function ($schema) use ($locks) {
+                    $schema->string('key')->primary();
+                    if ($locks) $schema->string('owner'); else $schema->text('value');
+                    $schema->integer('expiration');
+                });
+            }
+            customerInvoice(7, 801); customerInvoice(8, 802);
+        },
+        'pause' => '/^insert into `billing_agreements`/',
+        'a' => fn ($gateway) => $payAndSave($gateway, 7, 801),
+        'b' => fn ($gateway) => $payAndSave($gateway, 8, 802),
+        'check' => fn ($results) => $results['a']['ok'] === 'redirect' && $results['b']['ok'] === 'redirect'
+            && Invoice::whereIn('id', [801, 802])->where('status', 'paid')->count() === 2
+            && App\Models\BillingAgreement::orderBy('user_id')->get()->map(fn ($row) => [$row->user_id, $row->external_reference])->all()
+                === [[7, 'pm_801'], [8, 'pm_802']]
+            && DB::table('audits')->where('auditable_type', App\Models\Property::class)->count() > 0],
+    // Audited settlement against a missing-subscription review, with normal web auditing.
     'subscription-review-vs-settlement' => [
         'seed' => function () {
             customerInvoice(7, 801);
@@ -183,6 +227,26 @@ $cases = [
         'b' => fn () => App\Helpers\ExtensionHelper::addPayment(814, 'Other', 20, null, 'other_814')->id,
         'check' => fn ($results) => $results['a']['ok'] === true && $rows(814) === [[20.0, 'succeeded', false]]
             && Invoice::find(814)->status === 'paid'],
+    // Different customers have different save/cache locks. Exercise persistence directly: A has validated its absent
+    // agreement and pauses before inserting; B must save its first card without a shared empty-index gap deadlock.
+    'saved-cards' => ['seed' => function () { customerInvoice(7, 821); customerInvoice(8, 822); },
+        'pause' => '/^insert into `billing_agreements`/',
+        'a' => fn ($gateway) => invoke($gateway, 'persistSavedMethod', User::find(7), (object) ['id' => 'pm_7'], ['source' => 'seti_7']),
+        'b' => fn ($gateway) => invoke($gateway, 'persistSavedMethod', User::find(8), (object) ['id' => 'pm_8'], ['source' => 'seti_8']),
+        'check' => fn () => App\Models\BillingAgreement::orderBy('user_id')->get()->map(fn ($row) => [$row->user_id, $row->external_reference])->all()
+            === [[7, 'pm_7'], [8, 'pm_8']]
+            && DB::table('properties')->where('key', 'like', 'ae_stripe_saved_%')->count() === 2],
+    // An earlier completed read must not hide a save committed while the second request waits for the owner.
+    'saved-cards-duplicate' => ['seed' => fn () => customerInvoice(7, 823), 'waits' => true,
+        'pause' => '/^insert into `billing_agreements`/',
+        'a' => fn ($gateway) => invoke($gateway, 'persistSavedMethod', User::find(7), (object) ['id' => 'pm_7'], ['source' => 'seti_7']),
+        'b' => function ($gateway) {
+            DB::transaction(fn () => App\Models\BillingAgreement::count());
+            return invoke($gateway, 'persistSavedMethod', User::find(7), (object) ['id' => 'pm_7'], ['source' => 'seti_7']);
+        },
+        'check' => fn () => App\Models\BillingAgreement::count() === 1
+            && App\Models\BillingAgreement::first()->external_reference === 'pm_7'
+            && DB::table('properties')->where('key', 'like', 'ae_stripe_saved_%')->count() === 1],
     // Two customers open Pay on invoices with no stored attempt; each reserves its attempt row in the properties index.
     'pay-pay' => ['seed' => function () { customerInvoice(7, 301); customerInvoice(8, 302); },
         'pause' => '/^insert into `properties`/',
@@ -314,6 +378,13 @@ if (($argv[1] ?? null) === 'worker') {
         config(['audit.enabled' => true, 'audit.console' => true]);
         App\Models\Property::observe(OwenIt\Auditing\AuditableObserver::class);
     }
+    if ($argv[3] === 'b' && !empty($case['prepared_b'])) {
+        pauseBefore('/^final-save$/');
+        $userLocks = 0;
+        DB::connection()->beforeExecuting(function ($sql) use (&$userLocks) {
+            if (preg_match('/^select .* from `users`.*for update$/', $sql) && ++$userLocks === 7) pausePoint('final-save');
+        });
+    }
     if ($argv[3] === 'a') pauseBefore($case['pause']);
     fwrite(STDOUT, 'ready ' . DB::selectOne('select connection_id() as id')->id . "\n"); fflush(STDOUT);
     try { $result = ['ok' => $case[$argv[3]]($gateway)]; } catch (Throwable $e) { $result = ['error' => get_class($e) . ': ' . $e->getMessage()]; }
@@ -337,23 +408,25 @@ foreach ($cases as $name => $case) {
     if (getenv('PAY_MARIADB_CASE') && !in_array($name, explode(',', getenv('PAY_MARIADB_CASE')), true)) continue;
     DB::statement('set foreign_key_checks = 0');
     foreach (['invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
-        'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users'] as $table) DB::table($table)->truncate();
+        'billing_agreements', 'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users'] as $table) DB::table($table)->truncate();
     DB::statement('set foreign_key_checks = 1');
     DB::table('settings')->where('key', 'ae_stripe_webhook_continuity')->delete();
     DB::table('settings')->where('key', 'ae_stripe_webhook_events')->update(['value' => 'ready']);
     $case['seed']();
     $before = $deadlocks();
     $workers = [];
-    foreach (['a', 'b'] as $role) {
+    foreach (!empty($case['prepared_b']) ? ['b', 'a'] : ['a', 'b'] as $role) {
         $process = proc_open([$php, '-d', 'auto_prepend_file=' . __DIR__ . '/entered.php', '-d', 'memory_limit=256M', __FILE__, 'worker', $name, $role],
             [0 => ['pipe', 'r'], 1 => ['pipe', 'w']], $pipes); // Errors go to the inherited stderr; passing it would rewind a log file.
         $workers[$role] = [$process, $pipes[0], $pipes[1], (int) substr(workerLine([$process, $pipes[0], $pipes[1]]), 6)];
+        if ($role === 'b' && !empty($case['prepared_b'])) check(workerLine($workers['b']) === 'paused', $name . ': B prepares consent before its final save locks');
         if ($role === 'a') check(($line = workerLine($workers['a'])) === 'paused', $name . ': request A reaches its pause point: ' . $line);
     }
     // B runs until it finishes or waits on a lock that A holds. The InnoDB transaction list can leave out a session waiting to
     // insert, so a statement still running after 1.5 seconds on this small database also counts as a lock wait.
     $waiting = fn () => (bool) DB::selectOne("select count(*) as n from information_schema.innodb_trx where trx_mysql_thread_id = ? and trx_state = 'LOCK WAIT'", [$workers['b'][3]])->n
         || (bool) DB::selectOne("select count(*) as n from information_schema.processlist where id = ? and command in ('Query', 'Execute') and time_ms > 1500", [$workers['b'][3]])->n;
+    if (!empty($case['prepared_b'])) fwrite($workers['b'][1], "go\n");
     $early = workerLine($workers['b'], $waiting);
     fwrite($workers['a'][1], "go\n");
     $results = ['a' => json_decode(substr(workerLine($workers['a']), 5), true),
@@ -361,6 +434,8 @@ foreach ($cases as $name => $case) {
     foreach ($workers as $worker) { fclose($worker[1]); fclose($worker[2]); proc_close($worker[0]); }
     echo $name . ': B ' . ($early === null ? 'waited on A' : 'finished while A was paused') . "\n";
     echo $name . ': requests ' . json_encode($results) . '; deadlocks=' . ($deadlocks() - $before) . "\n";
+    if (!empty($case['prepared_b'])) echo $name . ': saved_cards=' . DB::table('billing_agreements')->count()
+        . '; paid_invoices=' . Invoice::where('status', 'paid')->count() . "\n";
     check(($early === null) === !empty($case['waits']), $name . ': B ' . (empty($case['waits']) ? 'never waits on A' : 'waits on A'));
     check(isset($results['a']['ok'], $results['b']['ok']), $name . ': both requests finish: ' . json_encode($results));
     check($deadlocks() - $before === ($case['deadlocks'] ?? 0), $name . ': InnoDB reports ' . ($case['deadlocks'] ?? 0) . ' deadlocks between the two');

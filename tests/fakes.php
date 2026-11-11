@@ -573,6 +573,9 @@ namespace Illuminate\Support\Facades {
         public static function transaction($callback) {
             $priorUserLock = self::$userLocked;
             $outerLocked = self::$locked;
+            // A completed transaction's read view cannot survive into a new save transaction.
+            $agreementSnapshot = \App\Models\BillingAgreement::$snapshot;
+            if (!$outerLocked) \App\Models\BillingAgreement::$snapshot = null;
             if (!$outerLocked) self::$concurrentPayments = [];
             $callbacks = count(self::$afterCommit);
             $properties = \App\Models\User::$row?->props->values;
@@ -585,7 +588,7 @@ namespace Illuminate\Support\Facades {
             $notifications = \App\Models\Notification::$rows;
             self::$locked = true;
             try { $result = $callback(); } catch (\Throwable $e) { self::$afterCommit = array_slice(self::$afterCommit, 0, $callbacks); if (\App\Models\User::$row && $properties !== null) \App\Models\User::$row->props->values = $properties; self::$tables = $before; \App\Helpers\ExtensionHelper::$payments = array_replace($payments, self::$concurrentPayments); \App\Models\Credit::$rows = $credits; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
-            finally { self::$locked = $outerLocked; self::$userLocked = $priorUserLock; }
+            finally { self::$locked = $outerLocked; self::$userLocked = $priorUserLock; if (!$outerLocked) \App\Models\BillingAgreement::$snapshot = $agreementSnapshot; }
             if ($hook = self::$afterTransaction) { self::$afterTransaction = null; $hook(); }
             if (!$outerLocked) { $pending = self::$afterCommit; self::$afterCommit = []; foreach ($pending as $callback) $callback(); }
             return $result;
