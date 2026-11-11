@@ -79,6 +79,11 @@ trait CheckoutIntent
                         $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
                     }
                     if (($fresh->amount_received ?? 0) !== 0 || !$this->paymentAttemptFailed($stored, $fresh)) return false;
+                    // A rolled-back confirmation can still have its earlier refusal under the intent ID.
+                    if (!empty($stored['confirmation']['previous_charge'])
+                        && $stored['confirmation']['previous_charge'] !== ($fresh->latest_charge ?? null)) {
+                        $this->keepFailedAttempt((object) ['id' => $fresh->id, 'latest_charge' => $stored['confirmation']['previous_charge']]);
+                    }
                     // Keep the claimed confirmation until refusal and renewal policy commit together.
                     $this->recordIntentPayment($fresh, 'failed');
                     return $fresh;
@@ -517,23 +522,28 @@ trait CheckoutIntent
             $expectedAmount = $attempt['confirmation']['amount'];
         }
         $writeStarted = false;
+        $previous = null;
         // Records Stripe's answer: a proven refusal ends this confirmation, and a declined renewal is recorded as failed.
         // The refusal, the failed payment and the renewal policy commit in one owner and invoice transaction, or not at all.
-        $record = fn ($outcome) => $this->withPaymentLock($invoice, function () use ($outcome, $invoice, $attempt) {
-            if (is_array($outcome)) {
-                [$fresh, $e] = [$outcome['refused'], $outcome['error']];
-                $this->storePaymentAttempt($invoice, $attempt, ['retry' => false, 'confirmation' => null, 'agreement_id' => null], confirmationOnly: true);
-                $declined = $fresh->status === 'requires_payment_method' && ($e->response->status() === 402 || !empty($fresh->last_payment_error));
-                if ($declined) $this->recordIntentPayment($fresh, 'failed');
-                $reason = $this->paymentRefusalReason($e, $invoice, $fresh->last_payment_error->code ?? null, $fresh->last_payment_error->decline_code ?? null);
-                return $declined ? new PaymentDeclinedException($reason) : new DisplayException($reason);
-            }
-            if (!empty($attempt['automatic_renewal']) && $outcome->status === 'requires_payment_method'
-                && ($outcome->amount_received ?? 0) === 0 && !empty($outcome->last_payment_error)) $this->recordIntentPayment($outcome, 'failed');
-            return $outcome;
-        });
+        $record = function ($outcome) use ($invoice, $attempt, &$previous) {
+            return $this->withPaymentLock($invoice, function () use ($outcome, $invoice, $attempt, $previous) {
+                // Repeat the idempotent re-key if the confirmation transaction rolled back.
+                if ($previous) $this->keepFailedAttempt($previous);
+                if (is_array($outcome)) {
+                    [$fresh, $e] = [$outcome['refused'], $outcome['error']];
+                    $this->storePaymentAttempt($invoice, $attempt, ['retry' => false, 'confirmation' => null, 'agreement_id' => null], confirmationOnly: true);
+                    $declined = $fresh->status === 'requires_payment_method' && ($e->response->status() === 402 || !empty($fresh->last_payment_error));
+                    if ($declined) $this->recordIntentPayment($fresh, 'failed');
+                    $reason = $this->paymentRefusalReason($e, $invoice, $fresh->last_payment_error->code ?? null, $fresh->last_payment_error->decline_code ?? null);
+                    return $declined ? new PaymentDeclinedException($reason) : new DisplayException($reason);
+                }
+                if (!empty($attempt['automatic_renewal']) && $outcome->status === 'requires_payment_method'
+                    && ($outcome->amount_received ?? 0) === 0 && !empty($outcome->last_payment_error)) $this->recordIntentPayment($outcome, 'failed');
+                return $outcome;
+            });
+        };
         $outcome = null;
-        $confirm = function ($user, $current) use ($attempt, $intentId, $params, $agreement, $expectedAmount, $expectedCurrency, &$writeStarted, &$outcome, $record) {
+        $confirm = function ($user, $current) use ($attempt, $intentId, $params, $agreement, $expectedAmount, $expectedCurrency, &$writeStarted, &$outcome, &$previous, $record) {
             $stored = $this->readPaymentAttempt($user, $current);
             if (($stored['confirmation']['key'] ?? null) !== $attempt['confirmation']['key']) return null;
             try {
@@ -572,6 +582,7 @@ trait CheckoutIntent
                     if (array_key_exists($field, $params)) { $updates[$field] = $params[$field]; unset($params[$field]); }
                 }
                 $this->keepFailedAttempt($intent);
+                $previous = clone $intent;
                 $writeStarted = true;
                 $this->request('post', '/payment_intents/' . $intentId, $updates);
                 $outcome = $this->request('post', '/payment_intents/' . $intentId . '/confirm', $params, $attempt['confirmation']['key']);
