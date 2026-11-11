@@ -137,6 +137,28 @@ function invoiceStaff(): void
     foreach ([7, 8] as $id) User::find($id)->update(['role_id' => $role->id]);
 }
 $cases = [
+    'refusal-events' => ['seed' => function () {
+        customerInvoice(7, 591); customerInvoice(8, 592);
+    }, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
+        $fail = true;
+        App\Models\Notification::created(function () use (&$fail) {
+            if ($fail) { $fail = false; throw new RuntimeException('First refusal delivery interrupted'); }
+        });
+        foreach (['first', 'second'] as $event) {
+            User::find(7)->properties()->create(['key' => 'ae_stripe_checkout_591', 'value' => json_encode([
+                'version' => 2, 'key' => 'checkout_' . $event, 'state' => 'reconcile'])]);
+            $gateway->resolveChargeAttempt(Invoice::find(591), null, 'Verified no charge in the original account');
+            if ($event === 'first') check(App\Models\Audit::where('event', 'ae_stripe_payment_refused')
+                ->where('new_values->notice_sent', false)->count() === 1, 'Failed refusal delivery retains its own retry marker');
+        }
+        invoke($gateway, 'retryPaymentNotices');
+        invoke($gateway, 'retryPaymentNotices');
+        return 'resolved';
+    }, 'b' => fn ($gateway) => settle($gateway, 592),
+    'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_attempt_resolved')->count() === 2
+        && App\Models\Audit::where('event', 'ae_stripe_payment_refused')->where('new_values->notice_sent', true)->count() === 2
+        && DB::table('notifications')->where('user_id', 7)->where('title', 'Payment not completed')->count() === 2
+        && Invoice::find(591)->status === 'pending' && Invoice::find(592)->status === 'paid'],
     // Real recipient foreign keys and a full retry batch expose deleted users blocking later notices.
     'deleted-notice-recipients' => ['seed' => function () {
         customerInvoice(7, 591); customerInvoice(8, 592);
