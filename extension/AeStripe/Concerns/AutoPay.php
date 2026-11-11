@@ -196,7 +196,7 @@ trait AutoPay
      */
     private function stopWaitingRenewals(User $user): void
     {
-        foreach ($user->properties()->where('key', 'like', 'ae_stripe_checkout_%')->lockForUpdate()->get() as $row) {
+        foreach ($this->lockedUserProperties($user, 'ae_stripe_checkout_') as $row) {
             $attempt = json_decode((string) $row->value, true);
             if (!is_array($attempt) || ($attempt['renewal']['state'] ?? null) !== 'waiting') continue;
             $attempt['renewal']['state'] = 'stopped';

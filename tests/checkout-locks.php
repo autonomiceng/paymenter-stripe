@@ -5,6 +5,8 @@
 // properties unique index (key, model_id, model_type): a locking read that finds no row locks the gap before the next
 // index entry, and an insert into a gap waits for every other transaction that locked it. Two transactions that each
 // lock one gap and then insert into it wait on each other, which MariaDB reports as deadlock SQLSTATE 40001.
+// A locking `like` read of a key prefix scans and locks every customer's keys in that range, with the gaps between them
+// and the gap after the last.
 use App\Models\{Invoice, User};
 use Illuminate\Database\Events\TransactionBeginning;
 use Illuminate\Support\Facades\{DB, Event};
@@ -21,20 +23,28 @@ function gapOf(array $entry): int
 }
 DB::connection()->beforeExecuting(function ($sql, $bindings) use (&$transaction) {
     if (!is_array($GLOBALS['gapTrace']) || DB::transactionLevel() === 0) return;
-    if (preg_match('/^select .* from "properties" where (.*) \/\* for update \*\/$/', $sql, $where)
-        && preg_match_all('/"([a-z_]+)" (=|like) \?/', $where[1], $columns, PREG_SET_ORDER)) {
+    $trace = function ($kind, $gap, $label) use (&$transaction) { $GLOBALS['gapTrace'][] = [$transaction, $kind, $gap, $label]; };
+    if (preg_match('/^select .* from "(properties)" where (.*) \/\* for update \*\/$/', $sql, $where)
+        && preg_match_all('/"([a-z_]+)" (=|like) \?/', $where[2], $columns, PREG_SET_ORDER)) {
         $values = [];
         foreach ($columns as $index => $column) $values[$column[1]] = [$column[2], $bindings[$index]];
-        if (($values['key'][0] ?? null) !== '=' || !isset($values['model_id'], $values['model_type'])) return;
+        if (!isset($values['key'], $values['model_id'], $values['model_type'])) return;
+        if ($values['key'][0] === 'like') {
+            $prefix = rtrim($values['key'][1], '%');
+            $from = count(array_filter($GLOBALS['gapIndex'], fn ($row) => strcmp($row[0], $prefix) < 0));
+            $to = count(array_filter($GLOBALS['gapIndex'], fn ($row) => strcmp($row[0], $prefix) < 0 || str_starts_with($row[0], $prefix)));
+            for ($gap = $from; $gap <= $to; ++$gap) $trace('lock', $gap, $prefix . '%');
+            return;
+        }
         $entry = [$values['key'][1], $values['model_id'][1], $values['model_type'][1]];
         $found = DB::connection()->getPdo()->prepare('select count(*) from properties where key = ? and model_id = ? and model_type = ?');
         $found->execute($entry);
-        if ((int) $found->fetchColumn() === 0) $GLOBALS['gapTrace'][] = [$transaction, 'lock', gapOf($entry), $entry[0]];
+        if ((int) $found->fetchColumn() === 0) $trace('lock', gapOf($entry), $entry[0]);
         return;
     }
-    if (($write = nativeWrite($sql, $bindings)) && $write[0] === 'properties' && str_starts_with($sql, 'insert')) {
-        $GLOBALS['gapTrace'][] = [$transaction, 'insert', gapOf([$write[1]['key'], $write[1]['model_id'], $write[1]['model_type']]), $write[1]['key']];
-    }
+    if (!($write = nativeWrite($sql, $bindings)) || !str_starts_with($sql, 'insert')) return;
+    [$table, $row] = $write;
+    if ($table === 'properties') $trace('insert', gapOf([$row['key'], $row['model_id'], $row['model_type']]), $row['key']);
 });
 /** Gaps a request's transaction locked while missing a row and then inserted into, as gap => key. */
 function lockedThenInserted(array $trace): array
@@ -166,7 +176,9 @@ function traced(callable $request): array
     try { $request(); } finally { $trace = $GLOBALS['gapTrace']; $GLOBALS['gapTrace'] = null; }
     return $trace;
 }
-$indexNow = function () { $GLOBALS['gapIndex'] = DB::table('properties')->get(['key', 'model_id', 'model_type'])->map(fn ($row) => [$row->key, $row->model_id, $row->model_type])->all(); };
+$indexNow = function () {
+    $GLOBALS['gapIndex'] = DB::table('properties')->get(['key', 'model_id', 'model_type'])->map(fn ($row) => [$row->key, $row->model_id, $row->model_type])->all();
+};
 $insertedKey = fn ($trace, $prefix) => (bool) array_filter($trace, fn ($event) => $event[1] === 'insert' && str_starts_with($event[3], $prefix));
 $customer(11, 'cus_11');
 $customer(12, 'cus_12');
@@ -234,3 +246,25 @@ $cleanupTrace = traced(fn () => invoke($gateway, 'cleanupCard', App\Models\Billi
 check($insertedKey($cleanupTrace, 'ae_stripe_duplicate_pm_dup_11') && App\Models\BillingAgreement::find(612) === null,
     'Cleanup reserves and removes the duplicate card');
 check(!gapWaits($cleanupTrace), 'The duplicate card reservation takes no missing-row gap lock before inserting');
+
+// Two customers turn Auto Pay on at once, each with a renewal retry waiting on an open invoice. Stopping the retries
+// must not lock the range of every customer's payment attempts, which the Auto Pay records are inserted beside.
+foreach ([11 => 341, 12 => 342] as $userId => $invoiceId) {
+    nativeAgreement(700 + $userId, 'pm_auto_' . $userId, ['user_id' => $userId]);
+    $invoiceFor($invoiceId, $userId);
+    User::findOrFail($userId)->properties()->create(['key' => 'ae_stripe_checkout_' . $invoiceId, 'value' => json_encode(['version' => 2,
+        'key' => 'renewal_' . $invoiceId, 'created' => time(), 'retry' => false, 'renewal' => ['state' => 'waiting']])]);
+}
+$enable = fn (int $userId) => traced(fn () => DB::transaction(function () use ($gateway, $userId) {
+    invoke($gateway, 'enableAutoPay', User::where('id', $userId)->lockForUpdate()->firstOrFail(), 700 + $userId);
+}));
+$indexNow();
+$firstTrace = $enable(11);
+$secondTrace = $enable(12);
+check($insertedKey($firstTrace, 'ae_stripe_auto_pay_') && $insertedKey($secondTrace, 'ae_stripe_auto_pay_'), 'Each customer stores its Auto Pay choice');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
+    'Two customers turning Auto Pay on at once never deadlock on their waiting renewals');
+foreach ([11 => 341, 12 => 342] as $userId => $invoiceId) {
+    check((json_decode(User::find($userId)->properties()->where('key', 'ae_stripe_checkout_' . $invoiceId)->value('value'), true)['renewal']['state'] ?? null) === 'stopped',
+        'Turning Auto Pay on stops the customer\'s waiting renewal retry');
+}

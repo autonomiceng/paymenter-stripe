@@ -359,6 +359,20 @@ trait CheckoutIntent
         return $user->properties()->where('key', $key)->lockForUpdate()->first();
     }
 
+    /**
+     * The user's properties whose keys start with the prefix, read under the user row lock like lockedUserProperty.
+     * Each row is then locked by its exact key: a locking range read would lock every customer's keys in that range and
+     * the gaps between them, so two customers inserting their own keys there deadlock.
+     */
+    private function lockedUserProperties($user, string $prefix): array
+    {
+        $rows = [];
+        foreach ($user->properties()->where('key', 'like', $prefix . '%')->get() as $row) {
+            if ($locked = $user->properties()->where('key', $row->key)->lockForUpdate()->first()) $rows[] = $locked;
+        }
+        return $rows;
+    }
+
     private function clearFinishedPaymentConstraints(array $attempt): array
     {
         // An ended instruction cannot constrain a later Pay. Unknown confirmations and funds keep their constraints.

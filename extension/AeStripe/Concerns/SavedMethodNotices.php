@@ -33,7 +33,7 @@ trait SavedMethodNotices
                 $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
                 $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
                 if ($current->user_id != $user->id) return null;
-                foreach ($user->properties()->where('key', 'like', 'ae_stripe_notice_%')->lockForUpdate()->get() as $property) {
+                foreach ($this->lockedUserProperties($user, 'ae_stripe_notice_') as $property) {
                     $existing = json_decode($property->value, true);
                     if (($existing['intent_id'] ?? null) === $intent->id && ($existing['invoice_id'] ?? null) == $invoice->id
                         && ($existing['user_id'] ?? null) == $user->id && isset($existing['token'])
