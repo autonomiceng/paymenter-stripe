@@ -55,9 +55,11 @@ jobs:
         run: |
           set -euo pipefail
           curl --fail --location --retry 3 https://codeload.github.com/Paymenter/Paymenter/tar.gz/ee729f7d99ac18942625b79f3f93d8d8b21255e8 -o "$RUNNER_TEMP/paymenter.tar.gz"
-          echo "0b8e6c9f3b9c28aa69ee4c2978ec544814a70edb3e96a4ae3bc150a0acee6c1c  $RUNNER_TEMP/paymenter.tar.gz" | sha256sum --check
+          # Hash the source tar, independent of codeload gzip compression.
+          gzip -dc "$RUNNER_TEMP/paymenter.tar.gz" > "$RUNNER_TEMP/paymenter.tar"
+          echo "1bcb9f30a6061cc15aae187c7a269f5ee109bae4a5fe705a6923723995c6e3d7  $RUNNER_TEMP/paymenter.tar" | sha256sum --check
           mkdir "$RUNNER_TEMP/paymenter"
-          tar -xzf "$RUNNER_TEMP/paymenter.tar.gz" --strip-components=1 -C "$RUNNER_TEMP/paymenter"
+          tar -xf "$RUNNER_TEMP/paymenter.tar" --strip-components=1 -C "$RUNNER_TEMP/paymenter"
           composer install --working-dir="$RUNNER_TEMP/paymenter" --no-interaction --prefer-dist --no-progress --no-scripts
       - name: Run isolated native pending integration (public default theme)
         env:
@@ -91,9 +93,11 @@ jobs:
         run: |
           set -euo pipefail
           curl --fail --location --retry 3 https://codeload.github.com/Paymenter/Paymenter/tar.gz/ee729f7d99ac18942625b79f3f93d8d8b21255e8 -o "$RUNNER_TEMP/paymenter.tar.gz"
-          echo "0b8e6c9f3b9c28aa69ee4c2978ec544814a70edb3e96a4ae3bc150a0acee6c1c  $RUNNER_TEMP/paymenter.tar.gz" | sha256sum --check
+          # Hash the source tar, independent of codeload gzip compression.
+          gzip -dc "$RUNNER_TEMP/paymenter.tar.gz" > "$RUNNER_TEMP/paymenter.tar"
+          echo "1bcb9f30a6061cc15aae187c7a269f5ee109bae4a5fe705a6923723995c6e3d7  $RUNNER_TEMP/paymenter.tar" | sha256sum --check
           mkdir "$RUNNER_TEMP/paymenter"
-          tar -xzf "$RUNNER_TEMP/paymenter.tar.gz" --strip-components=1 -C "$RUNNER_TEMP/paymenter"
+          tar -xf "$RUNNER_TEMP/paymenter.tar" --strip-components=1 -C "$RUNNER_TEMP/paymenter"
           composer install --working-dir="$RUNNER_TEMP/paymenter" --no-interaction --prefer-dist --no-progress --no-scripts
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:

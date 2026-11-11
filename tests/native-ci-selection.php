@@ -2,7 +2,69 @@
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 // Configuration coverage: a passing offline job alone must not hide missing native CI.
 $workflow = file_get_contents(__DIR__ . '/../.github/workflows/ci.yml');
-check(str_contains($workflow, 'PAY_PENDING_MATRIX:') && str_contains($workflow, 'PAYMENTER_TEST_APP:') && str_contains($workflow, 'composer install') && str_contains($workflow, "php-version: '8.4.27'"), 'CI provisions and selects the native pending integration matrix');
+// Read the literal job/step layout used here. Unsupported YAML forms fail the contract explicitly.
+$nativeJobValid = static function (string $workflow): bool {
+    if (!preg_match('/^  native-pending:\n(.*?)(?=^  [a-z][a-z-]*:|\z)/ms', $workflow, $job)
+        || preg_match('/^    (?:if|continue-on-error):/m', $job[1])) return false;
+    $field = static function (string $step, string $key): ?string {
+        if (preg_match_all('/^        ' . preg_quote($key, '/') . ': ([^\n]*)$/m', $step, $matches) !== 1) return null;
+        if ($matches[1][0] !== '|') return trim($matches[1][0], "'\"");
+        preg_match('/^        ' . preg_quote($key, '/') . ': \|\n((?:          [^\n]*\n|\n)*)/m', $step, $body);
+        return trim(preg_replace('/^          /m', '', $body[1] ?? ''));
+    };
+    $ready = static fn (string $step): bool => !preg_match('/^        (?:if|continue-on-error|env):/m', $step);
+    $setup = $provision = false;
+    foreach (preg_split('/(?=^      - )/m', $job[1]) as $step) {
+        if (preg_match('/^      - uses: shivammathur\/setup-php@44454db4f0199b8b9685a5d763dc37cbf79108e1(?: #.*)?$/m', $step)) {
+            $setup = $ready($step) && preg_match("/^          php-version: '8\\.4\\.27'$/m", $step)
+                && preg_match('/^          tools: composer:v2$/m', $step)
+                && preg_match('/^          extensions: ([^\n]+)$/m', $step, $extensions)
+                && !array_diff(['bcmath', 'curl', 'dom', 'fileinfo', 'gd', 'intl', 'mbstring', 'pdo_mysql', 'pdo_sqlite', 'sqlite3', 'zip'], explode(', ', $extensions[1]));
+        }
+        $run = $field($step, 'run');
+        if ($run !== null && str_contains($run, 'composer install')) {
+            $provision = $setup && $ready($step) && $field($step, 'shell') === 'bash'
+                && str_contains($run, "\ncomposer install --working-dir=\"\$RUNNER_TEMP/paymenter\" --no-interaction --prefer-dist --no-progress --no-scripts");
+        }
+        if ($run !== 'php -d memory_limit=256M tests/run.php') continue;
+        if (!$provision || preg_match('/^        (?:if|continue-on-error):/m', $step)
+            || !preg_match('/^        env:\n((?:          [^\n]+\n)+)/m', $step, $environment)) return false;
+        $values = [];
+        foreach (explode("\n", trim($environment[1])) as $line) {
+            if (!preg_match('/^\s*([A-Z_]+): (.+)$/', $line, $entry) || isset($values[$entry[1]])) return false;
+            $values[$entry[1]] = trim($entry[2], "'\"");
+        }
+        return ($values['PAY_PENDING_MATRIX'] ?? null) === '1'
+            && ($values['PAYMENTER_TEST_APP'] ?? null) === '${{ runner.temp }}/paymenter'
+            && ($values['TMPDIR'] ?? null) === '${{ runner.temp }}';
+    }
+    return false;
+};
+check($nativeJobValid($workflow), 'CI provisions and selects the native pending integration matrix');
+preg_match('/^  native-pending:\n(.*?)(?=^  [a-z][a-z-]*:|\z)/ms', $workflow, $nativeJob);
+$nativeBlock = $nativeJob[0];
+preg_match('/^        env:\n(?:          [^\n]+\n)+/m', $nativeBlock, $nativeEnvironment);
+$nativeCommand = '        run: php -d memory_limit=256M tests/run.php';
+$invalidNative = [
+    'wrong command' => str_replace($nativeCommand, '        run: php tests/not-the-matrix.php', $nativeBlock),
+    'missing selector' => str_replace("          PAY_PENDING_MATRIX: '1'\n", '', $nativeBlock),
+    'wrong selector' => str_replace("PAY_PENDING_MATRIX: '1'", 'PAY_PENDING_MATRIX: browser', $nativeBlock),
+    'missing app' => str_replace('          PAYMENTER_TEST_APP: ${{ runner.temp }}/paymenter' . "\n", '', $nativeBlock),
+    'missing dependencies' => preg_replace('/^          composer install[^\n]+\n/m', '', $nativeBlock),
+    'wrong PHP' => str_replace("php-version: '8.4.27'", "php-version: '8.3'", $nativeBlock),
+    'missing setup' => str_replace('uses: shivammathur/setup-php@', 'uses: missing/setup-php@', $nativeBlock),
+    'conditional provision' => str_replace('        shell: bash', "        if: false\n        shell: bash", $nativeBlock),
+    'missing SQLite' => str_replace(', pdo_sqlite', '', $nativeBlock),
+    'conditional run' => str_replace($nativeCommand, "        if: false\n" . $nativeCommand, $nativeBlock),
+    'ignored failure' => str_replace($nativeCommand, "        continue-on-error: true\n" . $nativeCommand, $nativeBlock),
+];
+$withoutEnvironment = str_replace($nativeEnvironment[0], '', $nativeBlock);
+$invalidNative['environment on another step'] = str_replace('      - name: Keep the loaded test file list for the coverage job',
+    "      - name: Unrelated command\n" . $nativeEnvironment[0] . "        run: echo unrelated\n      - name: Keep the loaded test file list for the coverage job", $withoutEnvironment);
+foreach ($invalidNative as $reason => $invalid) {
+    check(!$nativeJobValid(str_replace($nativeBlock, $invalid, $workflow)), 'Native job rejects ' . $reason . ' even when another job has valid settings');
+}
+
 check(str_contains($workflow, 'php -n tests/run.php') && !str_contains($workflow, 'PAY_NOTICE_THEME:') && !str_contains($workflow, 'secrets.'), 'Public integration keeps stripped offline CI and never provisions private themes or credentials');
 check(str_contains($workflow, 'PAY_PENDING_MATRIX: browser') && str_contains($workflow, 'PLAYWRIGHT_MODULE:') && str_contains($workflow, 'playwright@1.58.2') && str_contains($workflow, 'install --with-deps chromium'), 'CI provisions Playwright and selects the browser matrix');
 // A matrix child that reaches the offline suite would start these checks again; stop it at one level.
@@ -22,6 +84,43 @@ require_once __DIR__ . '/temporary-root.php';
 $fixture = TemporaryRoot::create('ae-stripe-matrix-');
 mkdir($fixture . '/app/vendor', 0700, true); mkdir($fixture . '/other/vendor', 0700, true);
 file_put_contents($fixture . '/app/vendor/autoload.php', '<?php'); file_put_contents($fixture . '/other/vendor/autoload.php', '<?php');
+// Execute each job's real verification commands with local tar fixtures, without downloads or Composer.
+$source = $fixture . '/source';
+mkdir($source);
+file_put_contents($source . '/composer.lock', 'locked public dependencies');
+[$status, $printed] = $launch(['tar', '-cf', $fixture . '/source.tar', '-C', $source, 'composer.lock'], $inherited);
+check($status === 0, 'Create the source archive fixture: ' . $printed);
+$tar = file_get_contents($fixture . '/source.tar');
+$archives = [];
+foreach (['-1', '-9'] as $level) {
+    [$status, $compressed] = $launch(['gzip', $level, '-c', $fixture . '/source.tar'], $inherited);
+    check($status === 0, 'Compress the same source with ' . $level);
+    $archives[$level] = $compressed;
+}
+check($archives['-1'] !== $archives['-9'], 'Source fixtures have different gzip bytes');
+foreach (['native-pending', 'browser'] as $job) {
+    preg_match('/^  ' . $job . ':\n(.*?)(?=^  [a-z][a-z-]*:|\z)/ms', $workflow, $jobMatch);
+    preg_match('/^          curl [^\n]+\n(.*?)^          mkdir /ms', $jobMatch[1] ?? '', $verification);
+    $command = preg_replace('/^          /m', '', $verification[1] ?? '');
+    check($command !== '' && preg_match('/[a-f0-9]{64}/', $command, $digest), $job . ' has an explicit source digest before extraction');
+    check($digest[0] === '1bcb9f30a6061cc15aae187c7a269f5ee109bae4a5fe705a6923723995c6e3d7'
+        && str_contains($jobMatch[1], 'https://codeload.github.com/Paymenter/Paymenter/tar.gz/ee729f7d99ac18942625b79f3f93d8d8b21255e8')
+        && str_contains($jobMatch[1], 'tar -xf "$RUNNER_TEMP/paymenter.tar" --strip-components=1 -C "$RUNNER_TEMP/paymenter"'), $job . ' keeps the exact public source pin and extracts the verified tar');
+    // Only substitute the trusted digest and archive location; execute the workflow's verification unchanged.
+    $command = str_replace($digest[0], hash('sha256', $tar), $command);
+    $directory = $fixture . '/' . $job;
+    mkdir($directory);
+    $verify = function (string $bytes, string $script) use ($directory, $inherited, $launch): int {
+        file_put_contents($directory . '/paymenter.tar.gz', $bytes);
+        return $launch(['bash', '-euo', 'pipefail', '-c', $script], array_replace($inherited, ['RUNNER_TEMP' => $directory]))[0];
+    };
+    foreach ($archives as $level => $compressed) check($verify($compressed, $command) === 0, $job . ' accepts identical source under gzip ' . $level);
+    file_put_contents($fixture . '/altered.tar', str_replace('locked public dependencies', 'edited public dependencies', $tar));
+    [$status, $altered] = $launch(['gzip', '-c', $fixture . '/altered.tar'], $inherited);
+    check($status === 0 && $verify($altered, $command) !== 0, $job . ' rejects changed source content');
+    check($verify($archives['-1'], str_replace(hash('sha256', $tar), str_repeat('0', 64), $command)) !== 0, $job . ' rejects a bad source digest');
+    check($verify(substr($archives['-1'], 0, -8), $command) !== 0, $job . ' rejects truncated gzip even when decompressed bytes match');
+}
 $evidence = $fixture . '/evidence/offline.txt';
 for ($run = 1; $run <= 2; ++$run) {
     [$status] = $launch([PHP_BINARY, '-n', '-d', 'auto_prepend_file=' . __DIR__ . '/entered.php', __DIR__ . '/native-suites.php'], array_replace($inherited, ['PAY_TEST_ENTERED' => $evidence]));
