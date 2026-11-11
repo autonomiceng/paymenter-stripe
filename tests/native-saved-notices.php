@@ -13,8 +13,8 @@ foreach (['bootstrap/app.php', 'bootstrap/providers.php', 'composer.json'] as $p
 symlink($release . '/themes/default', $root . '/themes/default');
 $themeRoot = getenv('PAY_NOTICE_THEME');
 if ($themeRoot && !is_file($themeRoot . '/views/invoices/show.blade.php')) throw new RuntimeException('Selected native theme is unavailable.');
-$theme = $themeRoot ? 'beco' : 'default';
-if ($themeRoot) symlink($themeRoot, $root . '/themes/beco');
+$theme = $themeRoot ? 'fixture' : 'default';
+if ($themeRoot) symlink($themeRoot, $root . '/themes/fixture');
 foreach (['APP_ENV' => 'testing', 'APP_KEY' => 'base64:' . base64_encode(str_repeat('t', 32)), 'APP_URL' => 'http://stripe-tests.invalid',
     'DB_CONNECTION' => 'sqlite', 'DB_DATABASE' => ':memory:', 'CACHE_STORE' => 'array', 'QUEUE_CONNECTION' => 'database',
     'SESSION_DRIVER' => 'array', 'MAIL_MAILER' => 'array', 'APP_TELEMETRY_ENABLED' => 'false'] as $key => $value) {

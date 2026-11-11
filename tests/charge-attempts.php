@@ -594,7 +594,7 @@ use Illuminate\Support\Facades\{DB, Http};
         });
         $run('business-name', function ($invoice) use ($gateway) {
             $names = fn () => [$gateway->pay($invoice, 20)['data'], $gateway->createBillingAgreement($invoice->user)['data']];
-            foreach (['Beco Technologies' => 'Beco Technologies', '  Beco  ' => 'Beco', '' => null, ' ' => null] as $value => $expected) {
+            foreach (['Example Technologies' => 'Example Technologies', '  Example  ' => 'Example', '' => null, ' ' => null] as $value => $expected) {
                 $GLOBALS['fakeConfig']['settings.company_name'] = (string) $value;
                 foreach ($names() as $data) check(array_key_exists('businessName', $data) && $data['businessName'] === $expected,
                     'Both Stripe forms name the site\'s Company Name, or nothing when it is empty');
