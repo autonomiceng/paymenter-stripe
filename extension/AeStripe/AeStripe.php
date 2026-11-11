@@ -654,29 +654,40 @@ class AeStripe extends Gateway
      */
     private function createOrGetStripeCustomer($user, $includeDetails = true)
     {
-        return ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $includeDetails) {
-            User::where('id', $user->id)->firstOrFail();
-            return $this->lockedStripeCustomer($user, $includeDetails);
+        $previous = ExtensionLocks::transaction('user:' . $user->id,
+            fn () => $this->lockedUserProperty($user, 'stripe_id')?->value);
+        if ($previous) {
+            try {
+                $customer = $this->request('get', '/customers/' . $previous);
+                if (($customer->deleted ?? false) !== true) return $customer;
+            } catch (RequestException $e) {
+                if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') throw $e;
+            }
+        }
+        $claim = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $includeDetails, $previous) {
+            abort_unless($this->lockedUserProperty($user, 'stripe_id')?->value === $previous, 409);
+            $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
+            if ($stored) return json_decode($stored->value, true, flags: JSON_THROW_ON_ERROR);
+            $claim = ['key' => 'customer_' . bin2hex(random_bytes(16)), 'previous' => $previous,
+                'created' => time(), 'payload' => $this->customerPayload($user, $includeDetails)];
+            $user->properties()->updateOrCreate(['key' => 'ae_stripe_customer_create'], ['value' => json_encode($claim, JSON_THROW_ON_ERROR)]);
+            return $claim;
+        });
+        abort_unless($claim['previous'] === $previous && time() - $claim['created'] < 23 * 3600, 409);
+        $customer = $this->request('post', '/customers', $claim['payload'], $claim['key']);
+        return ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $previous, $claim, $customer) {
+            $current = $this->lockedUserProperty($user, 'stripe_id')?->value;
+            abort_unless(in_array($current, [$previous, $customer->id], true), 409);
+            $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
+            if ($stored) abort_unless(json_decode($stored->value, true)['key'] === $claim['key'], 409);
+            $user->properties()->updateOrCreate(['key' => 'stripe_id'], ['value' => $customer->id]);
+            $user->properties()->where('key', 'ae_stripe_customer_create')->delete();
+            return $customer;
         });
     }
 
-    private function lockedStripeCustomer($user, bool $includeDetails)
+    private function customerPayload($user, bool $includeDetails): array
     {
-        $stripeCustomerId = $this->lockedUserProperty($user, 'stripe_id');
-
-        if ($stripeCustomerId) {
-            try {
-                $customer = $this->request('get', '/customers/' . $stripeCustomerId->value);
-                if (($customer->deleted ?? false) !== true) {
-                    return $customer;
-                }
-            } catch (RequestException $e) {
-                if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') {
-                    throw $e;
-                }
-            }
-        }
-
         // Build basic payload
         $payload = [
             'email' => $user->email,
@@ -710,11 +721,7 @@ class AeStripe extends Gateway
             }
         }
 
-        $customer = $this->request('post', '/customers', $payload);
-
-        $user->properties()->updateOrCreate(['key' => 'stripe_id'], ['value' => $customer->id]);
-
-        return $customer;
+        return $payload;
     }
 
     public function createBillingAgreement($user)

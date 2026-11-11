@@ -129,6 +129,34 @@ function pendingNotice(string $event, string $type = Invoice::class): void
         ]]]]);
 }
 $cases = [
+    'outbox-customer-http' => ['seed' => function () {
+        customerInvoice(7, 951)->user->properties()->where('key', 'stripe_id')->delete();
+    }, 'pause' => '#^POST /customers$#', 'a' => function ($gateway) {
+        $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) {
+            check(DB::transactionLevel() === 0, 'Customer creation runs outside every transaction');
+            $claim = json_decode(User::find(7)->properties()->where('key', 'ae_stripe_customer_create')->value('value'), true);
+            check($request->header('Idempotency-Key')[0] === $claim['key'] && $data == $claim['payload'], 'Customer payload and key are committed before send');
+            return ['id' => 'cus_created'];
+        };
+        return invoke($gateway, 'createOrGetStripeCustomer', User::find(7), false)->id;
+    }, 'b' => fn () => User::where('id', 7)->update(['first_name' => 'Updated']),
+        'check' => fn ($results) => $results['a']['ok'] === 'cus_created' && User::find(7)->properties()->where('key', 'stripe_id')->value('value') === 'cus_created'
+            && !User::find(7)->properties()->where('key', 'ae_stripe_customer_create')->exists()
+            && DB::table('invoice_transactions')->count() === 0 && User::find(7)->first_name === 'Updated'],
+    'outbox-subscription-binding-http' => ['seed' => fn () => subscriptionInvoice(7, 952),
+        'pause' => '#^POST /invoices/in_952$#', 'a' => function ($gateway) {
+            $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) {
+                if ($verb === 'get') return ['id' => 'in_952', 'metadata' => (object) []];
+                check(DB::transactionLevel() === 0, 'Subscription binding HTTP runs outside every transaction');
+                $claim = json_decode(User::find(7)->properties()->where('key', 'ae_stripe_invoice_binding_in_952')->value('value'), true);
+                check($request->header('Idempotency-Key')[0] === $claim['key'] && $data['metadata']['ae_stripe_invoice_id'] === $claim['invoice_id'],
+                    'Subscription binding sends its committed invoice and key');
+                return ['id' => 'in_952'];
+            };
+            return invoke($gateway, 'bindSubscriptionInvoice', paidSubscription(952), App\Models\Service::where('subscription_id', 'sub_952')->first());
+        }, 'b' => fn () => App\Models\Service::where('subscription_id', 'sub_952')->update(['price' => 21]),
+        'check' => fn ($results) => $results['a']['ok'] === true && (float) App\Models\Service::where('subscription_id', 'sub_952')->value('price') === 21.0
+            && DB::table('invoice_transactions')->count() === 0],
     'outbox-refund-http' => ['seed' => fn () => customerInvoice(7, 601),
         'pause' => '#^POST /refunds$#', 'a' => function ($gateway) {
             $handler = $GLOBALS['stripeHandler'];

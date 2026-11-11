@@ -59,7 +59,7 @@ class AdoptionFake
             $index = count(array_filter($this->calls, fn ($c) => $c[1] === '/account')) - 1;
             return ['id' => $this->accounts[$index % 2]];
         }
-        check($this->locked, 'Redisplay stays under the user lock through the Stripe update');
+        check(!$this->locked, 'Redisplay HTTP runs outside the transaction');
         check($verb === 'post' && str_starts_with($path, '/payment_methods/') && $data === ['allow_redisplay' => 'always'], 'Only redisplay writes');
         if ($this->fail && $path === '/payment_methods/pm_12') throw new RuntimeException('private transport error');
         return ['id' => basename($path)];

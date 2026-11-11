@@ -126,9 +126,11 @@ final class AdoptionStore
         }
     }
 
-    public function stripe(string $key, string $verb, string $path, array $data): array
+    public function stripe(string $key, string $verb, string $path, array $data, ?string $idempotencyKey = null): array
     {
-        return Http::withHeaders(['Authorization' => 'Bearer ' . $key, 'Stripe-Version' => '2025-07-30.basil'])
+        $headers = ['Authorization' => 'Bearer ' . $key, 'Stripe-Version' => '2025-07-30.basil'];
+        if ($idempotencyKey !== null) $headers['Idempotency-Key'] = $idempotencyKey;
+        return Http::withHeaders($headers)
             ->asForm()->timeout(30)->$verb('https://api.stripe.com/v1' . $path, $data)->throw()->json();
     }
 

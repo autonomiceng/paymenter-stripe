@@ -127,9 +127,9 @@ trait Webhooks
                     $service = Service::where('subscription_id', $invoice->parent->subscription_details->subscription)->first();
 
                     if ($service && $this->bindSubscriptionInvoice($invoice, $service)) {
-                        $this->request('post', '/invoices/' . $invoice->id . '/finalize');
+                        $this->request('post', '/invoices/' . $invoice->id . '/finalize', [], 'finalize_' . $invoice->id);
                         // Pay the invoice using Stripe
-                        $this->request('post', '/invoices/' . $invoice->id . '/pay');
+                        $this->request('post', '/invoices/' . $invoice->id . '/pay', [], 'pay_' . $invoice->id);
                     }
                 }
                 break;
