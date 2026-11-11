@@ -351,7 +351,12 @@ namespace App\Models {
             if (Gateway::$rows === null && ($this->extension ?? '') === 'Stripe') Gateway::$bundledEnabled = $this->enabled;
         }
     }
-    class Audit {
+    class Audit extends \stdClass {
+        public function __construct(array $row) { foreach ($row as $key => $value) $this->$key = $value; }
+        public function update(array $values) {
+            foreach (self::$rows as $index => $row) if ($row['id'] === $this->id) self::$rows[$index] = array_replace($row, $values);
+            foreach ($values as $key => $value) $this->$key = $value;
+        }
         public static $rows = [], $fail = false;
         public static function where($key, $value) { return new class($key, $value) {
             private $filters = [], $currentRead = false;
@@ -365,15 +370,18 @@ namespace App\Models {
                         $actual = str_starts_with($key, 'new_values->') ? ($row['new_values'][substr($key, 12)] ?? null) : ($row[$key] ?? null);
                         if ($actual !== $value) continue 2;
                     }
-                    return (object) $row;
+                    return new Audit($row);
                 }
                 return null;
             }
+            public function firstOrFail() { return $this->first() ?? throw new \RuntimeException('Missing audit'); }
         }; }
         public static function create($row) {
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Review record lock missing');
             if (self::$fail) { self::$fail = false; throw new \RuntimeException('Review record unavailable'); }
+            $row['id'] = count(self::$rows) + 1;
             self::$rows[] = $row;
+            return new self($row);
         }
     }
     class Notification {

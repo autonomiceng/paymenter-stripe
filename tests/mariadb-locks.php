@@ -136,6 +136,50 @@ $cases = [
             && App\Models\BillingAgreement::orderBy('user_id')->get()->map(fn ($row) => [$row->user_id, $row->external_reference])->all()
                 === [[7, 'pm_801'], [8, 'pm_802']]
             && DB::table('audits')->where('auditable_type', App\Models\Property::class)->count() > 0],
+    // A gateway staff member also owns the settling invoice (the access alert's notification recipient FK).
+    'access-staff-settlement' => ['audit' => true, 'seed' => function () {
+            customerInvoice(7, 801);
+            $role = App\Models\Role::create(['name' => 'Gateway staff', 'permissions' => ['admin.gateways.viewAny', 'admin.gateways.update']]);
+            User::find(7)->update(['role_id' => $role->id]);
+            User::find(7)->properties()->create(['key' => 'ae_stripe_checkout_801', 'value' => json_encode([
+                'version' => 2, 'key' => 'checkout_801', 'created' => time(), 'retry' => true])]);
+        }, 'waits' => true, 'pause' => '/^insert into `invoice_transactions`/',
+        'a' => function ($gateway) {
+            $intent = intentOf(801, 'succeeded', 2000);
+            $intent->metadata->ae_stripe_attempt = 'checkout_801';
+            invoke($gateway, 'recordIntentPayment', $intent, 'succeeded');
+            return 'settled';
+        },
+        'b' => fn ($gateway) => invoke($gateway, 'notifyPaymentAccessRefusal') ?? 'reviewed',
+        'check' => fn () => $rows(801) === [[20.0, 'succeeded', false]] && Invoice::find(801)->status === 'paid'
+            && DB::table('audits')->where('event', 'ae_stripe_access_refused')->count() === 1
+            && DB::table('audits')->where('auditable_type', App\Models\Property::class)->count() > 0
+            && DB::table('notifications')->where('user_id', 7)->where('title', 'Stripe access needs attention')->count() === 1],
+    // Two deliveries share one durable audit. A failed notification must leave a pending marker and no partial notice.
+    'access-notice-retry' => ['seed' => function () {
+            customerInvoice(7, 801);
+            $role = App\Models\Role::create(['name' => 'Gateway staff', 'permissions' => ['admin.gateways.viewAny', 'admin.gateways.update']]);
+            User::find(7)->update(['role_id' => $role->id]);
+        }, 'waits' => true, 'pause' => '/^insert into `notifications`/',
+        'a' => function ($gateway) {
+            $fail = true;
+            App\Models\Notification::created(function () use (&$fail) { if ($fail) { $fail = false; throw new RuntimeException('Delivery failed'); } });
+            // Let the first delivery fail after its insert; pause only the retry.
+            $GLOBALS['pauses'] = [];
+            invoke($gateway, 'notifyPaymentAccessRefusal');
+            check(DB::table('notifications')->count() === 0 && DB::table('audits')->where('event', 'ae_stripe_access_refused')
+                ->where('new_values->notice_sent', false)->count() === 1, 'Failed delivery keeps its pending audit only');
+            pauseBefore('/^insert into `notifications`/');
+            invoke($gateway, 'notifyPaymentAccessRefusal');
+            return 'retried';
+        },
+        'b' => fn ($gateway) => DB::transaction(function () use ($gateway) {
+            DB::table('audits')->count(); // Dedupe must also survive an older enclosing transaction snapshot.
+            invoke($gateway, 'notifyPaymentAccessRefusal');
+            return 'reviewed';
+        }),
+        'check' => fn () => DB::table('notifications')->where('user_id', 7)->where('title', 'Stripe access needs attention')->count() === 1
+            && DB::table('audits')->where('event', 'ae_stripe_access_refused')->where('new_values->notice_sent', true)->count() === 1],
     // Audited settlement against a missing-subscription review, with normal web auditing.
     'subscription-review-vs-settlement' => [
         'seed' => function () {
@@ -408,7 +452,7 @@ foreach ($cases as $name => $case) {
     if (getenv('PAY_MARIADB_CASE') && !in_array($name, explode(',', getenv('PAY_MARIADB_CASE')), true)) continue;
     DB::statement('set foreign_key_checks = 0');
     foreach (['invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
-        'billing_agreements', 'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users'] as $table) DB::table($table)->truncate();
+        'billing_agreements', 'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users', 'roles'] as $table) DB::table($table)->truncate();
     DB::statement('set foreign_key_checks = 1');
     DB::table('settings')->where('key', 'ae_stripe_webhook_continuity')->delete();
     DB::table('settings')->where('key', 'ae_stripe_webhook_events')->update(['value' => 'ready']);

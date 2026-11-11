@@ -211,22 +211,29 @@ trait ChargeRecovery
         DB::afterCommit(function () {
             try {
                 $id = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
-                DB::transaction(function () use ($id) {
+                $audit = DB::transaction(function () use ($id) {
                     $gateway = $this->gatewayRowForUpdate($id)->firstOrFail();
                     $fingerprint = hash('sha256', $this->config('stripe_secret_key'));
-                    if (Audit::where('auditable_type', $gateway->getMorphClass())->where('auditable_id', $gateway->id)
-                        ->where('event', 'ae_stripe_access_refused')->where('new_values->key_fingerprint', $fingerprint)->lockForUpdate()->first()) return;
-                    Audit::create(['event' => 'ae_stripe_access_refused', 'auditable_type' => $gateway->getMorphClass(),
-                        'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => ['key_fingerprint' => $fingerprint]]);
+                    $existing = Audit::where('auditable_type', $gateway->getMorphClass())->where('auditable_id', $gateway->id)
+                        ->where('event', 'ae_stripe_access_refused')->where('new_values->key_fingerprint', $fingerprint)->lockForUpdate()->first();
+                    return $existing ?? Audit::create(['event' => 'ae_stripe_access_refused', 'auditable_type' => $gateway->getMorphClass(),
+                        'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => ['key_fingerprint' => $fingerprint, 'notice_sent' => false]]);
+                });
+                // Commit the gateway before recipient FKs. Lock only this audit to dedupe delivery and retry a rollback.
+                DB::transaction(function () use ($audit) {
+                    $audit = Audit::where('id', $audit->id)->lockForUpdate()->firstOrFail();
+                    $values = $audit->new_values;
+                    if ($values['notice_sent'] ?? true) return; // Older markers already delivered their notices.
                     foreach ($this->noticeStaff('gateway') as $staff) {
                         Notification::create([
                             'user_id' => $staff->id, 'title' => 'Stripe access needs attention',
                             'body' => 'Stripe refused payment checks. Check the API key and its permissions.',
-                            'url' => url('/admin/gateways/' . $gateway->id . '/edit'),
+                            'url' => url('/admin/gateways/' . $audit->auditable_id . '/edit'),
                         ]);
                     }
+                    $audit->update(['new_values' => array_replace($values, ['notice_sent' => true])]);
                 });
-            } catch (\Throwable $e) { report($e); } // Failed delivery rolls back the marker; the next refused check retries.
+            } catch (\Throwable $e) { report($e); } // A failed delivery keeps its pending marker for the next refused check.
         });
     }
 
