@@ -244,7 +244,7 @@ $cases = [
         'a' => fn ($gateway) => invoke($gateway, 'recordSubscriptionReview', paidSubscription(811), 'Service missing') ?? 'recorded',
         'b' => fn () => App\Helpers\ExtensionHelper::addPayment(811, 'Other', 20, null, 'other_811')->id,
         'check' => fn () => $rows(811) === [[20.0, 'succeeded', false]] && Invoice::find(811)->status === 'paid'],
-    'gateway-access' => ['seed' => fn () => customerInvoice(7, 812),
+    'gateway-access' => ['audit' => true, 'seed' => fn () => customerInvoice(7, 812),
         'pause' => '/^insert into `audits`/',
         'a' => fn ($gateway) => invoke($gateway, 'notifyPaymentAccessRefusal') ?? 'recorded',
         'b' => fn () => App\Helpers\ExtensionHelper::addPayment(812, 'Other', 20, null, 'other_812')->id,

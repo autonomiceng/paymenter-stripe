@@ -215,7 +215,7 @@ trait ChargeRecovery
                     $gateway = $this->gatewayRowForUpdate($id)->firstOrFail();
                     $fingerprint = hash('sha256', $this->config('stripe_secret_key'));
                     $existing = Audit::where('auditable_type', $gateway->getMorphClass())->where('auditable_id', $gateway->id)
-                        ->where('event', 'ae_stripe_access_refused')->where('new_values->key_fingerprint', $fingerprint)->lockForUpdate()->first();
+                        ->where('event', 'ae_stripe_access_refused')->where('new_values->key_fingerprint', $fingerprint)->first();
                     return $existing ?? Audit::create(['event' => 'ae_stripe_access_refused', 'auditable_type' => $gateway->getMorphClass(),
                         'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => ['key_fingerprint' => $fingerprint, 'notice_sent' => false]]);
                 });
