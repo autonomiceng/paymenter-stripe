@@ -3,8 +3,8 @@
 // Two customers' payment requests at once, on real MariaDB sessions (tests/mariadb-app.php). Each case runs request A
 // in one process until it reaches a chosen point inside its transaction and holds it there. Request B then runs in a
 // second process until it finishes or InnoDB makes it wait on A. A then continues. Any lock cycle between the two is
-// a deadlock that InnoDB reports and counts, so each case requires an unchanged deadlock count, both requests
-// finishing, and the money rows each request owes, once each.
+// a deadlock that InnoDB reports and counts. Each case requires B to wait on A exactly when it says so ('waits'), the
+// deadlocks it makes on purpose and no other ('deadlocks'), both requests finishing, and the rows each one owes, once.
 // Usage: PAY_MARIADB_PORT=... PAY_MARIADB_PASSWORD=... php tests/mariadb-locks.php
 use App\Models\{Invoice, User};
 use Illuminate\Support\Facades\DB;
@@ -30,7 +30,8 @@ function intentOf(int $invoiceId, string $status, int $received = 0): object
     $invoice = Invoice::findOrFail($invoiceId);
     return (object) ['id' => 'pi_' . $invoiceId, 'object' => 'payment_intent', 'status' => $status, 'amount' => 2000, 'amount_received' => $received,
         'currency' => 'usd', 'customer' => 'cus_' . $invoice->user_id, 'confirmation_method' => 'manual', 'payment_method_types' => ['card'],
-        'metadata' => (object) ['invoice_id' => (string) $invoiceId], 'latest_charge' => (object) ['id' => 'ch_' . $invoiceId, 'disputed' => false]];
+        'metadata' => (object) ['invoice_id' => (string) $invoiceId], 'latest_charge' => (object) ['id' => 'ch_' . $invoiceId, 'disputed' => false,
+            'payment_method_details' => (object) ['type' => 'card', 'card' => (object) ['brand' => 'visa', 'last4' => '4242']]]];
 }
 /** Settle an invoice's PaymentIntent as its succeeded webhook does, and any receipt return it queues after commit. */
 function settle($gateway, int $invoiceId, int $received = 2000): string
@@ -38,8 +39,25 @@ function settle($gateway, int $invoiceId, int $received = 2000): string
     invoke($gateway, 'recordIntentPayment', intentOf($invoiceId, 'succeeded', $received), 'succeeded');
     return 'settled';
 }
+/** The customer's pending invoice for a subscription service, sub_<invoice>. */
+function subscriptionInvoice(int $userId, int $invoiceId): void
+{
+    $invoice = customerInvoice($userId, $invoiceId);
+    $product = App\Models\Product::create(['category_id' => App\Models\Category::create(['slug' => 'locks' . $invoiceId, 'name' => 'Locks'])->id,
+        'name' => 'Locks', 'slug' => 'locks' . $invoiceId]);
+    $plan = $product->plans()->create(['name' => 'Monthly', 'type' => 'recurring', 'billing_unit' => 'month', 'billing_period' => 1]);
+    $service = App\Models\Service::create(['user_id' => $userId, 'product_id' => $product->id, 'plan_id' => $plan->id, 'price' => 20,
+        'currency_code' => 'USD', 'quantity' => 1, 'status' => 'active', 'subscription_id' => 'sub_' . $invoiceId]);
+    $invoice->items()->update(['reference_type' => App\Models\Service::class, 'reference_id' => $service->id]);
+}
+/** The paid Stripe invoice of that subscription, paid with pi_<invoice>. */
+function paidSubscription(int $invoiceId): object
+{
+    return (object) ['id' => 'in_' . $invoiceId, 'currency' => 'usd', 'amount_paid' => 2000, 'metadata' => (object) ['ae_stripe_invoice_id' => (string) $invoiceId],
+        'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) ['subscription' => 'sub_' . $invoiceId]]];
+}
 // Stripe as the requests see it: Pay creates one intent per invoice, a refund of a receipt return fails, so the
-// return becomes account credit, and a confirmation of pi_<invoice> is declined.
+// return becomes account credit, a confirmation of pi_401 is declined, and each charge's fee is 0.50 USD.
 $GLOBALS['stripeHandler'] = function ($verb, $path, $data) {
     static $declined = false;
     if ($verb === 'get' && preg_match('#^/customers/(cus_\d+)$#', $path, $id)) return ['id' => $id[1]];
@@ -58,7 +76,10 @@ $GLOBALS['stripeHandler'] = function ($verb, $path, $data) {
         if (($id[2] ?? '') === '/confirm') throw new StripeFixtureError(402, ['error' => ['code' => 'card_declined', 'decline_code' => 'insufficient_funds']]);
         return $intent;
     }
+    if ($verb === 'get' && preg_match('#^/balance_transactions/(txn_\d+)$#', $path, $id)) return ['id' => $id[1], 'fee' => 50, 'currency' => 'usd'];
     if ($verb === 'get' && $path === '/refunds') return ['has_more' => false, 'data' => []];
+    if ($verb === 'get' && $path === '/invoice_payments') return ['data' => [['status' => 'paid', 'amount_paid' => 2000,
+        'payment' => ['type' => 'payment_intent', 'payment_intent' => 'pi_' . substr($data['invoice'], 3)]]]];
     if ($verb === 'post' && $path === '/refunds') return ['id' => 're_' . $data['payment_intent'], 'payment_intent' => $data['payment_intent'],
         'amount' => (int) $data['amount'], 'currency' => 'usd', 'status' => 'failed', 'metadata' => $data['metadata']];
     throw new RuntimeException('Unexpected Stripe request: ' . $verb . ' ' . $path);
@@ -98,6 +119,29 @@ $cases = [
         'b' => fn ($gateway) => settle($gateway, 502),
         'check' => fn () => $rows(501) === [[20.0, 'succeeded', false]] && $rows(502) === [[20.0, 'succeeded', false]]
             && Invoice::find(501)->status === 'paid' && Invoice::find(502)->status === 'paid'],
+    // The same, paused after A has replaced any card label of its new payment, just before it saves the new label.
+    'settlement-card-label' => ['seed' => function () { customerInvoice(7, 511); customerInvoice(8, 512); },
+        'pause' => '/^insert ignore into `ae_stripe_transaction_methods`/',
+        'a' => fn ($gateway) => settle($gateway, 511),
+        'b' => fn ($gateway) => settle($gateway, 512),
+        'check' => fn () => $rows(511) === [[20.0, 'succeeded', false]] && $rows(512) === [[20.0, 'succeeded', false]]
+            && DB::table('ae_stripe_transaction_methods')->pluck('label')->all() === ['Visa **** 4242', 'Visa **** 4242']],
+    // Stripe settles two customers' subscription invoices at once. Each finds its own service, never the other's.
+    'subscription-subscription' => ['seed' => function () { subscriptionInvoice(8, 582); subscriptionInvoice(7, 581); },
+        'pause' => '/^insert into `invoice_transactions`/',
+        'a' => fn ($gateway) => invoke($gateway, 'recordSubscriptionPayment', paidSubscription(581)) ?? 'settled',
+        'b' => fn ($gateway) => invoke($gateway, 'recordSubscriptionPayment', paidSubscription(582)) ?? 'settled',
+        'check' => fn () => $rows(581) === [[20.0, 'succeeded', false]] && $rows(582) === [[20.0, 'succeeded', false]]],
+    // Two customers' charge fees are recorded at once, each on a settled payment with no fee row yet.
+    'fee-fee' => ['seed' => function () use ($gateway) { customerInvoice(7, 701); customerInvoice(8, 702); settle($gateway, 701); settle($gateway, 702); },
+        'pause' => '/^insert into `ae_stripe_payment_fees`/',
+        'a' => fn ($gateway) => invoke($gateway, 'recordChargeFee', (object) ['payment_intent' => 'pi_701', 'paid' => true, 'status' => 'succeeded',
+            'id' => 'ch_701', 'balance_transaction' => 'txn_701']),
+        'b' => fn ($gateway) => invoke($gateway, 'recordChargeFee', (object) ['payment_intent' => 'pi_702', 'paid' => true, 'status' => 'succeeded',
+            'id' => 'ch_702', 'balance_transaction' => 'txn_702']),
+        'check' => fn () => DB::table('ae_stripe_payment_fees')->orderBy('payment_intent_id')->get(['payment_intent_id', 'state'])
+            ->map(fn ($row) => [$row->payment_intent_id, $row->state])->all() === [['pi_701', 'completed'], ['pi_702', 'completed']]
+            && DB::table('invoice_transactions')->where('fee', 0.5)->count() === 2],
     // Two customers overpay neighbouring invoices; Stripe refuses each refund, so each excess becomes account credit.
     // Another customer's finished return sorts between their payments in the receipt index, as in a used ledger.
     'receipt-returns' => ['seed' => function () {
@@ -140,8 +184,8 @@ $deadlocks = fn () => (int) DB::selectOne("show global status like 'Innodb_deadl
 $php = getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY;
 foreach ($cases as $name => $case) {
     DB::statement('set foreign_key_checks = 0');
-    foreach (['invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'credits', 'audits', 'notifications',
-        'properties', 'invoice_items', 'invoices', 'users'] as $table) DB::table($table)->truncate();
+    foreach (['invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
+        'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users'] as $table) DB::table($table)->truncate();
     DB::statement('set foreign_key_checks = 1');
     $case['seed']();
     $before = $deadlocks();
@@ -162,8 +206,9 @@ foreach ($cases as $name => $case) {
         'b' => json_decode(substr($early ?? workerLine($workers['b']), 5), true)];
     foreach ($workers as $worker) { fclose($worker[1]); fclose($worker[2]); proc_close($worker[0]); }
     echo $name . ': B ' . ($early === null ? 'waited on A' : 'finished while A was paused') . "\n";
+    check(($early === null) === !empty($case['waits']), $name . ': B ' . (empty($case['waits']) ? 'never waits on A' : 'waits on A'));
     check(isset($results['a']['ok'], $results['b']['ok']), $name . ': both requests finish: ' . json_encode($results));
-    check($deadlocks() === $before, $name . ': InnoDB reports no deadlock between the two requests');
+    check($deadlocks() - $before === ($case['deadlocks'] ?? 0), $name . ': InnoDB reports ' . ($case['deadlocks'] ?? 0) . ' deadlocks between the two');
     check($case['check']($results), $name . ': each request leaves its own rows, once: ' . json_encode($results));
 }
 echo "PASS: $count MariaDB lock assertions\n";

@@ -689,7 +689,8 @@ namespace {
         }
         public function first() {
             if ($hook = self::$beforeRead) { self::$beforeRead = null; $hook(); }
-            if (!$this->locked || !\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Fee current read lock missing');
+            // Under the owner lock a plain read finds the fee row; only a row it found is then locked.
+            if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Fee current read lock missing');
             return $this->get()[0] ?? null;
         }
         public function insert($row) {

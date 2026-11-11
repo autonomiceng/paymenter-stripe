@@ -43,9 +43,12 @@ trait TransactionMethod
     {
         $table = DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $transaction->id);
         $stored = $failed ? $table->first() : null;
+        // Settlement holds the invoice lock that every writer here holds, so a plain read finds the row. A delete of a
+        // missing row would lock the index gap that this payment and a neighbouring one then insert into: a deadlock.
+        $exists = $stored || $table->exists();
         // The locked success guard permits only the first successful settlement here.
-        if ($succeeded || $failed) $table->delete();
-        elseif ($table->exists()) return;
+        if ($succeeded || $failed) { if ($exists) $table->delete(); }
+        elseif ($exists) return;
         $charge = $intent->latest_charge ?? null;
         $details = is_object($charge) ? ($charge->payment_method_details ?? null) : null;
         if ($failed) $details ??= $intent->last_payment_error->payment_method ?? null;

@@ -141,7 +141,10 @@ trait PaymentFees
             $current = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentId))[0] ?? null;
             abort_unless(($current->gateway->extension ?? null) === 'AeStripe'
                 && $current->invoice->id === $invoice->id, 409);
-            $row = $this->feeRows()->where('payment_intent_id', $paymentId)->lockForUpdate()->first();
+            // Every insert of a fee row holds this owner lock, so a plain read finds it, and only an existing row is locked.
+            // A locking read of a missing key locks the gap two payments then insert into, and they deadlock.
+            $row = $this->feeRows()->where('payment_intent_id', $paymentId)->first()
+                ? $this->feeRows()->where('payment_intent_id', $paymentId)->lockForUpdate()->first() : null;
             if ($row && $row->state !== 'pending') return;
             if ($row && ($row->charge_id !== ($snapshot ? $snapshot->charge_id : $chargeId)
                 || $row->balance_transaction_id !== ($snapshot ? $snapshot->balance_transaction_id : $balanceId))) return;

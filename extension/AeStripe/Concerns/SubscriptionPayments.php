@@ -85,7 +85,11 @@ trait SubscriptionPayments
         DB::transaction(function () use ($stripeInvoice, $subscriptionId, $paymentId, $intent, $ownerId) {
             // Match PaymentIntent settlement: serialize on the customer before other rows.
             User::where('id', $ownerId)->lockForUpdate()->firstOrFail();
-            $service = Service::where('subscription_id', $subscriptionId)->lockForUpdate()->first();
+            // services has no subscription_id index, so a locking read by it locks every row it scans, other customers'
+            // services too. Find the row with a plain read under the owner lock, then lock only it by primary key.
+            $id = Service::where('subscription_id', $subscriptionId)->first()?->id;
+            $service = $id ? Service::where('id', $id)->lockForUpdate()->first() : null;
+            if ($service?->subscription_id !== $subscriptionId) $service = null;
             if ($service) abort_unless($service->user_id === $ownerId, 409);
             if (!$service) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
             if ($settled = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentId), 'succeeded')[0] ?? null) {
