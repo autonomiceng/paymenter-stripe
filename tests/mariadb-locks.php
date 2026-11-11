@@ -92,6 +92,46 @@ $attempt = fn (int $user, int $invoice) => json_decode(User::find($user)->proper
 $rows = fn (int $invoice) => DB::table('invoice_transactions')->where('invoice_id', $invoice)->orderBy('id')->get(['amount', 'status', 'is_credit_transaction'])
     ->map(fn ($row) => [(float) $row->amount, $row->status, (bool) $row->is_credit_transaction])->all();
 $cases = [
+    // Audited settlement and missing-subscription review, using the review fixture with normal web auditing.
+    'subscription-review-vs-settlement' => [
+        'seed' => function () {
+            customerInvoice(7, 801);
+            User::find(7)->properties()->create(['key' => 'ae_stripe_checkout_801', 'value' => json_encode([
+                'version' => 2, 'key' => 'checkout_801', 'created' => time(), 'retry' => true])]);
+        },
+        'audit' => true,
+        'pause' => '/^insert into `invoice_transactions`/',
+        'a' => function ($gateway) {
+            $intent = intentOf(801, 'succeeded', 2000);
+            $intent->metadata->ae_stripe_attempt = 'checkout_801';
+            invoke($gateway, 'recordIntentPayment', $intent, 'succeeded');
+            return 'settled';
+        },
+        'b' => fn ($gateway) => invoke($gateway, 'recordSubscriptionPayment', (object) [
+            'id' => 'in_missing_subscription', 'amount_paid' => 2000, 'currency' => 'usd',
+            'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) []]]) ?? 'reviewed',
+        'check' => fn () => $rows(801) === [[20.0, 'succeeded', false]] && Invoice::find(801)->status === 'paid'
+            && DB::table('audits')->where('auditable_type', App\Models\Property::class)->count() > 0
+            && DB::table('audits')->where('event', 'ae_stripe_subscription_review')->count() === 1,
+    ],
+    // Subscription review must not lock an unrelated invoice's existing audit row while it records its own audit.
+    'subscription-audit' => ['seed' => fn () => App\Models\Audit::create(['event' => 'fixture',
+            'auditable_type' => Invoice::class, 'auditable_id' => 801, 'old_values' => [], 'new_values' => []]),
+        'pause' => '/^insert into `audits`/',
+        'a' => fn ($gateway) => invoke($gateway, 'recordSubscriptionReview', paidSubscription(801), 'Service missing') ?? 'recorded',
+        'b' => fn () => DB::transaction(fn () => App\Models\Audit::where('id', 1)->update(['event' => 'invoice_checked'])),
+        'check' => fn () => App\Models\Audit::where('id', 1)->first()->event === 'invoice_checked'
+            && App\Models\Audit::where('event', 'ae_stripe_subscription_review')->count() === 1],
+    // Duplicate review deliveries still serialize on the gateway and record exactly one entry.
+    'subscription-review-duplicate' => ['seed' => fn () => null, 'waits' => true,
+        'pause' => '/^insert into `audits`/',
+        'a' => fn ($gateway) => invoke($gateway, 'recordSubscriptionReview', paidSubscription(802), 'Service missing') ?? 'recorded',
+        'b' => fn ($gateway) => DB::transaction(function () use ($gateway) {
+            DB::table('audits')->count(); // An older settlement snapshot must not hide A's later committed review.
+            invoke($gateway, 'recordSubscriptionReview', paidSubscription(802), 'Service missing');
+            return 'recorded';
+        }),
+        'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_subscription_review')->count() === 1],
     // Two customers open Pay on invoices with no stored attempt; each reserves its attempt row in the properties index.
     'pay-pay' => ['seed' => function () { customerInvoice(7, 301); customerInvoice(8, 302); },
         'pause' => '/^insert into `properties`/',
@@ -219,6 +259,10 @@ $cases = [
 
 if (($argv[1] ?? null) === 'worker') {
     $case = $cases[$argv[2]];
+    if (!empty($case['audit'])) {
+        config(['audit.enabled' => true, 'audit.console' => true]);
+        App\Models\Property::observe(OwenIt\Auditing\AuditableObserver::class);
+    }
     if ($argv[3] === 'a') pauseBefore($case['pause']);
     fwrite(STDOUT, 'ready ' . DB::selectOne('select connection_id() as id')->id . "\n"); fflush(STDOUT);
     try { $result = ['ok' => $case[$argv[3]]($gateway)]; } catch (Throwable $e) { $result = ['error' => get_class($e) . ': ' . $e->getMessage()]; }
@@ -239,6 +283,7 @@ function workerLine(array $worker, ?callable $stop = null): ?string
 $deadlocks = fn () => (int) DB::selectOne("show global status like 'Innodb_deadlocks'")->Value;
 $php = getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY;
 foreach ($cases as $name => $case) {
+    if (getenv('PAY_MARIADB_CASE') && !in_array($name, explode(',', getenv('PAY_MARIADB_CASE')), true)) continue;
     DB::statement('set foreign_key_checks = 0');
     foreach (['invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
         'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users'] as $table) DB::table($table)->truncate();
@@ -262,6 +307,7 @@ foreach ($cases as $name => $case) {
         'b' => json_decode(substr($early ?? workerLine($workers['b']), 5), true)];
     foreach ($workers as $worker) { fclose($worker[1]); fclose($worker[2]); proc_close($worker[0]); }
     echo $name . ': B ' . ($early === null ? 'waited on A' : 'finished while A was paused') . "\n";
+    echo $name . ': requests ' . json_encode($results) . '; deadlocks=' . ($deadlocks() - $before) . "\n";
     check(($early === null) === !empty($case['waits']), $name . ': B ' . (empty($case['waits']) ? 'never waits on A' : 'waits on A'));
     check(isset($results['a']['ok'], $results['b']['ok']), $name . ': both requests finish: ' . json_encode($results));
     check($deadlocks() - $before === ($case['deadlocks'] ?? 0), $name . ': InnoDB reports ' . ($case['deadlocks'] ?? 0) . ' deadlocks between the two');

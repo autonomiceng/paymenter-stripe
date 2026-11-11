@@ -39,18 +39,24 @@ trait SubscriptionPayments
     private function recordSubscriptionReview($stripeInvoice, string $reason): void
     {
         // No invoice can be inferred safely. Keep a gateway audit entry for the Stripe invoice.
-        DB::transaction(function () use ($stripeInvoice, $reason) {
-            $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->lockForUpdate()->firstOrFail();
-            if (\App\Models\Audit::where('event', 'ae_stripe_subscription_review')
-                ->where('new_values->stripe_invoice_id', $stripeInvoice->id)->lockForUpdate()->first()) return;
-            \App\Models\Audit::create([
-                'event' => 'ae_stripe_subscription_review', 'auditable_type' => \App\Models\Gateway::class,
-                'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => [
-                    'stripe_invoice_id' => $stripeInvoice->id, 'amount_minor' => $stripeInvoice->amount_paid,
-                    'currency' => $stripeInvoice->currency, 'reason' => $reason,
-                    'subscription_id' => $stripeInvoice->parent->subscription_details->subscription ?? null,
-                ],
-            ]);
+        DB::afterCommit(function () use ($stripeInvoice, $reason) {
+            $id = \App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+            DB::transaction(function () use ($stripeInvoice, $reason, $id) {
+                // Lock the existing gateway before the first plain read. A fresh transaction after settlement avoids an
+                // older invoice snapshot; the gateway serializes dedupe without locking another customer's property audits.
+                $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->where('id', $id)->lockForUpdate()->firstOrFail();
+                if (\App\Models\Audit::where('auditable_type', \App\Models\Gateway::class)->where('auditable_id', $gateway->id)
+                    ->where('event', 'ae_stripe_subscription_review')
+                    ->where('new_values->stripe_invoice_id', $stripeInvoice->id)->first()) return;
+                \App\Models\Audit::create([
+                    'event' => 'ae_stripe_subscription_review', 'auditable_type' => \App\Models\Gateway::class,
+                    'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => [
+                        'stripe_invoice_id' => $stripeInvoice->id, 'amount_minor' => $stripeInvoice->amount_paid,
+                        'currency' => $stripeInvoice->currency, 'reason' => $reason,
+                        'subscription_id' => $stripeInvoice->parent->subscription_details->subscription ?? null,
+                    ],
+                ]);
+            });
         });
     }
 
