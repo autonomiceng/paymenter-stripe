@@ -79,11 +79,7 @@ trait CheckoutIntent
                         $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
                     }
                     if (($fresh->amount_received ?? 0) !== 0 || !$this->paymentAttemptFailed($stored, $fresh)) return false;
-                    // A rolled-back confirmation can still have its earlier refusal under the intent ID.
-                    if (!empty($stored['confirmation']['previous_charge'])
-                        && $stored['confirmation']['previous_charge'] !== ($fresh->latest_charge ?? null)) {
-                        $this->keepFailedAttempt((object) ['id' => $fresh->id, 'latest_charge' => $stored['confirmation']['previous_charge']]);
-                    }
+                    $this->keepPreviousFailedAttempt($stored, $fresh);
                     // Keep the claimed confirmation until refusal and renewal policy commit together.
                     $this->recordIntentPayment($fresh, 'failed');
                     return $fresh;
@@ -270,7 +266,25 @@ trait CheckoutIntent
             $values += ['agreement_id' => null, 'confirmation' => null];
             $values['retry'] = false;
         }
-        return $this->storePaymentAttempt($invoice, $attempt, $values);
+        return $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intent, $values) {
+            $stored = $this->readPaymentAttempt($user, $current);
+            if (($stored['key'] ?? null) !== $attempt['key']) return false;
+            $refused = !empty($stored['confirmation']) && $this->paymentAttemptFailed($stored, $intent);
+            if ($refused) $this->keepPreviousFailedAttempt($stored, $intent);
+            $this->writePaymentAttempt($user, $current, array_replace($stored, $values));
+            // The earlier refusal, cleared confirmation and new outcome commit together.
+            if ($refused) $this->recordIntentPayment($intent, 'failed');
+            return true;
+        });
+    }
+
+    private function keepPreviousFailedAttempt(array $attempt, $intent): void
+    {
+        // A rolled-back confirmation can still have its earlier refusal under the intent ID.
+        if (!empty($attempt['confirmation']['previous_charge'])
+            && $attempt['confirmation']['previous_charge'] !== ($intent->latest_charge ?? null)) {
+            $this->keepFailedAttempt((object) ['id' => $intent->id, 'latest_charge' => $attempt['confirmation']['previous_charge']]);
+        }
     }
 
     /**

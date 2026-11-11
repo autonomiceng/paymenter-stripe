@@ -446,35 +446,44 @@ check($victims === 0 && $posts === ['/payment_intents/pi_renewal381', '/payment_
     && DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $earlierId)->value('label') === 'Visa ending in 1111',
     'A deadlock recording a declined renewal sends one update and one confirmation and keeps both refusals and the earlier method label: '
         . json_encode(['posts' => $posts, 'result' => $declined]));
-// Every rerun of that recording is a deadlock victim too. Nothing commits alone: the renewal keeps its claimed
-// confirmation and Auto Pay state, so the next automatic charge records the decline from Stripe without confirming again.
-App\Models\InvoiceTransaction::where('invoice_id', 381)->delete();
-$owner->properties()->where('key', 'ae_stripe_checkout_381')->update(['value' => $claimed]);
-[$intent->latest_charge, $posts, $victims] = ['ch_previous381', [], 4];
-$earlierId = $earlierRefusal();
-unset($intent->last_payment_error);
-$loseWrites('invoice_transactions');
-try {
-    try { invoke($gateway, 'confirmAttempt', $invoice, $intent->id, $params, $agreement, 2000, 'usd'); $declined = 'not declined'; }
-    catch (Throwable $e) { $declined = get_class($e) . ': ' . $e->getMessage(); }
-} finally {
-    beforeWrite('invoice_transactions', null);
+// Native transaction rollback must preserve the earlier refusal until recovery commits both rows.
+// Run the same fixture for automatic renewal and an ordinary customer saved-card payment.
+foreach ([true, false] as $automatic) {
+    App\Models\InvoiceTransaction::where('invoice_id', 381)->delete();
+    $attempt = json_decode($claimed, true);
+    if (!$automatic) {
+        unset($attempt['automatic_renewal'], $attempt['renewal'], $attempt['confirmation']);
+        $attempt['customer_payment'] = true;
+        $attempt['latest_charge'] = 'ch_previous381';
+    }
+    $owner->properties()->where('key', 'ae_stripe_checkout_381')->update(['value' => json_encode($attempt)]);
+    [$intent->latest_charge, $posts, $victims] = ['ch_previous381', [], 4];
+    $earlierId = $earlierRefusal();
+    unset($intent->last_payment_error);
+    $loseWrites('invoice_transactions');
+    try {
+        try { invoke($gateway, 'confirmAttempt', $invoice, $intent->id, $params, $agreement, 2000, 'usd'); $declined = 'not declined'; }
+        catch (Throwable $e) { $declined = get_class($e) . ': ' . $e->getMessage(); }
+    } finally {
+        beforeWrite('invoice_transactions', null);
+    }
+    $stored = json_decode($owner->properties()->where('key', 'ae_stripe_checkout_381')->value('value'), true);
+    check($victims === 0 && DB::transactionLevel() === 0 && $declined === 'Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException: '
+        . 'We are checking this payment automatically. Refresh the invoice for its status.'
+        && !empty($stored['confirmation']['key']) && $stored['confirmation']['previous_charge'] === 'ch_previous381' && $stored['retry'] === true
+        && (!$automatic || $stored['confirmation']['key'] === 'confirm_renewal381' && $stored['renewal']['state'] === 'active')
+        && App\Models\InvoiceTransaction::where('invoice_id', 381)->count() === 1
+        && App\Models\InvoiceTransaction::find($earlierId)->transaction_id === 'pi_renewal381',
+        'A decline whose every recording is a deadlock victim keeps its claimed confirmation and records nothing alone: '
+            . json_encode(['result' => $declined, 'attempt' => $stored]));
+    try { $next = $automatic ? $gateway->charge($invoice->fresh(), 20, $agreement) : $gateway->retryChargeAttempts(); } catch (Throwable $e) { $next = get_class($e) . ': ' . $e->getMessage(); }
+    $stored = json_decode($owner->properties()->where('key', 'ae_stripe_checkout_381')->value('value'), true);
+    check(count($posts) === 2 && $stored['confirmation'] === null && (!$automatic || $stored['renewal']['state'] === 'waiting')
+        && App\Models\InvoiceTransaction::where('invoice_id', 381)->where('status', 'failed')->count() === 2
+        && App\Models\InvoiceTransaction::find($earlierId)->transaction_id === 'pi_renewal381:ch_previous381'
+        && DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $earlierId)->value('label') === 'Visa ending in 1111',
+        ($automatic ? 'The next automatic charge' : 'Ordinary saved-card recovery') . ' records that decline once and never confirms it again: ' . json_encode(['posts' => $posts, 'result' => $next]));
 }
-$stored = json_decode($owner->properties()->where('key', 'ae_stripe_checkout_381')->value('value'), true);
-check($victims === 0 && DB::transactionLevel() === 0 && $declined === 'Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException: '
-    . 'We are checking this payment automatically. Refresh the invoice for its status.'
-    && ($stored['confirmation']['key'] ?? null) === 'confirm_renewal381' && $stored['retry'] === true && $stored['renewal']['state'] === 'active'
-    && App\Models\InvoiceTransaction::where('invoice_id', 381)->count() === 1
-    && App\Models\InvoiceTransaction::find($earlierId)->transaction_id === 'pi_renewal381',
-    'A decline whose every recording is a deadlock victim keeps its claimed confirmation and records nothing alone: '
-        . json_encode(['result' => $declined, 'attempt' => $stored]));
-try { $next = $gateway->charge($invoice->fresh(), 20, $agreement); } catch (Throwable $e) { $next = get_class($e) . ': ' . $e->getMessage(); }
-$stored = json_decode($owner->properties()->where('key', 'ae_stripe_checkout_381')->value('value'), true);
-check(count($posts) === 2 && $stored['confirmation'] === null && $stored['renewal']['state'] === 'waiting'
-    && App\Models\InvoiceTransaction::where('invoice_id', 381)->where('status', 'failed')->count() === 2
-    && App\Models\InvoiceTransaction::find($earlierId)->transaction_id === 'pi_renewal381:ch_previous381'
-    && DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', $earlierId)->value('label') === 'Visa ending in 1111',
-    'The next automatic charge records that decline once and never confirms it again: ' . json_encode(['posts' => $posts, 'result' => $next]));
 // A Pay that is a deadlock victim on every attempt is rolled back and asks the customer to try again.
 $created = 0;
 $GLOBALS['stripeHandler'] = function ($verb, $path) use (&$created) {
