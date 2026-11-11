@@ -327,14 +327,33 @@ trait CheckoutIntent
         });
     }
 
-    private function withPaymentLock($invoice, callable $callback)
+    /**
+     * Runs $callback in a transaction holding the owner's user row and the invoice row, and runs it again when MariaDB
+     * rolls it back as a deadlock victim. With $rerun, a rolled back transaction runs again only while $rerun() is
+     * true: a callback that sends a Stripe write makes it false first, so that write is never sent twice.
+     */
+    private function withPaymentLock($invoice, callable $callback, ?callable $rerun = null)
     {
-        return DB::transaction(function () use ($invoice, $callback) {
+        $locked = function () use ($invoice, $callback) {
             $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
             $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
             abort_unless($current->user_id === $user->id, 403);
             return $callback($user, $current);
-        }, self::SETTLEMENT_ATTEMPTS);
+        };
+        if (!$rerun) return DB::transaction($locked, self::SETTLEMENT_ATTEMPTS);
+        for ($attempt = 1; ; ++$attempt) {
+            try { return DB::transaction($locked, 1); }
+            catch (\Throwable $e) {
+                if ($attempt >= self::SETTLEMENT_ATTEMPTS || DB::transactionLevel() > 0 || !$rerun() || !$this->lockConflict($e)) throw $e;
+            }
+        }
+    }
+
+    /** A deadlock or lock wait timeout, after which MariaDB has rolled the work back and it can run again. */
+    private function lockConflict(\Throwable $e): bool
+    {
+        return $e instanceof \Illuminate\Database\DeadlockException || $e instanceof \Illuminate\Database\QueryException
+            && preg_match('/SQLSTATE\[40001\]|Deadlock found when trying to get lock|Lock wait timeout exceeded/', $e->getMessage());
     }
 
     private function paymentBalance($invoice): int
@@ -496,7 +515,22 @@ trait CheckoutIntent
             $expectedAmount = $attempt['confirmation']['amount'];
         }
         $writeStarted = false;
-        $result = $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intentId, $params, $agreement, $expectedAmount, $expectedCurrency, &$writeStarted) {
+        // Records Stripe's answer: a proven refusal ends this confirmation, and a declined renewal is recorded as failed.
+        $record = function ($outcome) use ($invoice, $attempt) {
+            if (is_array($outcome)) {
+                [$fresh, $e] = [$outcome['refused'], $outcome['error']];
+                $this->storePaymentAttempt($invoice, $attempt, ['retry' => false, 'confirmation' => null, 'agreement_id' => null], confirmationOnly: true);
+                $declined = $fresh->status === 'requires_payment_method' && ($e->response->status() === 402 || !empty($fresh->last_payment_error));
+                if ($declined) $this->recordIntentPayment($fresh, 'failed');
+                $reason = $this->paymentRefusalReason($e, $invoice, $fresh->last_payment_error->code ?? null, $fresh->last_payment_error->decline_code ?? null);
+                return $declined ? new PaymentDeclinedException($reason) : new DisplayException($reason);
+            }
+            if (!empty($attempt['automatic_renewal']) && $outcome->status === 'requires_payment_method'
+                && ($outcome->amount_received ?? 0) === 0 && !empty($outcome->last_payment_error)) $this->recordIntentPayment($outcome, 'failed');
+            return $outcome;
+        };
+        $outcome = null;
+        $confirm = function ($user, $current) use ($attempt, $intentId, $params, $agreement, $expectedAmount, $expectedCurrency, &$writeStarted, &$outcome, $record) {
             $stored = $this->readPaymentAttempt($user, $current);
             if (($stored['confirmation']['key'] ?? null) !== $attempt['confirmation']['key']) return null;
             try {
@@ -537,28 +571,29 @@ trait CheckoutIntent
                 $this->keepFailedAttempt($intent);
                 $writeStarted = true;
                 $this->request('post', '/payment_intents/' . $intentId, $updates);
-                $result = $this->request('post', '/payment_intents/' . $intentId . '/confirm', $params, $attempt['confirmation']['key']);
-                if (!empty($stored['automatic_renewal']) && $result->status === 'requires_payment_method'
-                    && ($result->amount_received ?? 0) === 0 && !empty($result->last_payment_error)) $this->recordIntentPayment($result, 'failed');
-                return $result;
+                $outcome = $this->request('post', '/payment_intents/' . $intentId . '/confirm', $params, $attempt['confirmation']['key']);
+                return $record($outcome);
             } catch (RequestException | ConnectionException $e) {
                 if ($e instanceof RequestException && $writeStarted && $this->definitePaymentRefusal($e)) {
                     // Even a 400 may follow a debit. Prove refusal and commit its transition before releasing these locks.
                     try {
                         $fresh = $this->request('get', '/payment_intents/' . $intentId);
                         if (($fresh->amount_received ?? 0) === 0 && in_array($fresh->status, ['requires_payment_method', 'requires_confirmation', 'canceled'], true)) {
-                            $this->writePaymentAttempt($user, $current, array_replace($stored, ['retry' => false, 'confirmation' => null, 'agreement_id' => null]));
-                            $declined = $fresh->status === 'requires_payment_method' && ($e->response->status() === 402 || !empty($fresh->last_payment_error));
-                            if ($declined) $this->recordIntentPayment($fresh, 'failed');
-                            $reason = $this->paymentRefusalReason($e, $current, $fresh->last_payment_error->code ?? null, $fresh->last_payment_error->decline_code ?? null);
-                            return $declined ? new PaymentDeclinedException($reason) : new DisplayException($reason);
+                            return $record($outcome = ['refused' => $fresh, 'error' => $e]);
                         }
                         return $fresh;
                     } catch (RequestException | ConnectionException $readError) { return $readError; }
                 }
                 return $e;
             }
-        });
+        };
+        // A lock conflict reruns the confirmation only before the Stripe update is sent, so no rerun repeats it.
+        try { $result = $this->withPaymentLock($invoice, $confirm, function () use (&$writeStarted) { return !$writeStarted; }); }
+        catch (\Throwable $e) {
+            // Stripe answered, but a lock conflict rolled back its recording: record that answer again without calling Stripe.
+            if ($outcome === null || DB::transactionLevel() > 0 || !$this->lockConflict($e)) throw $e;
+            $result = $record($outcome);
+        }
         if ($result === null || $result instanceof RequestException || $result instanceof ConnectionException) {
             $this->paymentStripeUnavailable = true;
             $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');

@@ -28,9 +28,9 @@ trait Checkout
      * add in the admin panel takes no invoice lock, so a settlement at that moment may not count it. Core code can still
      * make this transaction a deadlock victim; MariaDB rolls all of it back, so it runs again from the settled check.
      * Pay and the other payment lock transactions (withPaymentLock) use the same count: a rerun locks the user and invoice
-     * again and rereads the attempt and balance. Laravel reruns only the outermost transaction. A Stripe write inside a
-     * payment lock runs again only when a later statement was the victim, and each such write carries an idempotency key
-     * or follows a fresh read of the payment.
+     * again and rereads the attempt and balance. Laravel reruns only the outermost transaction. A Stripe cancel or amount
+     * update inside a payment lock is its last statement, so a rerun follows only a victim before it was sent. The
+     * confirmation never reruns once it sent its update; a later victim records Stripe's answer again (confirmAttempt).
      */
     private const SETTLEMENT_ATTEMPTS = 3;
 

@@ -420,3 +420,49 @@ $attempt = json_decode(User::find(11)->properties()->where('key', 'ae_stripe_che
 check(is_object($view) && $victims === 0 && $view->getData()['intent']->id === 'pi_victim_371' && $created === 1
     && ($attempt['intent'] ?? null) === 'pi_victim_371',
     'A Pay chosen as a deadlock victim runs again and gives one working page with one intent: ' . (is_string($view) ? $view : ''));
+
+// A deadlock while recording a declined renewal never sends the Stripe update or confirmation again: the confirmation
+// does not rerun after its update, and the decline Stripe already returned is recorded in new transactions.
+$invoice = nativeInvoice(381, 20, 'USD');
+$due = now()->addDays(7)->format('Y-m-d');
+$invoice->update(['due_at' => $due]);
+$agreement = nativeAgreement(381, 'pm_renewal381');
+$service = nativeService(null, [$invoice]);
+$service->update(['billing_agreement_id' => $agreement->id, 'expires_at' => $due]);
+$intent = (object) ['id' => 'pi_renewal381', 'status' => 'requires_payment_method', 'amount' => 2000, 'amount_received' => 0, 'currency' => 'usd',
+    'customer' => 'cus_owner', 'confirmation_method' => 'manual', 'payment_method_types' => ['card'], 'latest_charge' => null,
+    'metadata' => (object) ['invoice_id' => '381']];
+$params = ['payment_method' => 'pm_renewal381', 'off_session' => 'true'];
+$owner->properties()->create(['key' => 'ae_stripe_checkout_381', 'value' => json_encode(['version' => 2, 'key' => 'checkout_renewal381',
+    'created' => time(), 'intent' => $intent->id, 'retry' => true, 'automatic_renewal' => true, 'agreement_id' => $agreement->id,
+    'confirmation' => ['key' => 'confirm_renewal381', 'params' => $params, 'agreement' => $agreement->id, 'amount' => 2000, 'currency' => 'usd', 'previous_charge' => null],
+    'renewal' => ['state' => 'active', 'services' => [(int) $service->id], 'agreement_id' => $agreement->id, 'cutoff' => $due, 'retries' => 0]])]);
+$posts = [];
+$GLOBALS['stripeHandler'] = function ($verb, $path) use (&$intent, &$posts) {
+    if ($verb === 'get' && $path === '/payment_intents/pi_renewal381') return $intent;
+    if ($verb === 'get' && $path === '/payment_methods/pm_renewal381') return nativeCard('pm_renewal381');
+    if ($verb !== 'post' || !str_starts_with($path, '/payment_intents/pi_renewal381')) throw new RuntimeException('Unexpected renewal request: ' . $verb . ' ' . $path);
+    $posts[] = $path;
+    if ($path === '/payment_intents/pi_renewal381') return $intent;
+    $intent->last_payment_error = (object) ['code' => 'card_declined', 'decline_code' => 'insufficient_funds'];
+    throw new StripeFixtureError(402, ['error' => ['code' => 'card_declined', 'decline_code' => 'insufficient_funds']]);
+};
+$victims = 1;
+beforeWrite('invoice_transactions', function ($values, $sql) use (&$victims) {
+    if ($victims <= 0 || !str_starts_with($sql, 'insert')) return;
+    --$victims;
+    throw new Illuminate\Database\QueryException('mysql', $sql, [],
+        new PDOException('SQLSTATE[40001]: Serialization failure: 1213 Deadlock found when trying to get lock; try restarting transaction'));
+});
+try {
+    try { invoke($gateway, 'confirmAttempt', $invoice, $intent->id, $params, $agreement, 2000, 'usd'); $declined = 'not declined'; }
+    catch (Throwable $e) { $declined = get_class($e) . ': ' . $e->getMessage(); }
+} finally {
+    beforeWrite('invoice_transactions', null);
+}
+$stored = json_decode($owner->properties()->where('key', 'ae_stripe_checkout_381')->value('value'), true);
+check($victims === 0 && $posts === ['/payment_intents/pi_renewal381', '/payment_intents/pi_renewal381/confirm']
+    && str_ends_with($declined, 'PaymentDeclinedException: Insufficient funds. Try a different card, or contact your bank.')
+    && App\Models\InvoiceTransaction::where('invoice_id', 381)->where('status', 'failed')->count() === 1 && $stored['confirmation'] === null,
+    'A deadlock recording a declined renewal sends one update and one confirmation and records the decline once: '
+        . json_encode(['posts' => $posts, 'result' => $declined]));
