@@ -1,5 +1,32 @@
 <?php
-// Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE. Two customers' payment requests at once, on real MariaDB sessions (tests/mariadb-app.php). Each case runs request A in one process until it reaches a chosen point inside its transaction and holds it there. Request B then runs in a second process until it finishes or InnoDB makes it wait on A. A then continues. Any lock cycle between the two is a deadlock that InnoDB reports and counts. Each case requires B to wait on A exactly when it says so ('waits'), the deadlocks it makes on purpose and no other ('deadlocks'), both requests finishing, and the rows each one owes, once. Usage: PAY_MARIADB_PORT=... PAY_MARIADB_PASSWORD=... php tests/mariadb-locks.php
+// Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
+// Real sessions with normal model and console auditing. A pauses before a statement while B finishes or waits.
+// Check the declared wait, deadlock count, both results and exact final rows. Only rollback-retry creates a deadlock.
+// Usage: PAY_MARIADB_PORT=... PAY_MARIADB_PASSWORD=... php tests/mariadb-locks.php
+/* Case evidence index. Paths below are relative to ~/.cache/beco-suites/.
+ * r5=stripe-locks-r5; r6=stripe-locks-r6; r7=stripe-locks-r7/addendum;
+ * r8=lanes/journeys-r2/stripe-r8-20261110; r9=lanes/journeys-r2/stripe-r9-20261110.
+ * Fail-first cases and the red log for their fix:
+ * staff-reversals: r9/red-staff-original-ready.log
+ * staff-attempt-review: r9/red-staff-attempt-review.log
+ * staff-reversal-notice-retry: r9/red-staff-reversal-notice-retry.log
+ * pay-return-card-save: r7/red/final2-pay-return-card-save.log
+ * access-staff-settlement: r8/red-access-regression.log
+ * subscription-review-vs-settlement: r7/red/final2-subscription-review-vs-settlement.log
+ * gateway-review: r7/red/final2-gateway-review.log
+ * gateway-access: r8/red-audit-range.log
+ * pay-pay: r5/dev/m1-7bdc0612.log
+ * pay-settlement: r5/red/c3f4e8a3-all.log
+ * settlement-settlement: r5/red/c3f4e8a3-settlement-settlement.log
+ * settlement-card-label: r6/red/fc1ef637-mariadb-TransactionMethod.log
+ * subscription-subscription: r6/red/fc1ef637-mariadb-SubscriptionPayments.log
+ * fee-fee: r6/red/fc1ef637-mariadb-PaymentFees.log
+ * receipt-returns: r5/red/credits-reverted-receipt-returns.log
+ * rollback-retry: r6/red/no-settlement-rerun-mariadb.log
+ * Continuity cases, with no separate red claim: access-notice-retry, subscription-audit,
+ * subscription-review-duplicate, gateway-state-current, gateway-events, gateway-signature, saved-cards,
+ * saved-cards-duplicate, same-payment-duplicate, same-payment-return, subscription-owner, reversal-duplicate.
+ */
 use App\Models\{Invoice, User};
 use Illuminate\Support\Facades\DB;
 $install = ($argv[1] ?? null) !== 'worker';
