@@ -332,7 +332,7 @@ trait CheckoutIntent
             $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
             abort_unless($current->user_id === $user->id, 403);
             return $callback($user, $current);
-        });
+        }, self::SETTLEMENT_ATTEMPTS);
     }
 
     private function paymentBalance($invoice): int

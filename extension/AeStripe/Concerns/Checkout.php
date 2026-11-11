@@ -27,6 +27,10 @@ trait Checkout
      * with neighbouring invoices, and then inserts the payment into that gap. Staff can add a transaction without the
      * invoice lock, so the locking read stays. A Pay or settlement of a neighbouring invoice can therefore make this
      * transaction a deadlock victim; MariaDB rolls all of it back, so it runs again from the settled check.
+     * Pay and the other payment lock transactions (withPaymentLock) use the same count: a rerun locks the user and invoice
+     * again and rereads the attempt and balance. Laravel reruns only the outermost transaction. A Stripe write inside a
+     * payment lock runs again only when a later statement was the victim, and each such write carries an idempotency key
+     * or follows a fresh read of the payment.
      */
     private const SETTLEMENT_ATTEMPTS = 3;
 

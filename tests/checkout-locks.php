@@ -388,3 +388,35 @@ check(($returns['pi_rev391:stripe:dispute:dp_rev_391']['state'] ?? null) === 'op
     'Each dispute is recorded once beside its receipt, with one staff record');
 check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
     'Two disputes reported at once never deadlock on their receipt rows or staff records');
+
+// Pay chosen as a deadlock victim runs again from the locked balance check, so the customer gets a working page.
+$victims = 0;
+beforeWrite('properties', function ($values, $sql) use (&$victims) {
+    if ($victims <= 0 || !str_starts_with($sql, 'insert') || ($values['key'] ?? null) !== 'ae_stripe_checkout_371') return;
+    --$victims;
+    throw new Illuminate\Database\QueryException('mysql', $sql, [],
+        new PDOException('SQLSTATE[40001]: Serialization failure: 1213 Deadlock found when trying to get lock; try restarting transaction'));
+});
+$created = 0;
+$GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use (&$created) {
+    if ($verb === 'get' && $path === '/customers/cus_11') return ['id' => 'cus_11'];
+    if ($verb === 'post' && $path === '/customer_sessions') return ['client_secret' => 'cuss_11'];
+    if ($verb === 'post' && $path === '/payment_intents') {
+        ++$created;
+        return ['id' => 'pi_victim_371', 'status' => 'requires_payment_method', 'amount' => $data['amount'], 'amount_received' => 0,
+            'currency' => strtolower($data['currency']), 'customer' => $data['customer'], 'confirmation_method' => 'automatic',
+            'payment_method_types' => $data['payment_method_types'], 'latest_charge' => null, 'client_secret' => 'pi_victim_secret',
+            'metadata' => (object) $data['metadata']];
+    }
+    throw new RuntimeException('Unexpected Pay request: ' . $verb . ' ' . $path);
+};
+$victims = 1;
+try {
+    try { [$view] = $open($gateway, $invoiceFor(371, 11)); } catch (Throwable $e) { $view = get_class($e) . ': ' . $e->getMessage(); }
+} finally {
+    beforeWrite('properties', null);
+}
+$attempt = json_decode(User::find(11)->properties()->where('key', 'ae_stripe_checkout_371')->value('value') ?? 'null', true);
+check(is_object($view) && $victims === 0 && $view->getData()['intent']->id === 'pi_victim_371' && $created === 1
+    && ($attempt['intent'] ?? null) === 'pi_victim_371',
+    'A Pay chosen as a deadlock victim runs again and gives one working page with one intent: ' . (is_string($view) ? $view : ''));
