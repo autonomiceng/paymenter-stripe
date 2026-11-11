@@ -4,6 +4,11 @@ require_once __DIR__ . '/entered.php';
 // Any nonempty mode, even "0", goes to the matrix, which rejects unknown modes before starting a child.
 if (!in_array(getenv('PAY_PENDING_MATRIX'), [false, ''], true)) { require __DIR__ . '/native-pending-matrix.php'; return; }
 if (in_array('--receipt-returns', $argv, true)) putenv('PAY_NATIVE_SUITE=receipt-returns');
+if (getenv('PAY_NATIVE_SUITE') === 'conversion-bootstrap') {
+    $argv[1] = getenv('PAYMENTER_TEST_APP');
+    require __DIR__ . '/conversion-bootstrap.php';
+    return;
+}
 if (getenv('PAY_NATIVE_SUITE')) {
     // A separate process: the native suite declares its own helpers on real Paymenter classes. It inherits the
     // descriptors: passing STDOUT rewinds a file log, so the child would overwrite output written before it started.

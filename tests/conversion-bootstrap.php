@@ -13,8 +13,10 @@ Illuminate\Support\Facades\Facade::setFacadeApplication($container);
 $database = new class {
     public string $extension = 'StripeSaved';
     public array $locks = [];
+    public bool $fail = false;
     public function connection() { return $this; }
     public function getDatabaseName() { return 'paymenter'; }
+    public function getDriverName() { return 'sqlite'; }
     public function transactionLevel() { return 0; }
     public function transaction($callback) { return $callback(); }
     public function table($name) {
@@ -34,6 +36,7 @@ $database = new class {
             public function firstOrFail() { return (object) $this->database->locks[$this->scope]; }
         };
         if ($name !== 'extensions') throw new RuntimeException('Unexpected table');
+        if ($this->fail) throw new RuntimeException('Synthetic private conversion detail');
         return new class($this) {
             public function __construct(private $database) {}
             public function orderBy($key) { return $this; }
@@ -45,6 +48,11 @@ $database = new class {
     }
 };
 Illuminate\Support\Facades\DB::swap($database);
+$logger = new class {
+    public array $errors = [];
+    public function error($message, array $context = []) { $this->errors[] = [$message, $context]; }
+};
+Illuminate\Support\Facades\Log::swap($logger);
 Illuminate\Support\Facades\Schema::swap(new class {
     public function getTableListing($schema = null, $schemaQualified = true) {
         if ($schema !== 'paymenter' || $schemaQualified) throw new RuntimeException('Expected current schema and bare names');
@@ -62,4 +70,13 @@ foreach ([[[], 'Dry run'], [['--apply' => true], 'Converted gateway #42'], [[], 
         throw new RuntimeException('Explicit registration did not call the conversion command');
     }
 }
-echo "PASS: explicit Artisan registration and dry/apply dispatch with Paymenter vendor classes\n";
+$database->fail = true;
+$output = new Symfony\Component\Console\Output\BufferedOutput;
+$status = $artisan->call('ae-stripe:convert-from-stripe-saved', [], $output);
+$message = $output->fetch();
+if ($status !== 1 || !str_contains($message, 'Conversion failed. Keep writers and webhook delivery paused.')
+    || str_contains($message, 'Synthetic private conversion detail') || $container->bound('config')
+    || $logger->errors !== [['AE Stripe conversion failed.', ['exception' => RuntimeException::class, 'code' => 'conversion_failed']]]) {
+    throw new RuntimeException('Conversion failure must return its status and sanitized record without booting the app');
+}
+echo "PASS: explicit Artisan registration, dry/apply dispatch and sanitized failure without app configuration\n";
