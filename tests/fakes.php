@@ -215,13 +215,13 @@ namespace App\Models {
                     }
                     return false;
                 });
-                return new NativeModelQuery($rows);
+                return new NativeModelQuery($rows, Gateway::class);
             }
             $bundled = $value === 'Stripe';
             $present = $bundled ? self::$bundled : self::$present;
             $deleted = $bundled ? self::$bundledDeleted : self::$deleted;
             return new NativeModelQuery($present && ($withTrashed || !$deleted)
-                ? [new Extension(['id' => $bundled ? 1 : 2, 'extension' => $value, 'enabled' => $bundled ? self::$bundledEnabled : self::$enabled])] : []);
+                ? [new Extension(['id' => $bundled ? 1 : 2, 'extension' => $value, 'enabled' => $bundled ? self::$bundledEnabled : self::$enabled])] : [], Gateway::class);
         }
     }
     class NativeServiceRow extends \stdClass {
@@ -232,8 +232,8 @@ namespace App\Models {
         }
     }
     class NativeModelQuery implements \IteratorAggregate {
-        public function __construct(private array $rows) {}
-        public static function table($table) { return new self(array_map(fn ($r) => $table === 'services' ? new NativeServiceRow($r) : (object) $r, \Illuminate\Support\Facades\DB::$tables[$table] ?? [])); }
+        public function __construct(private array $rows, private ?string $model = null) {}
+        public static function table($table) { return new self(array_map(fn ($r) => $table === 'services' ? new NativeServiceRow($r) : (object) $r, \Illuminate\Support\Facades\DB::$tables[$table] ?? []), $table === 'services' ? Service::class : null); }
         public function where($key, $value) { $this->rows = array_filter($this->rows, fn ($r) => ($r->$key ?? null) == $value); return $this; }
         public function whereIn($key, $values) { $this->rows = array_filter($this->rows, fn ($r) => in_array($r->$key ?? null, (array) $values)); return $this; }
         public function whereNull($key) { return $this->where($key, null); }
@@ -244,7 +244,7 @@ namespace App\Models {
                 $callback($query); return $query->exists();
             }); return $this;
         }
-        public function lockForUpdate() { \Illuminate\Support\Facades\DB::$locked = true; \Illuminate\Support\Facades\DB::$modelLocks[] = Gateway::class; return $this; }
+        public function lockForUpdate() { \Illuminate\Support\Facades\DB::$locked = true; if ($this->model === Gateway::class) \Illuminate\Support\Facades\DB::$gatewayLocked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
         public function get() { return $this; }
         public function first() { return reset($this->rows) ?: null; }
         public function firstOrFail() { return $this->first() ?? throw new \RuntimeException('Missing row'); }
@@ -375,7 +375,7 @@ namespace App\Models {
             public function orderBy($key) { return $this; }
             public function limit($n) { return $this; }
             public function first() {
-                if (!$this->currentRead && \Illuminate\Support\Facades\DB::$locked && !\Illuminate\Support\Facades\DB::$userLocked && !in_array(Gateway::class, \Illuminate\Support\Facades\DB::$modelLocks, true)) throw new \RuntimeException('Review guard needs the owner lock');
+                if (!$this->currentRead && \Illuminate\Support\Facades\DB::$locked && !\Illuminate\Support\Facades\DB::$userLocked && !\Illuminate\Support\Facades\DB::$gatewayLocked) throw new \RuntimeException('Review guard needs the owner lock');
                 return $this->get()[0] ?? null;
             }
             public function get() {
@@ -591,10 +591,11 @@ namespace Illuminate\Support\Facades {
         public static function transactionLevel() { return self::$locked ? 1 : 0; }
         private static $afterCommit = [];
         public static function afterCommit($callback) { if (!self::$locked) $callback(); else self::$afterCommit[] = $callback; }
-        public static $locked = false, $userLocked = false;
+        public static $locked = false, $userLocked = false, $gatewayLocked = false;
         public static $modelLocks = [];
         public static function transaction($callback) {
             $priorUserLock = self::$userLocked;
+            $priorGatewayLock = self::$gatewayLocked;
             $outerLocked = self::$locked;
             // A completed transaction's read view cannot survive into a new save transaction.
             $agreementSnapshot = \App\Models\BillingAgreement::$snapshot;
@@ -611,7 +612,7 @@ namespace Illuminate\Support\Facades {
             $notifications = \App\Models\Notification::$rows;
             self::$locked = true;
             try { $result = $callback(); } catch (\Throwable $e) { self::$afterCommit = array_slice(self::$afterCommit, 0, $callbacks); if (\App\Models\User::$row && $properties !== null) \App\Models\User::$row->props->values = $properties; self::$tables = $before; \App\Helpers\ExtensionHelper::$payments = array_replace($payments, self::$concurrentPayments); \App\Models\Credit::$rows = $credits; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
-            finally { self::$locked = $outerLocked; self::$userLocked = $priorUserLock; if (!$outerLocked) \App\Models\BillingAgreement::$snapshot = $agreementSnapshot; }
+            finally { self::$locked = $outerLocked; self::$userLocked = $priorUserLock; self::$gatewayLocked = $priorGatewayLock; if (!$outerLocked) \App\Models\BillingAgreement::$snapshot = $agreementSnapshot; }
             if ($hook = self::$afterTransaction) { self::$afterTransaction = null; $hook(); }
             if (!$outerLocked) { $pending = self::$afterCommit; self::$afterCommit = []; foreach ($pending as $callback) $callback(); }
             return $result;

@@ -114,6 +114,30 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        $run('audit-lock-scope', function () {
+            $audit = fn () => Audit::where('event', 'ae_stripe_attempt_review')->first();
+            DB::transaction(function () use ($audit) {
+                Gateway::where('extension', 'AeStripe')->lockForUpdate()->firstOrFail();
+                check($audit() === null, 'A gateway lock allows its audit read in the same transaction');
+            });
+            rejects(fn () => DB::transaction($audit), 'Review guard needs the owner lock');
+            DB::transaction(function () use ($audit) {
+                User::where('id', 7)->lockForUpdate()->firstOrFail();
+                check($audit() === null, 'An owner lock allows its audit read');
+                DB::$userLocked = false; // Simulate a caller dropping its owner lock after the earlier gateway transaction.
+                rejects($audit, 'Review guard needs the owner lock');
+            });
+            rejects(fn () => DB::transaction(function () use ($audit) {
+                App\Models\Service::whereIn('id', [41])->lockForUpdate()->first();
+                $audit();
+            }), 'Review guard needs the owner lock');
+            DB::transaction(function () use ($audit) {
+                Gateway::where('extension', 'AeStripe')->lockForUpdate()->firstOrFail();
+                DB::transaction(fn () => null);
+                check($audit() === null, 'A nested transaction retains its outer gateway lock');
+            });
+            rejects(fn () => DB::transaction($audit), 'Review guard needs the owner lock');
+        });
         require __DIR__ . '/renewal-retries.php';
         foreach (['requires_payment_method', 'requires_action', 'processing', 'partial'] as $state) {
             $run('new-card-old-form-'.$state, function ($invoice, $stripe) use ($gateway, $state) {
