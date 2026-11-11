@@ -12,7 +12,7 @@ InvoiceTransaction::saved(function () use (&$applications) { ++$applications; })
 $activations = 0;
 Invoice::updated(function ($invoice) use (&$activations) { if ($invoice->wasChanged('status') && $invoice->status === 'paid') ++$activations; });
 $reset = function () use ($owner) {
-    foreach (['ae_stripe_settlements', 'invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices', 'services'] as $table) DB::table($table)->delete();
+    foreach (['ae_stripe_outbox', 'ae_stripe_settlements', 'invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices', 'services'] as $table) DB::table($table)->delete();
     $owner->properties()->where('key', '!=', 'stripe_id')->delete();
 };
 $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
@@ -158,7 +158,7 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
         $records = count(audits());
         $before = $applications;
         $locks = count(lockLog());
-        beforeLock('audits', fn () => check(!holdsLock('ae_stripe_locks') && !holdsLock('invoices'), 'Staff delivery locks its marker after the owner commits'));
+        beforeLock('ae_stripe_outbox', fn () => check(!holdsLock('ae_stripe_locks') && !holdsLock('invoices'), 'Staff delivery locks its marker after the owner commits'));
         $deliver();
         $deliver();
         check($applications === $before && count(audits()) === $records + 1,
@@ -171,7 +171,7 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
             && $record->new_values['reason'] === (str_contains($reason, 'currency') ? 'currency mismatch' : 'customer mismatch'),
             'Subscription staff record preserves binding, received units and refusal reason: ' . $reason);
         check(array_slice(lockLog(), $locks, 3) === ['ae_stripe_locks', 'services', 'invoices']
-            && count(array_filter(array_slice(lockLog(), $locks), fn ($table) => $table === 'audits')) === 1,
+            && count(array_filter(array_slice(lockLog(), $locks), fn ($table) => $table === 'ae_stripe_outbox')) === 1,
             'Subscription refusal locks the owner and invoice before its separate notice delivery: ' . $reason . ': ' . json_encode(array_slice(lockLog(), $locks)));
         check(!str_contains(json_encode($record->toArray()), 'cus_foreign') && !str_contains(json_encode($record->toArray()), $invoice->user->email),
             'Subscription review excludes customer details');

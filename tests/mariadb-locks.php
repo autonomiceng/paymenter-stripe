@@ -121,14 +121,99 @@ function invoiceStaff(): void
     $role = App\Models\Role::create(['name' => 'Invoice staff', 'permissions' => ['admin.invoices.viewAny', 'admin.invoices.view', 'admin.invoices.update']]);
     foreach ([7, 8] as $id) User::find($id)->update(['role_id' => $role->id]);
 }
-function pendingNotice(string $event, string $type = Invoice::class): void
+function pendingNotice(string $event, string $type = Invoice::class, string $title = 'Queued payment notice'): void
 {
     App\Models\Audit::create(['event' => $event, 'auditable_type' => $type, 'auditable_id' => 591,
         'old_values' => [], 'new_values' => ['notice_sent' => false, 'notices' => [[
-            'user_id' => 7, 'title' => 'Queued payment notice', 'body' => 'Fixture', 'url' => '/',
+            'user_id' => 7, 'title' => $title, 'body' => 'Fixture', 'url' => '/',
         ]]]]);
+    if (!User::find(7)->role_id) invoiceStaff();
+    if (method_exists($GLOBALS['gateway'], 'backfillPaymentNotices')) $GLOBALS['gateway']->backfillPaymentNotices();
+}
+function dueNotices(): void
+{
+    if (Illuminate\Support\Facades\Schema::hasTable('ae_stripe_outbox')) DB::table('ae_stripe_outbox')->where('state', 'pending')->update(['next_at' => 0]);
+    else foreach (App\Models\Audit::where('new_values->notice_sent', false)->get() as $audit) $audit->update(['new_values' => array_replace($audit->new_values, ['notice_retry_at' => 0])]);
+}
+function noticeAuditCount(string $event, bool $sent): int
+{
+    return App\Models\Audit::where('event', $event)->get()->filter(function ($audit) use ($sent) {
+        if (!method_exists($GLOBALS['gateway'], 'noticeIdentity')) return ($audit->new_values['notice_sent'] ?? true) === $sent;
+        $identity = invoke($GLOBALS['gateway'], 'noticeIdentity', $audit);
+        $rows = DB::table('ae_stripe_outbox')->where('source', $identity['source'])
+            ->whereIn('kind', [$identity['kind'] . ':staff', $identity['kind'] . ':customer'])->get();
+        $complete = $rows->isNotEmpty() && $rows->every(fn ($row) => in_array($row->state, ['sent', 'skipped'], true));
+        return $sent ? $complete : $rows->isNotEmpty() && !$complete;
+    })->count();
 }
 $cases = [
+    'outbox-adoption-http' => ['seed' => function () {
+        customerInvoice(7, 967);
+        $source = App\Models\Gateway::create(['name' => 'Bundled Stripe', 'extension' => 'Stripe', 'type' => 'gateway', 'enabled' => true]);
+        foreach ([$source, App\Models\Gateway::where('extension', 'AeStripe')->first()] as $native) {
+            foreach (['stripe_secret_key' => 'rk_test_fixture', 'stripe_publishable_key' => 'pk_test_fixture', 'stripe_webhook_secret' => 'whsec_test'] as $key => $value) {
+                $native->settings()->updateOrCreate(['key' => $key], ['value' => $value]);
+            }
+        }
+        App\Models\BillingAgreement::create(['user_id' => 7, 'gateway_id' => $source->id, 'external_reference' => 'pm_adopt', 'name' => 'Fixture', 'type' => 'card']);
+    }, 'pause' => '#^POST /payment_methods/pm_adopt$#', 'a' => function () {
+        require_once __DIR__ . '/../extension/AeStripe/Adoption.php';
+        require_once __DIR__ . '/../extension/AeStripe/AdoptionStore.php';
+        $GLOBALS['stripeHandler'] = function ($verb, $path) {
+            if ($path === '/account') return ['id' => 'acct_fixture'];
+            check(DB::transactionLevel() === 0, 'Adoption redisplay HTTP runs outside every transaction');
+            return ['id' => 'pm_adopt'];
+        };
+        $adoption = new Paymenter\Extensions\Gateways\AeStripe\Adoption(new Paymenter\Extensions\Gateways\AeStripe\AdoptionStore);
+        $plan = $adoption->run(); $applied = $adoption->run($plan['digest']);
+        return $adoption->redisplay($applied, $applied['manifest'])['pm_adopt'];
+    }, 'b' => fn () => User::where('id', 7)->update(['first_name' => 'Updated']),
+        'check' => fn ($results) => $results['a']['ok'] === 'ok' && User::find(7)->first_name === 'Updated'
+            && App\Models\BillingAgreement::first()->gateway->extension === 'AeStripe' && DB::table('invoice_transactions')->count() === 0],
+    'outbox-recipient-failure' => ['seed' => function () use ($gateway) {
+        customerInvoice(7, 961); customerInvoice(8, 962); invoiceStaff();
+        $audit = App\Models\Audit::create(['event' => 'ae_stripe_attempt_review', 'auditable_type' => Invoice::class, 'auditable_id' => 961,
+            'old_values' => [], 'new_values' => ['attempt_key' => 'checkout_961', 'notice_sent' => false, 'notices' => [
+                ['user_id' => 7, 'title' => 'Review', 'body' => 'Fixture', 'url' => '/'],
+                ['user_id' => 8, 'title' => 'Review', 'body' => 'Fixture', 'url' => '/']]]]);
+        if (method_exists($gateway, 'backfillPaymentNotices')) $gateway->backfillPaymentNotices();
+    }, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
+        App\Models\Notification::created(function ($notice) { if ($notice->user_id === 7) throw new RuntimeException('private provider detail'); });
+        $id = Illuminate\Support\Facades\Schema::hasTable('ae_stripe_outbox') ? 1 : App\Models\Audit::where('event', 'ae_stripe_attempt_review')->value('id');
+        invoke($gateway, 'deliverPaymentNotices', $id);
+        for ($n = 1; $n < 8; ++$n) { dueNotices(); invoke($gateway, 'deliverPaymentNotices', $id); }
+        return 'failed';
+    }, 'b' => function ($gateway) {
+        $id = Illuminate\Support\Facades\Schema::hasTable('ae_stripe_outbox') ? 2 : App\Models\Audit::where('event', 'ae_stripe_attempt_review')->value('id');
+        invoke($gateway, 'deliverPaymentNotices', $id);
+        return 'delivered';
+    }, 'check' => fn () => DB::table('notifications')->pluck('user_id')->all() === [8]
+        && DB::table('ae_stripe_outbox')->where('id', 1)->value('state') === 'failed'
+        && DB::table('ae_stripe_outbox')->where('id', 1)->value('attempts') === 8
+        && DB::table('ae_stripe_outbox')->where('id', 1)->value('last_error') === 'Notification delivery failed'
+        && DB::table('ae_stripe_outbox')->where('id', 2)->value('state') === 'sent'
+        && DB::table('invoice_transactions')->count() === 0],
+    'outbox-backfill-repeat' => ['seed' => function () {
+        customerInvoice(7, 963); customerInvoice(8, 964); invoiceStaff();
+        App\Helpers\ExtensionHelper::addPayment(963, 'AeStripe', 20, null, 'pi_963');
+        pendingNotice('ae_stripe_attempt_review');
+        if (Illuminate\Support\Facades\Schema::hasTable('ae_stripe_outbox')) DB::table('ae_stripe_outbox')->truncate();
+    }, 'pause' => '/^insert ignore into `ae_stripe_outbox`/',
+        'a' => function ($gateway) {
+            $GLOBALS['stripeHandler'] = fn () => throw new RuntimeException('Backfill must never call Stripe');
+            $columns = array_map(fn ($index) => $index->Column_name, DB::select("show index from ae_stripe_outbox where Key_name = 'ae_stripe_outbox_state_next_at_index'"));
+            check($columns === ['state', 'next_at'], 'Pending work has the state and due-time index');
+            Paymenter\Extensions\Gateways\AeStripe\SettlementStore::backfill();
+            $gateway->backfillPaymentNotices(); $gateway->backfillPaymentNotices();
+            check(Illuminate\Support\Facades\Artisan::call('ae-stripe:backfill-outbox') === 0
+                && Illuminate\Support\Facades\Artisan::call('ae-stripe:backfill-outbox') === 0, 'The registered backfill command is safe to repeat');
+            return 'copied';
+        }, 'b' => function ($gateway) {
+            Paymenter\Extensions\Gateways\AeStripe\SettlementStore::backfill();
+            $gateway->backfillPaymentNotices(); return 'copied';
+        }, 'check' => fn () => DB::table('ae_stripe_outbox')->count() === 1
+            && DB::table('ae_stripe_settlements')->where('payment_intent_id', 'pi_963')->count() === 1
+            && DB::table('notifications')->count() === 0 && $rows(963) === [[20.0, 'succeeded', false]]],
     'outbox-allocation-http' => ['seed' => function () {
         customerInvoice(7, 954);
         App\Helpers\ExtensionHelper::addPayment(954, 'AeStripe', 20, null, 'pi_954');
@@ -271,13 +356,13 @@ $cases = [
     }, 'pause' => '/^paused-notices-checked$/', 'a' => function ($gateway) {
         App\Models\Gateway::where('extension', 'AeStripe')->update(['enabled' => false]);
         $queries = 0;
-        DB::listen(function ($query) use (&$queries) { if (str_contains($query->sql, 'notice_sent')) ++$queries; });
+        DB::listen(function ($query) use (&$queries) { if (str_contains($query->sql, 'ae_stripe_outbox')) ++$queries; });
         $gateway->retryChargeAttempts(); $gateway->retryReceiptReturns(); $gateway->retryPaymentFees();
         check($queries === 0 && DB::table('notifications')->count() === 0, 'Paused gateway never queries or delivers the notice retry queue');
         pausePoint('paused-notices-checked');
         return 'paused';
     }, 'b' => fn ($gateway) => settle($gateway, 592),
-    'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', false)->count() === 1
+    'check' => fn () => noticeAuditCount('ae_stripe_attempt_review', false) === 1
         && DB::table('notifications')->count() === 0 && Invoice::find(592)->status === 'paid'],
     'notice-retry-owner' => ['seed' => function () {
         customerInvoice(7, 591); customerInvoice(8, 592);
@@ -288,7 +373,7 @@ $cases = [
         $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
         return 'retried';
     }, 'b' => fn ($gateway) => settle($gateway, 592),
-    'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', true)->count() === 1
+    'check' => fn () => noticeAuditCount('ae_stripe_attempt_review', true) === 1
         && DB::table('notifications')->count() === 1 && Invoice::find(592)->status === 'paid'],
     'notice-retry-scope' => ['seed' => function () {
         customerInvoice(7, 591); customerInvoice(8, 592);
@@ -304,7 +389,7 @@ $cases = [
     }, 'b' => fn ($gateway) => settle($gateway, 592),
     'check' => fn () => App\Models\Audit::where('event', 'updated')->where('new_values->notice_sent', false)->count() === 100
         && App\Models\Audit::where('auditable_type', User::class)->where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', false)->count() === 1
-        && App\Models\Audit::where('new_values->notice_sent', true)->count() === 7
+        && DB::table('ae_stripe_outbox')->where('state', 'sent')->count() === 7
         && DB::table('notifications')->count() === 7 && Invoice::find(592)->status === 'paid'],
     'notice-retry-fairness' => ['seed' => function () {
         customerInvoice(7, 591); customerInvoice(8, 592);
@@ -317,24 +402,20 @@ $cases = [
         });
         invoke($gateway, 'retryPaymentNotices');
         check(count($attempted) === 100, 'The first failing batch is bounded to 100 notices');
-        pendingNotice('ae_stripe_attempt_review');
-        $new = App\Models\Audit::where('event', 'ae_stripe_attempt_review')->latest('id')->first();
-        $values = $new->new_values; $values['notices'][0]['title'] = 'New payment notice';
-        $new->update(['new_values' => $values]);
+        pendingNotice('ae_stripe_attempt_review', Invoice::class, 'New payment notice');
         invoke($gateway, 'retryPaymentNotices');
         check(count($attempted) === 102 && in_array('New payment notice', $attempted, true),
             '101 persistently failing notices cannot starve a new notice');
-        $pending = App\Models\Audit::where('event', 'ae_stripe_attempt_review')->get();
-        check($pending->every(fn ($audit) => !$audit->new_values['notice_sent']
-            && ($audit->new_values['notice_retry_at'] ?? 0) > time()), 'Every failed delivery retains a future retry time');
+        $pending = DB::table('ae_stripe_outbox')->get();
+        check($pending->every(fn ($row) => $row->state === 'pending' && $row->next_at > time()), 'Every failed delivery retains a future retry time');
         invoke($gateway, 'retryPaymentNotices');
         check(count($attempted) === 102, 'Notices in backoff are not attempted again before their retry time');
-        foreach ($pending as $audit) $audit->update(['new_values' => array_replace($audit->new_values, ['notice_retry_at' => time() - 1])]);
+        dueNotices();
         invoke($gateway, 'retryPaymentNotices');
         check(count($attempted) === 202, 'Due failures get another bounded batch after their retry time');
         return 'retried';
     }, 'b' => fn ($gateway) => settle($gateway, 592),
-    'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', false)->count() === 102
+    'check' => fn () => noticeAuditCount('ae_stripe_attempt_review', false) === 102
         && DB::table('notifications')->count() === 0 && Invoice::find(592)->status === 'paid'],
     'refusal-events' => ['seed' => function () {
         customerInvoice(7, 591); customerInvoice(8, 592);
@@ -347,18 +428,15 @@ $cases = [
             User::find(7)->properties()->create(['key' => 'ae_stripe_checkout_591', 'value' => json_encode([
                 'version' => 2, 'key' => 'checkout_' . $event, 'state' => 'reconcile'])]);
             $gateway->resolveChargeAttempt(Invoice::find(591), null, 'Verified no charge in the original account');
-            if ($event === 'first') check(App\Models\Audit::where('event', 'ae_stripe_payment_refused')
-                ->where('new_values->notice_sent', false)->count() === 1, 'Failed refusal delivery retains its own retry marker');
+            if ($event === 'first') check(noticeAuditCount('ae_stripe_payment_refused', false) === 1, 'Failed refusal delivery retains its own retry marker');
         }
-        foreach (App\Models\Audit::where('new_values->notice_sent', false)->get() as $audit) {
-            $audit->update(['new_values' => array_replace($audit->new_values, ['notice_retry_at' => 0])]);
-        }
+        dueNotices();
         invoke($gateway, 'retryPaymentNotices');
         invoke($gateway, 'retryPaymentNotices');
         return 'resolved';
     }, 'b' => fn ($gateway) => settle($gateway, 592),
     'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_attempt_resolved')->count() === 2
-        && App\Models\Audit::where('event', 'ae_stripe_payment_refused')->where('new_values->notice_sent', true)->count() === 2
+        && noticeAuditCount('ae_stripe_payment_refused', true) === 2
         && DB::table('notifications')->where('user_id', 7)->where('title', 'Payment not completed')->count() === 2
         && Invoice::find(591)->status === 'pending' && Invoice::find(592)->status === 'paid'],
     // Real recipient foreign keys and a full retry batch expose deleted users blocking later notices.
@@ -372,31 +450,31 @@ $cases = [
                 'auditable_id' => 591, 'old_values' => [], 'new_values' => [
                     'notice_sent' => false, 'notices' => array_map($notice, $recipients)]]);
         }
+        invoiceStaff();
+        if (method_exists($gateway = $GLOBALS['gateway'], 'backfillPaymentNotices')) $gateway->backfillPaymentNotices();
         $deleted->delete();
     }, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
         invoke($gateway, 'retryPaymentNotices');
-        check(App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', true)->count() === 100,
+        check(noticeAuditCount('ae_stripe_attempt_review', true) === 100,
             'Deleted-only recipients complete the first retry batch');
         invoke($gateway, 'retryPaymentNotices');
         invoke($gateway, 'retryPaymentNotices');
         return 'retried';
     }, 'b' => fn ($gateway) => settle($gateway, 592),
     'check' => fn () => DB::table('notifications')->orderBy('user_id')->pluck('user_id')->all() === [7, 8]
-        && App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', true)->count() === 102
+        && noticeAuditCount('ae_stripe_attempt_review', true) === 102
         && Invoice::find(592)->status === 'paid'],
     'staff-reversal-notice-retry' => ['seed' => function () use ($gateway) {
         customerInvoice(7, 561); customerInvoice(8, 562);
         invoiceStaff();
         settle($gateway, 561);
     }, 'waits' => true, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
-        $GLOBALS['pauses'] = []; $inserts = 0;
-        App\Models\Notification::created(function () use (&$inserts) { if (++$inserts === 2) throw new RuntimeException('Delivery failed'); });
+        $GLOBALS['pauses'] = []; $down = true;
+        App\Models\Notification::created(function () use (&$down) { if ($down) throw new RuntimeException('Delivery failed'); });
         invoke($gateway, 'recordReceiptReversalEvent', (object) ['id' => 're_561', 'payment_intent' => 'pi_561'], 'refund');
-        check(DB::table('notifications')->count() === 0 && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')
-            ->where('new_values->notice_sent', false)->count() === 1, 'Notice rollback retains the committed reversal and pending audit');
-        foreach (App\Models\Audit::where('new_values->notice_sent', false)->get() as $audit) {
-            $audit->update(['new_values' => array_replace($audit->new_values, ['notice_retry_at' => 0])]);
-        }
+        check(DB::table('notifications')->count() === 0 && noticeAuditCount('ae_stripe_receipt_reversal', false) === 1, 'Notice rollback retains the committed reversal and pending audit');
+        dueNotices();
+        $down = false;
         pauseBefore('/^insert into `notifications`/');
         invoke($gateway, 'retryPaymentNotices');
         return 'retried';
@@ -405,7 +483,7 @@ $cases = [
         invoke($gateway, 'recordReceiptReversalEvent', (object) ['id' => 're_561', 'payment_intent' => 'pi_561'], 'refund');
         return 'retried';
     }, 'check' => fn () => DB::table('ae_stripe_receipt_returns')->count() === 1 && DB::table('notifications')->count() === 2
-        && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')->where('new_values->notice_sent', true)->count() === 1],
+        && noticeAuditCount('ae_stripe_receipt_reversal', true) === 1],
     'staff-reversals' => ['seed' => function () use ($gateway) {
         customerInvoice(7, 561); customerInvoice(8, 562);
         invoiceStaff();
@@ -468,8 +546,8 @@ $cases = [
             // Let the first delivery fail after its insert; pause only the retry.
             $GLOBALS['pauses'] = [];
             invoke($gateway, 'notifyPaymentAccessRefusal');
-            check(DB::table('notifications')->count() === 0 && DB::table('audits')->where('event', 'ae_stripe_access_refused')
-                ->where('new_values->notice_sent', false)->count() === 1, 'Failed delivery keeps its pending audit only');
+            check(DB::table('notifications')->count() === 0 && noticeAuditCount('ae_stripe_access_refused', false) === 1, 'Failed delivery keeps its pending audit only');
+            dueNotices();
             pauseBefore('/^insert into `notifications`/');
             invoke($gateway, 'notifyPaymentAccessRefusal');
             return 'retried';
@@ -478,7 +556,7 @@ $cases = [
             invoke($gateway, 'notifyPaymentAccessRefusal');
             return 'reviewed';
         }), 'check' => fn () => DB::table('notifications')->where('user_id', 7)->where('title', 'Stripe access needs attention')->count() === 1
-            && DB::table('audits')->where('event', 'ae_stripe_access_refused')->where('new_values->notice_sent', true)->count() === 1],
+            && noticeAuditCount('ae_stripe_access_refused', true) === 1],
     // Audited settlement against a missing-subscription review, with normal web auditing.
     'subscription-review-vs-settlement' => [ 'seed' => function () {
             customerInvoice(7, 801);
@@ -651,6 +729,46 @@ $cases = [
                 ->get(['allocation_key', 'state'])->map(fn ($row) => [$row->allocation_key, $row->state])->all() === [['stripe:refund:re_561', 'refunded']]
             && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')->count() === 1 && $rows(561) === [[20.0, 'succeeded', false]]],
 ];
+$cases['outbox-confirm-card-removal'] = $cases['outbox-confirm-http'];
+$cases['outbox-confirm-card-removal']['seed'] = function () use ($cases) {
+    $cases['outbox-confirm-http']['seed']();
+    App\Models\BillingAgreement::create(['user_id' => 7, 'gateway_id' => App\Models\Gateway::where('extension', 'AeStripe')->first()->id,
+        'external_reference' => 'pm_401', 'name' => 'Fixture', 'type' => 'card']);
+};
+$cases['outbox-confirm-card-removal']['b'] = function ($gateway) {
+    $GLOBALS['stripeHandler'] = fn () => throw new RuntimeException('A pending confirmation cannot detach or read cards');
+    return invoke($gateway, 'removeSavedMethodCopies', App\Models\BillingAgreement::where('external_reference', 'pm_401')->first());
+};
+$cases['outbox-confirm-card-removal']['check'] = fn ($results) => $results['a']['ok']['levels'] === [0, 0]
+    && $results['b']['ok'] === false && App\Models\BillingAgreement::where('external_reference', 'pm_401')->count() === 1
+    && $rows(401) === [[20.0, 'failed', false]];
+
+foreach (['role', 'permission', 'fallback'] as $change) {
+    $cases['outbox-staff-' . $change] = ['seed' => function () use ($gateway) {
+        customerInvoice(7, 965); customerInvoice(8, 966); invoiceStaff();
+        $role = App\Models\Role::create(['name' => 'Separate staff', 'permissions' => ['admin.invoices.viewAny', 'admin.invoices.view', 'admin.invoices.update']]);
+        User::find(7)->update(['role_id' => $role->id]);
+        $down = true;
+        App\Models\Notification::created(function () use (&$down) { if ($down) throw new RuntimeException('Inbox unavailable'); });
+        invoke($gateway, 'withPaymentLock', Invoice::find(965), function () use ($gateway) {
+            $audit = App\Models\Audit::create(['event' => 'ae_stripe_attempt_review', 'auditable_type' => Invoice::class,
+                'auditable_id' => 965, 'old_values' => [], 'new_values' => ['attempt_key' => 'checkout_audience']]);
+            invoke($gateway, 'queuePaymentNotices', $audit, invoke($gateway, 'staffPaymentNotices', 'invoice', [
+                'title' => 'Staff review', 'body' => 'Private fixture', 'url' => '/admin/invoices/965/edit']));
+            invoke($gateway, 'queueRefusalNotice', Invoice::find(965), 'Customer refusal', 'confirm_audience');
+        });
+        $down = false; dueNotices();
+    }, 'pause' => '/^audience-recheck$/', 'a' => function ($gateway) {
+        pausePoint('audience-recheck'); invoke($gateway, 'retryPaymentNotices'); invoke($gateway, 'retryPaymentNotices'); return 'retried';
+    }, 'b' => function () use ($change) {
+        if ($change === 'role') User::find(7)->update(['role_id' => null]);
+        elseif ($change === 'permission') App\Models\Role::find(User::find(7)->role_id)->update(['permissions' => []]);
+        else foreach (App\Models\Role::all() as $role) $role->update(['permissions' => []]);
+        return 'changed';
+    }, 'check' => fn () => DB::table('notifications')->where('title', 'Staff review')->orderBy('user_id')->pluck('user_id')->all() === ($change === 'fallback' ? [7, 8] : [8])
+        && DB::table('notifications')->where('title', 'Payment not completed')->pluck('user_id')->all() === [7]
+        && DB::table('invoice_transactions')->count() === 0 && Invoice::find(965)->status === 'pending'];
+}
 foreach (['settings', 'reconcile'] as $operation) {
     $cases['outbox-webhook-' . $operation . '-http'] = [
         'seed' => function () {
@@ -720,6 +838,35 @@ foreach (['owner', 'gateway', 'deleted', 'same'] as $conflict) {
         },
     ];
 }
+// A failed USD 10 return overlaps native fulfillment of the same customer's USD 20 credit deposit.
+$cases['outbox-return-credit-deposit'] = ['seed' => function () {
+    customerInvoice(7, 601);
+    customerInvoice(7, 970)->items()->update(['reference_type' => App\Models\Credit::class]);
+}, 'pause' => '/^insert into `credits`/', 'waits' => true,
+    'a' => function ($gateway) {
+        settle($gateway, 601, 3000);
+        return ['credits' => DB::table('credits')->orderBy('id')->pluck('amount')->all(),
+            'return' => DB::table('ae_stripe_receipt_returns')->where('payment_intent_id', 'pi_601')->value('state')];
+    }, 'b' => function () {
+        App\Helpers\ExtensionHelper::addPayment(970, 'Other', 20, null, 'deposit_970');
+        return 'deposit fulfilled';
+    }, 'check' => function () use ($rows) {
+        $credit = User::find(7)->credits()->where('currency_code', 'USD')->first();
+        $return = DB::table('ae_stripe_receipt_returns')->where('payment_intent_id', 'pi_601')->sole();
+        echo 'outbox-return-credit-deposit: credit_rows=' . DB::table('credits')->count()
+            . '; spendable_usd=' . $credit?->amount . '; return=' . $return->state . '; returned_minor=' . $return->amount_minor . "\n";
+        return DB::table('credits')->count() === 1 && (float) $credit?->amount === 30.0
+            && $return->state === 'credited' && (int) $return->amount_minor === 1000
+            && (int) $return->credit_id === $credit->id && !$return->retry && !$return->recheck
+            && $rows(601) === [[30.0, 'succeeded', false], [-10.0, 'succeeded', true]]
+            && $rows(970) === [[20.0, 'succeeded', false]] && Invoice::find(970)->status === 'paid'
+            && DB::table('audits')->where('event', 'ae_stripe_receipt_return')->count() === 1;
+    }];
+// The native deposit can also hold the user row before the return reaches its credit transaction.
+$cases['outbox-deposit-return-credit'] = $cases['outbox-return-credit-deposit'];
+$cases['outbox-deposit-return-credit']['a'] = $cases['outbox-return-credit-deposit']['b'];
+$cases['outbox-deposit-return-credit']['b'] = $cases['outbox-return-credit-deposit']['a'];
+
 $cases['outbox-credit-after-http'] = ['seed' => function () {
     customerInvoice(7, 968)->user->properties()->create(['key' => 'ae_stripe_checkout_968', 'value' => json_encode([
         'version' => 2, 'key' => 'checkout_968', 'created' => time(), 'intent' => 'pi_968'])]);
@@ -800,8 +947,8 @@ $php = getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY;
 foreach ($cases as $name => $case) {
     if (getenv('PAY_MARIADB_CASE') && !in_array($name, explode(',', getenv('PAY_MARIADB_CASE')), true)) continue;
     DB::statement('set foreign_key_checks = 0');
-    foreach (['ae_stripe_settlements', 'ae_stripe_locks', 'invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
-        'billing_agreements', 'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users', 'roles'] as $table) { if (in_array($table, ['ae_stripe_locks', 'ae_stripe_settlements'], true) && !Illuminate\Support\Facades\Schema::hasTable($table)) continue; DB::table($table)->truncate(); }
+    foreach (['ae_stripe_outbox', 'ae_stripe_settlements', 'ae_stripe_locks', 'invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
+        'billing_agreements', 'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users', 'roles'] as $table) { if (in_array($table, ['ae_stripe_locks', 'ae_stripe_settlements', 'ae_stripe_outbox'], true) && !Illuminate\Support\Facades\Schema::hasTable($table)) continue; DB::table($table)->truncate(); }
     DB::statement('set foreign_key_checks = 1');
     DB::table('settings')->where('key', 'ae_stripe_webhook_continuity')->delete();
     DB::table('settings')->where('key', 'ae_stripe_webhook_events')->update(['value' => 'ready']);

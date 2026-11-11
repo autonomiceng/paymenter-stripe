@@ -44,6 +44,38 @@ check(!$gateway->receiptReversals($i, 'pi_return')[0]['needs_review'] && !credit
 check($returns()[$storedKey]['provider_created_at'] === 1793400000,
     'A later canonical status change never moves the original provider date');
 
+// An older HTTP response arrives after a second delivery commits the later refund state.
+foreach ([['pending', 'succeeded', 'refunded'], ['pending', 'failed', 'failed'], ['succeeded', 'failed', 'failed']] as [$older, $newer, $expected]) {
+    [$i, $s] = $setup(2000, 20); $deliver($s);
+    $s->refunds['foreign'] = (object) ['id' => 're_delayed', 'payment_intent' => 'pi_return',
+        'currency' => 'usd', 'amount' => 500, 'created' => 1793400000, 'status' => $older, 'metadata' => (object) []];
+    $normal = $GLOBALS['stripeHandler']; $committed = null; $interleaved = false;
+    $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($normal, $gateway, $s, $newer, $expected, $returns, &$committed, &$interleaved) {
+        $answer = $normal($verb, $path, $data, $request);
+        if (!$interleaved && $path === '/refunds/re_delayed') {
+            check(DB::transactionLevel() === 0, 'Canonical refund HTTP runs before the owner transaction');
+            $interleaved = true; $answer = clone $answer;
+            $s->refunds['foreign']->status = $newer;
+            $response = $gateway->webhook(eventRequest($s->refunds['foreign'], type: 'refund.updated'));
+            $committed = $returns()['pi_return:stripe:refund:re_delayed'];
+            check($response->getStatusCode() === 200 && $committed['state'] === $expected && !$committed['retry'],
+                'The later canonical refund response commits and is acknowledged first');
+        }
+        return $answer;
+    };
+    $settled = [payments(), moneyRows(), credits()];
+    $response = $gateway->webhook(eventRequest($s->refunds['foreign'], type: 'refund.created'));
+    $GLOBALS['stripeHandler'] = $normal;
+    $summary = $gateway->invoiceReversalSummary($i);
+    check($interleaved && $response->getStatusCode() === 200
+        && $returns()['pi_return:stripe:refund:re_delayed'] === $committed
+        && $summary['totals'] === ['refunded' => $expected === 'refunded' ? 5.0 : 0.0,
+            'open_disputes' => 0.0, 'lost_disputes' => 0.0, 'net_received' => $expected === 'refunded' ? 15.0 : 20.0]
+        && count(audits()) === 1 && count(notices()) === 1 && !$s->posts
+        && [payments(), moneyRows(), credits()] === $settled,
+        'Delayed ' . $older . ' refund response preserves the committed ' . $newer . ' observation, cash totals and single notice');
+}
+
 // Captured invoice 53: a du_ dispute for 1200 USD cents, closed lost. Reuse spent-credit coverage.
 [$i, $s] = $setup(1200, 2); $s->status = 'failed'; $deliver($s);
 Credit::where('user_id', 7)->update(['amount' => 0]); // The customer has already spent all fallback credit.
@@ -132,10 +164,10 @@ $s->refunds['foreign'] = clone $foreign; $s->refunds['foreign']->status = 'succe
 $settled = [payments(), moneyRows()]; $inboxDown();
 $gateway->webhook($request);
 $inboxUp();
-check(count($gateway->receiptReversals($i, 'pi_return')) === 1 && count(audits()) === 1 && !notices() && !audits()[0]['new_values']['notice_sent']
+check(count($gateway->receiptReversals($i, 'pi_return')) === 1 && count(audits()) === 1 && !notices() && DB::table('ae_stripe_outbox')->where('state', 'pending')->count() === 1
     && [payments(), moneyRows()] === $settled, 'Failed delivery preserves the reversal, original money and pending notice');
 $gateway->retryChargeAttempts(); $gateway->webhook($request); $gateway->retryChargeAttempts();
-check(count(audits()) === 1 && count(notices()) === 1 && audits()[0]['new_values']['notice_sent'], 'Recovery and replay deliver the committed reversal notice exactly once');
+check(count(audits()) === 1 && count(notices()) === 1 && DB::table('ae_stripe_outbox')->where('state', 'sent')->count() === 1, 'Recovery and replay deliver the committed reversal notice exactly once');
 
 $s->refunds['foreign']->currency = 'eur';
 rejects(fn () => $gateway->webhook($request), 'HTTP 409');

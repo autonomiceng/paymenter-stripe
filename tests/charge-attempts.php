@@ -16,7 +16,7 @@ use Illuminate\Support\Facades\{DB, Http};
         $GLOBALS['fakeConsole'] = false;
         User::$row = new User(new Properties('cus_owner'));
         $invoice = new Invoice(User::$row); $invoice->id = 920; Invoice::$rows[920] = $invoice;
-        ExtensionHelper::$payments = []; DB::$tables['ae_stripe_settlements'] = []; Audit::$rows = []; Notification::$rows = []; Gateway::$enabled = true; DB::$tables['ae_stripe_receipt_returns'] = [];
+        ExtensionHelper::$payments = []; DB::$tables['ae_stripe_settlements'] = []; DB::$tables['ae_stripe_outbox'] = []; Audit::$rows = []; Notification::$rows = []; Gateway::$enabled = true; DB::$tables['ae_stripe_receipt_returns'] = [];
         ExtensionHelper::$agreements = ['pm_test' => ['id' => 4, 'user_id' => 7, 'gateway_id' => 3],
             'pm_other' => ['id' => 5, 'user_id' => 7, 'gateway_id' => 3]];
         $stripe = new class {
@@ -581,9 +581,9 @@ use Illuminate\Support\Facades\{DB, Http};
             $stripe->failure = fn ($verb, $path) => $path === '/payment_intents' ? throw new RequestException(400) : null;
             Notification::$fail = true; $gateway->retryChargeAttempts();
             $notice = json_decode(User::$row->props->values['ae_stripe_checkout_920'] ?? 'null', true);
-            check(!$notice && !Notification::$rows && count(array_filter(Audit::$rows, fn ($a) => $a['event'] === 'ae_stripe_payment_refused' && !$a['new_values']['notice_sent'])) === 1, 'A failed refusal notice keeps its pending audit without a saved debit instruction');
+            check(!$notice && !Notification::$rows && count(pendingOutbox()) === 1, 'A failed refusal notice keeps its pending audit without a saved debit instruction');
             Notification::$fail = false;
-            foreach (Audit::$rows as &$audit) $audit['new_values']['notice_retry_at'] = 0;
+            dueOutbox();
             unset($audit);
             $stripe->failure = null; $calls = count(Http::$calls);
             $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
@@ -1090,11 +1090,16 @@ use Illuminate\Support\Facades\{DB, Http};
         $run('recovery-decline', function ($invoice, $stripe) use ($gateway) {
             $stripe->beforeConfirm = fn () => throw new ConnectionException('Confirm not sent');
             paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)); $stripe->beforeConfirm = null;
-            $stripe->failure = function ($verb, $path) { if (str_ends_with($path, '/confirm')) throw new RequestException(402, ['error' => ['code' => 'card_declined']]); };
+            $stripe->failure = function ($verb, $path) use ($stripe) {
+                if (!str_ends_with($path, '/confirm')) return;
+                $stripe->intents['pi_test1']->latest_charge = 'ch_recovery_decline';
+                throw new RequestException(402, ['error' => ['code' => 'card_declined']]);
+            };
             $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
             $customer = array_filter(Notification::$rows, fn ($notice) => $notice['user_id'] == $invoice->user_id);
             check(count($customer) === 1 && str_contains(reset($customer)['body'], 'declined'), 'Recovery decline tells the customer the reason once');
             check(count(Notification::$rows) === 1, 'A card decline gives staff no task');
+            check(array_column(DB::$tables['ae_stripe_outbox'], 'source') === ['ch_recovery_decline'], 'A declined charge supplies its natural notice identity');
             check((failedPaymentRow(920, 'pi_test1')['status'] ?? null) === 'failed', 'Recovery records a definite decline for the native failed-payment notice');
             $stripe->failure = null;
             check($gateway->charge($invoice, 20, new BillingAgreement) === true, 'Recovery decline leaves the invoice payable');
@@ -1336,7 +1341,11 @@ use Illuminate\Support\Facades\{DB, Http};
             check($gateway->charge($invoice, 20, new BillingAgreement(['id' => 5, 'external_reference' => 'pm_other'])) === true, 'Definite refusal cannot wedge another card or a repaired setup');
         });
         $run('confirm-refusal', function ($invoice, $stripe) use ($gateway) {
-            $stripe->failure = function ($verb, $path) { if (str_ends_with($path, '/confirm')) throw new RequestException(402, ['error' => ['code' => 'card_declined']]); };
+            $stripe->failure = function ($verb, $path) use ($stripe) {
+                if (!str_ends_with($path, '/confirm')) return;
+                $stripe->intents['pi_test1']->latest_charge = 'ch_recovery_decline';
+                throw new RequestException(402, ['error' => ['code' => 'card_declined']]);
+            };
             check(paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement)) === 'Your bank declined this card. Try a different card, or contact your bank.', 'Definite 402 without an intent gives the real refusal');
             $stripe->failure = null;
             check($gateway->charge($invoice, 20, new BillingAgreement(['id' => 5, 'external_reference' => 'pm_other'])) === true && count($stripe->intents) === 1,
@@ -1681,7 +1690,7 @@ use Illuminate\Support\Facades\{DB, Http};
             check($gateway->charge($invoice, 20, new BillingAgreement) === true && isset(ExtensionHelper::$payments['920:pi_test1']),
                 'Inbox failure after committed settlement cannot send cron payment-failed email');
             Notification::$fail = false;
-            foreach (Audit::$rows as &$audit) $audit['new_values']['notice_retry_at'] = 0;
+            dueOutbox();
             unset($audit);
             $gateway->retryReceiptReturns();
             $gateway->retryChargeAttempts();

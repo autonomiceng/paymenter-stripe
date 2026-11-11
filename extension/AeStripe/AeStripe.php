@@ -142,11 +142,13 @@ class AeStripe extends Gateway
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryPaymentFees())
                 ->name('ae-stripe:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
             require_once __DIR__ . '/ResolveChargeCommand.php';
+            require_once __DIR__ . '/BackfillOutboxCommand.php';
             require_once __DIR__ . '/DeduplicateCardsCommand.php';
             require_once __DIR__ . '/AdoptBundledCommand.php';
             require_once __DIR__ . '/ConvertFromStripeSavedCommand.php';
             \Illuminate\Console\Application::starting(function ($artisan) {
                 $artisan->resolve(ResolveChargeCommand::class);
+                $artisan->resolve(BackfillOutboxCommand::class);
                 $artisan->resolve(DeduplicateCardsCommand::class);
                 $artisan->resolve(AdoptBundledCommand::class);
                 $artisan->resolve(ConvertFromStripeSavedCommand::class);

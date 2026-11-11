@@ -117,7 +117,7 @@ use Illuminate\Support\Facades\{DB, Http};
     $pending = DB::$tables['ae_stripe_payment_fees']['pi_review'];
     $pending['state'] = 'pending'; $pending['attempts'] = 0;
     $seed = function ($count = 2) use ($pending) {
-        DB::$tables['ae_stripe_payment_fees'] = [];
+        DB::$tables['ae_stripe_payment_fees'] = []; DB::$tables['ae_stripe_outbox'] = [];
         for ($i = 0; $i < $count; ++$i) {
             $id = 'pi_batch' . $i;
             ExtensionHelper::$payments['12:' . $id] = ['gateway' => 'AeStripe', 'amount' => 20.0, 'status' => 'succeeded'];

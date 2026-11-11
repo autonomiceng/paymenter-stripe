@@ -16,7 +16,7 @@ $activations = 0;
 Invoice::updated(function ($invoice) use (&$activations) { if ($invoice->wasChanged('status') && $invoice->status === 'paid') ++$activations; });
 $setup = function ($amount = 2000, $total = 10, $currency = 'usd') use ($owner, $nativeGateway) {
     beforeWrite('ae_stripe_receipt_returns', null); beforeWrite('notifications', null);
-    foreach (['ae_stripe_settlements', 'invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices'] as $table) DB::table($table)->delete();
+    foreach (['ae_stripe_outbox', 'ae_stripe_settlements', 'invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices'] as $table) DB::table($table)->delete();
     $owner->properties()->where('key', '!=', 'stripe_id')->delete();
     $owner->properties()->updateOrCreate(['key' => 'stripe_id'], ['value' => 'cus_owner']);
     $owner->forceFill(['role_id' => null])->save();
@@ -62,9 +62,7 @@ $inboxDown = fn () => beforeWrite('notifications', fn () => throw new RuntimeExc
 $inboxUp = function () {
     beforeWrite('notifications', null);
     // Reach the next retry time without sleeping in these delivery recovery tests.
-    foreach (Audit::where('new_values->notice_sent', false)->get() as $audit) {
-        $audit->update(['new_values' => array_replace($audit->new_values, ['notice_retry_at' => 0])]);
-    }
+    DB::table('ae_stripe_outbox')->where('state', 'pending')->update(['next_at' => 0]);
 };
 
 [$i, $s] = $setup(); $deliver($s); $deliver($s); $gateway->retryReceiptReturns();
