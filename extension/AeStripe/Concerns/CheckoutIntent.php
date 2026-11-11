@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Exceptions\DisplayException;
 use App\Models\{BillingAgreement, Credit, Invoice, InvoiceTransaction, User};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
@@ -347,21 +349,21 @@ trait CheckoutIntent
     }
 
     /**
-     * Runs $callback in a transaction holding the owner's user row and the invoice row, and runs it again when MariaDB
+     * Runs $callback under the customer's extension scope and the invoice's exact primary key, and runs it again when MariaDB
      * rolls it back as a deadlock victim. With $rerun, a rolled back transaction runs again only while $rerun() is
      * true: a callback that sends a Stripe write makes it false first, so that write is never sent twice.
      */
     private function withPaymentLock($invoice, callable $callback, ?callable $rerun = null)
     {
         $locked = function () use ($invoice, $callback) {
-            $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
+            $user = User::where('id', $invoice->user_id)->firstOrFail();
             $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
             abort_unless($current->user_id === $user->id, 403);
             return $callback($user, $current);
         };
-        if (!$rerun) return DB::transaction($locked, self::SETTLEMENT_ATTEMPTS);
+        if (!$rerun) return ExtensionLocks::transaction('user:' . $invoice->user_id, $locked, self::SETTLEMENT_ATTEMPTS);
         for ($attempt = 1; ; ++$attempt) {
-            try { return DB::transaction($locked, 1); }
+            try { return ExtensionLocks::transaction('user:' . $invoice->user_id, $locked, 1); }
             catch (\Throwable $e) {
                 if ($attempt >= self::SETTLEMENT_ATTEMPTS || DB::transactionLevel() > 0 || !$rerun() || !$this->lockConflict($e)) throw $e;
             }
@@ -387,28 +389,18 @@ trait CheckoutIntent
         return $stored ? $this->clearFinishedPaymentConstraints(json_decode($stored, true, flags: JSON_THROW_ON_ERROR)) : null;
     }
 
-    /**
-     * One of the user's properties, read under the user row lock. Every writer of these keys holds that lock, so a
-     * plain read sees the latest row, and only a row that exists is then locked. A locking read of a missing key would
-     * lock a gap of the properties index shared with other customers: two customers whose Pay each locks that gap and
-     * then inserts its own key deadlock (SQLSTATE 40001).
-     */
+    /** Read extension properties under the customer's extension scope, without locking shared index gaps. */
     private function lockedUserProperty($user, string $key)
     {
-        if (!$user->properties()->where('key', $key)->first()) return null;
-        return $user->properties()->where('key', $key)->lockForUpdate()->first();
+        return $user->properties()->where('key', $key)->first();
     }
 
-    /**
-     * The user's properties whose keys start with the prefix, read under the user row lock like lockedUserProperty.
-     * Each row is then locked by its exact key: a locking range read would lock every customer's keys in that range and
-     * the gaps between them, so two customers inserting their own keys there deadlock.
-     */
+    /** Read and sort the customer's extension properties without a locking range scan. */
     private function lockedUserProperties($user, string $prefix): array
     {
         $rows = [];
         foreach ($user->properties()->where('key', 'like', $prefix . '%')->get() as $row) {
-            if ($locked = $user->properties()->where('key', $row->key)->lockForUpdate()->first()) $rows[] = $locked;
+            if ($locked = $user->properties()->where('key', $row->key)->first()) $rows[] = $locked;
         }
         return $rows;
     }
@@ -425,7 +417,10 @@ trait CheckoutIntent
     {
         $ids = ($status === null ? $query : $query->where('status', $status))->pluck('id')->all();
         $locked = [];
-        foreach ($ids ? InvoiceTransaction::whereKey($ids)->orderBy('id')->lockForUpdate()->get() : [] as $row) {
+        sort($ids);
+        foreach ($ids as $id) {
+            $row = InvoiceTransaction::whereKey($id)->lockForUpdate()->first();
+            if (!$row) continue;
             if ($status === null || ($row->status->value ?? $row->status) === $status) $locked[] = $row;
         }
         return $locked;

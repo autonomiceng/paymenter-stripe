@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Models\{BillingAgreement, Gateway, Invoice, Service, User};
 use Illuminate\Support\Facades\{Auth, DB};
 use Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException;
@@ -22,7 +24,7 @@ trait SavedMethodBindings
     // Call under the shared lock and user transaction, before changing any binding or consent.
     private function assertSavedMethodBindable($user, $agreement): void
     {
-        $customer = $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value;
+        $customer = $user->properties()->where('key', 'stripe_id')->first()?->value;
         $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
         if ($this->savedMethodUnavailable($user, $agreement->external_reference, $customer, $gateway)) throw new SavedMethodRetryException(self::BINDING_RETRY);
     }
@@ -49,8 +51,8 @@ trait SavedMethodBindings
                 ->action(function ($livewire) {
                     $record = $livewire->getRecord();
                     \Illuminate\Support\Facades\Gate::authorize('update', $record);
-                    DB::transaction(function () use ($record) {
-                        User::where('id', $record->user_id)->lockForUpdate()->firstOrFail();
+                    ExtensionLocks::transaction('user:' . $record->user_id, function () use ($record) {
+                        User::where('id', $record->user_id)->firstOrFail();
                         $service = Service::where('id', $record->id)->where('user_id', $record->user_id)->lockForUpdate()->firstOrFail();
                         abort_if((bool) $service->subscription_id, 409, 'This service uses its Stripe subscription billing method.');
                         $current = $service->billingAgreement;
@@ -69,8 +71,8 @@ trait SavedMethodBindings
     {
         if ($component instanceof \App\Livewire\Services\Show && $method === 'clearBillingAgreement'
             && $component->service->properties()->where('key', self::AUTO_PAY_PENDING)->exists()) {
-            DB::transaction(function () use ($component) {
-                User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
+            ExtensionLocks::transaction('user:' . Auth::id(), function () use ($component) {
+                User::where('id', Auth::id())->firstOrFail();
                 $service = Service::where('id', $component->service->id)->where('user_id', Auth::id())->lockForUpdate()->firstOrFail();
                 $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
                 $service->update(['billing_agreement_id' => null]);
@@ -89,8 +91,8 @@ trait SavedMethodBindings
         if (!$agreement) return;
         try {
             $this->withSavedMethodBindingLock((int) Auth::id(), function () use ($component, $agreement, $gateway, $servicePage) {
-                DB::transaction(function () use ($component, $agreement, $gateway, $servicePage) {
-                    $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
+                ExtensionLocks::transaction('user:' . Auth::id(), function () use ($component, $agreement, $gateway, $servicePage) {
+                    $user = User::where('id', Auth::id())->firstOrFail();
                     $current = BillingAgreement::where('id', $agreement->id)->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
                     if (!$current || !$this->gatewayEnabled()) throw new SavedMethodRetryException(self::BINDING_RETRY);
                     $this->assertSavedMethodBindable($user, $current);

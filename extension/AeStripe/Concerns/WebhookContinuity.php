@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Exceptions\DisplayException;
 use App\Models\Extension;
 use Illuminate\Support\Facades\DB;
@@ -16,9 +18,8 @@ trait WebhookContinuity
 
     private function gatewayRowForUpdate(?int $id)
     {
-        // Resolve extension before the transaction, then lock by primary key so other gateways' foreign key checks proceed.
-        // The first plain settings read must follow this lock, with no older snapshot from the gateway lookup.
-        return \App\Models\Gateway::where('extension', 'AeStripe')->where('id', $id)->lockForUpdate();
+        // The caller holds the gateway extension scope. Core gateway rows stay free for payment foreign keys.
+        return \App\Models\Gateway::where('extension', 'AeStripe')->where('id', $id);
     }
 
     private function webhookEvents(array $existing = []): array
@@ -32,7 +33,7 @@ trait WebhookContinuity
     private function reconcileWebhookSubscriptions(): void
     {
         $id = \App\Models\Gateway::where('extension', 'AeStripe')->first()?->id;
-        DB::transaction(function () use ($id) {
+        ExtensionLocks::transaction('gateway', function () use ($id) {
             $gateway = $this->gatewayRowForUpdate($id)->first();
             if (!$gateway || $gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'ready') return;
             try {
@@ -88,7 +89,7 @@ trait WebhookContinuity
 
         // Serialize proof with settings saves so an in-flight old request cannot retire a newer secret.
         $id = \App\Models\Gateway::where('extension', 'AeStripe')->first()?->id;
-        return DB::transaction(function () use ($payload, $header, $id) {
+        return ExtensionLocks::transaction('gateway', function () use ($payload, $header, $id) {
             $gateway = $this->gatewayRowForUpdate($id)->first();
             $stored = $gateway?->settings()->where('key', self::WEBHOOK_STATE)->first()?->value;
             $state = $stored ? json_decode($stored, true, flags: JSON_THROW_ON_ERROR) : $this->continuityState();
@@ -128,8 +129,8 @@ trait WebhookContinuity
         if ($page instanceof \App\Admin\Resources\GatewayResource\Pages\EditGateway && $page->getRecord()->id === $gateway->id) {
             $page->data['settings']['stripe_revoke_previous_secrets'] = false;
         }
-        $failure = DB::transaction(function () use ($gateway) {
-            \App\Models\Gateway::where('extension', 'AeStripe')->where('id', $gateway->id)->lockForUpdate()->firstOrFail();
+        $failure = ExtensionLocks::transaction('gateway', function () use ($gateway) {
+            \App\Models\Gateway::where('extension', 'AeStripe')->where('id', $gateway->id)->firstOrFail();
             $stored = $gateway->settings()->where('key', self::WEBHOOK_STATE)->first()?->value;
             $state = $stored ? json_decode($stored, true, flags: JSON_THROW_ON_ERROR) : [];
             $names = ['stripe_secret_key', 'stripe_publishable_key', 'stripe_webhook_secret'];

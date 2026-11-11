@@ -12,10 +12,27 @@ Illuminate\Support\Facades\Facade::setFacadeApplication($container);
 // No app boot or gateway creation. The database boundary starts with the old identity.
 $database = new class {
     public string $extension = 'StripeSaved';
+    public array $locks = [];
     public function connection() { return $this; }
     public function getDatabaseName() { return 'paymenter'; }
+    public function transactionLevel() { return 0; }
     public function transaction($callback) { return $callback(); }
     public function table($name) {
+        if ($name === 'ae_stripe_locks') return new class($this) {
+            private string $scope;
+            public function __construct(private $database) {}
+            public function insertOrIgnore($row) {
+                if (isset($this->database->locks[$row['scope']])) return 0;
+                $this->database->locks[$row['scope']] = $row;
+                return 1;
+            }
+            public function where($key, $value) {
+                if ($key !== 'scope') throw new RuntimeException('Unexpected lock key');
+                $this->scope = $value; return $this;
+            }
+            public function lockForUpdate() { return $this; }
+            public function firstOrFail() { return (object) $this->database->locks[$this->scope]; }
+        };
         if ($name !== 'extensions') throw new RuntimeException('Unexpected table');
         return new class($this) {
             public function __construct(private $database) {}

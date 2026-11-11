@@ -129,6 +129,32 @@ function pendingNotice(string $event, string $type = Invoice::class): void
         ]]]]);
 }
 $cases = [
+    'outbox-credit-status' => ['seed' => fn () => customerInvoice(7, 904),
+        'pause' => '/^select .* from `invoices`.*for update$/',
+        'a' => function ($gateway) { auth()->login(User::find(7)); return $gateway->cancelInvoicePayments(Invoice::find(904), true); },
+        'b' => fn () => Invoice::where('id', 904)->update(['status' => 'paid']),
+        'check' => fn ($results) => $results['a']['ok'] === false && Invoice::find(904)->status === 'paid'
+            && DB::table('invoice_transactions')->count() === 0],
+    'outbox-first-core-seeders' => ['seed' => fn () => customerInvoice(7, 902), 'waits' => true,
+        'pause' => '/^select .* from `invoices`.*for update$/',
+        'a' => fn ($gateway) => DB::transaction(fn () => invoke($gateway, 'withPaymentLock', Invoice::find(902), fn () => 'checked')),
+        'b' => fn ($gateway) => DB::transaction(fn () => invoke($gateway, 'withPaymentLock', Invoice::find(902), fn () => 'checked')),
+        'check' => fn ($results) => $results['a']['ok'] === 'checked' && $results['b']['ok'] === 'checked'
+            && DB::table('ae_stripe_locks')->where('scope', 'user:7')->count() === 1],
+    'outbox-core-owner-writer' => ['seed' => fn () => customerInvoice(7, 903),
+        'pause' => '/^select .* from `invoices`.*for update$/',
+        'a' => fn ($gateway) => DB::transaction(fn () => invoke($gateway, 'withPaymentLock', Invoice::find(903), fn () => 'checked')),
+        'b' => fn () => User::where('id', 7)->update(['first_name' => 'Updated']),
+        'check' => fn ($results) => $results['a']['ok'] === 'checked' && User::find(7)->first_name === 'Updated'],
+    // A customer transaction already holding a core invoice can enter Stripe while another request owns its scope.
+    // The extension must support that caller without an invoice -> scope -> invoice cycle.
+    'outbox-core-invoice-order' => ['seed' => fn () => customerInvoice(7, 901), 'waits' => true,
+        'pause' => '/^select .* from `invoices`.*for update$/',
+        'a' => fn ($gateway) => invoke($gateway, 'withPaymentLock', Invoice::find(901), fn () => 'checked'),
+        'b' => fn ($gateway) => DB::transaction(function () use ($gateway) {
+            auth()->login(User::find(7));
+            return $gateway->cancelInvoicePayments(Invoice::find(901), true);
+        }), 'check' => fn ($results) => $results['a']['ok'] === 'checked' && $results['b']['ok'] === true && Invoice::find(901)->status === 'pending'],
     'notice-retry-paused' => ['seed' => function () {
         customerInvoice(7, 591); customerInvoice(8, 592);
         pendingNotice('ae_stripe_attempt_review');
@@ -311,7 +337,7 @@ $cases = [
             User::find(7)->update(['role_id' => $role->id]);
             User::find(7)->properties()->create(['key' => 'ae_stripe_checkout_801', 'value' => json_encode([
                 'version' => 2, 'key' => 'checkout_801', 'created' => time(), 'retry' => true])]);
-        }, 'waits' => true, 'pause' => '/^insert into `invoice_transactions`/', 'a' => function ($gateway) {
+        }, 'waits' => false, 'pause' => '/^insert into `invoice_transactions`/', 'a' => function ($gateway) {
             $intent = intentOf(801, 'succeeded', 2000);
             $intent->metadata->ae_stripe_attempt = 'checkout_801';
             invoke($gateway, 'recordIntentPayment', $intent, 'succeeded');
@@ -378,8 +404,7 @@ $cases = [
     'gateway-state-current' => ['seed' => fn () => DB::table('settings')->where('key', 'ae_stripe_webhook_events')->update(['value' => 'retry']),
         'waits' => true, 'pause' => '/^update `settings`/', 'a' => function () {
             $owner = App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail();
-            return DB::transaction(function () use ($owner) {
-                App\Models\Gateway::where('id', $owner->id)->lockForUpdate()->firstOrFail();
+            return Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks::transaction('gateway', function () use ($owner) {
                 $owner->settings()->where('key', 'ae_stripe_webhook_events')->update(['value' => 'ready']);
                 return 'updated';
             });
@@ -498,7 +523,7 @@ $cases = [
             DB::beginTransaction();
             DB::table('lock_ballast')->insert(array_map(fn ($id) => ['id' => $id], range(1, 200)));
             DB::table('ae_stripe_transaction_methods')->where('invoice_transaction_id', 1)->lockForUpdate()->first();
-            User::where('id', 7)->lockForUpdate()->first();
+            DB::table('ae_stripe_locks')->where('scope', 'user:7')->lockForUpdate()->first();
             DB::rollBack();
             return 'released';
         }, 'check' => fn () => $rows(541) === [[20.0, 'succeeded', false]] && Invoice::find(541)->status === 'paid'
@@ -516,13 +541,38 @@ $cases = [
                 ->get(['allocation_key', 'state'])->map(fn ($row) => [$row->allocation_key, $row->state])->all() === [['stripe:refund:re_561', 'refunded']]
             && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')->count() === 1 && $rows(561) === [[20.0, 'succeeded', false]]],
 ];
+foreach (['owner', 'gateway', 'deleted', 'same'] as $conflict) {
+    $cases['outbox-agreement-conflict-' . $conflict] = [
+        'seed' => function () { customerInvoice(7, 911); customerInvoice(8, 912); },
+        'pause' => '/^insert into `billing_agreements`/',
+        'a' => function ($gateway) {
+            try { invoke($gateway, 'persistSavedMethod', User::find(7), (object) ['id' => 'pm_7'], ['source' => 'seti_7']); return 'saved'; }
+            catch (App\Exceptions\DisplayException $e) { return 'refused'; }
+        },
+        'b' => function () use ($conflict) {
+            $gateway = App\Models\Gateway::where('extension', $conflict === 'gateway' ? 'Other' : 'AeStripe')->firstOrFail();
+            $row = App\Models\BillingAgreement::create(['user_id' => $conflict === 'owner' ? 8 : 7,
+                'gateway_id' => $gateway->id, 'external_reference' => 'pm_7', 'name' => 'Original name', 'type' => 'original']);
+            if ($conflict === 'deleted') $row->delete();
+            return 'inserted';
+        },
+        'check' => function ($results) use ($conflict) {
+            $row = App\Models\BillingAgreement::withTrashed()->where('external_reference', 'pm_7')->firstOrFail();
+            return $results['a']['ok'] === ($conflict === 'same' ? 'saved' : 'refused')
+                && App\Models\BillingAgreement::withTrashed()->count() === 1
+                && ($conflict === 'same' || $row->name === 'Original name' && $row->type === 'original')
+                && DB::table('properties')->where('key', 'like', 'ae_stripe_saved_%')->where('value', 'like', '%"reference"%')->count()
+                    === ($conflict === 'same' ? 1 : 0);
+        },
+    ];
+}
 if (($argv[1] ?? null) === 'worker') {
     $case = $cases[$argv[2]];
     if ($argv[3] === 'b' && !empty($case['prepared_b'])) {
         pauseBefore('/^final-save$/');
         $userLocks = 0;
         DB::connection()->beforeExecuting(function ($sql) use (&$userLocks) {
-            if (preg_match('/^select .* from `users`.*for update$/', $sql) && ++$userLocks === 7) pausePoint('final-save');
+            if (preg_match('/^select .* from `ae_stripe_locks`.*for update$/', $sql) && ++$userLocks === 7) pausePoint('final-save');
         });
     }
     if ($argv[3] === 'a') pauseBefore($case['pause']);
@@ -546,8 +596,8 @@ $php = getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY;
 foreach ($cases as $name => $case) {
     if (getenv('PAY_MARIADB_CASE') && !in_array($name, explode(',', getenv('PAY_MARIADB_CASE')), true)) continue;
     DB::statement('set foreign_key_checks = 0');
-    foreach (['invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
-        'billing_agreements', 'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users', 'roles'] as $table) DB::table($table)->truncate();
+    foreach (['ae_stripe_locks', 'invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
+        'billing_agreements', 'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users', 'roles'] as $table) { if ($table === 'ae_stripe_locks' && !Illuminate\Support\Facades\Schema::hasTable($table)) continue; DB::table($table)->truncate(); }
     DB::statement('set foreign_key_checks = 1');
     DB::table('settings')->where('key', 'ae_stripe_webhook_continuity')->delete();
     DB::table('settings')->where('key', 'ae_stripe_webhook_events')->update(['value' => 'ready']);

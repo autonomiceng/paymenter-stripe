@@ -57,7 +57,6 @@ if ($case === 'followup-staff-race') {
 } elseif (str_starts_with($case, 'followup-webhook')) {
     $key = $notice($token);
     $gateway = new Paymenter\Extensions\Gateways\AeStripe\AeStripe(['stripe_secret_key' => 'rk_test_fixture', 'stripe_webhook_secret' => 'whsec_fixture']);
-    foreach (glob(__DIR__ . '/../extension/AeStripe/database/migrations/*.php') as $migration) (require $migration)->up();
     if (str_contains($case, 'discard')) $methods['pm_new']['customer'] = 'cus_foreign';
     $body = json_encode(['type' => 'payment_intent.succeeded', 'data' => ['object' => $intent]]);
     $signature = 't=' . time() . ',v1=' . hash_hmac('sha256', time() . '.' . $body, 'whsec_fixture');

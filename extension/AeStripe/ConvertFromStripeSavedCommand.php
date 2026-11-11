@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 namespace Paymenter\Extensions\Gateways\AeStripe;
 
+require_once __DIR__ . '/ExtensionLocks.php';
+
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\{DB, Log, Schema};
 
@@ -13,7 +15,7 @@ final class ConvertFromStripeSavedCommand extends Command
     public function handle(): int
     {
         try {
-            $plan = DB::transaction(function () {
+            $plan = ExtensionLocks::transaction('gateway', function () {
                 return $this->plan();
             });
             if (is_int($plan)) return $plan;
@@ -32,7 +34,7 @@ final class ConvertFromStripeSavedCommand extends Command
             // Completed renames disappear from the next plan if this run is interrupted.
             foreach ($columns as [$table, $from, $to]) Schema::table($table, fn ($blueprint) => $blueprint->renameColumn($from, $to));
             foreach ($renames as $from => $to) Schema::rename($from, $to);
-            DB::transaction(function () use ($plan) {
+            ExtensionLocks::transaction('gateway', function () use ($plan) {
                 // Re-plan under fresh row locks after DDL released the preflight locks.
                 $fresh = $this->plan();
                 if (is_int($fresh) || $fresh['renames'] || $fresh['columns'] || $fresh['old'] != $plan['old'] || $fresh['updates'] !== $plan['updates']) {
@@ -57,7 +59,7 @@ final class ConvertFromStripeSavedCommand extends Command
     {
         $old = []; $new = [];
         // Raw rows include soft-deleted gateways and avoid booting either extension.
-        foreach (DB::table('extensions')->orderBy('id')->lockForUpdate()->get() as $row) {
+        foreach (DB::table('extensions')->orderBy('id')->get() as $row) {
             if ($row->extension === 'StripeSaved') $old[] = $row;
             if ($row->extension === 'AeStripe') $new[] = $row;
         }
@@ -99,7 +101,7 @@ final class ConvertFromStripeSavedCommand extends Command
                 $query->where('settingable_id', $old[0]->id)
                     ->whereIn('settingable_type', [\App\Models\Gateway::class, \App\Models\Extension::class]);
             }
-            $rows = $query->orderBy('id')->lockForUpdate()->get();
+            $rows = $query->orderBy('id')->get();
             foreach ($rows as $row) {
                 $value = $row->$field;
                 $target = str_replace(['stripe_saved_', 'stripe-saved', 'StripeSaved'], ['ae_stripe_', 'ae-stripe', 'AeStripe'], $value);
@@ -108,7 +110,7 @@ final class ConvertFromStripeSavedCommand extends Command
                     $owner = $table === 'settings' ? ['settingable_id', 'settingable_type'] : ['model_id', 'model_type'];
                     $other = DB::table($table)->where($field, $target)
                         ->where($owner[0], $row->{$owner[0]})->where($owner[1], $row->{$owner[1]})
-                        ->lockForUpdate()->first();
+                        ->first();
                     if ($other) throw new ConversionRefusal('Both source and target keys exist in ' . $table . ' for row #' . $row->id);
                 }
                 $updates[] = [$table, $row->id, $field, $target, (array) $row];

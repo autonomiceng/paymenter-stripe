@@ -82,6 +82,20 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
     };
 };
 
+// Select the existing behavior fragments without running the full offline suite.
+if ($suite = getenv('PAY_OFFLINE_SUITE')) {
+    $files = match ($suite) {
+        'charge-attempts', 'agreement-persistence', 'auto-pay-consent', 'setup-intents', 'webhook-continuity' => [$suite],
+        'payment-fees' => ['fee-recovery', 'fee-recovery-review'],
+        'adoption-store' => ['gateway-lifecycle', 'adoption', 'adoption-store'],
+        'ci-coverage' => ['native-ci-selection'],
+        default => throw new RuntimeException('Unknown offline suite'),
+    };
+    foreach ($files as $file) require __DIR__ . '/' . $file . '.php';
+    echo "PASS: $count $suite assertions\n";
+    return;
+}
+
 if (getenv('PAY_CHECKOUT_CASE')) {
     require __DIR__ . '/checkout-followups.php';
     return;

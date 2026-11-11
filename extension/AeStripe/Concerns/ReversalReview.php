@@ -32,7 +32,7 @@ trait ReversalReview
         $this->withPaymentLock($invoice, function ($user, $current) use ($actor, $paymentId, $id, $kind, $reviewKey, $note) {
             $receipt = $this->readReceipt($user, $paymentId);
             abort_unless($receipt && $receipt['invoice_id'] === $current->id && $receipt['currency'] === strtolower($current->currency_code), 409);
-            $row = $this->receiptRows()->where('payment_intent_id', $paymentId)->where('allocation_key', 'stripe:' . $kind . ':' . $id)->lockForUpdate()->first();
+            $row = $this->receiptRows()->where('payment_intent_id', $paymentId)->where('allocation_key', 'stripe:' . $kind . ':' . $id)->first();
             abort_unless($row, 409);
             $review = $this->reversalReview($current, $row);
             abort_unless(hash_equals($review['review_key'], $reviewKey), 409);

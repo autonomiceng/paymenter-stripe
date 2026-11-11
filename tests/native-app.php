@@ -82,21 +82,21 @@ $connection->beforeExecuting(function ($sql, $bindings) {
     // Guards that MariaDB and the payment design require but SQLite cannot enforce.
     if (str_starts_with($sql, 'insert into "audits"') && $level === 0) throw new RuntimeException('Review record lock missing');
     // A plain review read sees every record only under the owner lock that every review writer holds.
-    if (preg_match('/^select .* from "audits"/', $sql) && $level > 0 && !$locked && !holdsLock('users')
-        && !(holdsLock('extensions') && in_array(App\Models\Gateway::class, $bindings, true))) throw new RuntimeException('Review guard needs the owner lock');
+    if (preg_match('/^select .* from "audits"/', $sql) && $level > 0 && !$locked && !holdsLock('ae_stripe_locks')
+        && !(holdsLock('ae_stripe_locks') && in_array(App\Models\Gateway::class, $bindings, true))) throw new RuntimeException('Review guard needs the owner lock');
     // A plain settlement read sees every payment only under the owner lock that every payment writer here holds.
-    if (preg_match('/^select .* from "invoice_transactions" where "transaction_id" = \? and "status" = \?/', $sql) && $level > 0 && !$locked && !holdsLock('users')) {
+    if (preg_match('/^select .* from "invoice_transactions" where "transaction_id" = \? and "status" = \?/', $sql) && $level > 0 && !$locked && !holdsLock('ae_stripe_locks')) {
         throw new RuntimeException('Settlement guard needs the owner lock');
     }
     if (preg_match('/^select .* from "ae_stripe_receipt_returns"/', $sql) && $locked && $level === 0) throw new RuntimeException('Return read needs transaction');
-    if (str_starts_with($sql, 'update "invoice_transactions" set "is_credit_transaction" = ? where "id" = ?') && !holdsLock('users')) {
+    if (str_starts_with($sql, 'update "invoice_transactions" set "is_credit_transaction" = ? where "id" = ?') && !holdsLock('ae_stripe_locks')) {
         throw new RuntimeException('Classification requires payment locks');
     }
     if (!$write = nativeWrite($sql, $bindings)) return;
     [$table, $values] = $write;
     if ($table === 'ae_stripe_receipt_returns') {
         // Allocation and observation writes carry their owner; queue maintenance updates do not.
-        if (array_key_exists('user_id', $values) && !holdsLock('users')) throw new RuntimeException('Return write needs owner lock');
+        if (array_key_exists('user_id', $values) && !holdsLock('ae_stripe_locks')) throw new RuntimeException('Return write needs owner lock');
         if (strlen((string) ($values['return_key'] ?? '')) > 74) throw new Illuminate\Database\QueryException('sqlite', $sql, $bindings, new PDOException('Data too long for column return_key'));
     }
     foreach ($GLOBALS['nativeBeforeWrite'][$table] ?? [] as $hook) $hook($values, $sql);
@@ -124,7 +124,7 @@ $connection->beforeExecuting(function ($sql) {
 /** Tables locked for update, in statement order, since the process started. */
 function lockLog(): array { return $GLOBALS['nativeLockLog']; }
 /** Run a hook once, just before the next row lock on this table. */
-function beforeLock(string $table, callable $hook): void { $GLOBALS['nativeBeforeLock'][$table] = $hook; }
+function beforeLock(string $table, callable $hook): void { if ($table === 'users') $table = 'ae_stripe_locks'; $GLOBALS['nativeBeforeLock'][$table] = $hook; }
 // Log entries as [level, message, context]; the null log channel still dispatches each entry.
 $GLOBALS['nativeLog'] = [];
 Illuminate\Support\Facades\Event::listen(Illuminate\Log\Events\MessageLogged::class, function ($entry) { $GLOBALS['nativeLog'][] = [$entry->level, $entry->message, $entry->context]; });

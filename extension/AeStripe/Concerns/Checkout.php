@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Helpers\ExtensionHelper;
 use App\Exceptions\DisplayException;
 use Illuminate\Http\Client\{ConnectionException, RequestException};
@@ -317,8 +319,8 @@ trait Checkout
         $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
         $userId = $invoice->user_id;
         if ($prepareMethod) $intent = $this->prepareTransactionMethod($invoice, $intent, $status);
-        DB::transaction(function () use ($intent, $status, $userId, $subscriptionInvoiceId) {
-            $user = User::where('id', $userId)->lockForUpdate()->firstOrFail();
+        ExtensionLocks::transaction('user:' . $userId, function () use ($intent, $status, $userId, $subscriptionInvoiceId) {
+            $user = User::where('id', $userId)->firstOrFail();
             $invoice = Invoice::where('id', $intent->metadata->invoice_id)->lockForUpdate()->firstOrFail();
             $this->bindWebhookAttempt($user, $invoice, $intent);
             if ($this->lockedTransactions(InvoiceTransaction::where('transaction_id', $intent->id), 'succeeded')) {
@@ -479,7 +481,7 @@ trait Checkout
     private function methodCustomerMatches($user, $method, bool $current = false): bool
     {
         $property = $user->properties()->where('key', 'stripe_id');
-        $customer = ($current ? $property->lockForUpdate() : $property)->first()?->value;
+        $customer = ($current ? $property : $property)->first()?->value;
         if (!$customer || ($method->customer ?? null) !== $customer) {
             \Illuminate\Support\Facades\Log::warning('AeStripe saved method customer mismatch', ['user_id' => $user->id]);
             return false;

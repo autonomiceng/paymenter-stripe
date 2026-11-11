@@ -79,6 +79,7 @@ if ($scenario === 'all') {
     $service->billing_agreement_id = 33;
     $service->auto_pay = false;
     $serviceBefore = serialize($service);
+    DB::$tables['ae_stripe_locks']['user:7'] = ['scope' => 'user:7'];
     $tablesBefore = DB::$tables;
     $entries = [
         'persistence' => fn () => invoke($gateway, 'persistAgreement', $user, $agreementMethod),

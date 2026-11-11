@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Models\User;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Http\Client\RequestException;
@@ -13,8 +15,8 @@ trait SetupIntent
         $property = 'ae_stripe_setup';
         $digest = hash('sha256', json_encode($data, JSON_THROW_ON_ERROR));
         $reserve = function (?string $completedKey = null) use ($user, $property, $digest) {
-            return DB::transaction(function () use ($user, $property, $digest, $completedKey) {
-                $owner = User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+            return ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $property, $digest, $completedKey) {
+                $owner = User::where('id', $user->id)->firstOrFail();
                 $stored = $owner->properties()->where('key', $property)->first()?->value;
                 $attempt = $stored ? json_decode($stored, true, flags: JSON_THROW_ON_ERROR) : null;
                 if ($attempt && $attempt['key'] !== $completedKey) {
@@ -60,8 +62,8 @@ trait SetupIntent
         // Commit the retry key before HTTP. An ambiguous response must never create a second intent.
         abort_unless(time() - $attempt['created'] < 23 * 3600, 409);
         $intent = $this->request('post', '/setup_intents', $data, $attempt['key']);
-        DB::transaction(function () use ($user, $property, $attempt, $intent) {
-            $owner = User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+        ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $property, $attempt, $intent) {
+            $owner = User::where('id', $user->id)->firstOrFail();
             $current = json_decode($owner->properties()->where('key', $property)->first()->value, true, flags: JSON_THROW_ON_ERROR);
             abort_unless($current['key'] === $attempt['key'], 409);
             $owner->properties()->updateOrCreate(['key' => $property], ['value' => json_encode($attempt + ['intent' => $intent->id], JSON_THROW_ON_ERROR)]);

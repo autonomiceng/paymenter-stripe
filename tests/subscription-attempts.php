@@ -150,7 +150,7 @@ use Illuminate\Support\Facades\{DB, Http};
                 $beforeCalls = count(Http::$calls);
                 rejects(fn () => invoke($gateway, 'subscriptionAttempt', $user, $olderSetup, $service, $data), 'HTTP 409');
                 check($user->props->values[$property] === $concurrent && count(Http::$calls) === $beforeCalls + 1
-                    && array_slice(DB::$modelLocks, $before) === [User::class, User::class],
+                    && array_slice(DB::$modelLocks, $before) === ['ae_stripe_locks:user:7', 'ae_stripe_locks:user:7'],
                     'A changed attempt is checked under the user lock and cannot be replaced or returned');
             }
         }

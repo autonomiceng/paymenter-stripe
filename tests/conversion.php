@@ -8,6 +8,7 @@ use Paymenter\Extensions\Gateways\AeStripe\ConvertFromStripeSavedCommand;
     \Illuminate\Support\Facades\Schema::$foreignTables = ['other_app' => ['stripe_saved_payment_fees' => [['stripe_saved_probe' => 'foreign']]]];
     \Illuminate\Support\Facades\Schema::$inspectedTables = [];
     DB::$tables = [
+        'ae_stripe_locks' => ['gateway' => ['scope' => 'gateway']],
         'extensions' => [['id' => 42, 'type' => 'gateway', 'extension' => 'StripeSaved', 'name' => 'Stripe Saved Methods', 'enabled' => true, 'deleted_at' => null]],
         'settings' => [['id' => 9, 'settingable_id' => 42, 'settingable_type' => \App\Models\Gateway::class, 'key' => 'stripe_secret_key', 'value' => 'encrypted-placeholder']],
         'properties' => [['id' => 11, 'model_id' => 7, 'model_type' => \App\Models\User::class, 'key' => 'stripe_saved_subscription_91', 'value' => '{"key":"immutable","data":{"metadata":{"stripe_saved_gateway":"1"}}}']],
@@ -53,7 +54,8 @@ use Paymenter\Extensions\Gateways\AeStripe\ConvertFromStripeSavedCommand;
         $command = new ConvertFromStripeSavedCommand;
         check($command->handle() === 0, 'Conversion defaults to a successful dry run');
         check(DB::$tables === $before, 'Dry run preserves schema, settings and every row');
-        check(!str_contains(implode("\n", $command->output), 'Previous apply was partial'), 'Fresh dry run does not report a partial apply');
+        // The installed lock schema is already an AE Stripe table before conversion.
+        check(str_contains(implode("\n", $command->output), 'Previous apply was partial'), 'Dry run reports existing AE Stripe schema and still lists all remaining work');
         check(str_contains(implode("\n", $command->output), 'stripe_saved_payment_fees -> ae_stripe_payment_fees'), 'Dry run describes the table rename');
         $command = new ConvertFromStripeSavedCommand;
         $command->options = ['apply' => true];

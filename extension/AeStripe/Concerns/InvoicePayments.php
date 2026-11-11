@@ -7,9 +7,13 @@ use App\Models\InvoiceTransaction;
 trait InvoicePayments
 {
     /** Call under the caller's user/invoice transaction before applying credit. False means funds are in flight. */
-    public function cancelInvoicePayments($invoice): bool
+    public function cancelInvoicePayments($invoice, bool $forCredit = false): bool
     {
-        return $this->withPaymentLock($invoice, function ($user, $current) {
+        return $this->withPaymentLock($invoice, function ($user, $current) use ($forCredit) {
+            if ($forCredit) {
+                abort_unless($current->user_id == \Illuminate\Support\Facades\Auth::id(), 403);
+                if ($current->status !== 'pending') return false;
+            }
             $attempt = $this->readPaymentAttempt($user, $current);
             if (!$attempt) {
                 // Older asynchronous debits may predate durable attempt properties.

@@ -30,6 +30,7 @@ config(['hashing.bcrypt.rounds' => 4, 'audit.enabled' => false, 'settings.mail_d
 if (config('database.default') !== 'sqlite' || config('database.connections.sqlite.database') !== ':memory:') throw new RuntimeException('In-memory fixture required.');
 Illuminate\Support\Facades\Http::preventStrayRequests();
 Illuminate\Support\Facades\Artisan::call('migrate', ['--force' => true]);
+foreach (glob(__DIR__ . '/../extension/AeStripe/database/migrations/*.php') as $migration) (require $migration)->up();
 config(['cache.default' => 'database']);
 foreach (['cache' => false, 'cache_locks' => true] as $table => $locks) Illuminate\Support\Facades\Schema::create($table, function ($schema) use ($locks) {
     $schema->string('key')->primary();

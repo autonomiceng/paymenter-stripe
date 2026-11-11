@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Models\{Audit, BillingAgreement, Gateway, Invoice, Property, User};
 use Illuminate\Support\Facades\DB;
 use Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException;
@@ -203,7 +205,7 @@ trait ChargeRecovery
         DB::afterCommit(function () {
             try {
                 $id = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
-                DB::transaction(function () use ($id) {
+                ExtensionLocks::transaction('gateway', function () use ($id) {
                     $gateway = $this->gatewayRowForUpdate($id)->firstOrFail();
                     $fingerprint = hash('sha256', $this->config('stripe_secret_key'));
                     $audit = Audit::where('auditable_type', $gateway->getMorphClass())->where('auditable_id', $gateway->id)

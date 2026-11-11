@@ -327,7 +327,9 @@ namespace App\Models {
         public function exists() { return $this->nativeRows()->exists(); }
         public function pluck($key) { return $this->nativeRows()->pluck($key); }
         public function get() {
-            $rows = $this->current ? \App\Helpers\ExtensionHelper::$agreements : (BillingAgreement::$snapshot ?? \App\Helpers\ExtensionHelper::$agreements);
+            $rows = $this->current || !\Illuminate\Support\Facades\DB::$locked
+                ? \App\Helpers\ExtensionHelper::$agreements
+                : (BillingAgreement::$snapshot ??= \App\Helpers\ExtensionHelper::$agreements);
             foreach ($rows as $id => $row) {
                 $row += ['external_reference' => $id, 'deleted_at' => null];
                 if (!$this->trashed && $row['deleted_at'] !== null) continue;
@@ -462,9 +464,10 @@ namespace App\Models {
             }
         }; }
         /** Payments by their fake ids (crc32 of invoice:transaction_id), in id order, for locking and updating by primary key. */
-        public static function whereKey(array $ids) { return new class($ids) {
+        public static function whereKey($ids) { return new class((array) $ids) {
             public function __construct(private $ids) {}
             public function orderBy($key) { return $this; }
+            public function first() { return $this->get()[0] ?? null; }
             public function lockForUpdate() { \Illuminate\Support\Facades\DB::$modelLocks[] = InvoiceTransaction::class; return $this; }
             public function get() {
                 $rows = [];
@@ -591,7 +594,7 @@ namespace Illuminate\Support\Facades {
         public static $tables = [], $locks = [], $updates = [];
         public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } }; }
         public static $concurrentAgreements = [], $concurrentPayments = [];
-        public static function table($name) { return match ($name) { 'invoice_transactions' => new \TransactionClassificationQuery, 'ae_stripe_receipt_returns' => new \ReceiptReturnQuery, 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
+        public static function table($name) { return match ($name) { 'ae_stripe_locks' => new \ExtensionLockQuery, 'invoice_transactions' => new \TransactionClassificationQuery, 'ae_stripe_receipt_returns' => new \ReceiptReturnQuery, 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
         public static $beforeUserLock = null, $beforeServiceLock = null, $afterTransaction = null;
         public static function transactionLevel() { return self::$locked ? 1 : 0; }
         private static $afterCommit = [];
@@ -656,6 +659,35 @@ namespace Carbon {
 namespace {
     $GLOBALS['fakeConfig']['cache.default'] = 'database';
     $GLOBALS['fakeConfig']['cache.stores.database.driver'] = 'database';
+    class ExtensionLockQuery {
+        private ?string $scope = null;
+        public function insertOrIgnore(array $row) {
+            $key = $row['scope'];
+            if (isset(\Illuminate\Support\Facades\DB::$tables['ae_stripe_locks'][$key])) return 0;
+            \Illuminate\Support\Facades\DB::$tables['ae_stripe_locks'][$key] = $row;
+            return 1;
+        }
+        public function where($key, $value) {
+            if ($key !== 'scope') throw new RuntimeException('Lock query needs its primary key');
+            $this->scope = $value; return $this;
+        }
+        public function lockForUpdate() {
+            $db = \Illuminate\Support\Facades\DB::class;
+            if (!$db::$locked || !$this->scope || !isset($db::$tables['ae_stripe_locks'][$this->scope])) throw new RuntimeException('Lock row must exist before locking');
+            if (str_starts_with($this->scope, 'user:')) {
+                if ($hook = $db::$beforeUserLock) {
+                    $db::$beforeUserLock = null;
+                    $before = \App\Helpers\ExtensionHelper::$payments;
+                    $hook();
+                    foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) if (($before[$key] ?? null) !== $row) $db::$concurrentPayments[$key] = $row;
+                }
+                $db::$userLocked = true;
+            } else $db::$gatewayLocked = true;
+            $db::$modelLocks[] = 'ae_stripe_locks:' . $this->scope;
+            return $this;
+        }
+        public function firstOrFail() { return (object) \Illuminate\Support\Facades\DB::$tables['ae_stripe_locks'][$this->scope]; }
+    }
     class TransactionClassificationQuery {
         private $id;
         public function where($key, $value) {

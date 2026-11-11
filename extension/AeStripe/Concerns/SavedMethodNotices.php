@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Exceptions\DisplayException;
 use App\Models\{Invoice, Property, User};
 use Illuminate\Support\Facades\{Auth, Cache, DB, Log};
@@ -29,8 +31,8 @@ trait SavedMethodNotices
             $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
             if ($invoice->user_id != Auth::id() || ($intent->customer ?? null) !== $invoice->user->properties()->where('key', 'stripe_id')->first()?->value) return null;
             $token = is_string($token) && preg_match('/\A[a-f0-9]{32}\z/', $token) ? $token : bin2hex(random_bytes(16));
-            $token = DB::transaction(function () use ($invoice, $intent, $token) {
-                $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
+            $token = ExtensionLocks::transaction('user:' . $invoice->user_id, function () use ($invoice, $intent, $token) {
+                $user = User::where('id', $invoice->user_id)->firstOrFail();
                 $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
                 if ($current->user_id != $user->id) return null;
                 foreach ($this->lockedUserProperties($user, 'ae_stripe_notice_') as $property) {
@@ -72,9 +74,9 @@ trait SavedMethodNotices
     {
         if (empty($intent->metadata->invoice_id) || empty($intent->id)) return;
         $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
-        DB::transaction(function () use ($invoice, $intent) {
-            $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
-            foreach ($user->properties()->where('key', 'like', 'ae_stripe_notice_%')->lockForUpdate()->get() as $property) {
+        ExtensionLocks::transaction('user:' . $invoice->user_id, function () use ($invoice, $intent) {
+            $user = User::where('id', $invoice->user_id)->firstOrFail();
+            foreach ($user->properties()->where('key', 'like', 'ae_stripe_notice_%')->get() as $property) {
                 $notice = json_decode($property->value, true);
                 if (($notice['intent_id'] ?? null) === $intent->id && ($notice['invoice_id'] ?? null) == $invoice->id
                     && ($notice['state'] ?? null) === 'pending') $user->properties()->where('key', $property->key)->delete();
@@ -86,9 +88,9 @@ trait SavedMethodNotices
     {
         if ($saved !== true && !is_array($saved)) return;
         $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
-        DB::transaction(function () use ($invoice, $intent, $saved) {
-            $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
-            foreach ($user->properties()->where('key', 'like', 'ae_stripe_notice_%')->lockForUpdate()->get() as $property) {
+        ExtensionLocks::transaction('user:' . $invoice->user_id, function () use ($invoice, $intent, $saved) {
+            $user = User::where('id', $invoice->user_id)->firstOrFail();
+            foreach ($user->properties()->where('key', 'like', 'ae_stripe_notice_%')->get() as $property) {
                 $notice = json_decode($property->value, true);
                 if (($notice['intent_id'] ?? null) !== $intent->id || ($notice['invoice_id'] ?? null) != $invoice->id
                     || ($notice['user_id'] ?? null) != $user->id || !in_array($notice['state'] ?? null, ['pending', 'failed'], true) || ($notice['consumed'] ?? false)) continue;
@@ -140,9 +142,9 @@ trait SavedMethodNotices
             $context?->addMemo('aeStripeNoticeDelay', true);
         }
         if (!$done && !empty($notice['notice'])) {
-            DB::transaction(function () use ($component, $token, &$done) {
-                $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
-                $property = $user->properties()->where('key', $this->savedNoticeKey($token))->lockForUpdate()->first();
+            ExtensionLocks::transaction('user:' . Auth::id(), function () use ($component, $token, &$done) {
+                $user = User::where('id', Auth::id())->firstOrFail();
+                $property = $user->properties()->where('key', $this->savedNoticeKey($token))->first();
                 $current = json_decode($property?->value ?? 'null', true);
                 $done = true;
                 if (!$current || ($current['user_id'] ?? null) != $user->id || ($current['invoice_id'] ?? null) != $component->invoice->id
@@ -150,7 +152,7 @@ trait SavedMethodNotices
                 $component->notify($current['notice']['message'], $current['notice']['type']);
                 $current['consumed'] = true; $current['consumed_at'] = now()->timestamp;
                 if (isset($current['receipt_key'])) {
-                    $receipt = json_decode($user->properties()->where('key', $current['receipt_key'])->lockForUpdate()->first()?->value ?? 'null', true);
+                    $receipt = json_decode($user->properties()->where('key', $current['receipt_key'])->first()?->value ?? 'null', true);
                     if (is_array($receipt)) $user->properties()->updateOrCreate(['key' => $current['receipt_key']], ['value' => json_encode(array_replace($receipt, ['notice_consumed' => true]), JSON_THROW_ON_ERROR)]);
                 }
                 $property->update(['value' => json_encode($current, JSON_THROW_ON_ERROR)]);
@@ -162,9 +164,9 @@ trait SavedMethodNotices
     // Recheck the exact reservation under the owner lock after every provider read.
     private function changeSavedNotice($snapshot, callable $change): void
     {
-        DB::transaction(function () use ($snapshot, $change) {
-            $user = User::where('id', $snapshot->model_id)->lockForUpdate()->first();
-            $current = $user?->properties()->where('key', $snapshot->key)->lockForUpdate()->first();
+        ExtensionLocks::transaction('user:' . $snapshot->model_id, function () use ($snapshot, $change) {
+            $user = User::where('id', $snapshot->model_id)->first();
+            $current = $user?->properties()->where('key', $snapshot->key)->first();
             if (!$current || $current->id !== $snapshot->id || $current->value !== $snapshot->value) return;
             $notice = json_decode($current->value, true);
             $next = $change($user, is_array($notice) ? $notice : [], $current);
@@ -222,7 +224,7 @@ trait SavedMethodNotices
                 if ($created === null) return array_replace($notice, ['created_at' => now()->timestamp]);
                 if ($created >= now()->timestamp - 30 * 86400) return $notice;
                 if (isset($notice['receipt_key'])) {
-                    $receipt = json_decode($user->properties()->where('key', $notice['receipt_key'])->lockForUpdate()->first()?->value ?? 'null', true);
+                    $receipt = json_decode($user->properties()->where('key', $notice['receipt_key'])->first()?->value ?? 'null', true);
                     if (is_array($receipt)) $user->properties()->updateOrCreate(['key' => $notice['receipt_key']],
                         ['value' => json_encode(array_replace($receipt, ['notice_consumed' => true]), JSON_THROW_ON_ERROR)]);
                 }

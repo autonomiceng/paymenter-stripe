@@ -6,6 +6,7 @@ use App\Models\{Gateway, User};
 use Illuminate\Support\Facades\{DB, Http};
 
 require_once __DIR__ . '/GatewayLifecycle.php';
+require_once __DIR__ . '/ExtensionLocks.php';
 
 final class AdoptionStore
 {
@@ -64,15 +65,15 @@ final class AdoptionStore
         return $config;
     }
 
-    public function transaction(callable $callback): mixed { return DB::transaction($callback); }
+    public function transaction(callable $callback): mixed { return ExtensionLocks::transaction('gateway', $callback); }
 
-    public function lockUser(int $id): void { User::where('id', $id)->lockForUpdate()->firstOrFail(); }
+    public function lockUser(int $id): void { User::where('id', $id)->firstOrFail(); }
 
     private function rows(string $table, callable $filter): array
     {
         $query = $filter(DB::table($table));
         $rows = [];
-        foreach ($query->orderBy('id')->lockForUpdate()->get() as $row) $rows[$row->id] = (array) $row;
+        foreach ($query->orderBy('id')->get() as $row) $rows[$row->id] = (array) $row;
         return $rows;
     }
 

@@ -39,6 +39,7 @@ $capsule->setEventDispatcher($container['events']); $capsule->bootEloquent();
 $container->instance('db', $capsule->getDatabaseManager());
 $container->bind('db.schema', fn () => $capsule->getConnection()->getSchemaBuilder());
 Facade::setFacadeApplication($container);
+(require __DIR__ . '/../extension/AeStripe/database/migrations/2026_11_11_000001_create_ae_stripe_locks.php')->up();
 Http::preventStrayRequests();
 Schema::create('users', fn ($t) => $t->id());
 Schema::create('extensions', function ($t) {

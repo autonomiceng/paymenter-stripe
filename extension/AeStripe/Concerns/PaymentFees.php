@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Helpers\ExtensionHelper;
 use App\Models\{Audit, Invoice, InvoiceTransaction, User};
 use Illuminate\Support\Facades\DB;
@@ -40,7 +42,7 @@ trait PaymentFees
             try {
                 $transaction = InvoiceTransaction::where('transaction_id', $row->payment_intent_id)->first();
                 if (!$transaction || !$transaction->invoice || ($transaction->gateway->extension ?? null) !== 'AeStripe') {
-                    DB::transaction(function () use ($row) {
+                    ExtensionLocks::transaction('gateway', function () use ($row) {
                         $current = $this->feeRows()->where('payment_intent_id', $row->payment_intent_id)->lockForUpdate()->first();
                         if (($current->state ?? null) !== 'pending') return;
                         $current->last_error = 'Payment transaction unavailable';
@@ -56,7 +58,7 @@ trait PaymentFees
                 report($e);
                 // The failed transaction rolled back. Count this attempt separately.
                 try {
-                    $failed = DB::transaction(function () use ($row, $e) {
+                    $failed = ExtensionLocks::transaction('gateway', function () use ($row, $e) {
                         $current = $this->feeRows()->where('payment_intent_id', $row->payment_intent_id)->lockForUpdate()->first();
                         if (($current->state ?? null) !== 'pending') return;
                         $current->attempts++;
@@ -67,7 +69,7 @@ trait PaymentFees
                         return $current;
                     });
                     if ($failed && ($failed->attempts >= 24 || time() - $failed->created_at >= 72 * 3600)) {
-                        DB::transaction(function () use ($failed) {
+                        ExtensionLocks::transaction('gateway', function () use ($failed) {
                             $current = $this->feeRows()->where('payment_intent_id', $failed->payment_intent_id)->lockForUpdate()->first();
                             if (($current->state ?? null) !== 'pending') return;
                             $this->stopPaymentFee($current, null);
@@ -135,8 +137,8 @@ trait PaymentFees
                 $error = 'Balance transaction lookup failed';
             }
         }
-        DB::transaction(function () use ($charge, $paymentId, $transaction, $snapshot, $balanceId, $chargeId, $balance, $error) {
-            User::where('id', $transaction->invoice->user_id)->lockForUpdate()->firstOrFail();
+        ExtensionLocks::transaction('user:' . $transaction->invoice->user_id, function () use ($charge, $paymentId, $transaction, $snapshot, $balanceId, $chargeId, $balance, $error) {
+            User::where('id', $transaction->invoice->user_id)->firstOrFail();
             $invoice = Invoice::where('id', $transaction->invoice->id)->lockForUpdate()->firstOrFail();
             $current = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentId))[0] ?? null;
             abort_unless(($current->gateway->extension ?? null) === 'AeStripe'
@@ -144,7 +146,7 @@ trait PaymentFees
             // Every insert of a fee row holds this owner lock, so a plain read finds it, and only an existing row is locked.
             // A locking read of a missing key locks the gap two payments then insert into, and they deadlock.
             $row = $this->feeRows()->where('payment_intent_id', $paymentId)->first()
-                ? $this->feeRows()->where('payment_intent_id', $paymentId)->lockForUpdate()->first() : null;
+                ? $this->feeRows()->where('payment_intent_id', $paymentId)->first() : null;
             if ($row && $row->state !== 'pending') return;
             if ($row && ($row->charge_id !== ($snapshot ? $snapshot->charge_id : $chargeId)
                 || $row->balance_transaction_id !== ($snapshot ? $snapshot->balance_transaction_id : $balanceId))) return;
@@ -154,7 +156,7 @@ trait PaymentFees
                     'charge_id' => $chargeId, 'balance_transaction_id' => $balanceId,
                     'state' => 'pending', 'attempts' => 0, 'created_at' => time(), 'last_error' => null,
                 ]);
-                $row = $this->feeRows()->where('payment_intent_id', $paymentId)->lockForUpdate()->first();
+                $row = $this->feeRows()->where('payment_intent_id', $paymentId)->first();
             }
             if ($row->attempts >= 24 || time() - $row->created_at >= 72 * 3600) {
                 $this->stopPaymentFee($row, $invoice);

@@ -93,7 +93,7 @@ trait ReceiptReturns
     private function lockedReceiptRow(string $id, string $key): ?object
     {
         $row = fn () => $this->receiptRows()->where('payment_intent_id', $id)->where('allocation_key', $key);
-        return $row()->first() ? $row()->lockForUpdate()->first() : null;
+        return $row()->first() ? $row()->first() : null;
     }
 
     private function receiptNotice(array $a): string

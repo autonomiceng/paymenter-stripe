@@ -42,7 +42,7 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
     end(Schedule::$callbacks)();
     check($row()['state'] === 'completed' && ExtensionHelper::$fees['pi_recovery'] === 0.67
         && ExtensionHelper::$feeWrites === $writes + 1, 'Registered task recovers the converted fee once');
-    check(array_slice(DB::$modelLocks, $locks, 3) === [User::class, Invoice::class, App\Models\InvoiceTransaction::class],
+    check(array_slice(DB::$modelLocks, $locks, 3) === ['ae_stripe_locks:user:7', Invoice::class, App\Models\InvoiceTransaction::class],
         'Fee worker uses the settlement lock order');
     $calls = count(Http::$calls);
     $deliver(); $gateway->retryPaymentFees();

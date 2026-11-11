@@ -61,7 +61,7 @@ trait RenewalRetry
     private function nativeRenewalServices($invoice): ?array
     {
         $ids = [];
-        foreach ($invoice->items()->lockForUpdate()->get() as $item) {
+        foreach ($invoice->items()->get() as $item) {
             if ($item->reference_type !== (new Service)->getMorphClass()) return null;
             $ids[] = (int) $item->reference_id;
         }
