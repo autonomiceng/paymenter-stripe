@@ -166,7 +166,7 @@ namespace App\Models {
         public $total = 20;
         public $due_at = null;
         public $items = [];
-        public function __construct(public User $user) {}
+        public function __construct(public ?User $user = null) {}
         public function items() { return new NativeModelQuery($this->items); }
         public function getMorphClass() { return self::class; }
         public function fresh() { return $this; }
@@ -365,10 +365,12 @@ namespace App\Models {
             foreach ($values as $key => $value) $this->$key = $value;
         }
         public static $rows = [], $fail = false;
+        public static function whereIn($key, $values) { return self::where($key, $values); }
         public static function where($key, $value) { return new class($key, $value) {
             private $filters = [], $currentRead = false;
             public function __construct($key, $value) { $this->where($key, $value); }
             public function where($key, $value) { $this->filters[$key] = $value; return $this; }
+            public function whereIn($key, $values) { return $this->where($key, $values); }
             public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = isset($this->filters['id']) ? Audit::class . ':' . $this->filters['id'] : Audit::class; return $this; }
             public function orderBy($key) { return $this; }
             public function limit($n) { return $this; }
@@ -381,7 +383,7 @@ namespace App\Models {
                 foreach (Audit::$rows as $row) {
                     foreach ($this->filters as $key => $value) {
                         $actual = str_starts_with($key, 'new_values->') ? ($row['new_values'][substr($key, 12)] ?? null) : ($row[$key] ?? null);
-                        if ($actual !== $value) continue 2;
+                        if (is_array($value) ? !in_array($actual, $value, true) : $actual !== $value) continue 2;
                     }
                     $rows[] = new Audit($row);
                 }

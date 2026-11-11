@@ -134,7 +134,7 @@ $gateway->webhook($request);
 $inboxUp();
 check(count($gateway->receiptReversals($i, 'pi_return')) === 1 && count(audits()) === 1 && !notices() && !audits()[0]['new_values']['notice_sent']
     && [payments(), moneyRows()] === $settled, 'Failed delivery preserves the reversal, original money and pending notice');
-$gateway->retryReceiptReturns(); $gateway->webhook($request); $gateway->retryReceiptReturns();
+$gateway->retryChargeAttempts(); $gateway->webhook($request); $gateway->retryChargeAttempts();
 check(count(audits()) === 1 && count(notices()) === 1 && audits()[0]['new_values']['notice_sent'], 'Recovery and replay deliver the committed reversal notice exactly once');
 
 $s->refunds['foreign']->currency = 'eur';

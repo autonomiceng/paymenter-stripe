@@ -2,7 +2,7 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
-use App\Models\{Audit, Notification, User};
+use App\Models\{Audit, Gateway, Invoice, Notification, User};
 use Illuminate\Support\Facades\DB;
 
 trait PaymentNotices
@@ -44,7 +44,11 @@ trait PaymentNotices
 
     private function retryPaymentNotices(): void
     {
-        foreach (Audit::where('new_values->notice_sent', false)->orderBy('id')->limit(100)->get() as $audit) {
+        $events = ['ae_stripe_attempt_review', 'ae_stripe_payment_refused', 'ae_stripe_access_refused', 'ae_stripe_payment_review',
+            'ae_stripe_fee_review', 'ae_stripe_receipt_return', 'ae_stripe_receipt_reversal'];
+        // The native auditable index narrows the rows before checking our events and JSON marker.
+        foreach (Audit::whereIn('auditable_type', [(new Invoice)->getMorphClass(), (new Gateway)->getMorphClass()])
+            ->whereIn('event', $events)->where('new_values->notice_sent', false)->orderBy('id')->limit(100)->get() as $audit) {
             if (isset($audit->new_values['notices'])) $this->deliverPaymentNotices($audit->id);
         }
     }

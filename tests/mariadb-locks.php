@@ -136,7 +136,55 @@ function invoiceStaff(): void
     $role = App\Models\Role::create(['name' => 'Invoice staff', 'permissions' => ['admin.invoices.viewAny', 'admin.invoices.view', 'admin.invoices.update']]);
     foreach ([7, 8] as $id) User::find($id)->update(['role_id' => $role->id]);
 }
+function pendingNotice(string $event, string $type = Invoice::class): void
+{
+    App\Models\Audit::create(['event' => $event, 'auditable_type' => $type, 'auditable_id' => 591,
+        'old_values' => [], 'new_values' => ['notice_sent' => false, 'notices' => [[
+            'user_id' => 7, 'title' => 'Queued payment notice', 'body' => 'Fixture', 'url' => '/',
+        ]]]]);
+}
 $cases = [
+    'notice-retry-paused' => ['seed' => function () {
+        customerInvoice(7, 591); customerInvoice(8, 592);
+        pendingNotice('ae_stripe_attempt_review');
+    }, 'pause' => '/^paused-notices-checked$/', 'a' => function ($gateway) {
+        App\Models\Gateway::where('extension', 'AeStripe')->update(['enabled' => false]);
+        $queries = 0;
+        DB::listen(function ($query) use (&$queries) { if (str_contains($query->sql, 'notice_sent')) ++$queries; });
+        $gateway->retryChargeAttempts(); $gateway->retryReceiptReturns(); $gateway->retryPaymentFees();
+        check($queries === 0 && DB::table('notifications')->count() === 0, 'Paused gateway never queries or delivers the notice retry queue');
+        pausePoint('paused-notices-checked');
+        return 'paused';
+    }, 'b' => fn ($gateway) => settle($gateway, 592),
+    'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', false)->count() === 1
+        && DB::table('notifications')->count() === 0 && Invoice::find(592)->status === 'paid'],
+    'notice-retry-owner' => ['seed' => function () {
+        customerInvoice(7, 591); customerInvoice(8, 592);
+        pendingNotice('ae_stripe_attempt_review');
+    }, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
+        $gateway->retryReceiptReturns(); $gateway->retryPaymentFees();
+        check(DB::table('notifications')->count() === 0, 'Receipt and fee schedulers leave queued notices to charge recovery');
+        $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+        return 'retried';
+    }, 'b' => fn ($gateway) => settle($gateway, 592),
+    'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', true)->count() === 1
+        && DB::table('notifications')->count() === 1 && Invoice::find(592)->status === 'paid'],
+    'notice-retry-scope' => ['seed' => function () {
+        customerInvoice(7, 591); customerInvoice(8, 592);
+        foreach (range(1, 100) as $unused) pendingNotice('updated');
+        pendingNotice('ae_stripe_attempt_review', User::class);
+        foreach (['ae_stripe_attempt_review', 'ae_stripe_payment_refused', 'ae_stripe_access_refused', 'ae_stripe_payment_review',
+            'ae_stripe_fee_review', 'ae_stripe_receipt_return', 'ae_stripe_receipt_reversal'] as $event) {
+            pendingNotice($event, $event === 'ae_stripe_access_refused' ? App\Models\Gateway::class : Invoice::class);
+        }
+    }, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
+        $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+        return 'retried';
+    }, 'b' => fn ($gateway) => settle($gateway, 592),
+    'check' => fn () => App\Models\Audit::where('event', 'updated')->where('new_values->notice_sent', false)->count() === 100
+        && App\Models\Audit::where('auditable_type', User::class)->where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', false)->count() === 1
+        && App\Models\Audit::where('new_values->notice_sent', true)->count() === 7
+        && DB::table('notifications')->count() === 7 && Invoice::find(592)->status === 'paid'],
     'refusal-events' => ['seed' => function () {
         customerInvoice(7, 591); customerInvoice(8, 592);
     }, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
@@ -482,6 +530,7 @@ foreach ($cases as $name => $case) {
     DB::statement('set foreign_key_checks = 1');
     DB::table('settings')->where('key', 'ae_stripe_webhook_continuity')->delete();
     DB::table('settings')->where('key', 'ae_stripe_webhook_events')->update(['value' => 'ready']);
+    App\Models\Gateway::where('extension', 'AeStripe')->update(['enabled' => true]);
     $case['seed']();
     $before = $deadlocks();
     $workers = [];

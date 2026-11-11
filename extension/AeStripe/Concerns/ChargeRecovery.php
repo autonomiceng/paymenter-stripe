@@ -60,9 +60,11 @@ trait ChargeRecovery
 
     public function retryChargeAttempts(): void
     {
-        $this->retryPaymentNotices();
         $collect = $this->gatewayEnabled();
-        if ($collect) $this->retryPaymentReviewAlerts();
+        if ($collect) {
+            $this->retryPaymentNotices();
+            $this->retryPaymentReviewAlerts();
+        }
         $this->paymentStripeUnavailable = false;
         foreach (Property::where('key', 'like', 'ae_stripe_checkout_%')
             ->orderByRaw('CASE WHEN value LIKE ? OR value NOT LIKE ? OR (value LIKE ? AND value NOT LIKE ?) THEN 0 ELSE 1 END',

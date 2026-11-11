@@ -152,7 +152,6 @@ trait ReceiptReturns
 
     public function retryReceiptReturns(): void
     {
-        $this->retryPaymentNotices();
         if (!$this->gatewayEnabled()) return;
         try { $this->reconcileWebhookSubscriptions(); } catch (\Throwable $e) { report($e); }
         $this->ensureReceiptReturnSchema();

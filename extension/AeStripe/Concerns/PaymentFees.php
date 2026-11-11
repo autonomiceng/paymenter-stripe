@@ -35,7 +35,6 @@ trait PaymentFees
 
     public function retryPaymentFees(): void
     {
-        $this->retryPaymentNotices();
         if (!$this->gatewayEnabled()) return;
         foreach ($this->feeRows()->where('state', 'pending')->orderBy('attempts')->orderBy('created_at')->limit(100)->get() as $row) {
             try {

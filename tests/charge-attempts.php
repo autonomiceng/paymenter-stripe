@@ -1519,6 +1519,7 @@ use Illuminate\Support\Facades\{DB, Http};
                 'Inbox failure after committed settlement cannot send cron payment-failed email');
             Notification::$fail = false;
             $gateway->retryReceiptReturns();
+            $gateway->retryChargeAttempts();
             check(count(Notification::$rows) === 1 && count($stripe->refunds) === 1, 'Scheduled recovery retries the failed return notice without repeating its refund');
         });
         $run('overpay-alert', function ($invoice, $stripe) use ($gateway) {
