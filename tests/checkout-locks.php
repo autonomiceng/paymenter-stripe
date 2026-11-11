@@ -437,14 +437,17 @@ $owner->properties()->create(['key' => 'ae_stripe_checkout_381', 'value' => json
     'created' => time(), 'intent' => $intent->id, 'retry' => true, 'automatic_renewal' => true, 'agreement_id' => $agreement->id,
     'confirmation' => ['key' => 'confirm_renewal381', 'params' => $params, 'agreement' => $agreement->id, 'amount' => 2000, 'currency' => 'usd', 'previous_charge' => null],
     'renewal' => ['state' => 'active', 'services' => [(int) $service->id], 'agreement_id' => $agreement->id, 'cutoff' => $due, 'retries' => 0]])]);
+$claimed = $owner->properties()->where('key', 'ae_stripe_checkout_381')->value('value');
 $posts = [];
 $GLOBALS['stripeHandler'] = function ($verb, $path) use (&$intent, &$posts) {
     if ($verb === 'get' && $path === '/payment_intents/pi_renewal381') return $intent;
     if ($verb === 'get' && $path === '/payment_methods/pm_renewal381') return nativeCard('pm_renewal381');
+    if ($verb === 'get' && $path === '/charges/ch_declined381') return ['id' => 'ch_declined381', 'payment_intent' => $intent->id, 'status' => 'failed'];
     if ($verb !== 'post' || !str_starts_with($path, '/payment_intents/pi_renewal381')) throw new RuntimeException('Unexpected renewal request: ' . $verb . ' ' . $path);
     $posts[] = $path;
     if ($path === '/payment_intents/pi_renewal381') return $intent;
     $intent->last_payment_error = (object) ['code' => 'card_declined', 'decline_code' => 'insufficient_funds'];
+    $intent->latest_charge = 'ch_declined381'; // Stripe keeps the declined charge on the intent.
     throw new StripeFixtureError(402, ['error' => ['code' => 'card_declined', 'decline_code' => 'insufficient_funds']]);
 };
 $victims = 1;
@@ -466,6 +469,37 @@ check($victims === 0 && $posts === ['/payment_intents/pi_renewal381', '/payment_
     && App\Models\InvoiceTransaction::where('invoice_id', 381)->where('status', 'failed')->count() === 1 && $stored['confirmation'] === null,
     'A deadlock recording a declined renewal sends one update and one confirmation and records the decline once: '
         . json_encode(['posts' => $posts, 'result' => $declined]));
+
+// Every rerun of that recording is a deadlock victim too. Nothing commits alone: the renewal keeps its claimed
+// confirmation and Auto Pay state, so the next automatic charge records the decline from Stripe without confirming again.
+App\Models\InvoiceTransaction::where('invoice_id', 381)->delete();
+$owner->properties()->where('key', 'ae_stripe_checkout_381')->update(['value' => $claimed]);
+[$intent->latest_charge, $posts, $victims] = [null, [], 4];
+unset($intent->last_payment_error);
+beforeWrite('invoice_transactions', function ($values, $sql) use (&$victims) {
+    if ($victims <= 0 || !str_starts_with($sql, 'insert')) return;
+    --$victims;
+    throw new Illuminate\Database\QueryException('mysql', $sql, [],
+        new PDOException('SQLSTATE[40001]: Serialization failure: 1213 Deadlock found when trying to get lock; try restarting transaction'));
+});
+try {
+    try { invoke($gateway, 'confirmAttempt', $invoice, $intent->id, $params, $agreement, 2000, 'usd'); $declined = 'not declined'; }
+    catch (Throwable $e) { $declined = get_class($e) . ': ' . $e->getMessage(); }
+} finally {
+    beforeWrite('invoice_transactions', null);
+}
+$stored = json_decode($owner->properties()->where('key', 'ae_stripe_checkout_381')->value('value'), true);
+check($victims === 0 && DB::transactionLevel() === 0 && $declined === 'Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException: '
+    . 'We are checking this payment automatically. Refresh the invoice for its status.'
+    && ($stored['confirmation']['key'] ?? null) === 'confirm_renewal381' && $stored['retry'] === true && $stored['renewal']['state'] === 'active'
+    && !App\Models\InvoiceTransaction::where('invoice_id', 381)->exists(),
+    'A decline whose every recording is a deadlock victim keeps its claimed confirmation and records nothing alone: '
+        . json_encode(['result' => $declined, 'attempt' => $stored]));
+try { $next = $gateway->charge($invoice->fresh(), 20, $agreement); } catch (Throwable $e) { $next = get_class($e) . ': ' . $e->getMessage(); }
+$stored = json_decode($owner->properties()->where('key', 'ae_stripe_checkout_381')->value('value'), true);
+check(count($posts) === 2 && $stored['confirmation'] === null && $stored['renewal']['state'] === 'waiting'
+    && App\Models\InvoiceTransaction::where('invoice_id', 381)->where('status', 'failed')->count() === 1,
+    'The next automatic charge records that decline once and never confirms it again: ' . json_encode(['posts' => $posts, 'result' => $next]));
 
 // A Pay that is a deadlock victim on every attempt is rolled back and asks the customer to try again.
 $created = 0;

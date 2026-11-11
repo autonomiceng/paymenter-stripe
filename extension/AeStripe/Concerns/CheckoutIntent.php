@@ -516,7 +516,8 @@ trait CheckoutIntent
         }
         $writeStarted = false;
         // Records Stripe's answer: a proven refusal ends this confirmation, and a declined renewal is recorded as failed.
-        $record = function ($outcome) use ($invoice, $attempt) {
+        // The refusal, the failed payment and the renewal policy commit in one owner and invoice transaction, or not at all.
+        $record = fn ($outcome) => $this->withPaymentLock($invoice, function () use ($outcome, $invoice, $attempt) {
             if (is_array($outcome)) {
                 [$fresh, $e] = [$outcome['refused'], $outcome['error']];
                 $this->storePaymentAttempt($invoice, $attempt, ['retry' => false, 'confirmation' => null, 'agreement_id' => null], confirmationOnly: true);
@@ -528,7 +529,7 @@ trait CheckoutIntent
             if (!empty($attempt['automatic_renewal']) && $outcome->status === 'requires_payment_method'
                 && ($outcome->amount_received ?? 0) === 0 && !empty($outcome->last_payment_error)) $this->recordIntentPayment($outcome, 'failed');
             return $outcome;
-        };
+        });
         $outcome = null;
         $confirm = function ($user, $current) use ($attempt, $intentId, $params, $agreement, $expectedAmount, $expectedCurrency, &$writeStarted, &$outcome, $record) {
             $stored = $this->readPaymentAttempt($user, $current);
@@ -592,7 +593,13 @@ trait CheckoutIntent
         catch (\Throwable $e) {
             // Stripe answered, but a lock conflict rolled back its recording: record that answer again without calling Stripe.
             if ($outcome === null || DB::transactionLevel() > 0 || !$this->lockConflict($e)) throw $e;
-            $result = $record($outcome);
+            try { $result = $record($outcome); }
+            catch (\Throwable $e) {
+                // Nothing was recorded and the confirmation stays claimed, so recovery reads Stripe's answer again.
+                if (DB::transactionLevel() > 0 || !$this->lockConflict($e)) throw $e;
+                report($e);
+                $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
+            }
         }
         if ($result === null || $result instanceof RequestException || $result instanceof ConnectionException) {
             $this->paymentStripeUnavailable = true;
