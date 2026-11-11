@@ -2,7 +2,7 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
-use App\Models\{Audit, BillingAgreement, Gateway, Invoice, Notification, Property, User};
+use App\Models\{Audit, BillingAgreement, Gateway, Invoice, Property, User};
 use Illuminate\Support\Facades\DB;
 use Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException;
 
@@ -39,36 +39,28 @@ trait ChargeRecovery
         $this->withPaymentLock($invoice, function ($user, $current) {
             $attempt = $this->readPaymentAttempt($user, $current);
             if (($attempt['state'] ?? null) !== 'reconcile' || ($attempt['alert_sent'] ?? false)) return;
-            if (!$this->invoiceAuditExists($current, 'ae_stripe_attempt_review', ['attempt_key' => $attempt['key']])) {
-                Audit::create(['event' => 'ae_stripe_attempt_review', 'auditable_type' => $current->getMorphClass(),
-                    'auditable_id' => $current->id, 'old_values' => [], 'new_values' => [
-                        'attempt_key' => $attempt['key'], 'reason' => $attempt['reason'],
-                        'confirm_key' => $attempt['confirmation']['key'] ?? null,
-                        'resolution' => 'Use ae-stripe:resolve-charge to link the verified payment or record proof that it did not charge.',
-                    ]]);
-            }
-            DB::afterCommit(function () use ($current) {
-                try {
-                    $this->withPaymentLock($current, function ($user, $invoice) {
-                        $attempt = $this->readPaymentAttempt($user, $invoice);
-                        if (($attempt['state'] ?? null) !== 'reconcile' || ($attempt['alert_sent'] ?? false)) return;
-                        foreach ($this->noticeStaff('invoice') as $staff) Notification::create([
-                            'user_id' => $staff->id, 'title' => 'Stripe payment needs review',
-                            'body' => $this->invoiceNoticeBody('payment',
-                                'Payment on invoice ' . $this->invoiceLabel($invoice) . '.',
-                                'Invoice ' . $this->invoiceLabel($invoice) . ': ' . $attempt['reason'] . ' Use ae-stripe:resolve-charge.'),
-                            'url' => $this->adminInvoiceUrl($invoice),
-                        ]);
-                        $attempt['alert_sent'] = true;
-                        $this->writePaymentAttempt($user, $invoice, $attempt);
-                    });
-                } catch (\Throwable $e) { report($e); } // The scheduler retries delivery; never fail a settled cron payment.
-            });
+            $audit = Audit::where('auditable_type', $current->getMorphClass())->where('auditable_id', $current->id)
+                ->where('event', 'ae_stripe_attempt_review')->where('new_values->attempt_key', $attempt['key'])->first();
+            $audit ??= Audit::create(['event' => 'ae_stripe_attempt_review', 'auditable_type' => $current->getMorphClass(),
+                'auditable_id' => $current->id, 'old_values' => [], 'new_values' => [
+                    'attempt_key' => $attempt['key'], 'reason' => $attempt['reason'],
+                    'confirm_key' => $attempt['confirmation']['key'] ?? null,
+                    'resolution' => 'Use ae-stripe:resolve-charge to link the verified payment or record proof that it did not charge.',
+                ]]);
+            $this->queuePaymentNotices($audit, $this->staffPaymentNotices('invoice', [
+                'title' => 'Stripe payment needs review',
+                'body' => $this->invoiceNoticeBody('payment',
+                    'Payment on invoice ' . $this->invoiceLabel($current) . '.',
+                    'Invoice ' . $this->invoiceLabel($current) . ': ' . $attempt['reason'] . ' Use ae-stripe:resolve-charge.'),
+                'url' => $this->adminInvoiceUrl($current),
+            ]));
+            $this->writePaymentAttempt($user, $current, array_replace($attempt, ['alert_sent' => true]));
         });
     }
 
     public function retryChargeAttempts(): void
     {
+        $this->retryPaymentNotices();
         $collect = $this->gatewayEnabled();
         if ($collect) $this->retryPaymentReviewAlerts();
         $this->paymentStripeUnavailable = false;
@@ -175,21 +167,11 @@ trait ChargeRecovery
                 return;
             }
             if (!empty($attempt['failure_notified'])) return;
-            $this->writePaymentAttempt($user, $current, array_replace($attempt, [
-                'agreement_id' => null, 'confirmation' => null, 'retry' => true, 'failure_reason' => $reason,
+            $this->queueRefusalNotice($current, $reason, $attempt['key'] ?? '');
+            if (!empty($attempt['notice_only'])) $user->properties()->where('key', 'ae_stripe_checkout_' . $current->id)->delete();
+            else $this->writePaymentAttempt($user, $current, array_replace($attempt, [
+                'agreement_id' => null, 'confirmation' => null, 'failure_reason' => $reason, 'failure_notified' => true, 'retry' => false,
             ]));
-            DB::afterCommit(function () use ($current, $reason) {
-                try {
-                    $this->withPaymentLock($current, function ($user, $invoice) use ($reason) {
-                        $attempt = $this->readPaymentAttempt($user, $invoice);
-                        if (!$attempt || ($attempt['failure_reason'] ?? null) !== $reason || !empty($attempt['failure_notified'])) return;
-                        Notification::create(['user_id' => $user->id, 'title' => 'Payment not completed',
-                            'body' => $reason, 'url' => route('invoices.show', $invoice)]);
-                        if (!empty($attempt['notice_only'])) $user->properties()->where('key', 'ae_stripe_checkout_' . $invoice->id)->delete();
-                        else $this->writePaymentAttempt($user, $invoice, array_replace($attempt, ['failure_notified' => true, 'retry' => false]));
-                    });
-                } catch (\Throwable $e) { report($e); }
-            });
         });
     }
 
@@ -197,43 +179,42 @@ trait ChargeRecovery
     {
         try {
             $this->withPaymentLock($invoice, function ($user, $current) use ($reason) {
-                if ($current->status === 'pending' && $this->paymentBalance($current) > 0) Notification::create([
-                    'user_id' => $user->id, 'title' => 'Payment not completed',
-                    'body' => $reason, 'url' => route('invoices.show', $current),
-                ]);
+                if ($current->status === 'pending' && $this->paymentBalance($current) > 0) $this->queueRefusalNotice($current, $reason);
             });
         } catch (\Throwable $e) { report($e); }
     }
 
+    private function queueRefusalNotice($invoice, string $reason, string $attemptKey = ''): void
+    {
+        $key = hash('sha256', $attemptKey . ':' . $reason);
+        $audit = Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
+            ->where('event', 'ae_stripe_payment_refused')->where('new_values->notice_key', $key)->first();
+        $audit ??= Audit::create(['event' => 'ae_stripe_payment_refused', 'auditable_type' => $invoice->getMorphClass(),
+            'auditable_id' => $invoice->id, 'old_values' => [], 'new_values' => ['notice_key' => $key]]);
+        $this->queuePaymentNotices($audit, [['user_id' => $invoice->user_id, 'title' => 'Payment not completed',
+            'body' => $reason, 'url' => route('invoices.show', $invoice)]]);
+    }
+
     private function notifyPaymentAccessRefusal(): void
     {
-        // Only staff can restore Stripe access. One alert per configured key, across invoices.
         DB::afterCommit(function () {
             try {
                 $id = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
-                $audit = DB::transaction(function () use ($id) {
+                DB::transaction(function () use ($id) {
                     $gateway = $this->gatewayRowForUpdate($id)->firstOrFail();
                     $fingerprint = hash('sha256', $this->config('stripe_secret_key'));
-                    $existing = Audit::where('auditable_type', $gateway->getMorphClass())->where('auditable_id', $gateway->id)
+                    $audit = Audit::where('auditable_type', $gateway->getMorphClass())->where('auditable_id', $gateway->id)
                         ->where('event', 'ae_stripe_access_refused')->where('new_values->key_fingerprint', $fingerprint)->first();
-                    return $existing ?? Audit::create(['event' => 'ae_stripe_access_refused', 'auditable_type' => $gateway->getMorphClass(),
+                    $audit ??= Audit::create(['event' => 'ae_stripe_access_refused', 'auditable_type' => $gateway->getMorphClass(),
                         'auditable_id' => $gateway->id, 'old_values' => [], 'new_values' => ['key_fingerprint' => $fingerprint, 'notice_sent' => false]]);
+                    if ($audit->new_values['notice_sent'] ?? true) return;
+                    $this->queuePaymentNotices($audit, $this->staffPaymentNotices('gateway', [
+                        'title' => 'Stripe access needs attention',
+                        'body' => 'Stripe refused payment checks. Check the API key and its permissions.',
+                        'url' => url('/admin/gateways/' . $gateway->id . '/edit'),
+                    ]));
                 });
-                // Commit the gateway before recipient FKs. Lock only this audit to dedupe delivery and retry a rollback.
-                DB::transaction(function () use ($audit) {
-                    $audit = Audit::where('id', $audit->id)->lockForUpdate()->firstOrFail();
-                    $values = $audit->new_values;
-                    if ($values['notice_sent'] ?? true) return; // Older markers already delivered their notices.
-                    foreach ($this->noticeStaff('gateway') as $staff) {
-                        Notification::create([
-                            'user_id' => $staff->id, 'title' => 'Stripe access needs attention',
-                            'body' => 'Stripe refused payment checks. Check the API key and its permissions.',
-                            'url' => url('/admin/gateways/' . $audit->auditable_id . '/edit'),
-                        ]);
-                    }
-                    $audit->update(['new_values' => array_replace($values, ['notice_sent' => true])]);
-                });
-            } catch (\Throwable $e) { report($e); } // A failed delivery keeps its pending marker for the next refused check.
+            } catch (\Throwable $e) { report($e); }
         });
     }
 

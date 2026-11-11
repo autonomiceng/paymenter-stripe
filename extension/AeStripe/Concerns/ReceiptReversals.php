@@ -2,7 +2,7 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
-use App\Models\{Audit, Credit, Invoice, InvoiceTransaction, Notification, User};
+use App\Models\{Audit, Credit, Invoice, InvoiceTransaction, User};
 
 trait ReceiptReversals
 {
@@ -217,12 +217,12 @@ trait ReceiptReversals
                 default => $amount . ' disputed on invoice ',
             }) . $this->invoiceLabel($current) . '.';
             $this->receiptRows()->updateOrInsert(['payment_intent_id' => $paymentId, 'allocation_key' => $key], $values);
-            Audit::create(['event' => 'ae_stripe_receipt_reversal', 'auditable_type' => $current->getMorphClass(), 'auditable_id' => $current->id,
+            $audit = Audit::create(['event' => 'ae_stripe_receipt_reversal', 'auditable_type' => $current->getMorphClass(), 'auditable_id' => $current->id,
                 'old_values' => $previous ? ['status' => $previous->state] : [],
                 'new_values' => array_diff_key($details, ['id' => true]) + ['stripe_id' => $id, 'next_step' => $auditStep]]);
-            foreach ($this->noticeStaff('invoice') as $staff) Notification::create(['user_id' => $staff->id,
+            $this->queuePaymentNotices($audit, $this->staffPaymentNotices('invoice', [
                 'title' => $details['needs_review'] ? 'Stripe reversal needs review' : 'Stripe reversal cleared',
-                'url' => $this->adminInvoiceUrl($current), 'body' => $this->invoiceNoticeBody('reversal', $bellText, $auditStep)]);
+                'url' => $this->adminInvoiceUrl($current), 'body' => $this->invoiceNoticeBody('reversal', $bellText, $auditStep)]));
         });
     }
 }

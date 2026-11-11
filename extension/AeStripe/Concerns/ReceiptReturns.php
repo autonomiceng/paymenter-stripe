@@ -3,7 +3,7 @@
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Helpers\ExtensionHelper;
-use App\Models\{Audit, Credit, Invoice, InvoiceTransaction, Notification};
+use App\Models\{Audit, Credit, Invoice, InvoiceTransaction};
 use Illuminate\Support\Facades\DB;
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 
@@ -152,6 +152,7 @@ trait ReceiptReturns
 
     public function retryReceiptReturns(): void
     {
+        $this->retryPaymentNotices();
         if (!$this->gatewayEnabled()) return;
         try { $this->reconcileWebhookSubscriptions(); } catch (\Throwable $e) { report($e); }
         $this->ensureReceiptReturnSchema();
@@ -356,20 +357,22 @@ trait ReceiptReturns
             $a = &$receipt['allocations'][$key];
             $notice = ($this->receiptStripeUnavailable ? 'staff:' : '') . $this->receiptNotice($a);
             if (($a['notified'] ?? null) === $notice) return;
-            Audit::create(['event' => 'ae_stripe_receipt_return', 'auditable_type' => $current->getMorphClass(), 'auditable_id' => $current->id,
+            $audit = Audit::create(['event' => 'ae_stripe_receipt_return', 'auditable_type' => $current->getMorphClass(), 'auditable_id' => $current->id,
                 'old_values' => [], 'new_values' => ['payment_intent_id' => $id, 'allocation' => $key] + $a]);
-            if (!$this->receiptStripeUnavailable) Notification::create(['user_id' => $user->id, 'title' => 'Payment return', 'url' => route('invoices.show', $current),
+            $notices = [];
+            if (!$this->receiptStripeUnavailable) $notices[] = ['user_id' => $user->id, 'title' => 'Payment return', 'url' => route('invoices.show', $current),
                 'body' => match ($a['state']) {
                     'refunded' => 'A payment of ' . number_format($this->fromMinorUnits($a['amount_minor'], $receipt['currency']), $this->currencyDecimals($receipt['currency']), '.', '') . ' ' . strtoupper($receipt['currency']) . ' has been returned to your original payment method.',
                     'credited' => 'Stripe could not refund your original payment method. The returned amount is now account credit. Open the invoice or contact support for help.',
                     'pending' => 'Your payment return is processing. We are checking it automatically. Open the invoice or contact support for help.',
                     default => 'Your payment return needs attention. We are checking it automatically. Contact support with invoice ' . $this->invoiceLabel($current) . ' for help.',
-                }]);
+                }];
             if ($a['state'] === 'review' || str_contains($a['reason'] ?? '', 'instructions')) {
-                foreach ($this->noticeStaff('invoice') as $staff) Notification::create(['user_id' => $staff->id,
+                $notices = array_merge($notices, $this->staffPaymentNotices('invoice', [
                     'title' => 'Stripe payment return needs attention', 'url' => $this->adminInvoiceUrl($current),
-                    'body' => 'Invoice ' . $this->invoiceLabel($current) . ', payment ' . $id . ': ' . $a['reason']]);
+                    'body' => 'Invoice ' . $this->invoiceLabel($current) . ', payment ' . $id . ': ' . $a['reason']]));
             }
+            $this->queuePaymentNotices($audit, $notices);
             $a['notified'] = $notice;
             $this->writeReceipt($user, $id, $receipt, $key);
         });

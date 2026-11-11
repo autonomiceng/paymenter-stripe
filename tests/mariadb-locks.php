@@ -1,19 +1,11 @@
 <?php
-// Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
-// Two customers' payment requests at once, on real MariaDB sessions (tests/mariadb-app.php). Each case runs request A
-// in one process until it reaches a chosen point inside its transaction and holds it there. Request B then runs in a
-// second process until it finishes or InnoDB makes it wait on A. A then continues. Any lock cycle between the two is
-// a deadlock that InnoDB reports and counts. Each case requires B to wait on A exactly when it says so ('waits'), the
-// deadlocks it makes on purpose and no other ('deadlocks'), both requests finishing, and the rows each one owes, once.
-// Usage: PAY_MARIADB_PORT=... PAY_MARIADB_PASSWORD=... php tests/mariadb-locks.php
+// Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE. Two customers' payment requests at once, on real MariaDB sessions (tests/mariadb-app.php). Each case runs request A in one process until it reaches a chosen point inside its transaction and holds it there. Request B then runs in a second process until it finishes or InnoDB makes it wait on A. A then continues. Any lock cycle between the two is a deadlock that InnoDB reports and counts. Each case requires B to wait on A exactly when it says so ('waits'), the deadlocks it makes on purpose and no other ('deadlocks'), both requests finishing, and the rows each one owes, once. Usage: PAY_MARIADB_PORT=... PAY_MARIADB_PASSWORD=... php tests/mariadb-locks.php
 use App\Models\{Invoice, User};
 use Illuminate\Support\Facades\DB;
-
 $install = ($argv[1] ?? null) !== 'worker';
 require __DIR__ . '/mariadb-app.php';
 $count = 0;
 function check($value, $label) { global $count; if (!$value) throw new RuntimeException($label); ++$count; }
-
 /** Customer $id, with Stripe customer cus_$id, owning a pending invoice of the total. */
 function customerInvoice(int $userId, int $invoiceId, float $total = 20): Invoice
 {
@@ -56,8 +48,7 @@ function paidSubscription(int $invoiceId): object
     return (object) ['id' => 'in_' . $invoiceId, 'currency' => 'usd', 'amount_paid' => 2000, 'metadata' => (object) ['ae_stripe_invoice_id' => (string) $invoiceId],
         'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) ['subscription' => 'sub_' . $invoiceId]]];
 }
-// Stripe as the requests see it: Pay creates one intent per invoice, a refund of a receipt return fails, so the
-// return becomes account credit, a confirmation of pi_401 is declined, and each charge's fee is 0.50 USD.
+// Stripe as the requests see it: Pay creates one intent per invoice, a refund of a receipt return fails, so the return becomes account credit, a confirmation of pi_401 is declined, and each charge's fee is 0.50 USD.
 $GLOBALS['stripeHandler'] = function ($verb, $path, $data) {
     static $declined = false;
     if ($verb === 'get' && preg_match('#^/customers/(cus_\d+)$#', $path, $id)) return ['id' => $id[1]];
@@ -88,7 +79,6 @@ $GLOBALS['stripeHandler'] = function ($verb, $path, $data) {
         'amount' => (int) $data['amount'], 'currency' => 'usd', 'status' => 'failed', 'metadata' => $data['metadata']];
     throw new RuntimeException('Unexpected Stripe request: ' . $verb . ' ' . $path);
 };
-
 // Cases: seed (driver), A and B (worker processes), where A pauses, and the rows both must leave behind.
 $attempt = fn (int $user, int $invoice) => json_decode(User::find($user)->properties()->where('key', 'ae_stripe_checkout_' . $invoice)->value('value') ?? 'null', true);
 $rows = fn (int $invoice) => DB::table('invoice_transactions')->where('invoice_id', $invoice)->orderBy('id')->get(['amount', 'status', 'is_credit_transaction'])
@@ -103,10 +93,8 @@ $payAndSave = function ($gateway, int $userId, int $invoiceId) {
 };
 $defaultStripe = $GLOBALS['stripeHandler'];
 $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($defaultStripe) {
-    if (preg_match('#^/payment_methods/pm_(80[12])$#', $path, $id)) return [
-        'id' => 'pm_' . $id[1], 'customer' => 'cus_' . ($id[1] === '801' ? 7 : 8), 'type' => 'card',
-        'card' => ['brand' => 'visa', 'last4' => '4242', 'exp_month' => 5, 'exp_year' => 2030, 'fingerprint' => 'fingerprint' . $id[1]],
-        'allow_redisplay' => 'always'];
+    if (preg_match('#^/payment_methods/pm_(80[12])$#', $path, $id)) return [ 'id' => 'pm_' . $id[1], 'customer' => 'cus_' . ($id[1] === '801' ? 7 : 8), 'type' => 'card',
+        'card' => ['brand' => 'visa', 'last4' => '4242', 'exp_month' => 5, 'exp_year' => 2030, 'fingerprint' => 'fingerprint' . $id[1]], 'allow_redisplay' => 'always'];
     $answer = $defaultStripe($verb, $path, $data, $request);
     if ($verb === 'get' && preg_match('#^/payment_intents/pi_(80[12])$#', $path, $id)) {
         $answer->metadata->ae_stripe_consent = '1';
@@ -116,7 +104,49 @@ $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($defau
     }
     return $answer;
 };
-$cases = [
+function invoiceStaff(): void
+{
+    $role = App\Models\Role::create(['name' => 'Invoice staff', 'permissions' => ['admin.invoices.viewAny', 'admin.invoices.view', 'admin.invoices.update']]);
+    foreach ([7, 8] as $id) User::find($id)->update(['role_id' => $role->id]);
+}
+$cases = [ 'staff-reversal-notice-retry' => ['seed' => function () use ($gateway) {
+        customerInvoice(7, 561); customerInvoice(8, 562);
+        invoiceStaff();
+        settle($gateway, 561);
+    }, 'waits' => true, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
+        $GLOBALS['pauses'] = []; $inserts = 0;
+        App\Models\Notification::created(function () use (&$inserts) { if (++$inserts === 2) throw new RuntimeException('Delivery failed'); });
+        invoke($gateway, 'recordReceiptReversalEvent', (object) ['id' => 're_561', 'payment_intent' => 'pi_561'], 'refund');
+        check(DB::table('notifications')->count() === 0 && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')
+            ->where('new_values->notice_sent', false)->count() === 1, 'Notice rollback retains the committed reversal and pending audit');
+        pauseBefore('/^insert into `notifications`/');
+        invoke($gateway, 'retryPaymentNotices');
+        return 'retried';
+    }, 'b' => function ($gateway) {
+        invoke($gateway, 'retryPaymentNotices');
+        invoke($gateway, 'recordReceiptReversalEvent', (object) ['id' => 're_561', 'payment_intent' => 'pi_561'], 'refund');
+        return 'retried';
+    }, 'check' => fn () => DB::table('ae_stripe_receipt_returns')->count() === 1 && DB::table('notifications')->count() === 2
+        && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')->where('new_values->notice_sent', true)->count() === 1],
+    'staff-reversals' => ['seed' => function () use ($gateway) {
+        customerInvoice(7, 561); customerInvoice(8, 562);
+        invoiceStaff();
+        settle($gateway, 561); settle($gateway, 562);
+    }, 'pause' => '/^insert into `notifications`/',
+    'a' => fn ($gateway) => invoke($gateway, 'recordReceiptReversalEvent', (object) ['id' => 're_561', 'payment_intent' => 'pi_561'], 'refund') ?? 'recorded',
+    'b' => fn ($gateway) => invoke($gateway, 'recordReceiptReversalEvent', (object) ['id' => 're_562', 'payment_intent' => 'pi_562'], 'refund') ?? 'recorded',
+    'check' => fn () => DB::table('ae_stripe_receipt_returns')->count() === 2 && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')->count() === 2
+        && DB::table('notifications')->count() === 4], 'staff-attempt-review' => ['seed' => function () {
+        customerInvoice(7, 571); customerInvoice(8, 572);
+        invoiceStaff();
+        foreach ([7 => 571, 8 => 572] as $user => $invoice) {
+            User::find($user)->properties()->create(['key' => 'ae_stripe_checkout_' . $invoice, 'value' => json_encode([
+                'key' => 'checkout_' . $invoice, 'state' => 'reconcile', 'reason' => 'Verify the original payment'])]);
+        }
+    }, 'pause' => '/^insert into `notifications`/', 'a' => fn ($gateway) => invoke($gateway, 'sendAttemptReview', Invoice::find(571)) ?? 'reviewed',
+    'b' => fn ($gateway) => invoke($gateway, 'sendAttemptReview', Invoice::find(572)) ?? 'reviewed',
+    'check' => fn () => DB::table('audits')->where('event', 'ae_stripe_attempt_review')->count() === 2
+        && DB::table('notifications')->where('title', 'Stripe payment needs review')->count() === 4],
     // Both public Pay returns finish preparation before overlapping final card saves.
     'pay-return-card-save' => ['prepared_b' => true, 'seed' => function () {
             foreach (['cache' => false, 'cache_locks' => true] as $table => $locks) {
@@ -127,15 +157,11 @@ $cases = [
                 });
             }
             customerInvoice(7, 801); customerInvoice(8, 802);
-        },
-        'pause' => '/^insert into `billing_agreements`/',
-        'a' => fn ($gateway) => $payAndSave($gateway, 7, 801),
-        'b' => fn ($gateway) => $payAndSave($gateway, 8, 802),
+        }, 'pause' => '/^insert into `billing_agreements`/', 'a' => fn ($gateway) => $payAndSave($gateway, 7, 801), 'b' => fn ($gateway) => $payAndSave($gateway, 8, 802),
         'check' => fn ($results) => $results['a']['ok'] === 'redirect' && $results['b']['ok'] === 'redirect'
             && Invoice::whereIn('id', [801, 802])->where('status', 'paid')->count() === 2
             && App\Models\BillingAgreement::orderBy('user_id')->get()->map(fn ($row) => [$row->user_id, $row->external_reference])->all()
-                === [[7, 'pm_801'], [8, 'pm_802']]
-            && DB::table('audits')->where('auditable_type', App\Models\Property::class)->count() > 0],
+                === [[7, 'pm_801'], [8, 'pm_802']] && DB::table('audits')->where('auditable_type', App\Models\Property::class)->count() > 0],
     // A gateway staff member also owns the settling invoice (the access alert's notification recipient FK).
     'access-staff-settlement' => ['seed' => function () {
             customerInvoice(7, 801);
@@ -143,14 +169,12 @@ $cases = [
             User::find(7)->update(['role_id' => $role->id]);
             User::find(7)->properties()->create(['key' => 'ae_stripe_checkout_801', 'value' => json_encode([
                 'version' => 2, 'key' => 'checkout_801', 'created' => time(), 'retry' => true])]);
-        }, 'waits' => true, 'pause' => '/^insert into `invoice_transactions`/',
-        'a' => function ($gateway) {
+        }, 'waits' => true, 'pause' => '/^insert into `invoice_transactions`/', 'a' => function ($gateway) {
             $intent = intentOf(801, 'succeeded', 2000);
             $intent->metadata->ae_stripe_attempt = 'checkout_801';
             invoke($gateway, 'recordIntentPayment', $intent, 'succeeded');
             return 'settled';
-        },
-        'b' => fn ($gateway) => invoke($gateway, 'notifyPaymentAccessRefusal') ?? 'reviewed',
+        }, 'b' => fn ($gateway) => invoke($gateway, 'notifyPaymentAccessRefusal') ?? 'reviewed',
         'check' => fn () => $rows(801) === [[20.0, 'succeeded', false]] && Invoice::find(801)->status === 'paid'
             && DB::table('audits')->where('event', 'ae_stripe_access_refused')->count() === 1
             && DB::table('audits')->where('auditable_type', App\Models\Property::class)->count() > 0
@@ -160,8 +184,7 @@ $cases = [
             customerInvoice(7, 801);
             $role = App\Models\Role::create(['name' => 'Gateway staff', 'permissions' => ['admin.gateways.viewAny', 'admin.gateways.update']]);
             User::find(7)->update(['role_id' => $role->id]);
-        }, 'waits' => true, 'pause' => '/^insert into `notifications`/',
-        'a' => function ($gateway) {
+        }, 'waits' => true, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
             $fail = true;
             App\Models\Notification::created(function () use (&$fail) { if ($fail) { $fail = false; throw new RuntimeException('Delivery failed'); } });
             // Let the first delivery fail after its insert; pause only the retry.
@@ -172,30 +195,23 @@ $cases = [
             pauseBefore('/^insert into `notifications`/');
             invoke($gateway, 'notifyPaymentAccessRefusal');
             return 'retried';
-        },
-        'b' => fn ($gateway) => DB::transaction(function () use ($gateway) {
+        }, 'b' => fn ($gateway) => DB::transaction(function () use ($gateway) {
             DB::table('audits')->count(); // Dedupe must also survive an older enclosing transaction snapshot.
             invoke($gateway, 'notifyPaymentAccessRefusal');
             return 'reviewed';
-        }),
-        'check' => fn () => DB::table('notifications')->where('user_id', 7)->where('title', 'Stripe access needs attention')->count() === 1
+        }), 'check' => fn () => DB::table('notifications')->where('user_id', 7)->where('title', 'Stripe access needs attention')->count() === 1
             && DB::table('audits')->where('event', 'ae_stripe_access_refused')->where('new_values->notice_sent', true)->count() === 1],
     // Audited settlement against a missing-subscription review, with normal web auditing.
-    'subscription-review-vs-settlement' => [
-        'seed' => function () {
+    'subscription-review-vs-settlement' => [ 'seed' => function () {
             customerInvoice(7, 801);
             User::find(7)->properties()->create(['key' => 'ae_stripe_checkout_801', 'value' => json_encode([
                 'version' => 2, 'key' => 'checkout_801', 'created' => time(), 'retry' => true])]);
-        },
-        'pause' => '/^insert into `invoice_transactions`/',
-        'a' => function ($gateway) {
+        }, 'pause' => '/^insert into `invoice_transactions`/', 'a' => function ($gateway) {
             $intent = intentOf(801, 'succeeded', 2000);
             $intent->metadata->ae_stripe_attempt = 'checkout_801';
             invoke($gateway, 'recordIntentPayment', $intent, 'succeeded');
             return 'settled';
-        },
-        'b' => fn ($gateway) => invoke($gateway, 'recordSubscriptionPayment', (object) [
-            'id' => 'in_missing_subscription', 'amount_paid' => 2000, 'currency' => 'usd',
+        }, 'b' => fn ($gateway) => invoke($gateway, 'recordSubscriptionPayment', (object) [ 'id' => 'in_missing_subscription', 'amount_paid' => 2000, 'currency' => 'usd',
             'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) []]]) ?? 'reviewed',
         'check' => fn () => $rows(801) === [[20.0, 'succeeded', false]] && Invoice::find(801)->status === 'paid'
             && DB::table('audits')->where('auditable_type', App\Models\Property::class)->count() > 0
@@ -203,96 +219,69 @@ $cases = [
     ],
     // Subscription review must not lock an unrelated invoice's existing audit row while it records its own audit.
     'subscription-audit' => ['seed' => fn () => App\Models\Audit::create(['event' => 'fixture',
-            'auditable_type' => Invoice::class, 'auditable_id' => 801, 'old_values' => [], 'new_values' => []]),
-        'pause' => '/^insert into `audits`/',
+            'auditable_type' => Invoice::class, 'auditable_id' => 801, 'old_values' => [], 'new_values' => []]), 'pause' => '/^insert into `audits`/',
         'a' => fn ($gateway) => invoke($gateway, 'recordSubscriptionReview', paidSubscription(801), 'Service missing') ?? 'recorded',
         'b' => fn () => DB::transaction(fn () => App\Models\Audit::where('id', 1)->update(['event' => 'invoice_checked'])),
         'check' => fn () => App\Models\Audit::where('id', 1)->first()->event === 'invoice_checked'
             && App\Models\Audit::where('event', 'ae_stripe_subscription_review')->count() === 1],
     // Duplicate review deliveries still serialize on the gateway and record exactly one entry.
-    'subscription-review-duplicate' => ['seed' => fn () => null, 'waits' => true,
-        'pause' => '/^insert into `audits`/',
+    'subscription-review-duplicate' => ['seed' => fn () => null, 'waits' => true, 'pause' => '/^insert into `audits`/',
         'a' => fn ($gateway) => invoke($gateway, 'recordSubscriptionReview', paidSubscription(802), 'Service missing') ?? 'recorded',
         'b' => fn ($gateway) => DB::transaction(function () use ($gateway) {
             DB::table('audits')->count(); // An older settlement snapshot must not hide A's later committed review.
             invoke($gateway, 'recordSubscriptionReview', paidSubscription(802), 'Service missing');
             return 'recorded';
-        }),
-        'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_subscription_review')->count() === 1],
+        }), 'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_subscription_review')->count() === 1],
     // Settings committed while the gateway lock was held must be current when the waiting job acquires that lock.
     'gateway-state-current' => ['seed' => fn () => DB::table('settings')->where('key', 'ae_stripe_webhook_events')->update(['value' => 'retry']),
-        'waits' => true, 'pause' => '/^update `settings`/',
-        'a' => function () {
+        'waits' => true, 'pause' => '/^update `settings`/', 'a' => function () {
             $owner = App\Models\Gateway::where('extension', 'AeStripe')->firstOrFail();
             return DB::transaction(function () use ($owner) {
                 App\Models\Gateway::where('id', $owner->id)->lockForUpdate()->firstOrFail();
                 $owner->settings()->where('key', 'ae_stripe_webhook_events')->update(['value' => 'ready']);
                 return 'updated';
             });
-        },
-        'b' => function ($gateway) {
+        }, 'b' => function ($gateway) {
             invoke($gateway, 'reconcileWebhookSubscriptions');
             return count($GLOBALS['stripeCalls']);
-        },
-        'check' => fn ($results) => $results['b']['ok'] === 0
-            && DB::table('settings')->where('key', 'ae_stripe_webhook_events')->value('value') === 'ready'],
-    // The gateway owner lock must not block a different gateway's payment FK check. Other precedes AeStripe in the
-    // extensions scan (mariadb-app.php), so the old unindexed locking read also locks that other gateway's row.
-    'gateway-review' => ['seed' => fn () => customerInvoice(7, 811),
-        'pause' => '/^insert into `audits`/',
+        }, 'check' => fn ($results) => $results['b']['ok'] === 0 && DB::table('settings')->where('key', 'ae_stripe_webhook_events')->value('value') === 'ready'],
+    // The gateway owner lock must not block a different gateway's payment FK check. Other precedes AeStripe in the extensions scan (mariadb-app.php), so the old unindexed locking read also locks that other gateway's row.
+    'gateway-review' => ['seed' => fn () => customerInvoice(7, 811), 'pause' => '/^insert into `audits`/',
         'a' => fn ($gateway) => invoke($gateway, 'recordSubscriptionReview', paidSubscription(811), 'Service missing') ?? 'recorded',
         'b' => fn () => App\Helpers\ExtensionHelper::addPayment(811, 'Other', 20, null, 'other_811')->id,
-        'check' => fn () => $rows(811) === [[20.0, 'succeeded', false]] && Invoice::find(811)->status === 'paid'],
-    'gateway-access' => ['seed' => fn () => customerInvoice(7, 812),
-        'pause' => '/^insert into `audits`/',
-        'a' => fn ($gateway) => invoke($gateway, 'notifyPaymentAccessRefusal') ?? 'recorded',
+        'check' => fn () => $rows(811) === [[20.0, 'succeeded', false]] && Invoice::find(811)->status === 'paid'], 'gateway-access' => ['seed' => fn () => customerInvoice(7, 812),
+        'pause' => '/^insert into `audits`/', 'a' => fn ($gateway) => invoke($gateway, 'notifyPaymentAccessRefusal') ?? 'recorded',
         'b' => fn () => App\Helpers\ExtensionHelper::addPayment(812, 'Other', 20, null, 'other_812')->id,
-        'check' => fn () => $rows(812) === [[20.0, 'succeeded', false]] && Invoice::find(812)->status === 'paid'],
-    'gateway-events' => ['seed' => fn () => customerInvoice(7, 813),
-        'pause' => '/^select .* from `settings`/',
-        'a' => fn ($gateway) => invoke($gateway, 'reconcileWebhookSubscriptions') ?? 'ready',
+        'check' => fn () => $rows(812) === [[20.0, 'succeeded', false]] && Invoice::find(812)->status === 'paid'], 'gateway-events' => ['seed' => fn () => customerInvoice(7, 813),
+        'pause' => '/^select .* from `settings`/', 'a' => fn ($gateway) => invoke($gateway, 'reconcileWebhookSubscriptions') ?? 'ready',
         'b' => fn () => App\Helpers\ExtensionHelper::addPayment(813, 'Other', 20, null, 'other_813')->id,
-        'check' => fn () => $rows(813) === [[20.0, 'succeeded', false]] && Invoice::find(813)->status === 'paid'],
-    'gateway-signature' => ['seed' => function () {
+        'check' => fn () => $rows(813) === [[20.0, 'succeeded', false]] && Invoice::find(813)->status === 'paid'], 'gateway-signature' => ['seed' => function () {
             customerInvoice(7, 814);
             App\Models\Gateway::where('extension', 'AeStripe')->first()->settings()->create(['key' => 'ae_stripe_webhook_continuity',
-                'value' => json_encode(['credentials' => ['stripe_webhook_secret' => 'whsec_test'],
-                    'previous' => [['secret' => 'whsec_old', 'until' => null]]])]);
-        },
-        'pause' => '/^select .* from `settings`/',
-        'a' => function ($gateway) {
+                'value' => json_encode(['credentials' => ['stripe_webhook_secret' => 'whsec_test'], 'previous' => [['secret' => 'whsec_old', 'until' => null]]])]);
+        }, 'pause' => '/^select .* from `settings`/', 'a' => function ($gateway) {
             // Only pause after acquiring the gateway lock, past the initial unlocked state read.
             $GLOBALS['pauses'] = [];
             DB::listen(function ($query) { if (str_contains($query->sql, 'for update')) pauseBefore('/^select .* from `settings`/'); });
             $time = time();
             return invoke($gateway, 'validWebhookSignature', '{}', 't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.{}', 'whsec_test'));
-        },
-        'b' => fn () => App\Helpers\ExtensionHelper::addPayment(814, 'Other', 20, null, 'other_814')->id,
-        'check' => fn ($results) => $results['a']['ok'] === true && $rows(814) === [[20.0, 'succeeded', false]]
-            && Invoice::find(814)->status === 'paid'],
-    // Different customers have different save/cache locks. Exercise persistence directly: A has validated its absent
-    // agreement and pauses before inserting; B must save its first card without a shared empty-index gap deadlock.
-    'saved-cards' => ['seed' => function () { customerInvoice(7, 821); customerInvoice(8, 822); },
-        'pause' => '/^insert into `billing_agreements`/',
+        }, 'b' => fn () => App\Helpers\ExtensionHelper::addPayment(814, 'Other', 20, null, 'other_814')->id,
+        'check' => fn ($results) => $results['a']['ok'] === true && $rows(814) === [[20.0, 'succeeded', false]] && Invoice::find(814)->status === 'paid'],
+    // Different customers have different save/cache locks. Exercise persistence directly: A has validated its absent agreement and pauses before inserting; B must save its first card without a shared empty-index gap deadlock.
+    'saved-cards' => ['seed' => function () { customerInvoice(7, 821); customerInvoice(8, 822); }, 'pause' => '/^insert into `billing_agreements`/',
         'a' => fn ($gateway) => invoke($gateway, 'persistSavedMethod', User::find(7), (object) ['id' => 'pm_7'], ['source' => 'seti_7']),
         'b' => fn ($gateway) => invoke($gateway, 'persistSavedMethod', User::find(8), (object) ['id' => 'pm_8'], ['source' => 'seti_8']),
         'check' => fn () => App\Models\BillingAgreement::orderBy('user_id')->get()->map(fn ($row) => [$row->user_id, $row->external_reference])->all()
-            === [[7, 'pm_7'], [8, 'pm_8']]
-            && DB::table('properties')->where('key', 'like', 'ae_stripe_saved_%')->count() === 2],
+            === [[7, 'pm_7'], [8, 'pm_8']] && DB::table('properties')->where('key', 'like', 'ae_stripe_saved_%')->count() === 2],
     // An earlier completed read must not hide a save committed while the second request waits for the owner.
-    'saved-cards-duplicate' => ['seed' => fn () => customerInvoice(7, 823), 'waits' => true,
-        'pause' => '/^insert into `billing_agreements`/',
-        'a' => fn ($gateway) => invoke($gateway, 'persistSavedMethod', User::find(7), (object) ['id' => 'pm_7'], ['source' => 'seti_7']),
-        'b' => function ($gateway) {
+    'saved-cards-duplicate' => ['seed' => fn () => customerInvoice(7, 823), 'waits' => true, 'pause' => '/^insert into `billing_agreements`/',
+        'a' => fn ($gateway) => invoke($gateway, 'persistSavedMethod', User::find(7), (object) ['id' => 'pm_7'], ['source' => 'seti_7']), 'b' => function ($gateway) {
             DB::transaction(fn () => App\Models\BillingAgreement::count());
             return invoke($gateway, 'persistSavedMethod', User::find(7), (object) ['id' => 'pm_7'], ['source' => 'seti_7']);
-        },
-        'check' => fn () => App\Models\BillingAgreement::count() === 1
-            && App\Models\BillingAgreement::first()->external_reference === 'pm_7'
+        }, 'check' => fn () => App\Models\BillingAgreement::count() === 1 && App\Models\BillingAgreement::first()->external_reference === 'pm_7'
             && DB::table('properties')->where('key', 'like', 'ae_stripe_saved_%')->count() === 1],
     // Two customers open Pay on invoices with no stored attempt; each reserves its attempt row in the properties index.
-    'pay-pay' => ['seed' => function () { customerInvoice(7, 301); customerInvoice(8, 302); },
-        'pause' => '/^insert into `properties`/',
+    'pay-pay' => ['seed' => function () { customerInvoice(7, 301); customerInvoice(8, 302); }, 'pause' => '/^insert into `properties`/',
         'a' => function ($gateway) { auth()->login(User::find(7)); return $gateway->pay(Invoice::find(301), 20)->getData()['intent']->id; },
         'b' => function ($gateway) { auth()->login(User::find(8)); return $gateway->pay(Invoice::find(302), 20)->getData()['intent']->id; },
         'check' => fn () => $attempt(7, 301)['intent'] === 'pi_301' && $attempt(8, 302)['intent'] === 'pi_302'],
@@ -301,34 +290,25 @@ $cases = [
             customerInvoice(7, 401)->user->properties()->create(['key' => 'ae_stripe_checkout_401',
                 'value' => json_encode(['version' => 2, 'key' => 'checkout_401', 'created' => time(), 'intent' => 'pi_401'])]);
             customerInvoice(8, 402);
-        },
-        'pause' => '#^POST /payment_intents/pi_401/confirm$#',
-        'a' => function ($gateway) {
+        }, 'pause' => '#^POST /payment_intents/pi_401/confirm$#', 'a' => function ($gateway) {
             try { invoke($gateway, 'confirmAttempt', Invoice::find(401), 'pi_401', ['payment_method' => 'pm_401'], null, 2000, 'usd'); }
             catch (Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException $e) { return $e->getMessage(); }
             return 'not declined';
-        },
-        'b' => fn ($gateway) => settle($gateway, 402),
-        'check' => fn ($results) => $results['a']['ok'] === 'Insufficient funds. Try a different card, or contact your bank.'
+        }, 'b' => fn ($gateway) => settle($gateway, 402), 'check' => fn ($results) => $results['a']['ok'] === 'Insufficient funds. Try a different card, or contact your bank.'
             && $rows(401) === [[20.0, 'failed', false]] && $rows(402) === [[20.0, 'succeeded', false]]
             && Invoice::find(401)->status === 'pending' && Invoice::find(402)->status === 'paid'],
     // Webhooks settle two neighbouring invoices of different customers at once.
-    'settlement-settlement' => ['seed' => function () { customerInvoice(7, 501); customerInvoice(8, 502); },
-        'pause' => '/^insert into `invoice_transactions`/',
-        'a' => fn ($gateway) => settle($gateway, 501),
-        'b' => fn ($gateway) => settle($gateway, 502),
+    'settlement-settlement' => ['seed' => function () { customerInvoice(7, 501); customerInvoice(8, 502); }, 'pause' => '/^insert into `invoice_transactions`/',
+        'a' => fn ($gateway) => settle($gateway, 501), 'b' => fn ($gateway) => settle($gateway, 502),
         'check' => fn () => $rows(501) === [[20.0, 'succeeded', false]] && $rows(502) === [[20.0, 'succeeded', false]]
             && Invoice::find(501)->status === 'paid' && Invoice::find(502)->status === 'paid'],
     // The same, paused after A has replaced any card label of its new payment, just before it saves the new label.
-    'settlement-card-label' => ['seed' => function () { customerInvoice(7, 511); customerInvoice(8, 512); },
-        'pause' => '/^insert ignore into `ae_stripe_transaction_methods`/',
-        'a' => fn ($gateway) => settle($gateway, 511),
-        'b' => fn ($gateway) => settle($gateway, 512),
+    'settlement-card-label' => ['seed' => function () { customerInvoice(7, 511); customerInvoice(8, 512); }, 'pause' => '/^insert ignore into `ae_stripe_transaction_methods`/',
+        'a' => fn ($gateway) => settle($gateway, 511), 'b' => fn ($gateway) => settle($gateway, 512),
         'check' => fn () => $rows(511) === [[20.0, 'succeeded', false]] && $rows(512) === [[20.0, 'succeeded', false]]
             && DB::table('ae_stripe_transaction_methods')->pluck('label')->all() === ['Visa **** 4242', 'Visa **** 4242']],
     // Stripe settles two customers' subscription invoices at once. Each finds its own service, never the other's.
-    'subscription-subscription' => ['seed' => function () { subscriptionInvoice(8, 582); subscriptionInvoice(7, 581); },
-        'pause' => '/^insert into `invoice_transactions`/',
+    'subscription-subscription' => ['seed' => function () { subscriptionInvoice(8, 582); subscriptionInvoice(7, 581); }, 'pause' => '/^insert into `invoice_transactions`/',
         'a' => fn ($gateway) => invoke($gateway, 'recordSubscriptionPayment', paidSubscription(581)) ?? 'settled',
         'b' => fn ($gateway) => invoke($gateway, 'recordSubscriptionPayment', paidSubscription(582)) ?? 'settled',
         'check' => fn () => $rows(581) === [[20.0, 'succeeded', false]] && $rows(582) === [[20.0, 'succeeded', false]]],
@@ -342,52 +322,36 @@ $cases = [
         'check' => fn () => DB::table('ae_stripe_payment_fees')->orderBy('payment_intent_id')->get(['payment_intent_id', 'state'])
             ->map(fn ($row) => [$row->payment_intent_id, $row->state])->all() === [['pi_701', 'completed'], ['pi_702', 'completed']]
             && DB::table('invoice_transactions')->where('fee', 0.5)->count() === 2],
-    // Two customers overpay neighbouring invoices; Stripe refuses each refund, so each excess becomes account credit.
-    // Another customer's finished return sorts between their payments in the receipt index, as in a used ledger.
+    // Two customers overpay neighbouring invoices; Stripe refuses each refund, so each excess becomes account credit. Another customer's finished return sorts between their payments in the receipt index, as in a used ledger.
     'receipt-returns' => ['seed' => function () {
             customerInvoice(7, 601); customerInvoice(8, 602);
             DB::table('ae_stripe_receipt_returns')->insert(['payment_intent_id' => 'pi_6015', 'allocation_key' => 'excess', 'user_id' => 9,
                 'invoice_id' => 6015, 'currency' => 'usd', 'received_minor' => 3000, 'amount_minor' => 1000, 'return_key' => 'ae-return-6015',
                 'state' => 'refunded', 'retry' => false, 'updated_at' => time()]);
-        },
-        'pause' => '/^insert into `credits`/',
-        'a' => fn ($gateway) => settle($gateway, 601, 3000),
-        'b' => fn ($gateway) => settle($gateway, 602, 3000),
-        'check' => fn () => $rows(601) === [[30.0, 'succeeded', false], [-10.0, 'succeeded', true]]
-            && $rows(602) === [[30.0, 'succeeded', false], [-10.0, 'succeeded', true]]
+        }, 'pause' => '/^insert into `credits`/', 'a' => fn ($gateway) => settle($gateway, 601, 3000), 'b' => fn ($gateway) => settle($gateway, 602, 3000),
+        'check' => fn () => $rows(601) === [[30.0, 'succeeded', false], [-10.0, 'succeeded', true]] && $rows(602) === [[30.0, 'succeeded', false], [-10.0, 'succeeded', true]]
             && DB::table('credits')->orderBy('user_id')->get(['user_id', 'amount'])->map(fn ($c) => [$c->user_id, (float) $c->amount])->all() === [[7, 10.0], [8, 10.0]]
             && DB::table('ae_stripe_receipt_returns')->whereIn('invoice_id', [601, 602])->orderBy('invoice_id')->pluck('state')->all() === ['credited', 'credited']
-            && DB::table('audits')->where('event', 'ae_stripe_receipt_return')->count() === 2
-            && DB::table('notifications')->where('title', 'Payment return')->count() === 2],
+            && DB::table('audits')->where('event', 'ae_stripe_receipt_return')->count() === 2 && DB::table('notifications')->where('title', 'Payment return')->count() === 2],
     // The same webhook is delivered twice at once: B waits for the customer, then finds the payment settled.
-    'same-payment-duplicate' => ['seed' => fn () => customerInvoice(7, 521), 'waits' => true,
-        'pause' => '/^insert into `invoice_transactions`/',
-        'a' => fn ($gateway) => settle($gateway, 521),
-        'b' => fn ($gateway) => settle($gateway, 521),
-        'check' => fn () => $rows(521) === [[20.0, 'succeeded', false]] && Invoice::find(521)->status === 'paid'
-            && DB::table('ae_stripe_transaction_methods')->count() === 1],
+    'same-payment-duplicate' => ['seed' => fn () => customerInvoice(7, 521), 'waits' => true, 'pause' => '/^insert into `invoice_transactions`/',
+        'a' => fn ($gateway) => settle($gateway, 521), 'b' => fn ($gateway) => settle($gateway, 521),
+        'check' => fn () => $rows(521) === [[20.0, 'succeeded', false]] && Invoice::find(521)->status === 'paid' && DB::table('ae_stripe_transaction_methods')->count() === 1],
     // The customer comes back from the bank while the webhook settles the same payment.
-    'same-payment-return' => ['seed' => fn () => customerInvoice(7, 531), 'waits' => true,
-        'pause' => '/^insert into `invoice_transactions`/',
-        'a' => fn ($gateway) => settle($gateway, 531),
-        'b' => function ($gateway) {
+    'same-payment-return' => ['seed' => fn () => customerInvoice(7, 531), 'waits' => true, 'pause' => '/^insert into `invoice_transactions`/',
+        'a' => fn ($gateway) => settle($gateway, 531), 'b' => function ($gateway) {
             auth()->login(User::find(7));
             $page = $gateway->finishPayment(Illuminate\Http\Request::create('/', 'GET', ['invoice' => 531, 'payment_intent' => 'pi_531',
                 'payment_intent_client_secret' => 'pi_secret']));
             return $page instanceof Illuminate\Http\RedirectResponse ? 'redirect' : $page->getData()['message'];
-        },
-        'check' => fn ($results) => $results['b']['ok'] === 'redirect' && $rows(531) === [[20.0, 'succeeded', false]]
+        }, 'check' => fn ($results) => $results['b']['ok'] === 'redirect' && $rows(531) === [[20.0, 'succeeded', false]]
             && Invoice::find(531)->status === 'paid' && DB::table('ae_stripe_transaction_methods')->count() === 1],
-    // A settlement is rolled back after writing its payment row and runs again. Another session, which has written more
-    // rows than A, locks the card label row A inserts next and then waits for A's customer. InnoDB breaks that cycle by
-    // rolling back A, the smaller transaction; A runs again once the other session ends. Its first payment row id is gone.
+    // A settlement is rolled back after writing its payment row and runs again. Another session, which has written more rows than A, locks the card label row A inserts next and then waits for A's customer. InnoDB breaks that cycle by rolling back A, the smaller transaction; A runs again once the other session ends. Its first payment row id is gone.
     'rollback-retry' => ['seed' => function () {
             customerInvoice(7, 541);
             DB::statement('create table if not exists lock_ballast (id int primary key)');
             DB::table('lock_ballast')->truncate();
-        },
-        'waits' => true, 'deadlocks' => 1, 'pause' => '/^insert ignore into `ae_stripe_transaction_methods`/',
-        'a' => fn ($gateway) => settle($gateway, 541),
+        }, 'waits' => true, 'deadlocks' => 1, 'pause' => '/^insert ignore into `ae_stripe_transaction_methods`/', 'a' => fn ($gateway) => settle($gateway, 541),
         'b' => function () {
             DB::beginTransaction();
             DB::table('lock_ballast')->insert(array_map(fn ($id) => ['id' => $id], range(1, 200)));
@@ -395,26 +359,21 @@ $cases = [
             User::where('id', 7)->lockForUpdate()->first();
             DB::rollBack();
             return 'released';
-        },
-        'check' => fn () => $rows(541) === [[20.0, 'succeeded', false]] && Invoice::find(541)->status === 'paid'
+        }, 'check' => fn () => $rows(541) === [[20.0, 'succeeded', false]] && Invoice::find(541)->status === 'paid'
             && DB::table('invoice_transactions')->pluck('id')->all() === [2] && DB::table('ae_stripe_transaction_methods')->pluck('invoice_transaction_id')->all() === [2]],
     // Stripe settles a subscription invoice while the same customer's other invoice settles: it waits for the customer.
-    'subscription-owner' => ['seed' => function () { customerInvoice(7, 551); subscriptionInvoice(7, 552); },
-        'waits' => true, 'pause' => '/^insert into `invoice_transactions`/',
-        'a' => fn ($gateway) => settle($gateway, 551),
-        'b' => fn ($gateway) => invoke($gateway, 'recordSubscriptionPayment', paidSubscription(552)) ?? 'settled',
+    'subscription-owner' => ['seed' => function () { customerInvoice(7, 551); subscriptionInvoice(7, 552); }, 'waits' => true, 'pause' => '/^insert into `invoice_transactions`/',
+        'a' => fn ($gateway) => settle($gateway, 551), 'b' => fn ($gateway) => invoke($gateway, 'recordSubscriptionPayment', paidSubscription(552)) ?? 'settled',
         'check' => fn () => $rows(551) === [[20.0, 'succeeded', false]] && $rows(552) === [[20.0, 'succeeded', false]]
             && DB::table('invoice_transactions')->where('invoice_id', 552)->value('transaction_id') === 'pi_552' && Invoice::find(552)->status === 'paid'],
     // A refund event is delivered twice at once: B waits for the customer, then finds the refund already recorded.
-    'reversal-duplicate' => ['seed' => function () use ($gateway) { customerInvoice(7, 561); settle($gateway, 561); },
-        'waits' => true, 'pause' => '/^insert into `audits`/',
+    'reversal-duplicate' => ['seed' => function () use ($gateway) { customerInvoice(7, 561); settle($gateway, 561); }, 'waits' => true, 'pause' => '/^insert into `audits`/',
         'a' => fn ($gateway) => invoke($gateway, 'recordReceiptReversalEvent', (object) ['id' => 're_561', 'payment_intent' => 'pi_561'], 'refund') ?? 'recorded',
         'b' => fn ($gateway) => invoke($gateway, 'recordReceiptReversalEvent', (object) ['id' => 're_561', 'payment_intent' => 'pi_561'], 'refund') ?? 'recorded',
         'check' => fn () => DB::table('ae_stripe_receipt_returns')->where('payment_intent_id', 'pi_561')->orderBy('allocation_key')
                 ->get(['allocation_key', 'state'])->map(fn ($row) => [$row->allocation_key, $row->state])->all() === [['stripe:refund:re_561', 'refunded']]
             && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')->count() === 1 && $rows(561) === [[20.0, 'succeeded', false]]],
 ];
-
 if (($argv[1] ?? null) === 'worker') {
     $case = $cases[$argv[2]];
     if ($argv[3] === 'b' && !empty($case['prepared_b'])) {
@@ -430,7 +389,6 @@ if (($argv[1] ?? null) === 'worker') {
     fwrite(STDOUT, 'done ' . json_encode($result) . "\n");
     exit(0);
 }
-
 /** The next line a worker writes, or null when $stop() becomes true first. Fails after 30 seconds. */
 function workerLine(array $worker, ?callable $stop = null): ?string
 {
@@ -461,15 +419,13 @@ foreach ($cases as $name => $case) {
         if ($role === 'b' && !empty($case['prepared_b'])) check(workerLine($workers['b']) === 'paused', $name . ': B prepares consent before its final save locks');
         if ($role === 'a') check(($line = workerLine($workers['a'])) === 'paused', $name . ': request A reaches its pause point: ' . $line);
     }
-    // B runs until it finishes or waits on a lock that A holds. The InnoDB transaction list can leave out a session waiting to
-    // insert, so a statement still running after 1.5 seconds on this small database also counts as a lock wait.
+    // B runs until it finishes or waits on a lock that A holds. The InnoDB transaction list can leave out a session waiting to insert, so a statement still running after 1.5 seconds on this small database also counts as a lock wait.
     $waiting = fn () => (bool) DB::selectOne("select count(*) as n from information_schema.innodb_trx where trx_mysql_thread_id = ? and trx_state = 'LOCK WAIT'", [$workers['b'][3]])->n
         || (bool) DB::selectOne("select count(*) as n from information_schema.processlist where id = ? and command in ('Query', 'Execute') and time_ms > 1500", [$workers['b'][3]])->n;
     if (!empty($case['prepared_b'])) fwrite($workers['b'][1], "go\n");
     $early = workerLine($workers['b'], $waiting);
     fwrite($workers['a'][1], "go\n");
-    $results = ['a' => json_decode(substr(workerLine($workers['a']), 5), true),
-        'b' => json_decode(substr($early ?? workerLine($workers['b']), 5), true)];
+    $results = ['a' => json_decode(substr(workerLine($workers['a']), 5), true), 'b' => json_decode(substr($early ?? workerLine($workers['b']), 5), true)];
     foreach ($workers as $worker) { fclose($worker[1]); fclose($worker[2]); proc_close($worker[0]); }
     echo $name . ': B ' . ($early === null ? 'waited on A' : 'finished while A was paused') . "\n";
     echo $name . ': requests ' . json_encode($results) . '; deadlocks=' . ($deadlocks() - $before) . "\n";

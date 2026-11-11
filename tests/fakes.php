@@ -362,17 +362,23 @@ namespace App\Models {
             private $filters = [], $currentRead = false;
             public function __construct($key, $value) { $this->where($key, $value); }
             public function where($key, $value) { $this->filters[$key] = $value; return $this; }
-            public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = Audit::class; return $this; }
+            public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = isset($this->filters['id']) ? Audit::class . ':' . $this->filters['id'] : Audit::class; return $this; }
+            public function orderBy($key) { return $this; }
+            public function limit($n) { return $this; }
             public function first() {
                 if (!$this->currentRead && \Illuminate\Support\Facades\DB::$locked && !\Illuminate\Support\Facades\DB::$userLocked && !in_array(Gateway::class, \Illuminate\Support\Facades\DB::$modelLocks, true)) throw new \RuntimeException('Review guard needs the owner lock');
+                return $this->get()[0] ?? null;
+            }
+            public function get() {
+                $rows = [];
                 foreach (Audit::$rows as $row) {
                     foreach ($this->filters as $key => $value) {
                         $actual = str_starts_with($key, 'new_values->') ? ($row['new_values'][substr($key, 12)] ?? null) : ($row[$key] ?? null);
                         if ($actual !== $value) continue 2;
                     }
-                    return new Audit($row);
+                    $rows[] = new Audit($row);
                 }
-                return null;
+                return $rows;
             }
             public function firstOrFail() { return $this->first() ?? throw new \RuntimeException('Missing audit'); }
         }; }

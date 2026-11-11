@@ -10,7 +10,6 @@ use App\Models\BillingAgreement;
 use App\Models\Gateway;
 use App\Models\Invoice;
 use App\Models\InvoiceTransaction;
-use App\Models\Notification;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -386,7 +385,6 @@ trait Checkout
             if (($attempt['intent'] ?? null) === $intent->id) $this->writePaymentAttempt($invoice->user, $invoice,
                 array_replace($attempt, ['state' => 'reconcile', 'reason' => $reason, 'retry' => true, 'alert_sent' => true, 'funds_pending' => true]));
         }
-        $this->schedulePaymentReviewAlert($invoice, $intent->id);
         if (!$this->invoiceAuditExists($invoice, 'ae_stripe_payment_review', ['payment_intent_id' => $intent->id])) Audit::create([
             'event' => 'ae_stripe_payment_review',
             'auditable_type' => $invoice->getMorphClass(), 'auditable_id' => $invoice->id,
@@ -403,15 +401,11 @@ trait Checkout
             $invoice->user->properties()->updateOrCreate(['key' => $key],
                 ['value' => json_encode(['reason' => $reason, 'sent' => false], JSON_THROW_ON_ERROR)]);
         }
+        $this->schedulePaymentReviewAlert($invoice, $intent->id);
     }
 
-    /**
-     * Whether the invoice has a staff record of this event with these values. Every writer of these records holds the
-     * invoice owner's row lock, and so does the caller before its first plain read, so a plain read sees every record. A
-     * locking read would lock the audits index gap after the invoice's records, which neighbouring invoices without audit
-     * rows share (core audits nothing from the console), and the record inserted next goes into that gap: two invoices
-     * doing this at once deadlock.
-     */
+    // Writers hold the owner lock before their first read. A plain read sees their records without locking
+    // the shared index gap where neighbouring invoices insert their audits.
     private function invoiceAuditExists($invoice, string $event, array $values): bool
     {
         $query = Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)->where('event', $event);
@@ -421,30 +415,23 @@ trait Checkout
 
     private function schedulePaymentReviewAlert($invoice, string $intentId): void
     {
-        // Settlement commits before any notification event can reach staff. Retrying a delivery
-        // retries the durable pending notice, including after the payment is already recorded.
-        DB::afterCommit(function () use ($invoice, $intentId) {
-            DB::transaction(function () use ($invoice, $intentId) {
-                $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
-                $key = 'ae_stripe_payment_alert_' . $invoice->id . '_' . $intentId;
-                $stored = $user->properties()->where('key', $key)->lockForUpdate()->first()?->value;
-                if (!$stored) return;
-                $alert = json_decode($stored, true, flags: JSON_THROW_ON_ERROR);
-                if ($alert['sent']) return;
-                foreach ($this->noticeStaff('invoice') as $staff) {
-                    Notification::create([
-                        'user_id' => $staff->id, 'title' => 'Stripe payment needs review',
-                        'url' => $this->adminInvoiceUrl($invoice),
-                        'body' => $this->invoiceNoticeBody('payment',
-                            'Payment on invoice ' . $this->invoiceLabel($invoice) . '.',
-                            'Invoice ' . $this->invoiceLabel($invoice) . ', payment ' . $intentId . ': ' . $alert['reason']
-                                . '. Check Stripe and choose a refund or account credit; this needs your decision.'),
-                    ]);
-                }
-                $alert['sent'] = true;
-                $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($alert, JSON_THROW_ON_ERROR)]);
-            });
-        });
+        // The caller holds the owner lock. Existing sent markers also cover pre-upgrade delivery.
+        $key = 'ae_stripe_payment_alert_' . $invoice->id . '_' . $intentId;
+        $property = $invoice->user->properties()->where('key', $key)->first();
+        if (!$property) return;
+        $alert = json_decode($property->value, true, flags: JSON_THROW_ON_ERROR);
+        if ($alert['sent']) return;
+        $audit = Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
+            ->where('event', 'ae_stripe_payment_review')->where('new_values->payment_intent_id', $intentId)->firstOrFail();
+        $this->queuePaymentNotices($audit, $this->staffPaymentNotices('invoice', [
+            'title' => 'Stripe payment needs review', 'url' => $this->adminInvoiceUrl($invoice),
+            'body' => $this->invoiceNoticeBody('payment',
+                'Payment on invoice ' . $this->invoiceLabel($invoice) . '.',
+                'Invoice ' . $this->invoiceLabel($invoice) . ', payment ' . $intentId . ': ' . $alert['reason']
+                    . '. Check Stripe and choose a refund or account credit; this needs your decision.'),
+        ]));
+        $alert['sent'] = true; // Delivery is now owned by the durable audit marker, independently of this property.
+        $invoice->user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($alert, JSON_THROW_ON_ERROR)]);
     }
 
     private function savePaidMethod($intent, $recoveryNotice = null)

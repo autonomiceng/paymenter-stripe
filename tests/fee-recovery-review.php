@@ -165,7 +165,8 @@ use Illuminate\Support\Facades\{DB, Http};
     $seed(); DB::$tables['ae_stripe_payment_fees']['pi_batch0']['attempts'] = 24;
     Notification::$fail = true;
     $gateway->retryPaymentFees(); Notification::$fail = false;
-    check(DB::$tables['ae_stripe_payment_fees']['pi_batch0']['attempts'] === 25
+    check(DB::$tables['ae_stripe_payment_fees']['pi_batch0']['attempts'] === 24
+        && DB::$tables['ae_stripe_payment_fees']['pi_batch0']['state'] === 'review'
         && DB::$tables['ae_stripe_payment_fees']['pi_batch1']['state'] === 'completed', 'Failed notice does not roll back later fees');
     $seed(101);
     foreach (DB::$tables['ae_stripe_payment_fees'] as &$row) $row['attempts'] = 10;

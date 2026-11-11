@@ -3,7 +3,7 @@
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Helpers\ExtensionHelper;
-use App\Models\{Audit, Invoice, InvoiceTransaction, Notification, User};
+use App\Models\{Audit, Invoice, InvoiceTransaction, User};
 use Illuminate\Support\Facades\DB;
 
 trait PaymentFees
@@ -35,6 +35,7 @@ trait PaymentFees
 
     public function retryPaymentFees(): void
     {
+        $this->retryPaymentNotices();
         if (!$this->gatewayEnabled()) return;
         foreach ($this->feeRows()->where('state', 'pending')->orderBy('attempts')->orderBy('created_at')->limit(100)->get() as $row) {
             try {
@@ -199,22 +200,20 @@ trait PaymentFees
 
     private function stopPaymentFee($row, $invoice): void
     {
-        Audit::create([
+        $audit = Audit::create([
             'event' => 'ae_stripe_fee_review', 'auditable_type' => $invoice?->getMorphClass() ?? Invoice::class,
             'auditable_id' => $row->invoice_id, 'old_values' => [], 'new_values' => array_merge((array) $row, ['state' => 'review',
                 'next_step' => 'Check the invoice Audit Log and the balance transaction in Stripe. Record the verified fee on the original transaction.']),
         ]);
-        foreach ($this->noticeStaff($invoice ? 'invoice' : 'audit') as $staff) {
-            Notification::create([
-                'user_id' => $staff->id, 'title' => 'Stripe payment fee needs review',
+        $this->queuePaymentNotices($audit, $this->staffPaymentNotices($invoice ? 'invoice' : 'audit', [
+                'title' => 'Stripe payment fee needs review',
                 'url' => $invoice ? $this->adminInvoiceUrl($invoice) : url('/admin/audits'),
                 'body' => !$invoice ? 'Stripe fee missing for invoice ' . $row->invoice_id . ', PaymentIntent ' . $row->payment_intent_id
                     . '. Check System > Audits and the balance transaction in Stripe.' : $this->invoiceNoticeBody('fee',
                     'Fee missing on invoice ' . $this->invoiceLabel($invoice) . '.',
                     'Stripe fee missing for invoice ' . $this->invoiceLabel($invoice) . ', PaymentIntent ' . $row->payment_intent_id
                         . '. Check the invoice Audit Log and the balance transaction in Stripe.'),
-            ]);
-        }
+            ]));
         $this->feeRows()->where('payment_intent_id', $row->payment_intent_id)->update(['state' => 'review', 'last_error' => $row->last_error]);
     }
 }

@@ -5,10 +5,7 @@
 // properties unique index (key, model_id, model_type): a locking read that finds no row locks the gap before the next
 // index entry, and an insert into a gap waits for every other transaction that locked it. Two transactions that each
 // lock one gap and then insert into it wait on each other, which MariaDB reports as deadlock SQLSTATE 40001.
-// A locking `like` read of a key prefix scans and locks every customer's keys in that range, with the gaps between them
-// and the gap after the last. The same rule is modelled on two more indexes: audits (auditable_type, auditable_id), where
-// a locking read always locks the gap after the invoice's records and a new record goes into it, and the receipt
-// returns unique index (payment_intent_id, allocation_key). Their gaps are named "audits:N" and "receipts:N".
+// A locking `like` read of a key prefix scans and locks every customer's keys in that range, with the gaps between them and the gap after the last. The same rule is modelled on two more indexes: audits (auditable_type, auditable_id), where a locking read always locks the gap after the invoice's records and a new record goes into it, and the receipt returns unique index (payment_intent_id, allocation_key). Their gaps are named "audits:N" and "receipts:N".
 use App\Models\{Invoice, User};
 use Illuminate\Database\Events\TransactionBeginning;
 use Illuminate\Support\Facades\{DB, Event};
@@ -144,8 +141,7 @@ DB::transaction(function () use ($unsaved) {
     User::findOrFail(8)->properties()->where('key', 'stripe_id')->lockForUpdate()->first();
     $unsaved->properties()->where('key', 'stripe_id')->lockForUpdate()->first();
 });
-check(array_map(fn ($event) => array_slice($event, 1), $GLOBALS['gapTrace']) === [['lock', 0, 'ae_stripe_checkout_301'], ['lock', 2, 'stripe_id']],
-    'The trace records a locking read of a missing property as a lock on its index gap, and none for an existing row');
+check(array_map(fn ($event) => array_slice($event, 1), $GLOBALS['gapTrace']) === [['lock', 0, 'ae_stripe_checkout_301'], ['lock', 2, 'stripe_id']], 'The trace records a locking read of a missing property as a lock on its index gap, and none for an existing row');
 $GLOBALS['gapTrace'] = null;
 [$firstView, $firstTrace] = $open($gateway, $first);
 [$secondView, $secondTrace] = $open($gateway, $second);
@@ -218,7 +214,6 @@ $indexNow = function () {
 $insertedKey = fn ($trace, $prefix) => (bool) array_filter($trace, fn ($event) => $event[1] === 'insert' && str_starts_with($event[3], $prefix));
 $customer(11, 'cus_11');
 $customer(12, 'cus_12');
-
 // Two payments from the wrong Stripe customer settle at once: each records a staff review alert for its invoice.
 $GLOBALS['stripeHandler'] = fn ($verb, $path) => throw new RuntimeException('Unexpected review request: ' . $verb . ' ' . $path);
 $review = fn (int $invoiceId, int $userId) => (object) ['id' => 'pi_review_' . $invoiceId, 'status' => 'succeeded', 'amount' => 2000,
@@ -228,13 +223,10 @@ $secondReview = $review(312, 12);
 $indexNow();
 $firstTrace = traced(fn () => invoke($gateway, 'recordIntentPayment', $firstReview, 'succeeded', false));
 $secondTrace = traced(fn () => invoke($gateway, 'recordIntentPayment', $secondReview, 'succeeded', false));
-check($insertedKey($firstTrace, 'ae_stripe_payment_alert_311_') && $insertedKey($secondTrace, 'ae_stripe_payment_alert_312_'),
-    'Each mismatched payment inserts its review alert');
-check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
-    'Two mismatched payments settling at once never deadlock on their review alerts');
+check($insertedKey($firstTrace, 'ae_stripe_payment_alert_311_') && $insertedKey($secondTrace, 'ae_stripe_payment_alert_312_'), 'Each mismatched payment inserts its review alert');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace), 'Two mismatched payments settling at once never deadlock on their review alerts');
 check(App\Models\Audit::where('event', 'ae_stripe_payment_review')->whereIn('auditable_id', [311, 312])->count() === 2
     && !App\Models\InvoiceTransaction::whereIn('invoice_id', [311, 312])->exists(), 'Each mismatched payment gets one staff review and no payment');
-
 // Two customers return from paying with "save card" at once: each reserves its saved card notice.
 $GLOBALS['stripeHandler'] = function ($verb, $path) {
     if ($verb === 'get' && preg_match('#^/payment_methods/(pm_notice_[0-9]+)$#', $path, $id)) return ['id' => $id[1], 'type' => 'sepa_debit'];
@@ -249,11 +241,8 @@ $indexNow();
 // A SEPA method is not saved, so each notice is discarded after its reservation.
 $firstTrace = traced(function () use ($gateway, $firstNotice) { auth()->login(User::findOrFail(11)); invoke($gateway, 'saveConsentedMethod', $firstNotice, null); });
 $secondTrace = traced(function () use ($gateway, $secondNotice) { auth()->login(User::findOrFail(12)); invoke($gateway, 'saveConsentedMethod', $secondNotice, null); });
-check($insertedKey($firstTrace, 'ae_stripe_notice_') && $insertedKey($secondTrace, 'ae_stripe_notice_'),
-    'Each return reserves its saved card notice');
-check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
-    'Two customers reserving saved card notices at once never deadlock');
-
+check($insertedKey($firstTrace, 'ae_stripe_notice_') && $insertedKey($secondTrace, 'ae_stripe_notice_'), 'Each return reserves its saved card notice');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace), 'Two customers reserving saved card notices at once never deadlock');
 // Two customers remove a saved card at once: each records its removal journal before detaching.
 $removing = $methods = [];
 foreach ([11, 12] as $userId) {
@@ -265,11 +254,8 @@ $GLOBALS['stripeHandler'] = nativeMethodHandler($methods);
 $indexNow();
 $firstTrace = traced(fn () => check(invoke($gateway, 'removeSavedMethodCopies', $removing[11]) === true, 'The first removal finishes'));
 $secondTrace = traced(fn () => check(invoke($gateway, 'removeSavedMethodCopies', $removing[12]) === true, 'The second removal finishes'));
-check($insertedKey($firstTrace, 'ae_stripe_removal_pm_remove_11') && $insertedKey($secondTrace, 'ae_stripe_removal_pm_remove_12'),
-    'Each removal inserts its journal');
-check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
-    'Two customers removing a saved card at once never deadlock on the removal journal');
-
+check($insertedKey($firstTrace, 'ae_stripe_removal_pm_remove_11') && $insertedKey($secondTrace, 'ae_stripe_removal_pm_remove_12'), 'Each removal inserts its journal');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace), 'Two customers removing a saved card at once never deadlock on the removal journal');
 // Card cleanup reserves a duplicate for a customer with no Auto Pay card. The reservation inserts a property, so it
 // must hold no missing-row gap lock, which the Auto Pay card check would otherwise take.
 foreach (['pm_keep_11' => 611, 'pm_dup_11' => 612] as $reference => $id) {
@@ -279,10 +265,8 @@ foreach (['pm_keep_11' => 611, 'pm_dup_11' => 612] as $reference => $id) {
 }
 $indexNow();
 $cleanupTrace = traced(fn () => invoke($gateway, 'cleanupCard', App\Models\BillingAgreement::findOrFail(612), $nativeGateway, true, fn () => null));
-check($insertedKey($cleanupTrace, 'ae_stripe_duplicate_pm_dup_11') && App\Models\BillingAgreement::find(612) === null,
-    'Cleanup reserves and removes the duplicate card');
+check($insertedKey($cleanupTrace, 'ae_stripe_duplicate_pm_dup_11') && App\Models\BillingAgreement::find(612) === null, 'Cleanup reserves and removes the duplicate card');
 check(!gapWaits($cleanupTrace), 'The duplicate card reservation takes no missing-row gap lock before inserting');
-
 // Two customers turn Auto Pay on at once, each with a renewal retry waiting on an open invoice. Stopping the retries
 // must not lock the range of every customer's payment attempts, which the Auto Pay records are inserted beside.
 foreach ([11 => 341, 12 => 342] as $userId => $invoiceId) {
@@ -298,8 +282,7 @@ $indexNow();
 $firstTrace = $enable(11);
 $secondTrace = $enable(12);
 check($insertedKey($firstTrace, 'ae_stripe_auto_pay_') && $insertedKey($secondTrace, 'ae_stripe_auto_pay_'), 'Each customer stores its Auto Pay choice');
-check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
-    'Two customers turning Auto Pay on at once never deadlock on their waiting renewals');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace), 'Two customers turning Auto Pay on at once never deadlock on their waiting renewals');
 foreach ([11 => 341, 12 => 342] as $userId => $invoiceId) {
     check((json_decode(User::find($userId)->properties()->where('key', 'ae_stripe_checkout_' . $invoiceId)->value('value'), true)['renewal']['state'] ?? null) === 'stopped',
         'Turning Auto Pay on stops the customer\'s waiting renewal retry');
@@ -322,11 +305,8 @@ $firstTrace = $save(13);
 $secondTrace = $save(14);
 check($insertedKey($firstTrace, 'ae_stripe_save_sequence') && $insertedKey($secondTrace, 'ae_stripe_save_sequence')
     && App\Models\BillingAgreement::where('external_reference', 'pm_save_13')->where('user_id', 13)->exists()
-    && App\Models\BillingAgreement::where('external_reference', 'pm_save_14')->where('user_id', 14)->exists(),
-    'Each first-time customer saves its card and numbers it');
-check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
-    'Two first-time customers saving a card at once never deadlock on the save sequence');
-
+    && App\Models\BillingAgreement::where('external_reference', 'pm_save_14')->where('user_id', 14)->exists(), 'Each first-time customer saves its card and numbers it');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace), 'Two first-time customers saving a card at once never deadlock on the save sequence');
 // Two held payments on neighbouring invoices go to staff review at once. Neither invoice has audit rows (core audits
 // nothing from the console, as for renewal invoices), so both review records go into one audits index gap.
 foreach ([11 => 351, 12 => 352] as $userId => $invoiceId) {
@@ -337,13 +317,10 @@ foreach ([11 => 351, 12 => 352] as $userId => $invoiceId) {
 $indexNow();
 $firstTrace = traced(fn () => invoke($gateway, 'sendAttemptReview', Invoice::findOrFail(351)));
 $secondTrace = traced(fn () => invoke($gateway, 'sendAttemptReview', Invoice::findOrFail(352)));
-check(App\Models\Audit::where('event', 'ae_stripe_attempt_review')->whereIn('auditable_id', [351, 352])->count() === 2,
-    'Each held payment gets one staff review record');
-check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
-    'Two held payments going to staff review at once never deadlock on their review records');
+check(App\Models\Audit::where('event', 'ae_stripe_attempt_review')->whereIn('auditable_id', [351, 352])->count() === 2, 'Each held payment gets one staff review record');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace), 'Two held payments going to staff review at once never deadlock on their review records');
 invoke($gateway, 'sendAttemptReview', Invoice::findOrFail(351));
 check(App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('auditable_id', 351)->count() === 1, 'A repeated review check records nothing more');
-
 // Two customers overpay neighbouring invoices at once: each settlement reserves its excess as a receipt return. Both
 // payments sort into one receipt returns index gap.
 $nativeGateway->update(['enabled' => false]); // Returns are sent after commit; this case covers only the reservation.
@@ -358,11 +335,8 @@ $secondTrace = traced(fn () => invoke($gateway, 'recordIntentPayment', $secondPa
 $nativeGateway->update(['enabled' => true]);
 $returns = tableRows('ae_stripe_receipt_returns', ['payment_intent_id', 'allocation_key']);
 check(($returns['pi_over_361:excess']['amount_minor'] ?? null) == 500 && ($returns['pi_over_362:excess']['amount_minor'] ?? null) == 500
-    && (moneyRows()['payments']['361:pi_over_361'] ?? 0) === 1 && (moneyRows()['payments']['362:pi_over_362'] ?? 0) === 1,
-    'Each overpayment is recorded once and its excess reserved for return');
-check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
-    'Two overpayments settling at once never deadlock on their receipt returns');
-
+    && (moneyRows()['payments']['361:pi_over_361'] ?? 0) === 1 && (moneyRows()['payments']['362:pi_over_362'] ?? 0) === 1, 'Each overpayment is recorded once and its excess reserved for return');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace), 'Two overpayments settling at once never deadlock on their receipt returns');
 // Stripe reports a dispute on two customers' neighbouring payments at once. Each event checks for a staff resolution,
 // then records the dispute beside the receipt and a staff record on the invoice. Both payments sort into one receipt
 // returns gap and both invoices into one audits gap.
@@ -384,19 +358,19 @@ $firstTrace = $dispute(391);
 $secondTrace = $dispute(392);
 $returns = tableRows('ae_stripe_receipt_returns', ['payment_intent_id', 'allocation_key']);
 check(($returns['pi_rev391:stripe:dispute:dp_rev_391']['state'] ?? null) === 'open' && ($returns['pi_rev392:stripe:dispute:dp_rev_392']['state'] ?? null) === 'open'
-    && App\Models\Audit::where('event', 'ae_stripe_receipt_reversal')->whereIn('auditable_id', [391, 392])->count() === 2,
-    'Each dispute is recorded once beside its receipt, with one staff record');
-check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
-    'Two disputes reported at once never deadlock on their receipt rows or staff records');
-
+    && App\Models\Audit::where('event', 'ae_stripe_receipt_reversal')->whereIn('auditable_id', [391, 392])->count() === 2, 'Each dispute is recorded once beside its receipt, with one staff record');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace), 'Two disputes reported at once never deadlock on their receipt rows or staff records');
 // Pay chosen as a deadlock victim runs again from the locked balance check, so the customer gets a working page.
 $victims = 0;
-beforeWrite('properties', function ($values, $sql) use (&$victims) {
-    if ($victims <= 0 || !str_starts_with($sql, 'insert') || ($values['key'] ?? null) !== 'ae_stripe_checkout_371') return;
-    --$victims;
-    throw new Illuminate\Database\QueryException('mysql', $sql, [],
-        new PDOException('SQLSTATE[40001]: Serialization failure: 1213 Deadlock found when trying to get lock; try restarting transaction'));
-});
+$loseWrites = function (string $table, ?string $key = null) use (&$victims) {
+    beforeWrite($table, function ($values, $sql) use (&$victims, $key) {
+        if ($victims <= 0 || !str_starts_with($sql, 'insert') || $key !== null && ($values['key'] ?? null) !== $key) return;
+        --$victims;
+        throw new Illuminate\Database\QueryException('mysql', $sql, [],
+            new PDOException('SQLSTATE[40001]: Serialization failure: 1213 Deadlock found when trying to get lock; try restarting transaction'));
+    });
+};
+$loseWrites('properties', 'ae_stripe_checkout_371');
 $created = 0;
 $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use (&$created) {
     if ($verb === 'get' && $path === '/customers/cus_11') return ['id' => 'cus_11'];
@@ -420,7 +394,6 @@ $attempt = json_decode(User::find(11)->properties()->where('key', 'ae_stripe_che
 check(is_object($view) && $victims === 0 && $view->getData()['intent']->id === 'pi_victim_371' && $created === 1
     && ($attempt['intent'] ?? null) === 'pi_victim_371',
     'A Pay chosen as a deadlock victim runs again and gives one working page with one intent: ' . (is_string($view) ? $view : ''));
-
 // A deadlock while recording a declined renewal never sends the Stripe update or confirmation again: the confirmation
 // does not rerun after its update, and the decline Stripe already returned is recorded in new transactions.
 $invoice = nativeInvoice(381, 20, 'USD');
@@ -451,12 +424,7 @@ $GLOBALS['stripeHandler'] = function ($verb, $path) use (&$intent, &$posts) {
     throw new StripeFixtureError(402, ['error' => ['code' => 'card_declined', 'decline_code' => 'insufficient_funds']]);
 };
 $victims = 1;
-beforeWrite('invoice_transactions', function ($values, $sql) use (&$victims) {
-    if ($victims <= 0 || !str_starts_with($sql, 'insert')) return;
-    --$victims;
-    throw new Illuminate\Database\QueryException('mysql', $sql, [],
-        new PDOException('SQLSTATE[40001]: Serialization failure: 1213 Deadlock found when trying to get lock; try restarting transaction'));
-});
+$loseWrites('invoice_transactions');
 try {
     try { invoke($gateway, 'confirmAttempt', $invoice, $intent->id, $params, $agreement, 2000, 'usd'); $declined = 'not declined'; }
     catch (Throwable $e) { $declined = get_class($e) . ': ' . $e->getMessage(); }
@@ -469,19 +437,13 @@ check($victims === 0 && $posts === ['/payment_intents/pi_renewal381', '/payment_
     && App\Models\InvoiceTransaction::where('invoice_id', 381)->where('status', 'failed')->count() === 1 && $stored['confirmation'] === null,
     'A deadlock recording a declined renewal sends one update and one confirmation and records the decline once: '
         . json_encode(['posts' => $posts, 'result' => $declined]));
-
 // Every rerun of that recording is a deadlock victim too. Nothing commits alone: the renewal keeps its claimed
 // confirmation and Auto Pay state, so the next automatic charge records the decline from Stripe without confirming again.
 App\Models\InvoiceTransaction::where('invoice_id', 381)->delete();
 $owner->properties()->where('key', 'ae_stripe_checkout_381')->update(['value' => $claimed]);
 [$intent->latest_charge, $posts, $victims] = [null, [], 4];
 unset($intent->last_payment_error);
-beforeWrite('invoice_transactions', function ($values, $sql) use (&$victims) {
-    if ($victims <= 0 || !str_starts_with($sql, 'insert')) return;
-    --$victims;
-    throw new Illuminate\Database\QueryException('mysql', $sql, [],
-        new PDOException('SQLSTATE[40001]: Serialization failure: 1213 Deadlock found when trying to get lock; try restarting transaction'));
-});
+$loseWrites('invoice_transactions');
 try {
     try { invoke($gateway, 'confirmAttempt', $invoice, $intent->id, $params, $agreement, 2000, 'usd'); $declined = 'not declined'; }
     catch (Throwable $e) { $declined = get_class($e) . ': ' . $e->getMessage(); }
@@ -500,7 +462,6 @@ $stored = json_decode($owner->properties()->where('key', 'ae_stripe_checkout_381
 check(count($posts) === 2 && $stored['confirmation'] === null && $stored['renewal']['state'] === 'waiting'
     && App\Models\InvoiceTransaction::where('invoice_id', 381)->where('status', 'failed')->count() === 1,
     'The next automatic charge records that decline once and never confirms it again: ' . json_encode(['posts' => $posts, 'result' => $next]));
-
 // A Pay that is a deadlock victim on every attempt is rolled back and asks the customer to try again.
 $created = 0;
 $GLOBALS['stripeHandler'] = function ($verb, $path) use (&$created) {
@@ -510,12 +471,7 @@ $GLOBALS['stripeHandler'] = function ($verb, $path) use (&$created) {
     throw new RuntimeException('Unexpected Pay request: ' . $verb . ' ' . $path);
 };
 $victims = 3;
-beforeWrite('properties', function ($values, $sql) use (&$victims) {
-    if ($victims <= 0 || !str_starts_with($sql, 'insert') || ($values['key'] ?? null) !== 'ae_stripe_checkout_372') return;
-    --$victims;
-    throw new Illuminate\Database\QueryException('mysql', $sql, [],
-        new PDOException('SQLSTATE[40001]: Serialization failure: 1213 Deadlock found when trying to get lock; try restarting transaction'));
-});
+$loseWrites('properties', 'ae_stripe_checkout_372');
 try {
     try { $open($gateway, $invoiceFor(372, 11)); $view = 'no error'; } catch (Throwable $e) { $view = get_class($e) . ': ' . $e->getMessage(); }
 } finally {

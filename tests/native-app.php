@@ -48,6 +48,9 @@ $connection->setQueryGrammar(new class($connection) extends SQLiteGrammar {
     protected function compileLock(Builder $query, $value) { return is_string($value) ? '/* ' . $value . ' */' : ($value ? '/* for update */' : '/* lock in share mode */'); }
 });
 $GLOBALS['nativeLocks'] = [];
+Illuminate\Support\Facades\Event::listen(Illuminate\Database\Events\TransactionBeginning::class, function () {
+    if (DB::transactionLevel() === 1) $GLOBALS['nativeLocks'] = [];
+});
 $GLOBALS['nativeBeforeWrite'] = [];
 $GLOBALS['nativeAfterCommit'] = null;
 DB::listen(function (QueryExecuted $query) {

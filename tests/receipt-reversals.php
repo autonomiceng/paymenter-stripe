@@ -130,12 +130,12 @@ check(!$gateway->receiptReversals($i, 'pi_return')[0]['needs_review'] && count(a
 [$i, $s] = $setup(2000, 20); $deliver($s);
 $s->refunds['foreign'] = clone $foreign; $s->refunds['foreign']->status = 'succeeded';
 $settled = [payments(), moneyRows()]; $inboxDown();
-rejects(fn () => $gateway->webhook($request), 'Inbox unavailable');
-$inboxUp();
-check(!$gateway->receiptReversals($i, 'pi_return') && !audits() && [payments(), moneyRows()] === $settled,
-    'Failed staff delivery escapes for Stripe to retry, rolling back the observation without losing the original payment');
 $gateway->webhook($request);
-check(count(audits()) === 1 && count(notices()) === 1, 'Stripe replay completes the rolled-back observation and alert');
+$inboxUp();
+check(count($gateway->receiptReversals($i, 'pi_return')) === 1 && count(audits()) === 1 && !notices() && !audits()[0]['new_values']['notice_sent']
+    && [payments(), moneyRows()] === $settled, 'Failed delivery preserves the reversal, original money and pending notice');
+$gateway->retryReceiptReturns(); $gateway->webhook($request); $gateway->retryReceiptReturns();
+check(count(audits()) === 1 && count(notices()) === 1 && audits()[0]['new_values']['notice_sent'], 'Recovery and replay deliver the committed reversal notice exactly once');
 
 $s->refunds['foreign']->currency = 'eur';
 rejects(fn () => $gateway->webhook($request), 'HTTP 409');
