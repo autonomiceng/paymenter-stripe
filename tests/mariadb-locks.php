@@ -129,6 +129,19 @@ function pendingNotice(string $event, string $type = Invoice::class): void
         ]]]]);
 }
 $cases = [
+    'outbox-allocation-http' => ['seed' => function () {
+        customerInvoice(7, 954);
+        App\Helpers\ExtensionHelper::addPayment(954, 'AeStripe', 20, null, 'pi_954');
+    }, 'pause' => '#^GET /payment_intents/pi_954$#', 'a' => function ($gateway) {
+        $handler = $GLOBALS['stripeHandler'];
+        $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($handler) {
+            if ($path === '/payment_intents/pi_954') check(DB::transactionLevel() === 0, 'Allocation observations run outside every transaction');
+            return $handler($verb, $path, $data, $request);
+        };
+        return $gateway->allocateReceiptReturn(Invoice::find(954), 'pi_954', 'domains:failed:1', 1000)['state'];
+    }, 'b' => fn () => User::where('id', 7)->update(['first_name' => 'Updated']),
+        'check' => fn ($results) => $results['a']['ok'] === 'credited' && $rows(954) === [[20.0, 'succeeded', false], [-10.0, 'succeeded', true]]
+            && (float) DB::table('credits')->where('user_id', 7)->value('amount') === 10.0 && User::find(7)->first_name === 'Updated'],
     'outbox-customer-http' => ['seed' => function () {
         customerInvoice(7, 951)->user->properties()->where('key', 'stripe_id')->delete();
     }, 'pause' => '#^POST /customers$#', 'a' => function ($gateway) {
@@ -638,6 +651,50 @@ $cases = [
                 ->get(['allocation_key', 'state'])->map(fn ($row) => [$row->allocation_key, $row->state])->all() === [['stripe:refund:re_561', 'refunded']]
             && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')->count() === 1 && $rows(561) === [[20.0, 'succeeded', false]]],
 ];
+foreach (['settings', 'reconcile'] as $operation) {
+    $cases['outbox-webhook-' . $operation . '-http'] = [
+        'seed' => function () {
+            customerInvoice(7, 953);
+            $gateway = App\Models\Gateway::where('extension', 'AeStripe')->first();
+            $credentials = ['stripe_secret_key' => 'rk_test_fixture', 'stripe_publishable_key' => 'pk_test_fixture', 'stripe_webhook_secret' => 'whsec_test'];
+            foreach ($credentials as $key => $value) $gateway->settings()->updateOrCreate(['key' => $key], ['value' => $value]);
+            $gateway->settings()->updateOrCreate(['key' => 'ae_stripe_webhook_events'], ['value' => 'retry']);
+            $gateway->settings()->updateOrCreate(['key' => 'ae_stripe_webhook_continuity'], ['value' => json_encode([
+                'account' => 'acct_fixture', 'mode' => 'test', 'endpoint' => 'we_fixture', 'delivery' => 'endpoint',
+                'credentials' => $credentials, 'previous' => [['secret' => 'whsec_older', 'until' => null]]])]);
+        }, 'pause' => '#^POST /webhook_endpoints/we_fixture$#',
+        'a' => function ($gateway) use ($operation) {
+            Illuminate\Support\Facades\Route::getRoutes()->refreshNameLookups();
+            $native = App\Models\Gateway::where('extension', 'AeStripe')->first();
+            $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($native) {
+                if ($path === '/account') return ['id' => 'acct_fixture'];
+                if ($verb === 'get') return ['data' => [['id' => 'we_fixture', 'url' => route('extensions.gateways.ae-stripe.webhook'),
+                    'enabled_events' => ['payment_intent.succeeded']]], 'has_more' => false];
+                check(DB::transactionLevel() === 0, 'Webhook writes run outside every transaction');
+                $claim = json_decode($native->settings()->where('key', 'ae_stripe_webhook_claim')->first()?->value, true);
+                $key = $request->header('Idempotency-Key')[0];
+                check($claim['writes'][$key]['data'] == $data, 'Webhook payload and key are committed before send');
+                return ['id' => 'we_fixture'];
+            };
+            if ($operation === 'settings') {
+                $native->settings()->updateOrCreate(['key' => 'stripe_webhook_secret'], ['value' => 'whsec_replacement']);
+                invoke($gateway, 'updateWebhookContinuity', $native);
+            } else invoke($gateway, 'reconcileWebhookSubscriptions');
+            return 'verified';
+        }, 'b' => function ($gateway) {
+            $time = time();
+            return invoke($gateway, 'validWebhookSignature', '{}', 't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.{}', 'whsec_test'));
+        }, 'check' => function ($results) use ($operation) {
+            $native = App\Models\Gateway::where('extension', 'AeStripe')->first();
+            $state = json_decode($native->settings()->where('key', 'ae_stripe_webhook_continuity')->first()?->value, true);
+            return $results['a']['ok'] === 'verified' && $results['b']['ok'] === true
+                && $state['previous'][0]['until'] > time()
+                && $state['credentials']['stripe_webhook_secret'] === ($operation === 'settings' ? 'whsec_replacement' : 'whsec_test')
+                && $native->settings()->where('key', 'ae_stripe_webhook_events')->value('value') === 'ready'
+                && !$native->settings()->where('key', 'ae_stripe_webhook_claim')->exists() && DB::table('invoice_transactions')->count() === 0;
+        },
+    ];
+}
 foreach (['owner', 'gateway', 'deleted', 'same'] as $conflict) {
     $cases['outbox-agreement-conflict-' . $conflict] = [
         'seed' => function () { customerInvoice(7, 911); customerInvoice(8, 912); },

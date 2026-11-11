@@ -23,6 +23,7 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
     $forceIncomplete = false;
     $endpoints = [$endpoint]; $failure = null; $oldKeyFailure = null; $secondPage = false; $creationCache = []; $loseCreation = false;
     Http::$handler = function ($verb, $path, $data) use (&$endpoints, &$failure, &$oldKeyFailure, &$secondPage, &$creationCache, &$loseCreation, &$forceIncomplete) {
+        check(DB::transactionLevel() === 0, 'Webhook verification HTTP runs outside every transaction');
         if ($failure === $verb) throw new RuntimeException('Synthetic provider detail must not be shown');
         if ($path === '/account') {
             $key = end(Http::$calls)[3]['Authorization'];

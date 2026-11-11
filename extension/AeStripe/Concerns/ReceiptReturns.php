@@ -45,12 +45,13 @@ trait ReceiptReturns
     {
         $this->ensureReceiptReturnSchema();
         abort_unless(preg_match('/^pi_[a-zA-Z0-9]+$/D', $paymentIntentId) && $allocationKey !== 'excess' && !$this->isReceiptObservation($allocationKey) && strlen($allocationKey) <= 180 && $allocationKey !== '' && $amountMinor > 0, 409);
-        $this->withPaymentLock($invoice, function ($user, $current) use ($paymentIntentId, $allocationKey, $amountMinor) {
+        $intent = $this->receiptRows()->where('payment_intent_id', $paymentIntentId)->first()
+            ? null : $this->request('get', '/payment_intents/' . $paymentIntentId);
+        $this->withPaymentLock($invoice, function ($user, $current) use ($paymentIntentId, $allocationKey, $amountMinor, $intent) {
             $receipt = $this->readReceipt($user, $paymentIntentId);
             if (!$receipt) {
                 $payment = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentIntentId), 'succeeded')[0] ?? null;
                 abort_unless($payment && $payment->invoice->id === $current->id && ($payment->gateway->extension ?? null) === 'AeStripe', 409);
-                $intent = $this->request('get', '/payment_intents/' . $paymentIntentId);
                 abort_unless(($intent->id ?? null) === $paymentIntentId && ($intent->status ?? null) === 'succeeded' && !empty($intent->customer)
                     && ($intent->customer ?? null) === $user->properties()->where('key', 'stripe_id')->first()?->value
                     && strtolower($intent->currency ?? '') === strtolower($current->currency_code)
