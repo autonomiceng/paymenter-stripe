@@ -317,8 +317,8 @@ trait Checkout
         $userId = $invoice->user_id;
         if ($prepareMethod) $intent = $this->prepareTransactionMethod($invoice, $intent, $status);
         ExtensionLocks::transaction('user:' . $userId, function () use ($intent, $status, $userId, $subscriptionInvoiceId) {
-            $user = User::where('id', $userId)->firstOrFail();
             $invoice = Invoice::where('id', $intent->metadata->invoice_id)->lockForUpdate()->firstOrFail();
+            $user = User::where('id', $userId)->firstOrFail();
             $this->bindWebhookAttempt($user, $invoice, $intent);
             if ($this->lockedTransactions(InvoiceTransaction::where('transaction_id', $intent->id), 'succeeded')) {
                 $this->schedulePaymentReviewAlert($invoice, $intent->id);

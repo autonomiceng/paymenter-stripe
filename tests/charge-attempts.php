@@ -114,6 +114,84 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        foreach ([false, true] as $enclosing) {
+            $run('partial-payment-snapshot-' . ($enclosing ? 'enclosing' : 'top-level'), function ($invoice, $stripe) use ($gateway, $enclosing) {
+                $invoice->total = 100;
+                DB::$trackPaymentSnapshot = true;
+                DB::$paymentSnapshot = null;
+                DB::$beforeInvoiceLock = function () {
+                    ExtensionHelper::$payments['920:manual_partial'] = ['amount' => 40, 'status' => 'succeeded', 'gateway' => 'Other'];
+                };
+                $balance = fn () => invoke($gateway, 'withPaymentLock', $invoice,
+                    fn ($user, $current) => invoke($gateway, 'paymentBalance', $current));
+                try {
+                    $amount = $enclosing ? DB::transaction(function () use ($balance) {
+                        DB::$paymentSnapshot = [];
+                        return $balance();
+                    }) : $balance();
+                    check($amount === 6000, 'A concurrent 40.00 partial payment leaves 60.00 due on a 100.00 invoice');
+                    $gateway->charge($invoice, 100, new BillingAgreement);
+                    check(count($stripe->charges) === 1 && $stripe->charges[0][1] === 6000,
+                        'Confirmation charges only the remaining 60.00 after the partial payment: ' . json_encode($stripe->charges));
+                } finally {
+                    DB::$trackPaymentSnapshot = false; DB::$paymentSnapshot = null; DB::$beforeInvoiceLock = null;
+                }
+            });
+        }
+        $run('partial-payment-owned-nesting', function ($invoice) use ($gateway) {
+            $invoice->total = 100;
+            DB::$driver = 'mariadb'; DB::$trackPaymentSnapshot = true;
+            try {
+                $amount = \Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks::transaction('user:7', function () use ($gateway, $invoice) {
+                    User::where('id', 7)->firstOrFail();
+                    ExtensionHelper::$payments['920:manual_partial'] = ['amount' => 40, 'status' => 'succeeded', 'gateway' => 'Other'];
+                    return invoke($gateway, 'withPaymentLock', $invoice,
+                        fn ($user, $current) => invoke($gateway, 'paymentBalance', $current));
+                });
+                check($amount === 6000, 'An owned transaction sees a partial payment committed after its first read');
+            } finally {
+                DB::$driver = 'sqlite'; DB::$trackPaymentSnapshot = false; DB::$paymentSnapshot = null;
+            }
+        });
+        $run('accepted-sending-opt-out', function ($invoice, $stripe) use ($gateway) {
+            foreach (ExtensionHelper::$agreements as &$row) $row['gateway_id'] = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+            unset($row);
+            User::$row->props->values['ae_stripe_auto_pay_default'] = json_encode([
+                'version' => $gateway::AUTO_PAY_CONSENT, 'user_id' => 7, 'accepted_at' => time(), 'agreement_id' => 4,
+            ]);
+            $stripe->failure = function ($verb, $path) {
+                if ($verb === 'post' && $path === '/payment_intents/pi_test1') throw new ConnectionException('Update never reached Stripe');
+            };
+            paymentStops(fn () => $gateway->chargeAutoPayAccepted($invoice, 20, new BillingAgreement));
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(isset($attempt['confirmation']['updates']), 'An unsent update retains its confirmation for recovery');
+            unset(User::$row->props->values['ae_stripe_auto_pay_default']);
+            $stripe->failure = null;
+            $gateway->retryChargeAttempts();
+            check(!$stripe->charges && !$stripe->confirms, 'Recovery cannot start an automatic debit after opt-out');
+        });
+        $run('late-refusal-new-confirmation', function ($invoice, $stripe) use ($gateway) {
+            $declined = false;
+            $stripe->failure = function ($verb, $path) use ($stripe, &$declined) {
+                if ($verb === 'post' && str_ends_with($path, '/confirm')) {
+                    $declined = true;
+                    $stripe->intents['pi_test1']->last_payment_error = (object) ['code' => 'card_declined'];
+                    throw new RequestException(402, ['error' => ['code' => 'card_declined']]);
+                }
+                if ($declined && $verb === 'get' && $path === '/payment_intents/pi_test1') {
+                    $declined = false;
+                    $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                    $attempt['confirmation']['key'] = 'confirm_newer';
+                    $attempt['confirmation']['phase'] = 'sending';
+                    $attempt['retry'] = true;
+                    User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+                }
+            };
+            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check(($attempt['confirmation']['key'] ?? null) === 'confirm_newer' && $attempt['retry'],
+                'A late refusal cannot clear a later confirmation or its recovery marker');
+        });
         $run('audit-lock-scope', function () {
             $audit = fn () => Audit::where('event', 'ae_stripe_attempt_review')->first();
             DB::transaction(function () use ($audit) {

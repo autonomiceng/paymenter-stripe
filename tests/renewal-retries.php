@@ -30,6 +30,21 @@ $renewalFixture = function ($invoice, $stripe) {
     $stripe->beforeConfirm = fn ($intent) => $intent->last_payment_error = (object) ['code' => 'card_declined'];
     return $service;
 };
+$run('renewal-sending-opt-out', function ($invoice, $stripe) use ($gateway, $renewalFixture) {
+    $service = $renewalFixture($invoice, $stripe);
+    $stripe->failure = function ($verb, $path) {
+        if ($verb === 'post' && $path === '/payment_intents/pi_test1') throw new ConnectionException('Update never reached Stripe');
+    };
+    $gateway->charge($invoice, 20, new BillingAgreement);
+    $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+    check(isset($attempt['confirmation']['updates']), 'The interrupted renewal retains its sending payload');
+    $service->billing_agreement_id = null;
+    $stripe->failure = null;
+    $stripe->beforeConfirm = null;
+    $stripe->status = 'succeeded';
+    $gateway->retryChargeAttempts();
+    check(!$stripe->charges && !$stripe->confirms, 'Recovery cannot start a reserved renewal debit after opt-out');
+});
 $dueRetry = function () {
     $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
     $attempt['renewal']['next_at'] = time() - 1;

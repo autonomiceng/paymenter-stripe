@@ -61,13 +61,14 @@ namespace App\Classes\Extension {
 }
 namespace App\Models {
     class Query {
+        private bool $currentRead = false;
         public function __construct(private $value, private ?string $model = null) {}
         public function first() { return $this->value; }
         public function exists() { return (bool) $this->value; }
-        public function firstOrFail() { return $this->value ?? throw new \RuntimeException('Missing row'); }
+        public function firstOrFail() { if (!$this->currentRead && $this->model === User::class && \Illuminate\Support\Facades\DB::$trackPaymentSnapshot && !\Illuminate\Support\Facades\DB::$readCommitted && \Illuminate\Support\Facades\DB::$locked) \Illuminate\Support\Facades\DB::$paymentSnapshot ??= \App\Helpers\ExtensionHelper::$payments; return $this->value ?? throw new \RuntimeException('Missing row'); }
         public function get() { return $this->value ? [$this->value] : []; }
         public function where($key, $value) { return $this; }
-        public function lockForUpdate() { if ($this->model === Service::class && ($hook = \Illuminate\Support\Facades\DB::$beforeServiceLock)) $hook(); if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $before = \App\Helpers\ExtensionHelper::$payments; $hook(); foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) if (($before[$key] ?? null) !== $row) \Illuminate\Support\Facades\DB::$concurrentPayments[$key] = $row; } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
+        public function lockForUpdate() { $this->currentRead = true; if ($this->model === Invoice::class && ($hook = \Illuminate\Support\Facades\DB::$beforeInvoiceLock)) { \Illuminate\Support\Facades\DB::$beforeInvoiceLock = null; $hook(); } if ($this->model === Service::class && ($hook = \Illuminate\Support\Facades\DB::$beforeServiceLock)) $hook(); if ($this->model === User::class && ($hook = \Illuminate\Support\Facades\DB::$beforeUserLock)) { \Illuminate\Support\Facades\DB::$beforeUserLock = null; $before = \App\Helpers\ExtensionHelper::$payments; $hook(); foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) if (($before[$key] ?? null) !== $row) \Illuminate\Support\Facades\DB::$concurrentPayments[$key] = $row; } if ($this->model === User::class) \Illuminate\Support\Facades\DB::$userLocked = true; \Illuminate\Support\Facades\DB::$locked = true; if ($this->model) \Illuminate\Support\Facades\DB::$modelLocks[] = $this->model; return $this; }
     }
     class Property {
         public static ?array $lastRawOrder = null;
@@ -168,17 +169,19 @@ namespace App\Models {
         public $items = [];
         public function __construct(public ?User $user = null) {}
         public function items() { return new NativeModelQuery($this->items); }
+        public function setRelation($key, $value) { $this->$key = is_array($value) ? $value : iterator_to_array($value); return $this; }
         public function getMorphClass() { return self::class; }
         public function fresh() { return $this; }
         public static function where($key, $id) { return new Query(self::$rows[$id] ?? (self::$row && self::$row->id == $id ? self::$row : null), Invoice::class); }
         public function transactions() { return new class($this->id) {
-            private $id, $status;
+            private $id, $status, $currentRead = false;
             public function __construct(private $invoiceId) {}
             public function where($key, $value) { if ($key === 'transaction_id') $this->id = $value; if ($key === 'status') $this->status = $value; return $this; }
-            public function lockForUpdate() { return $this; }
+            public function lockForUpdate() { $this->currentRead = true; return $this; }
             public function pluck($field) { return new PluckedIds(array_map('crc32', array_keys($this->get()->rows))); }
             public function get() {
-                $rows = array_filter(\App\Helpers\ExtensionHelper::$payments, fn ($row, $key) => str_starts_with($key, $this->invoiceId . ':') && (!$this->status || $row['status'] === $this->status), ARRAY_FILTER_USE_BOTH);
+                $source = !$this->currentRead && \Illuminate\Support\Facades\DB::$trackPaymentSnapshot && !\Illuminate\Support\Facades\DB::$readCommitted ? (\Illuminate\Support\Facades\DB::$paymentSnapshot ??= \App\Helpers\ExtensionHelper::$payments) : \App\Helpers\ExtensionHelper::$payments;
+                $rows = array_filter($source, fn ($row, $key) => str_starts_with($key, $this->invoiceId . ':') && (!$this->status || $row['status'] === $this->status), ARRAY_FILTER_USE_BOTH);
                 return new class($rows) implements \IteratorAggregate {
                     public function __construct(public $rows) {}
                     public function getIterator(): \Traversable { foreach ($this->rows as $key => $row) yield (object) [...$row, "transaction_id" => substr($key, strpos($key, ":") + 1), "gateway" => (object) ["extension" => $row["gateway"] ?? "AeStripe"]]; }
@@ -593,11 +596,21 @@ namespace Illuminate\Support\Facades {
     }
     class DB {
         public static $tables = [], $locks = [], $updates = [];
-        public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } }; }
+        public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } public function getDriverName() { return DB::$driver; } }; }
         public static $concurrentAgreements = [], $concurrentPayments = [];
         public static function table($name) { return match ($name) { 'ae_stripe_settlements' => new \SettlementQuery, 'ae_stripe_locks' => new \ExtensionLockQuery, 'invoice_transactions' => new \TransactionClassificationQuery, 'ae_stripe_receipt_returns' => new \ReceiptReturnQuery, 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
-        public static $beforeUserLock = null, $beforeServiceLock = null, $afterTransaction = null;
-        public static function transactionLevel() { return self::$locked ? 1 : 0; }
+        public static $beforeUserLock = null, $beforeServiceLock = null, $beforeInvoiceLock = null, $afterTransaction = null;
+        public static string $driver = 'sqlite';
+        public static bool $readCommitted = false;
+        private static bool $nextReadCommitted = false;
+        public static function statement($sql) {
+            if ($sql !== 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED' || self::transactionLevel() !== 0) throw new \RuntimeException('Unexpected isolation change');
+            self::$nextReadCommitted = true;
+        }
+        public static bool $trackPaymentSnapshot = false;
+        public static ?array $paymentSnapshot = null;
+        private static int $level = 0;
+        public static function transactionLevel() { return max(self::$level, self::$locked ? 1 : 0); }
         private static $afterCommit = [];
         public static function afterCommit($callback) { if (!self::$locked) $callback(); else self::$afterCommit[] = $callback; }
         public static $locked = false, $userLocked = false, $gatewayLocked = false;
@@ -606,10 +619,12 @@ namespace Illuminate\Support\Facades {
             $priorUserLock = self::$userLocked;
             $priorGatewayLock = self::$gatewayLocked;
             $outerLocked = self::$locked;
+            $previousIsolation = self::$readCommitted;
+            if (!$outerLocked) { self::$readCommitted = self::$nextReadCommitted; self::$nextReadCommitted = false; }
             // A completed transaction's read view cannot survive into a new save transaction.
             $agreementSnapshot = \App\Models\BillingAgreement::$snapshot;
             if (!$outerLocked) \App\Models\BillingAgreement::$snapshot = null;
-            if (!$outerLocked) self::$concurrentPayments = [];
+            if (!$outerLocked) { self::$concurrentPayments = []; self::$paymentSnapshot = null; }
             $callbacks = count(self::$afterCommit);
             $properties = \App\Models\User::$row?->props->values;
             $before = self::$tables;
@@ -620,8 +635,9 @@ namespace Illuminate\Support\Facades {
             $audit = \App\Models\Audit::$rows;
             $notifications = \App\Models\Notification::$rows;
             self::$locked = true;
+            ++self::$level;
             try { $result = $callback(); } catch (\Throwable $e) { self::$afterCommit = array_slice(self::$afterCommit, 0, $callbacks); if (\App\Models\User::$row && $properties !== null) \App\Models\User::$row->props->values = $properties; self::$tables = $before; \App\Helpers\ExtensionHelper::$payments = array_replace($payments, self::$concurrentPayments); \App\Models\Credit::$rows = $credits; \App\Helpers\ExtensionHelper::$agreements = array_replace($agreements, self::$concurrentAgreements); \App\Helpers\ExtensionHelper::$fees = $fees; \App\Models\Audit::$rows = $audit; \App\Models\Notification::$rows = $notifications; throw $e; }
-            finally { self::$locked = $outerLocked; self::$userLocked = $priorUserLock; self::$gatewayLocked = $priorGatewayLock; if (!$outerLocked) \App\Models\BillingAgreement::$snapshot = $agreementSnapshot; }
+            finally { self::$readCommitted = $previousIsolation; --self::$level; self::$locked = $outerLocked; self::$userLocked = $priorUserLock; self::$gatewayLocked = $priorGatewayLock; if (!$outerLocked) \App\Models\BillingAgreement::$snapshot = $agreementSnapshot; }
             if ($hook = self::$afterTransaction) { self::$afterTransaction = null; $hook(); }
             if (!$outerLocked) { $pending = self::$afterCommit; self::$afterCommit = []; foreach ($pending as $callback) $callback(); }
             return $result;

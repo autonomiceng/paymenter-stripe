@@ -368,8 +368,8 @@ trait CheckoutIntent
     private function withPaymentLock($invoice, callable $callback, ?callable $rerun = null)
     {
         $locked = function () use ($invoice, $callback) {
-            $user = User::where('id', $invoice->user_id)->firstOrFail();
             $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
+            $user = User::where('id', $invoice->user_id)->firstOrFail();
             abort_unless($current->user_id === $user->id, 403);
             return $callback($user, $current);
         };
@@ -391,6 +391,7 @@ trait CheckoutIntent
 
     private function paymentBalance($invoice): int
     {
+        if (DB::transactionLevel() > 1) $invoice->setRelation('items', $invoice->items()->lockForUpdate()->get());
         $paid = array_sum(array_map(fn ($row) => $row->amount, $this->lockedTransactions($invoice->transactions(), 'succeeded')));
         return $this->toMinorUnits($invoice->total - $paid, $invoice->currency_code);
     }
@@ -418,16 +419,15 @@ trait CheckoutIntent
     }
 
     /**
-     * Invoice transactions matching the query, with the given status, read under the payment locks. Paymenter writes a
-     * transaction while holding the invoice row lock (ExtensionHelper::addPayment) and this extension also holds the
-     * owner's user row lock, so a plain read sees the latest rows. Only the rows found are then locked, by primary key, in
-     * id order. invoice_transactions has no transaction_id index, so a locking read by transaction_id locks every row
-     * and gap of the table, and a locking read by invoice locks the invoice_id index gap shared with the next invoice.
-     * The payment inserted next waits on either, so two settlements, or a Pay and a settlement, deadlock.
+     * Discover payments after the invoice lock, then lock existing rows by primary key in id order. An enclosing
+     * transaction needs locking discovery because its earlier read view can omit newly committed payments. Fresh
+     * transactions avoid range locks: invoice_transactions has no transaction_id index, and even invoice_id locks
+     * share an index gap with the next invoice, so two settlements that subsequently insert could deadlock.
      */
     private function lockedTransactions($query, ?string $status = null): array
     {
-        $ids = ($status === null ? $query : $query->where('status', $status))->pluck('id')->all();
+        $query = $status === null ? $query : $query->where('status', $status);
+        $ids = ExtensionLocks::currentRead($query)->pluck('id')->all();
         $locked = [];
         sort($ids);
         foreach ($ids as $id) {
@@ -547,7 +547,13 @@ trait CheckoutIntent
         // Records Stripe's answer: a proven refusal ends this confirmation, and a declined renewal is recorded as failed.
         // The refusal, the failed payment and the renewal policy commit in one owner and invoice transaction, or not at all.
         $record = function ($outcome, bool $oneShot = false) use ($invoice, $attempt, &$previous) {
-            return $this->withPaymentLock($invoice, function () use ($outcome, $invoice, $attempt, $previous) {
+            return $this->withPaymentLock($invoice, function ($user, $current) use ($outcome, $invoice, $attempt, $previous) {
+                // A late answer belongs only to its own confirmation, never to a later instruction on the same intent.
+                $stored = $this->readPaymentAttempt($user, $current);
+                if (($stored['confirmation']['key'] ?? null) !== $attempt['confirmation']['key']) {
+                    if (!is_array($outcome) && $outcome->status !== 'requires_payment_method') return $outcome;
+                    return new PaymentPendingException('Payment changed. Refresh the invoice to check its status.');
+                }
                 // Repeat the idempotent re-key if the confirmation transaction rolled back.
                 if ($previous) $this->keepFailedAttempt($previous);
                 if (is_array($outcome)) {
@@ -576,7 +582,6 @@ trait CheckoutIntent
                 if (($stored['confirmation']['key'] ?? null) !== $attempt['confirmation']['key']) return null;
                 if (!empty($stored['action'])) return null;
                 if (!in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) return $intent;
-                if (isset($stored['confirmation']['updates'])) return $stored['confirmation'];
                 if (!empty($stored['automatic_renewal']) && (empty($stored['renewal'])
                     || $stored['renewal']['state'] !== 'active' || !$this->renewalStillAuthorized($current, $stored['renewal']))) {
                     return new DisplayException('Auto Pay stopped for this renewal. Open the invoice to pay the amount due.');
@@ -604,6 +609,7 @@ trait CheckoutIntent
                 if (($intent->confirmation_method ?? null) !== 'manual' && !$this->isElementsAttempt($stored, $intent)) return new DisplayException('The payment form changed. Refresh the invoice before paying.');
                 if (isset($params['confirmation_token']) && (!$this->isElementsAttempt($stored, $intent)
                     || !isset($intent->payment_method_types) || !self::sameMethodTypes($intent->payment_method_types, ['card', 'link']))) return new DisplayException('The payment form changed. Refresh the invoice before paying.');
+                if (isset($stored['confirmation']['updates'])) return $stored['confirmation'];
                 $updates = ['amount' => $amount];
                 foreach (['metadata', 'setup_future_usage'] as $field) {
                     if (array_key_exists($field, $params)) { $updates[$field] = $params[$field]; unset($params[$field]); }

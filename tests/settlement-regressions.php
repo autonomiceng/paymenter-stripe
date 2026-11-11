@@ -451,3 +451,30 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
         beforeWrite('invoice_transactions', null);
     }
 })();
+
+// Internally nested settlement must not regain range locks that block another customer's first payment insert.
+(function () use ($gateway, $reset) {
+    $reset();
+    $invoice = nativeInvoice(481, 20, 'USD');
+    nativeService('sub_owned', [$invoice]);
+    $intent = (object) ['id' => 'pi_owned', 'status' => 'succeeded', 'amount' => 2000,
+        'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner'];
+    $stripeInvoice = (object) ['id' => 'in_owned', 'currency' => 'usd', 'amount_paid' => 2000,
+        'metadata' => (object) ['ae_stripe_invoice_id' => 481],
+        'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) ['subscription' => 'sub_owned']]];
+    $GLOBALS['stripeHandler'] = function ($verb, $path) use ($intent) {
+        if ($verb === 'get' && $path === '/invoice_payments') return ['data' => [
+            ['status' => 'paid', 'amount_paid' => 2000, 'payment' => ['type' => 'payment_intent', 'payment_intent' => 'pi_owned']]]];
+        if ($verb === 'get' && $path === '/payment_intents/pi_owned') return $intent;
+        throw new RuntimeException('Unexpected subscription request: ' . $verb . ' ' . $path);
+    };
+    $recording = true; $rangeLocks = [];
+    DB::listen(function ($query) use (&$recording, &$rangeLocks) {
+        if ($recording && str_contains($query->sql, 'from "invoice_transactions"')
+            && str_contains($query->sql, '/* for update */') && !preg_match('/where (?:"invoice_transactions"\.)?"id" = \?/', $query->sql)) $rangeLocks[] = $query->sql;
+    });
+    try { invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice); }
+    finally { $recording = false; }
+    check(!$rangeLocks && payments()['481:pi_owned']['amount'] === 20.0,
+        'Owned subscription settlement records its payment using only exact payment-row locks');
+})();

@@ -616,6 +616,46 @@ $cases['outbox-credit-after-http'] = ['seed' => function () {
 }, 'b' => fn () => Invoice::where('id', 968)->update(['status' => 'paid']),
     'check' => fn ($results) => $results['a']['ok'] === false && Invoice::find(968)->status === 'paid' && DB::table('invoice_transactions')->count() === 0];
 
+// A core payment holds the invoice without taking the extension scope. B may already have a read view.
+foreach ([false, true] as $enclosing) {
+    $cases['partial-payment-current-' . ($enclosing ? 'enclosing' : 'top-level')] = [
+        'seed' => fn () => customerInvoice(7, 942, 100), 'waits' => true,
+        'pause' => '/^insert into `invoice_transactions`/',
+        'a' => function () { App\Helpers\ExtensionHelper::addPayment(Invoice::find(942), 'Other', 40, null, 'manual_partial'); return 'partial'; },
+        'b' => function ($gateway) use ($enclosing) {
+            $invoice = Invoice::find(942);
+            $read = fn () => invoke($gateway, 'withPaymentLock', $invoice,
+                fn ($user, $current) => invoke($gateway, 'paymentBalance', $current));
+            return $enclosing ? DB::transaction(function () use ($read) {
+                DB::table('invoice_transactions')->count();
+                return $read();
+            }) : $read();
+        },
+        'check' => fn ($results) => $results['b']['ok'] === 6000 && $rows(942) === [[40.0, 'succeeded', false]],
+    ];
+}
+$cases['receipt-current-enclosing'] = [
+    'seed' => function () use ($gateway) {
+        customerInvoice(7, 943, 100);
+        $intent = intentOf(943, 'succeeded', 10000);
+        invoke($gateway, 'recordIntentPayment', $intent, 'succeeded');
+        App\Models\Gateway::where('extension', 'AeStripe')->update(['enabled' => false]);
+        $handler = $GLOBALS['stripeHandler'];
+        $GLOBALS['stripeHandler'] = fn () => $intent;
+        try { $gateway->allocateReceiptReturn(Invoice::find(943), 'pi_943', 'first', 1000); }
+        finally { $GLOBALS['stripeHandler'] = $handler; }
+    }, 'waits' => true, 'pause' => '/^insert into `ae_stripe_receipt_returns`/',
+    'a' => fn ($gateway) => $gateway->allocateReceiptReturn(Invoice::find(943), 'pi_943', 'second', 5000)['state'],
+    'b' => fn ($gateway) => DB::transaction(function () use ($gateway) {
+        DB::table('ae_stripe_receipt_returns')->count();
+        try { $gateway->allocateReceiptReturn(Invoice::find(943), 'pi_943', 'third', 5000); }
+        catch (Symfony\Component\HttpKernel\Exception\HttpException $e) { return $e->getStatusCode(); }
+        return 'overallocated';
+    }),
+    'check' => fn ($results) => $results['a']['ok'] === 'reserved' && $results['b']['ok'] === 409
+        && (int) DB::table('ae_stripe_receipt_returns')->sum('amount_minor') === 6000,
+];
+
 if (($argv[1] ?? null) === 'worker') {
     $case = $cases[$argv[2]];
     if ($argv[3] === 'b' && !empty($case['prepared_b'])) {

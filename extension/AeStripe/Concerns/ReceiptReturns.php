@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Helpers\ExtensionHelper;
 use App\Models\{Audit, Credit, Invoice, InvoiceTransaction};
 use Illuminate\Support\Facades\DB;
@@ -66,7 +68,7 @@ trait ReceiptReturns
     private function readReceipt($user, string $id): ?array
     {
         $receipt = null;
-        foreach ($this->receiptRows()->where('payment_intent_id', $id)->get() as $row) {
+        foreach (ExtensionLocks::currentRead($this->receiptRows()->where('payment_intent_id', $id))->get() as $row) {
             if (!$row = $this->lockedReceiptRow($id, $row->allocation_key)) continue;
             abort_unless((int) $row->user_id === (int) $user->id, 409);
             $binding = ['invoice_id' => (int) $row->invoice_id, 'payment_intent_id' => $id,
@@ -85,15 +87,13 @@ trait ReceiptReturns
     }
 
     /**
-     * One receipt row, read under the owner's user row lock: every insert of these rows holds it, so a plain read sees
-     * the latest rows, and only a row that exists is then locked by its full key. A locking read of a missing row, or of
-     * all rows of a payment, would lock an index gap shared with other customers' payments, and the row inserted next
-     * goes into that gap: two settlements doing this at once deadlock.
+     * Fresh payment transactions read after the scope and invoice locks, without locking missing-key gaps shared by
+     * other payments. Enclosing transactions need current reads even for discovery, despite the possible gap locks.
      */
     private function lockedReceiptRow(string $id, string $key): ?object
     {
         $row = fn () => $this->receiptRows()->where('payment_intent_id', $id)->where('allocation_key', $key);
-        return $row()->first() ? $row()->first() : null;
+        return ExtensionLocks::currentRead($row())->first();
     }
 
     private function receiptNotice(array $a): string
