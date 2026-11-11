@@ -268,3 +268,25 @@ foreach ([11 => 341, 12 => 342] as $userId => $invoiceId) {
     check((json_decode(User::find($userId)->properties()->where('key', 'ae_stripe_checkout_' . $invoiceId)->value('value'), true)['renewal']['state'] ?? null) === 'stopped',
         'Turning Auto Pay on stops the customer\'s waiting renewal retry');
 }
+
+// Two first-time customers save a card at once: each numbers its first saved card.
+$customer(13, 'cus_13');
+$customer(14, 'cus_14');
+foreach ([13, 14] as $userId) {
+    $methods['pm_save_' . $userId] = (object) ['id' => 'pm_save_' . $userId, 'customer' => 'cus_' . $userId, 'type' => 'card', 'allow_redisplay' => 'unspecified',
+        'card' => (object) ['fingerprint' => 'fp_save_' . $userId, 'brand' => 'visa', 'last4' => '4242', 'exp_month' => 5, 'exp_year' => 2030]];
+}
+$GLOBALS['stripeHandler'] = nativeMethodHandler($methods);
+$save = fn (int $userId) => traced(function () use ($gateway, $methods, $userId) {
+    auth()->login(User::findOrFail($userId));
+    invoke($gateway, 'persistSavedMethod', User::findOrFail($userId), $methods['pm_save_' . $userId], []);
+});
+$indexNow();
+$firstTrace = $save(13);
+$secondTrace = $save(14);
+check($insertedKey($firstTrace, 'ae_stripe_save_sequence') && $insertedKey($secondTrace, 'ae_stripe_save_sequence')
+    && App\Models\BillingAgreement::where('external_reference', 'pm_save_13')->where('user_id', 13)->exists()
+    && App\Models\BillingAgreement::where('external_reference', 'pm_save_14')->where('user_id', 14)->exists(),
+    'Each first-time customer saves its card and numbers it');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
+    'Two first-time customers saving a card at once never deadlock on the save sequence');

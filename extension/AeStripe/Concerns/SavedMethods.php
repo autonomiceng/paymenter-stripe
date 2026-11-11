@@ -292,7 +292,7 @@ trait SavedMethods
             User::where('id', $user->id)->lockForUpdate()->firstOrFail();
             if (!$receipt) {
                 $sequenceKey = 'ae_stripe_save_sequence';
-                $sequence = 1 + (int) ($user->properties()->where('key', $sequenceKey)->lockForUpdate()->first()?->value ?? 0);
+                $sequence = 1 + (int) ($this->lockedUserProperty($user, $sequenceKey)?->value ?? 0);
                 $user->properties()->updateOrCreate(['key' => $sequenceKey], ['value' => (string) $sequence]);
                 $receipt = ['incoming' => $incomingId, 'consent' => $consent + ['accepted_at' => time(), 'user_id' => $user->id, 'sequence' => $sequence]];
                 $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($receipt, JSON_THROW_ON_ERROR)]);
