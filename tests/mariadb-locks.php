@@ -136,7 +136,31 @@ function invoiceStaff(): void
     $role = App\Models\Role::create(['name' => 'Invoice staff', 'permissions' => ['admin.invoices.viewAny', 'admin.invoices.view', 'admin.invoices.update']]);
     foreach ([7, 8] as $id) User::find($id)->update(['role_id' => $role->id]);
 }
-$cases = [ 'staff-reversal-notice-retry' => ['seed' => function () use ($gateway) {
+$cases = [
+    // Real recipient foreign keys and a full retry batch expose deleted users blocking later notices.
+    'deleted-notice-recipients' => ['seed' => function () {
+        customerInvoice(7, 591); customerInvoice(8, 592);
+        $deleted = User::forceCreate(['id' => 98, 'first_name' => 'Former', 'last_name' => 'Staff',
+            'email' => 'former@example.test', 'password' => 'synthetic']);
+        $notice = fn ($id) => ['user_id' => $id, 'title' => 'Queued payment notice', 'body' => 'Fixture', 'url' => '/'];
+        foreach (array_merge(array_fill(0, 100, [98]), [[98, 7], [8]]) as $recipients) {
+            App\Models\Audit::create(['event' => 'ae_stripe_attempt_review', 'auditable_type' => Invoice::class,
+                'auditable_id' => 591, 'old_values' => [], 'new_values' => [
+                    'notice_sent' => false, 'notices' => array_map($notice, $recipients)]]);
+        }
+        $deleted->delete();
+    }, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
+        invoke($gateway, 'retryPaymentNotices');
+        check(App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', true)->count() === 100,
+            'Deleted-only recipients complete the first retry batch');
+        invoke($gateway, 'retryPaymentNotices');
+        invoke($gateway, 'retryPaymentNotices');
+        return 'retried';
+    }, 'b' => fn ($gateway) => settle($gateway, 592),
+    'check' => fn () => DB::table('notifications')->orderBy('user_id')->pluck('user_id')->all() === [7, 8]
+        && App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', true)->count() === 102
+        && Invoice::find(592)->status === 'paid'],
+    'staff-reversal-notice-retry' => ['seed' => function () use ($gateway) {
         customerInvoice(7, 561); customerInvoice(8, 562);
         invoiceStaff();
         settle($gateway, 561);

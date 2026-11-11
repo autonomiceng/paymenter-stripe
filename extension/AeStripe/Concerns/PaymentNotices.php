@@ -2,7 +2,7 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
-use App\Models\{Audit, Notification};
+use App\Models\{Audit, Notification, User};
 use Illuminate\Support\Facades\DB;
 
 trait PaymentNotices
@@ -31,8 +31,12 @@ trait PaymentNotices
                 $values = $audit->new_values;
                 if (($values['notice_sent'] ?? true) || !isset($values['notices'])) return;
                 $notices = $values['notices'];
+                $live = [];
+                foreach (User::whereIn('id', array_column($notices, 'user_id'))->get() as $recipient) $live[$recipient->id] = true;
                 usort($notices, fn ($a, $b) => $a['user_id'] <=> $b['user_id']);
-                foreach ($notices as $notice) Notification::create($notice);
+                foreach ($notices as $notice) {
+                    if (isset($live[$notice['user_id']])) Notification::create($notice);
+                }
                 $audit->update(['new_values' => array_replace($values, ['notice_sent' => true])]);
             });
         } catch (\Throwable $e) { report($e); } // Roll back inserts and retain the marker for scheduled retry.

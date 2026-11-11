@@ -140,6 +140,13 @@ namespace App\Models {
         public function getMorphClass() { return self::class; }
         public function __get($key) { return $this->props; }
         public static function where($key, $id) { return new Query(self::$row && self::$row->$key == $id ? self::$row : null, User::class); }
+        public static function whereIn($key, $ids) { return new class($key, $ids) {
+            public function __construct(private $key, private $ids) {}
+            public function get() {
+                return array_filter(array_merge(User::$row ? [User::$row] : [], User::whereNotNull('role_id')->get()),
+                    fn ($user) => in_array($user->{$this->key}, $this->ids));
+            }
+        }; }
         public static function findOrFail($id) { return self::$row; }
         public static function whereNotNull($key) { return new class { public function get() {
             if (User::$noticeStaff !== null) return User::$noticeStaff;
