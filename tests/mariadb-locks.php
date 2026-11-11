@@ -118,7 +118,7 @@ $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($defau
 };
 $cases = [
     // Both public Pay returns finish preparation before overlapping final card saves.
-    'pay-return-card-save' => ['audit' => true, 'prepared_b' => true, 'seed' => function () {
+    'pay-return-card-save' => ['prepared_b' => true, 'seed' => function () {
             foreach (['cache' => false, 'cache_locks' => true] as $table => $locks) {
                 Illuminate\Support\Facades\Schema::create($table, function ($schema) use ($locks) {
                     $schema->string('key')->primary();
@@ -137,7 +137,7 @@ $cases = [
                 === [[7, 'pm_801'], [8, 'pm_802']]
             && DB::table('audits')->where('auditable_type', App\Models\Property::class)->count() > 0],
     // A gateway staff member also owns the settling invoice (the access alert's notification recipient FK).
-    'access-staff-settlement' => ['audit' => true, 'seed' => function () {
+    'access-staff-settlement' => ['seed' => function () {
             customerInvoice(7, 801);
             $role = App\Models\Role::create(['name' => 'Gateway staff', 'permissions' => ['admin.gateways.viewAny', 'admin.gateways.update']]);
             User::find(7)->update(['role_id' => $role->id]);
@@ -187,7 +187,6 @@ $cases = [
             User::find(7)->properties()->create(['key' => 'ae_stripe_checkout_801', 'value' => json_encode([
                 'version' => 2, 'key' => 'checkout_801', 'created' => time(), 'retry' => true])]);
         },
-        'audit' => true,
         'pause' => '/^insert into `invoice_transactions`/',
         'a' => function ($gateway) {
             $intent = intentOf(801, 'succeeded', 2000);
@@ -244,7 +243,7 @@ $cases = [
         'a' => fn ($gateway) => invoke($gateway, 'recordSubscriptionReview', paidSubscription(811), 'Service missing') ?? 'recorded',
         'b' => fn () => App\Helpers\ExtensionHelper::addPayment(811, 'Other', 20, null, 'other_811')->id,
         'check' => fn () => $rows(811) === [[20.0, 'succeeded', false]] && Invoice::find(811)->status === 'paid'],
-    'gateway-access' => ['audit' => true, 'seed' => fn () => customerInvoice(7, 812),
+    'gateway-access' => ['seed' => fn () => customerInvoice(7, 812),
         'pause' => '/^insert into `audits`/',
         'a' => fn ($gateway) => invoke($gateway, 'notifyPaymentAccessRefusal') ?? 'recorded',
         'b' => fn () => App\Helpers\ExtensionHelper::addPayment(812, 'Other', 20, null, 'other_812')->id,
@@ -418,10 +417,6 @@ $cases = [
 
 if (($argv[1] ?? null) === 'worker') {
     $case = $cases[$argv[2]];
-    if (!empty($case['audit'])) {
-        config(['audit.enabled' => true, 'audit.console' => true]);
-        App\Models\Property::observe(OwenIt\Auditing\AuditableObserver::class);
-    }
     if ($argv[3] === 'b' && !empty($case['prepared_b'])) {
         pauseBefore('/^final-save$/');
         $userLocks = 0;

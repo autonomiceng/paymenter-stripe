@@ -31,7 +31,7 @@ require_once $release . '/app/Classes/helpers.php';
 foreach (Illuminate\Foundation\Events\DiscoverEvents::within($release . '/app/Listeners', $release) as $event => $listeners) {
     foreach ($listeners as $listener) Illuminate\Support\Facades\Event::listen($event, $listener);
 }
-config(['hashing.bcrypt.rounds' => 4, 'audit.enabled' => false, 'settings.mail_disabled' => true, 'settings.default_currency' => 'USD',
+config(['hashing.bcrypt.rounds' => 4, 'audit.enabled' => true, 'audit.console' => true, 'settings.mail_disabled' => true, 'settings.default_currency' => 'USD',
     'settings.tax_enabled' => false, 'app.version' => 'development']);
 if (DB::connection()->getDriverName() !== 'mariadb' || !str_contains(DB::selectOne('select version() as v')->v, 'MariaDB')) throw new RuntimeException('A MariaDB server is required.');
 Http::preventStrayRequests();
