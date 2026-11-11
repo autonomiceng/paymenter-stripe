@@ -591,6 +591,9 @@ trait CheckoutIntent
                     return new DisplayException('The Auto Pay card changed. Refresh Payment methods before paying.');
                 }
                 $amount = $this->paymentBalance($current);
+                if (isset($stored['confirmation']['updates']) && ($stored['confirmation']['updates']['amount'] ?? null) !== $amount) {
+                    $this->paymentPending('The amount due changed. We are checking the earlier payment automatically.');
+                }
                 if ($current->status !== 'pending' || $amount <= 0) return new DisplayException('This invoice has no payment due. Refresh the invoice.');
                 if ($expectedCurrency !== null && strtolower($current->currency_code) !== strtolower($expectedCurrency)
                     || strtolower($intent->currency) !== strtolower($current->currency_code) || $expectedAmount !== null && $amount !== $expectedAmount) {

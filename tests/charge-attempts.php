@@ -153,6 +153,33 @@ use Illuminate\Support\Facades\{DB, Http};
                 DB::$driver = 'sqlite'; DB::$trackPaymentSnapshot = false; DB::$paymentSnapshot = null;
             }
         });
+        $run('sending-amount-changed-after-read', function ($invoice, $stripe) use ($gateway) {
+            $invoice->total = 100;
+            $stripe->failure = function ($verb, $path) {
+                if ($verb === 'post' && $path === '/payment_intents/pi_test1') throw new ConnectionException('Update never reached Stripe');
+            };
+            paymentStops(fn () => $gateway->charge($invoice, 100, new BillingAgreement));
+            $before = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check($before['confirmation']['updates']['amount'] === 10000, 'The interrupted update retains its original 100.00 payload');
+            $stripe->failure = null;
+            $handler = Http::$handler; $partial = false; $calls = count(Http::$calls);
+            Http::$handler = function ($verb, $path, $data) use ($handler, &$partial) {
+                if (!$partial && $verb === 'get' && $path === '/payment_methods/pm_test') {
+                    $partial = true;
+                    ExtensionHelper::$payments['920:manual_partial'] = ['amount' => 40, 'status' => 'succeeded', 'gateway' => 'Other'];
+                }
+                return $handler($verb, $path, $data);
+            };
+            $gateway->retryChargeAttempts();
+            $after = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+            check($partial && !$stripe->charges && !$stripe->confirms,
+                'Recovery refuses the stored 100.00 after a 40.00 payment commits during its payment-method read');
+            check($after['key'] === $before['key'] && $after['confirmation'] === $before['confirmation']
+                && $after['params'] === $before['params'] && $after['retry'],
+                'The uncertain send keeps its idempotency key, immutable payload and recovery marker');
+            check(!array_filter(array_slice(Http::$calls, $calls), fn ($call) => $call[0] === 'post' && str_starts_with($call[1], '/payment_intents/')),
+                'The changed balance sends neither an update nor a confirmation');
+        });
         $run('accepted-sending-opt-out', function ($invoice, $stripe) use ($gateway) {
             foreach (ExtensionHelper::$agreements as &$row) $row['gateway_id'] = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
             unset($row);
