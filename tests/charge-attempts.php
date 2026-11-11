@@ -698,8 +698,11 @@ use Illuminate\Support\Facades\{DB, Http};
             $gateway->pay($invoice, 20);
             $stripe->failure = fn ($verb, $path) => $verb === 'get' && $path === '/payment_intents/pi_test1' ? throw new RequestException(404) : null;
             paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $locks = count(DB::$modelLocks);
             $gateway->resolveChargeAttempt($invoice, null, 'Original Stripe account support case confirms no charge');
             check(!isset(User::$row->props->values['ae_stripe_checkout_920']), 'A permanently missing ID has an audited no-charge release');
+            // A locking audits read would lock the gap after the invoice's records, shared with neighbouring invoices.
+            check(!in_array(Audit::class, array_slice(DB::$modelLocks, $locks), true), 'A no-charge release checks staff reviews without locking audit rows');
             check(end(Audit::$rows)['new_values']['payment_intent_id'] === 'pi_test1', 'Missing-ID release audits the original identity');
         });
         $run('missing-release-money', function ($invoice, $stripe) use ($gateway) {

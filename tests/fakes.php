@@ -358,7 +358,7 @@ namespace App\Models {
             public function where($key, $value) { $this->filters[$key] = $value; return $this; }
             public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = Audit::class; return $this; }
             public function first() {
-                if (!$this->currentRead && \Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Review guard must use a current read');
+                if (!$this->currentRead && \Illuminate\Support\Facades\DB::$locked && !\Illuminate\Support\Facades\DB::$userLocked) throw new \RuntimeException('Review guard needs the owner lock');
                 foreach (Audit::$rows as $row) {
                     foreach ($this->filters as $key => $value) {
                         $actual = str_starts_with($key, 'new_values->') ? ($row['new_values'][substr($key, 12)] ?? null) : ($row[$key] ?? null);

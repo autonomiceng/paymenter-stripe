@@ -170,8 +170,8 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
             && $record->new_values['reason'] === (str_contains($reason, 'currency') ? 'currency mismatch' : 'customer mismatch'),
             'Subscription staff record preserves binding, received units and refusal reason: ' . $reason);
         check(array_slice(lockLog(), $locks, 4) === ['users', 'services', 'invoice_transactions', 'invoices']
-            && in_array('audits', array_slice(lockLog(), $locks), true),
-            'Subscription refusal locks owner and bound invoice before the shared audit guard');
+            && !in_array('audits', array_slice(lockLog(), $locks), true),
+            'Subscription refusal locks owner and bound invoice, then reads the shared staff review without locking audit rows');
         check(!str_contains(json_encode($record->toArray()), 'cus_foreign') && !str_contains(json_encode($record->toArray()), $invoice->user->email),
             'Subscription review excludes customer details');
     }

@@ -376,9 +376,7 @@ trait Checkout
                 array_replace($attempt, ['state' => 'reconcile', 'reason' => $reason, 'retry' => true, 'alert_sent' => true, 'funds_pending' => true]));
         }
         $this->schedulePaymentReviewAlert($invoice, $intent->id);
-        $review = Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
-            ->where('event', 'ae_stripe_payment_review')->where('new_values->payment_intent_id', $intent->id)->lockForUpdate()->first();
-        if (!$review) Audit::create([
+        if (!$this->invoiceAuditExists($invoice, 'ae_stripe_payment_review', ['payment_intent_id' => $intent->id])) Audit::create([
             'event' => 'ae_stripe_payment_review',
             'auditable_type' => $invoice->getMorphClass(), 'auditable_id' => $invoice->id,
             'old_values' => [],
@@ -394,6 +392,20 @@ trait Checkout
             $invoice->user->properties()->updateOrCreate(['key' => $key],
                 ['value' => json_encode(['reason' => $reason, 'sent' => false], JSON_THROW_ON_ERROR)]);
         }
+    }
+
+    /**
+     * Whether the invoice has a staff record of this event with these values. Every writer of these records holds the
+     * invoice owner's row lock, and so does the caller before its first plain read, so a plain read sees every record. A
+     * locking read would lock the audits index gap after the invoice's records, which neighbouring invoices without audit
+     * rows share (core audits nothing from the console), and the record inserted next goes into that gap: two invoices
+     * doing this at once deadlock.
+     */
+    private function invoiceAuditExists($invoice, string $event, array $values): bool
+    {
+        $query = Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)->where('event', $event);
+        foreach ($values as $field => $value) $query = $query->where('new_values->' . $field, $value);
+        return (bool) $query->first();
     }
 
     private function schedulePaymentReviewAlert($invoice, string $intentId): void

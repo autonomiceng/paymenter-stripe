@@ -39,8 +39,7 @@ trait ChargeRecovery
         $this->withPaymentLock($invoice, function ($user, $current) {
             $attempt = $this->readPaymentAttempt($user, $current);
             if (($attempt['state'] ?? null) !== 'reconcile' || ($attempt['alert_sent'] ?? false)) return;
-            if (!Audit::where('auditable_type', $current->getMorphClass())->where('auditable_id', $current->id)
-                ->where('event', 'ae_stripe_attempt_review')->where('new_values->attempt_key', $attempt['key'])->lockForUpdate()->first()) {
+            if (!$this->invoiceAuditExists($current, 'ae_stripe_attempt_review', ['attempt_key' => $attempt['key']])) {
                 Audit::create(['event' => 'ae_stripe_attempt_review', 'auditable_type' => $current->getMorphClass(),
                     'auditable_id' => $current->id, 'old_values' => [], 'new_values' => [
                         'attempt_key' => $attempt['key'], 'reason' => $attempt['reason'],
@@ -278,8 +277,7 @@ trait ChargeRecovery
                     throw new \App\Exceptions\DisplayException('A debit was sent for ' . ($attempt['intent'] ?? '(missing ID)') . '. In the original Stripe account, open it in Workbench Inspector > Logs and read request details for confirm key ' . ($attempt['confirmation']['key'] ?? '(missing)') . '. Logs must cover ' . gmdate('Y-m-d H:i', $attempt['created']) . ' UTC onward. If you cannot verify the key there, get Stripe support proof for that account, payment, key and dates. Use --checked-confirm-key only with proof it never reached Stripe.');
                 }
                 if (!empty($attempt['funds_pending'])
-                    || Audit::where('auditable_type', $current->getMorphClass())->where('auditable_id', $current->id)
-                        ->where('event', 'ae_stripe_payment_review')->where('new_values->payment_intent_id', $attempt['intent'] ?? '')->lockForUpdate()->first()
+                    || $this->invoiceAuditExists($current, 'ae_stripe_payment_review', ['payment_intent_id' => $attempt['intent'] ?? ''])
                     || \App\Models\InvoiceTransaction::where('transaction_id', $attempt['intent'] ?? '')->where('status', 'processing')->exists()
                     || \App\Models\InvoiceTransaction::where('transaction_id', $attempt['intent'] ?? '')->where('status', 'succeeded')->exists()) {
                     throw new \App\Exceptions\DisplayException('This payment may still hold money. Restore access to its Stripe account and account for the funds first.');
@@ -298,9 +296,7 @@ trait ChargeRecovery
 
     private function paymentManuallyAccounted($invoice, string $intentId): bool
     {
-        return (bool) Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
-            ->where('event', 'ae_stripe_attempt_resolved')->where('new_values->payment_intent_id', $intentId)
-            ->where('new_values->funds_accounted', true)->lockForUpdate()->first();
+        return $this->invoiceAuditExists($invoice, 'ae_stripe_attempt_resolved', ['payment_intent_id' => $intentId, 'funds_accounted' => true]);
     }
 
     private function bindWebhookAttempt($user, $invoice, $intent, ?string $requestKey = null): void

@@ -78,7 +78,8 @@ $connection->beforeExecuting(function ($sql, $bindings) {
     $locked = str_contains($sql, '/* for update */');
     // Guards that MariaDB and the payment design require but SQLite cannot enforce.
     if (str_starts_with($sql, 'insert into "audits"') && $level === 0) throw new RuntimeException('Review record lock missing');
-    if (preg_match('/^select .* from "audits"/', $sql) && $level > 0 && !$locked) throw new RuntimeException('Review guard must use a current read');
+    // A plain review read sees every record only under the owner lock that every review writer holds.
+    if (preg_match('/^select .* from "audits"/', $sql) && $level > 0 && !$locked && !holdsLock('users')) throw new RuntimeException('Review guard needs the owner lock');
     if (preg_match('/^select .* from "invoice_transactions" where "transaction_id" = \? and "status" = \?/', $sql) && $level > 0 && !$locked) {
         throw new RuntimeException('Settlement guard must use a current read');
     }

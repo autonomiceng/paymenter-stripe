@@ -6,7 +6,9 @@
 // index entry, and an insert into a gap waits for every other transaction that locked it. Two transactions that each
 // lock one gap and then insert into it wait on each other, which MariaDB reports as deadlock SQLSTATE 40001.
 // A locking `like` read of a key prefix scans and locks every customer's keys in that range, with the gaps between them
-// and the gap after the last.
+// and the gap after the last. The same rule is modelled on the audits index (auditable_type, auditable_id), where a
+// locking read always locks the gap after the invoice's records and a new record goes into it. Its gaps are named
+// "audits:N".
 use App\Models\{Invoice, User};
 use Illuminate\Database\Events\TransactionBeginning;
 use Illuminate\Support\Facades\{DB, Event};
@@ -21,13 +23,25 @@ function gapOf(array $entry): int
     $order = fn ($a, $b) => [$a[0], (int) $a[1], $a[2]] <=> [$b[0], (int) $b[1], $b[2]];
     return count(array_filter($GLOBALS['gapIndex'], fn ($row) => $order($row, $entry) < 0));
 }
+$GLOBALS['gapAudits'] = [];
+/** Number of entries of an index snapshot that sort before the entry, or with it when $inclusive. */
+function gapCount(array $index, array $entry, bool $inclusive = false): int
+{
+    return count(array_filter($index, fn ($row) => ($row <=> $entry) < ($inclusive ? 1 : 0)));
+}
 DB::connection()->beforeExecuting(function ($sql, $bindings) use (&$transaction) {
     if (!is_array($GLOBALS['gapTrace']) || DB::transactionLevel() === 0) return;
     $trace = function ($kind, $gap, $label) use (&$transaction) { $GLOBALS['gapTrace'][] = [$transaction, $kind, $gap, $label]; };
-    if (preg_match('/^select .* from "(properties)" where (.*) \/\* for update \*\/$/', $sql, $where)
+    if (preg_match('/^select .* from "(properties|audits)" where (.*) \/\* for update \*\/$/', $sql, $where)
         && preg_match_all('/"([a-z_]+)" (=|like) \?/', $where[2], $columns, PREG_SET_ORDER)) {
         $values = [];
         foreach ($columns as $index => $column) $values[$column[1]] = [$column[2], $bindings[$index]];
+        if ($where[1] === 'audits') {
+            if (!isset($values['auditable_type'], $values['auditable_id'])) return;
+            $entry = [$values['auditable_type'][1], (int) $values['auditable_id'][1]];
+            $trace('lock', 'audits:' . gapCount($GLOBALS['gapAudits'], $entry, true), 'audit');
+            return;
+        }
         if (!isset($values['key'], $values['model_id'], $values['model_type'])) return;
         if ($values['key'][0] === 'like') {
             $prefix = rtrim($values['key'][1], '%');
@@ -45,6 +59,7 @@ DB::connection()->beforeExecuting(function ($sql, $bindings) use (&$transaction)
     if (!($write = nativeWrite($sql, $bindings)) || !str_starts_with($sql, 'insert')) return;
     [$table, $row] = $write;
     if ($table === 'properties') $trace('insert', gapOf([$row['key'], $row['model_id'], $row['model_type']]), $row['key']);
+    if ($table === 'audits') $trace('insert', 'audits:' . gapCount($GLOBALS['gapAudits'], [$row['auditable_type'], (int) $row['auditable_id']], true), 'audit');
 });
 /** Gaps a request's transaction locked while missing a row and then inserted into, as gap => key. */
 function lockedThenInserted(array $trace): array
@@ -178,6 +193,7 @@ function traced(callable $request): array
 }
 $indexNow = function () {
     $GLOBALS['gapIndex'] = DB::table('properties')->get(['key', 'model_id', 'model_type'])->map(fn ($row) => [$row->key, $row->model_id, $row->model_type])->all();
+    $GLOBALS['gapAudits'] = DB::table('audits')->get(['auditable_type', 'auditable_id'])->map(fn ($row) => [$row->auditable_type, (int) $row->auditable_id])->all();
 };
 $insertedKey = fn ($trace, $prefix) => (bool) array_filter($trace, fn ($event) => $event[1] === 'insert' && str_starts_with($event[3], $prefix));
 $customer(11, 'cus_11');
@@ -290,3 +306,20 @@ check($insertedKey($firstTrace, 'ae_stripe_save_sequence') && $insertedKey($seco
     'Each first-time customer saves its card and numbers it');
 check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
     'Two first-time customers saving a card at once never deadlock on the save sequence');
+
+// Two held payments on neighbouring invoices go to staff review at once. Neither invoice has audit rows (core audits
+// nothing from the console, as for renewal invoices), so both review records go into one audits index gap.
+foreach ([11 => 351, 12 => 352] as $userId => $invoiceId) {
+    $invoiceFor($invoiceId, $userId);
+    User::findOrFail($userId)->properties()->create(['key' => 'ae_stripe_checkout_' . $invoiceId, 'value' => json_encode(['version' => 2,
+        'key' => 'held_' . $invoiceId, 'created' => time(), 'retry' => true, 'state' => 'reconcile', 'reason' => 'Stripe cannot find this payment.'])]);
+}
+$indexNow();
+$firstTrace = traced(fn () => invoke($gateway, 'sendAttemptReview', Invoice::findOrFail(351)));
+$secondTrace = traced(fn () => invoke($gateway, 'sendAttemptReview', Invoice::findOrFail(352)));
+check(App\Models\Audit::where('event', 'ae_stripe_attempt_review')->whereIn('auditable_id', [351, 352])->count() === 2,
+    'Each held payment gets one staff review record');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
+    'Two held payments going to staff review at once never deadlock on their review records');
+invoke($gateway, 'sendAttemptReview', Invoice::findOrFail(351));
+check(App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('auditable_id', 351)->count() === 1, 'A repeated review check records nothing more');
