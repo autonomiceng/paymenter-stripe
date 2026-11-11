@@ -116,7 +116,7 @@ check(ExtensionHelper::$applications === $before && end(Log::$warnings)[1] === [
 $stripeInvoice->currency = 'usd';
 \Illuminate\Support\Facades\DB::$modelLocks = [];
 $deliver($stripeInvoice);
-check(array_slice(\Illuminate\Support\Facades\DB::$modelLocks, 0, 4) === [\App\Models\User::class, Service::class, \App\Models\InvoiceTransaction::class, Invoice::class],
+check(array_slice(\Illuminate\Support\Facades\DB::$modelLocks, 0, 3) === [\App\Models\User::class, Service::class, Invoice::class],
     'Subscription settlement locks customer before service and invoice');
 check(ExtensionHelper::$payments['12:pi_subscription']['amount'] === 19.99, 'Subscription invoice records major units');
 $before = ExtensionHelper::$applications;

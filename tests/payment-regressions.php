@@ -106,7 +106,7 @@ use Illuminate\Support\Facades\{DB, Http, Log};
         check(ExtensionHelper::$applications === $before && $invoice->status === 'pending',
             'Refused successful payment cannot settle the invoice: ' . $reason);
         check(count(Audit::$rows) === $records + 1, 'One durable staff record per refused success: ' . $reason);
-        check(array_slice(DB::$modelLocks, $locks, 3) === [\App\Models\User::class, Invoice::class, \App\Models\InvoiceTransaction::class]
+        check(array_slice(DB::$modelLocks, $locks, 2) === [\App\Models\User::class, Invoice::class]
             && !in_array(Audit::class, array_slice(DB::$modelLocks, $locks), true),
             'Refused success uses the settlement lock order and reads its staff review under the owner lock, without locking audit rows');
         $record = end(Audit::$rows);

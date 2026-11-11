@@ -88,7 +88,7 @@ trait SubscriptionPayments
             $service = Service::where('subscription_id', $subscriptionId)->lockForUpdate()->first();
             if ($service) abort_unless($service->user_id === $ownerId, 409);
             if (!$service) { $this->recordSubscriptionReview($stripeInvoice, 'Service missing'); return; }
-            if ($settled = InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first()) {
+            if ($settled = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentId), 'succeeded')[0] ?? null) {
                 $this->schedulePaymentReviewAlert($settled->invoice, $paymentId);
                 return;
             }

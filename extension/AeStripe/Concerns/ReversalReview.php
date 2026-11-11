@@ -82,7 +82,7 @@ trait ReversalReview
         if (array_sum($refunds) > (int) $row->received_minor) $safe = false;
         $payments = $invoice->transactions();
         $creditEvidence = [];
-        foreach (($locked ? $payments->lockForUpdate() : $payments)->get() as $payment) {
+        foreach (($locked ? $this->lockedTransactions($payments) : $payments->get()) as $payment) {
             if ($payment->is_credit_transaction ?? false) {
                 $safe = false;
                 $creditEvidence[$payment->transaction_id ?? $payment->id] = [$payment->amount, $payment->status];

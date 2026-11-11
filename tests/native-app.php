@@ -80,8 +80,9 @@ $connection->beforeExecuting(function ($sql, $bindings) {
     if (str_starts_with($sql, 'insert into "audits"') && $level === 0) throw new RuntimeException('Review record lock missing');
     // A plain review read sees every record only under the owner lock that every review writer holds.
     if (preg_match('/^select .* from "audits"/', $sql) && $level > 0 && !$locked && !holdsLock('users')) throw new RuntimeException('Review guard needs the owner lock');
-    if (preg_match('/^select .* from "invoice_transactions" where "transaction_id" = \? and "status" = \?/', $sql) && $level > 0 && !$locked) {
-        throw new RuntimeException('Settlement guard must use a current read');
+    // A plain settlement read sees every payment only under the owner lock that every payment writer here holds.
+    if (preg_match('/^select .* from "invoice_transactions" where "transaction_id" = \? and "status" = \?/', $sql) && $level > 0 && !$locked && !holdsLock('users')) {
+        throw new RuntimeException('Settlement guard needs the owner lock');
     }
     if (preg_match('/^select .* from "ae_stripe_receipt_returns"/', $sql) && $locked && $level === 0) throw new RuntimeException('Return read needs transaction');
     if (str_starts_with($sql, 'update "invoice_transactions" set "is_credit_transaction" = ? where "id" = ?') && !holdsLock('users')) {

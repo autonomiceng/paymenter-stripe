@@ -138,7 +138,7 @@ trait PaymentFees
         DB::transaction(function () use ($charge, $paymentId, $transaction, $snapshot, $balanceId, $chargeId, $balance, $error) {
             User::where('id', $transaction->invoice->user_id)->lockForUpdate()->firstOrFail();
             $invoice = Invoice::where('id', $transaction->invoice->id)->lockForUpdate()->firstOrFail();
-            $current = InvoiceTransaction::where('transaction_id', $paymentId)->lockForUpdate()->first();
+            $current = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentId))[0] ?? null;
             abort_unless(($current->gateway->extension ?? null) === 'AeStripe'
                 && $current->invoice->id === $invoice->id, 409);
             $row = $this->feeRows()->where('payment_intent_id', $paymentId)->lockForUpdate()->first();

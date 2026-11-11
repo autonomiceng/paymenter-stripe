@@ -141,7 +141,7 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
     check(count($logged) === $warnings + 1 && end($logged) === [
         'AeStripe payment received for paid invoice', ['invoice_id' => $invoice->id]],
         'Late subscription payment logs only the invoice ID');
-    check(array_slice(lockLog(), $locks, 4) === ['users', 'services', 'invoice_transactions', 'invoices'],
+    check(array_slice(lockLog(), $locks, 3) === ['users', 'services', 'invoices'],
         'Subscription success keeps user-first settlement lock order');
     check(count(array_filter(array_slice($GLOBALS['stripeCalls'], $calls), fn ($call) => $call[0] !== 'get')) === 0,
         'Late subscription success makes no remote changes');
@@ -169,7 +169,7 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
             && $record->new_values['currency'] === $intent->currency
             && $record->new_values['reason'] === (str_contains($reason, 'currency') ? 'currency mismatch' : 'customer mismatch'),
             'Subscription staff record preserves binding, received units and refusal reason: ' . $reason);
-        check(array_slice(lockLog(), $locks, 4) === ['users', 'services', 'invoice_transactions', 'invoices']
+        check(array_slice(lockLog(), $locks, 3) === ['users', 'services', 'invoices']
             && !in_array('audits', array_slice(lockLog(), $locks), true),
             'Subscription refusal locks owner and bound invoice, then reads the shared staff review without locking audit rows');
         check(!str_contains(json_encode($record->toArray()), 'cus_foreign') && !str_contains(json_encode($record->toArray()), $invoice->user->email),

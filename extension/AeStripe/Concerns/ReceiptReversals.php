@@ -117,7 +117,7 @@ trait ReceiptReversals
     private function receiptReversalDetails($user, $invoice, array $receipt, $row): array
     {
         [, $kind, $id] = explode(':', $row->allocation_key, 3);
-        $credit = Credit::where('user_id', $user->id)->where('currency_code', $invoice->currency_code)->lockForUpdate()->first();
+        $credit = $this->lockedCredit($user, $invoice->currency_code);
         return ['kind' => $kind, 'id' => $id, 'status' => $row->state,
             'invoice_id' => $invoice->id, 'user_id' => $user->id, 'customer' => $receipt['customer'],
             'payment_intent_id' => $receipt['payment_intent_id'], 'currency' => $receipt['currency'],
@@ -154,7 +154,7 @@ trait ReceiptReversals
         $invoice = $payment?->invoice ?? Invoice::findOrFail($row->invoice_id);
         $this->withPaymentLock($invoice, function ($user, $current) use ($id, $kind, $paymentId) {
             $receipt = $this->readReceipt($user, $paymentId);
-            $payment = InvoiceTransaction::where('transaction_id', $paymentId)->where('status', 'succeeded')->lockForUpdate()->first();
+            $payment = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentId), 'succeeded')[0] ?? null;
             abort_unless($receipt || $payment, 409);
             if ($payment) abort_unless($payment->invoice->id === $current->id && ($payment->gateway->extension ?? null) === 'AeStripe', 409);
             $intent = $this->request('get', '/payment_intents/' . $paymentId);

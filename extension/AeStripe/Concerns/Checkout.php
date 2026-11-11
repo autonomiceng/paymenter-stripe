@@ -23,10 +23,10 @@ trait Checkout
     use ReceiptReturns;
 
     /**
-     * Settlement reads the paid balance with a locking read, which also locks the invoice_transactions index gap shared
-     * with neighbouring invoices, and then inserts the payment into that gap. Staff can add a transaction without the
-     * invoice lock, so the locking read stays. A Pay or settlement of a neighbouring invoice can therefore make this
-     * transaction a deadlock victim; MariaDB rolls all of it back, so it runs again from the settled check.
+     * Settlement reads the paid balance under the user and invoice row locks and locks only the payment rows it found
+     * (lockedTransactions), so it holds no index gap that a neighbouring invoice's payment waits on. A transaction staff
+     * add in the admin panel takes no invoice lock, so a settlement at that moment may not count it. Core code can still
+     * make this transaction a deadlock victim; MariaDB rolls all of it back, so it runs again from the settled check.
      * Pay and the other payment lock transactions (withPaymentLock) use the same count: a rerun locks the user and invoice
      * again and rereads the attempt and balance. Laravel reruns only the outermost transaction. A Stripe write inside a
      * payment lock runs again only when a later statement was the victim, and each such write carries an idempotency key
@@ -315,7 +315,7 @@ trait Checkout
             $user = User::where('id', $userId)->lockForUpdate()->firstOrFail();
             $invoice = Invoice::where('id', $intent->metadata->invoice_id)->lockForUpdate()->firstOrFail();
             $this->bindWebhookAttempt($user, $invoice, $intent);
-            if (InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->lockForUpdate()->first()) {
+            if ($this->lockedTransactions(InvoiceTransaction::where('transaction_id', $intent->id), 'succeeded')) {
                 $this->schedulePaymentReviewAlert($invoice, $intent->id);
                 DB::afterCommit(fn () => $this->processReceiptReturns($invoice, $intent->id));
                 return;

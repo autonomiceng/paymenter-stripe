@@ -66,6 +66,8 @@ $GLOBALS['stripeHandler'] = function ($verb, $path, $data) {
 
 // Cases: seed (driver), A and B (worker processes), where A pauses, and the rows both must leave behind.
 $attempt = fn (int $user, int $invoice) => json_decode(User::find($user)->properties()->where('key', 'ae_stripe_checkout_' . $invoice)->value('value') ?? 'null', true);
+$rows = fn (int $invoice) => DB::table('invoice_transactions')->where('invoice_id', $invoice)->orderBy('id')->get(['amount', 'status', 'is_credit_transaction'])
+    ->map(fn ($row) => [(float) $row->amount, $row->status, (bool) $row->is_credit_transaction])->all();
 $cases = [
     // Two customers open Pay on invoices with no stored attempt; each reserves its attempt row in the properties index.
     'pay-pay' => ['seed' => function () { customerInvoice(7, 301); customerInvoice(8, 302); },
@@ -73,6 +75,46 @@ $cases = [
         'a' => function ($gateway) { auth()->login(User::find(7)); return $gateway->pay(Invoice::find(301), 20)->getData()['intent']->id; },
         'b' => function ($gateway) { auth()->login(User::find(8)); return $gateway->pay(Invoice::find(302), 20)->getData()['intent']->id; },
         'check' => fn () => $attempt(7, 301)['intent'] === 'pi_301' && $attempt(8, 302)['intent'] === 'pi_302'],
+    // Pay now on a card the bank declines, recording the failed payment, while a neighbouring invoice settles.
+    'pay-settlement' => ['seed' => function () {
+            customerInvoice(7, 401)->user->properties()->create(['key' => 'ae_stripe_checkout_401',
+                'value' => json_encode(['version' => 2, 'key' => 'checkout_401', 'created' => time(), 'intent' => 'pi_401'])]);
+            customerInvoice(8, 402);
+        },
+        'pause' => '#^POST /payment_intents/pi_401/confirm$#',
+        'a' => function ($gateway) {
+            try { invoke($gateway, 'confirmAttempt', Invoice::find(401), 'pi_401', ['payment_method' => 'pm_401'], null, 2000, 'usd'); }
+            catch (Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException $e) { return $e->getMessage(); }
+            return 'not declined';
+        },
+        'b' => fn ($gateway) => settle($gateway, 402),
+        'check' => fn ($results) => $results['a']['ok'] === 'Insufficient funds. Try a different card, or contact your bank.'
+            && $rows(401) === [[20.0, 'failed', false]] && $rows(402) === [[20.0, 'succeeded', false]]
+            && Invoice::find(401)->status === 'pending' && Invoice::find(402)->status === 'paid'],
+    // Webhooks settle two neighbouring invoices of different customers at once.
+    'settlement-settlement' => ['seed' => function () { customerInvoice(7, 501); customerInvoice(8, 502); },
+        'pause' => '/^insert into `invoice_transactions`/',
+        'a' => fn ($gateway) => settle($gateway, 501),
+        'b' => fn ($gateway) => settle($gateway, 502),
+        'check' => fn () => $rows(501) === [[20.0, 'succeeded', false]] && $rows(502) === [[20.0, 'succeeded', false]]
+            && Invoice::find(501)->status === 'paid' && Invoice::find(502)->status === 'paid'],
+    // Two customers overpay neighbouring invoices; Stripe refuses each refund, so each excess becomes account credit.
+    // Another customer's finished return sorts between their payments in the receipt index, as in a used ledger.
+    'receipt-returns' => ['seed' => function () {
+            customerInvoice(7, 601); customerInvoice(8, 602);
+            DB::table('ae_stripe_receipt_returns')->insert(['payment_intent_id' => 'pi_6015', 'allocation_key' => 'excess', 'user_id' => 9,
+                'invoice_id' => 6015, 'currency' => 'usd', 'received_minor' => 3000, 'amount_minor' => 1000, 'return_key' => 'ae-return-6015',
+                'state' => 'refunded', 'retry' => false, 'updated_at' => time()]);
+        },
+        'pause' => '/^insert into `credits`/',
+        'a' => fn ($gateway) => settle($gateway, 601, 3000),
+        'b' => fn ($gateway) => settle($gateway, 602, 3000),
+        'check' => fn () => $rows(601) === [[30.0, 'succeeded', false], [-10.0, 'succeeded', true]]
+            && $rows(602) === [[30.0, 'succeeded', false], [-10.0, 'succeeded', true]]
+            && DB::table('credits')->orderBy('user_id')->get(['user_id', 'amount'])->map(fn ($c) => [$c->user_id, (float) $c->amount])->all() === [[7, 10.0], [8, 10.0]]
+            && DB::table('ae_stripe_receipt_returns')->whereIn('invoice_id', [601, 602])->orderBy('invoice_id')->pluck('state')->all() === ['credited', 'credited']
+            && DB::table('audits')->where('event', 'ae_stripe_receipt_return')->count() === 2
+            && DB::table('notifications')->where('title', 'Payment return')->count() === 2],
 ];
 
 if (($argv[1] ?? null) === 'worker') {

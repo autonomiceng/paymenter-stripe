@@ -169,10 +169,11 @@ namespace App\Models {
             public function __construct(private $invoiceId) {}
             public function where($key, $value) { if ($key === 'transaction_id') $this->id = $value; if ($key === 'status') $this->status = $value; return $this; }
             public function lockForUpdate() { return $this; }
+            public function pluck($field) { return new PluckedIds(array_map('crc32', array_keys($this->get()->rows))); }
             public function get() {
                 $rows = array_filter(\App\Helpers\ExtensionHelper::$payments, fn ($row, $key) => str_starts_with($key, $this->invoiceId . ':') && (!$this->status || $row['status'] === $this->status), ARRAY_FILTER_USE_BOTH);
                 return new class($rows) implements \IteratorAggregate {
-                    public function __construct(private $rows) {}
+                    public function __construct(public $rows) {}
                     public function getIterator(): \Traversable { foreach ($this->rows as $key => $row) yield (object) [...$row, "transaction_id" => substr($key, strpos($key, ":") + 1), "gateway" => (object) ["extension" => $row["gateway"] ?? "AeStripe"]]; }
                     public function sum($field) { return array_sum(array_column($this->rows, $field)); }
                 };
@@ -382,15 +383,18 @@ namespace App\Models {
     class Credit {
         public $id = 1;
         public static $rows = [];
+        public static function whereKey($id) { foreach (self::$rows as $row) if ($row->id === $id) return new Query($row, Credit::class); return new Query(null, Credit::class); }
         public function __construct(public $user_id, public $currency_code, public $amount) {}
         public static function where($key, $value) { return new class($value) {
             private $currency;
             public function __construct(private $user) {}
             public function where($key, $value) { $this->currency = $value; return $this; }
             public function lockForUpdate() { return $this; }
+            public function orderBy($key) { return $this; }
+            public function value($key) { return $this->first()?->$key; }
             public function first() { return Credit::$rows[$this->user . ':' . $this->currency] ?? null; }
         }; }
-        public static function create($row) { return self::$rows[$row['user_id'] . ':' . $row['currency_code']] = new self(...$row); }
+        public static function create($row) { $credit = new self(...$row); $credit->id = count(self::$rows) + 1; return self::$rows[$row['user_id'] . ':' . $row['currency_code']] = $credit; }
         public function update($row) { $this->amount = $row['amount']; }
     }
     class InvoiceTransaction {
@@ -409,6 +413,12 @@ namespace App\Models {
                 if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return (object) [...$row, 'id' => crc32($key), 'invoice' => Invoice::findOrFail(explode(':', $key)[0]), 'gateway' => (object) ['extension' => $row['gateway']]];
             } return null; }
             public function where($key, $value) { if ($key === 'status') $this->status = $value; return $this; }
+            public function pluck($field) {
+                // A plain settlement read sees every payment only under the owner lock that every payment writer holds.
+                if ($this->status && !\Illuminate\Support\Facades\DB::$userLocked) throw new \RuntimeException('Settlement guard needs the owner lock');
+                return new PluckedIds(array_map('crc32', array_keys(array_filter(\App\Helpers\ExtensionHelper::$payments,
+                    fn ($row, $key) => str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status), ARRAY_FILTER_USE_BOTH))));
+            }
             public function exists() { foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
                 if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return true;
             } return false; }
@@ -423,7 +433,24 @@ namespace App\Models {
                 return $count;
             }
         }; }
+        /** Payments by their fake ids (crc32 of invoice:transaction_id), in id order, for locking and updating by primary key. */
+        public static function whereKey(array $ids) { return new class($ids) {
+            public function __construct(private $ids) {}
+            public function orderBy($key) { return $this; }
+            public function lockForUpdate() { \Illuminate\Support\Facades\DB::$modelLocks[] = InvoiceTransaction::class; return $this; }
+            public function get() {
+                $rows = [];
+                foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) if (in_array(crc32($key), $this->ids, true)) $rows[crc32($key)] = (object) [...$row, 'id' => crc32($key),
+                    'transaction_id' => substr($key, strpos($key, ':') + 1), 'invoice' => Invoice::findOrFail(explode(':', $key)[0]), 'gateway' => (object) ['extension' => $row['gateway'] ?? 'AeStripe']];
+                ksort($rows);
+                return array_values($rows);
+            }
+            public function update(array $values) {
+                foreach ($this->get() as $row) InvoiceTransaction::where('transaction_id', $row->transaction_id)->update($values);
+            }
+        }; }
     }
+    class PluckedIds { public function __construct(private array $ids) {} public function all() { return $this->ids; } }
 }
 namespace App\Helpers {
     class NotificationHelper {

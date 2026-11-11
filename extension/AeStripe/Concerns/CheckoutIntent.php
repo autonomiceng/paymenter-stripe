@@ -3,7 +3,7 @@
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
 use App\Exceptions\DisplayException;
-use App\Models\{BillingAgreement, Invoice, InvoiceTransaction, User};
+use App\Models\{BillingAgreement, Credit, Invoice, InvoiceTransaction, User};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Support\Facades\DB;
 use Paymenter\Extensions\Gateways\AeStripe\{PaymentDeclinedException, PaymentPendingException};
@@ -204,7 +204,7 @@ trait CheckoutIntent
             if (!empty($attempt['notice_only'])) $attempt = null; // A new Pay starts fresh; this marker can only notify.
             if (!$attempt) {
                 // Earlier bank debits have a transaction ID but no attempt property.
-                $processing = $current->transactions()->where('status', 'processing')->lockForUpdate()->get();
+                $processing = $this->lockedTransactions($current->transactions(), 'processing');
                 foreach ($processing as $transaction) {
                     if (($transaction->gateway->extension ?? null) === 'AeStripe') {
                         $attempt = ['key' => 'adopt_' . $transaction->transaction_id, 'created' => time(), 'intent' => $transaction->transaction_id];
@@ -275,7 +275,9 @@ trait CheckoutIntent
     private function keepFailedAttempt($intent): void
     {
         $charge = is_string($intent->latest_charge ?? null) && $intent->latest_charge !== '' ? $intent->latest_charge : 'failed_' . bin2hex(random_bytes(6));
-        InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->update(['transaction_id' => $intent->id . ':' . $charge]);
+        // By primary key: an update by transaction_id would lock every row and gap of invoice_transactions.
+        $failed = array_map(fn ($row) => $row->id, $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $intent->id), 'failed'));
+        if ($failed) InvoiceTransaction::whereKey($failed)->update(['transaction_id' => $intent->id . ':' . $charge]);
     }
 
     private function paymentAttemptFailed(array $attempt, $intent): bool
@@ -337,7 +339,7 @@ trait CheckoutIntent
 
     private function paymentBalance($invoice): int
     {
-        $paid = $invoice->transactions()->where('status', 'succeeded')->lockForUpdate()->get()->sum('amount');
+        $paid = array_sum(array_map(fn ($row) => $row->amount, $this->lockedTransactions($invoice->transactions(), 'succeeded')));
         return $this->toMinorUnits($invoice->total - $paid, $invoice->currency_code);
     }
 
@@ -371,6 +373,36 @@ trait CheckoutIntent
             if ($locked = $user->properties()->where('key', $row->key)->lockForUpdate()->first()) $rows[] = $locked;
         }
         return $rows;
+    }
+
+    /**
+     * Invoice transactions matching the query, with the given status, read under the payment locks. Paymenter writes a
+     * transaction while holding the invoice row lock (ExtensionHelper::addPayment) and this extension also holds the
+     * owner's user row lock, so a plain read sees the latest rows. Only the rows found are then locked, by primary key, in
+     * id order. invoice_transactions has no transaction_id index, so a locking read by transaction_id locks every row
+     * and gap of the table, and a locking read by invoice locks the invoice_id index gap shared with the next invoice.
+     * The payment inserted next waits on either, so two settlements, or a Pay and a settlement, deadlock.
+     */
+    private function lockedTransactions($query, ?string $status = null): array
+    {
+        $ids = ($status === null ? $query : $query->where('status', $status))->pluck('id')->all();
+        $locked = [];
+        foreach ($ids ? InvoiceTransaction::whereKey($ids)->orderBy('id')->lockForUpdate()->get() : [] as $row) {
+            if ($status === null || ($row->status->value ?? $row->status) === $status) $locked[] = $row;
+        }
+        return $locked;
+    }
+
+    /**
+     * The owner's account credit in a currency, read under the user row lock that every credit change here holds, and
+     * then locked by primary key. Null when there is none; the caller inserts it without a locking read first. A locking
+     * read of a missing credit locks the credits user_id index gap shared with other customers, and two customers who
+     * each lock that gap and then insert their credit deadlock.
+     */
+    private function lockedCredit($user, string $currency): ?Credit
+    {
+        $id = Credit::where('user_id', $user->id)->where('currency_code', $currency)->orderBy('id')->value('id');
+        return $id ? Credit::whereKey($id)->lockForUpdate()->first() : null;
     }
 
     private function clearFinishedPaymentConstraints(array $attempt): array

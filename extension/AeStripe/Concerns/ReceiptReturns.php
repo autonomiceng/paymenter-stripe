@@ -46,7 +46,7 @@ trait ReceiptReturns
         $this->withPaymentLock($invoice, function ($user, $current) use ($paymentIntentId, $allocationKey, $amountMinor) {
             $receipt = $this->readReceipt($user, $paymentIntentId);
             if (!$receipt) {
-                $payment = InvoiceTransaction::where('transaction_id', $paymentIntentId)->where('status', 'succeeded')->lockForUpdate()->first();
+                $payment = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentIntentId), 'succeeded')[0] ?? null;
                 abort_unless($payment && $payment->invoice->id === $current->id && ($payment->gateway->extension ?? null) === 'AeStripe', 409);
                 $intent = $this->request('get', '/payment_intents/' . $paymentIntentId);
                 abort_unless(($intent->id ?? null) === $paymentIntentId && ($intent->status ?? null) === 'succeeded' && !empty($intent->customer)
@@ -211,7 +211,7 @@ trait ReceiptReturns
                         $receipt = $this->readReceipt($user, $id);
                         $a = &$receipt['allocations'][$key];
                         if ($a['state'] === 'credited' || $a['state'] === 'refunded' && empty($a['recheck'])) return;
-                        $payment = InvoiceTransaction::where('transaction_id', $id)->where('status', 'succeeded')->lockForUpdate()->first();
+                        $payment = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $id), 'succeeded')[0] ?? null;
                         abort_unless(strtolower($current->currency_code) === $receipt['currency'] && ($receipt['closed_invoice'] || ($payment
                             && $payment->invoice->id === $current->id && ($payment->gateway->extension ?? null) === 'AeStripe'
                             && $this->toMinorUnits($payment->amount, $receipt['currency']) === $receipt['received_minor'])), 409);
@@ -249,7 +249,7 @@ trait ReceiptReturns
                                 };
                                 if (($refund->failure_reason ?? '') === 'charge_for_pending_refund_disputed') $a['state'] = 'review';
                                 if ($a['state'] === 'credited') {
-                                    $credit = Credit::where('user_id', $user->id)->where('currency_code', $current->currency_code)->lockForUpdate()->first();
+                                    $credit = $this->lockedCredit($user, $current->currency_code);
                                     if (!$credit) $credit = Credit::create(['user_id' => $user->id, 'currency_code' => $current->currency_code, 'amount' => 0]);
                                     $a['credit_id'] = $credit->id;
                                     $credit->update(['amount' => $this->fromMinorUnits($this->toMinorUnits($credit->amount, $receipt['currency']) + $a['amount_minor'], $receipt['currency'])]);
@@ -308,7 +308,7 @@ trait ReceiptReturns
     private function postReceiptReturn($invoice, array $receipt, array $allocation): void
     {
         if ($allocation['state'] === 'credited') {
-            $return = InvoiceTransaction::where('transaction_id', $allocation['key'])->lockForUpdate()->first();
+            $return = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $allocation['key']))[0] ?? null;
             if ($return) {
                 abort_unless($return->invoice->id === $invoice->id && ($return->gateway->extension ?? null) === 'AeStripe'
                     && ($return->status->value ?? $return->status) === 'succeeded'
