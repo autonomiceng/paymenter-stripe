@@ -466,3 +466,27 @@ check($victims === 0 && $posts === ['/payment_intents/pi_renewal381', '/payment_
     && App\Models\InvoiceTransaction::where('invoice_id', 381)->where('status', 'failed')->count() === 1 && $stored['confirmation'] === null,
     'A deadlock recording a declined renewal sends one update and one confirmation and records the decline once: '
         . json_encode(['posts' => $posts, 'result' => $declined]));
+
+// A Pay that is a deadlock victim on every attempt is rolled back and asks the customer to try again.
+$created = 0;
+$GLOBALS['stripeHandler'] = function ($verb, $path) use (&$created) {
+    if ($verb === 'get' && $path === '/customers/cus_11') return ['id' => 'cus_11'];
+    if ($verb === 'post' && $path === '/customer_sessions') return ['client_secret' => 'cuss_11'];
+    if ($verb === 'post' && $path === '/payment_intents') ++$created;
+    throw new RuntimeException('Unexpected Pay request: ' . $verb . ' ' . $path);
+};
+$victims = 3;
+beforeWrite('properties', function ($values, $sql) use (&$victims) {
+    if ($victims <= 0 || !str_starts_with($sql, 'insert') || ($values['key'] ?? null) !== 'ae_stripe_checkout_372') return;
+    --$victims;
+    throw new Illuminate\Database\QueryException('mysql', $sql, [],
+        new PDOException('SQLSTATE[40001]: Serialization failure: 1213 Deadlock found when trying to get lock; try restarting transaction'));
+});
+try {
+    try { $open($gateway, $invoiceFor(372, 11)); $view = 'no error'; } catch (Throwable $e) { $view = get_class($e) . ': ' . $e->getMessage(); }
+} finally {
+    beforeWrite('properties', null);
+}
+check($victims === 0 && $view === 'App\Exceptions\DisplayException: Could not prepare your payment. Try again.' && $created === 0
+    && DB::transactionLevel() === 0 && !User::find(11)->properties()->where('key', 'ae_stripe_checkout_372')->exists(),
+    'A Pay that loses every attempt to a deadlock asks the customer to try again: ' . $view);

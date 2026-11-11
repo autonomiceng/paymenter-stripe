@@ -48,7 +48,14 @@ trait Checkout
             throw new DisplayException('Could not prepare your payment. Try again.');
         }
         $intentData = $this->checkoutPaymentData($invoice, $this->toMinorUnits($total, $invoice->currency_code), $customer->id);
-        $intent = $this->checkoutIntent($invoice, $intentData, elements: true);
+        try {
+            $intent = $this->checkoutIntent($invoice, $intentData, elements: true);
+        } catch (\Throwable $e) {
+            // Every attempt was a deadlock victim and was rolled back. Opening Pay never charges, so a new try is safe.
+            if (!$this->lockConflict($e)) throw $e;
+            \Illuminate\Support\Facades\Log::warning('AeStripe Pay lock conflict', ['invoice_id' => $invoice->id]);
+            throw new DisplayException('Could not prepare your payment. Try again.');
+        }
         if ($intent->status === 'succeeded') {
             $this->recordIntentPayment($intent, 'succeeded');
             if (!InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists()) {
