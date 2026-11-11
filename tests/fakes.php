@@ -367,13 +367,13 @@ namespace App\Models {
         public static $rows = [], $fail = false;
         public static function whereIn($key, $values) { return self::where($key, $values); }
         public static function where($key, $value) { return new class($key, $value) {
-            private $filters = [], $currentRead = false;
+            private $filters = [], $currentRead = false, $order = [], $maximum = null;
             public function __construct($key, $value) { $this->where($key, $value); }
             public function where($key, $value) { $this->filters[$key] = $value; return $this; }
             public function whereIn($key, $values) { return $this->where($key, $values); }
             public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = isset($this->filters['id']) ? Audit::class . ':' . $this->filters['id'] : Audit::class; return $this; }
-            public function orderBy($key) { return $this; }
-            public function limit($n) { return $this; }
+            public function orderBy($key) { $this->order[] = $key; return $this; }
+            public function limit($n) { $this->maximum = $n; return $this; }
             public function first() {
                 if (!$this->currentRead && \Illuminate\Support\Facades\DB::$locked && !\Illuminate\Support\Facades\DB::$userLocked && !\Illuminate\Support\Facades\DB::$gatewayLocked) throw new \RuntimeException('Review guard needs the owner lock');
                 return $this->get()[0] ?? null;
@@ -387,7 +387,12 @@ namespace App\Models {
                     }
                     $rows[] = new Audit($row);
                 }
-                return $rows;
+                $value = fn ($row, $key) => str_starts_with($key, 'new_values->') ? ($row->new_values[substr($key, 12)] ?? null) : ($row->$key ?? null);
+                usort($rows, function ($a, $b) use ($value) {
+                    foreach ($this->order as $key) if (($comparison = $value($a, $key) <=> $value($b, $key)) !== 0) return $comparison;
+                    return 0;
+                });
+                return $this->maximum === null ? $rows : array_slice($rows, 0, $this->maximum);
             }
             public function firstOrFail() { return $this->first() ?? throw new \RuntimeException('Missing audit'); }
         }; }

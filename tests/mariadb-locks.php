@@ -4,7 +4,7 @@
 // Check the declared wait, deadlock count, both results and exact final rows. Only rollback-retry creates a deadlock.
 // Usage: PAY_MARIADB_PORT=... PAY_MARIADB_PASSWORD=... php tests/mariadb-locks.php
 /* Fail-first cases: deleted-notice-recipients, refusal-events, notice-retry-paused, notice-retry-owner,
- * notice-retry-scope, staff-reversals, staff-attempt-review, staff-reversal-notice-retry,
+ * notice-retry-scope, notice-retry-fairness, staff-reversals, staff-attempt-review, staff-reversal-notice-retry,
  * pay-return-card-save, access-staff-settlement, subscription-review-vs-settlement, gateway-review,
  * gateway-access, pay-pay, pay-settlement, settlement-settlement, settlement-card-label,
  * subscription-subscription, fee-fee, receipt-returns, rollback-retry.
@@ -170,6 +170,36 @@ $cases = [
         && App\Models\Audit::where('auditable_type', User::class)->where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', false)->count() === 1
         && App\Models\Audit::where('new_values->notice_sent', true)->count() === 7
         && DB::table('notifications')->count() === 7 && Invoice::find(592)->status === 'paid'],
+    'notice-retry-fairness' => ['seed' => function () {
+        customerInvoice(7, 591); customerInvoice(8, 592);
+        foreach (range(1, 101) as $unused) pendingNotice('ae_stripe_attempt_review');
+    }, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
+        $attempted = [];
+        App\Models\Notification::created(function ($notice) use (&$attempted) {
+            $attempted[] = $notice->title;
+            throw new RuntimeException('Inbox still unavailable');
+        });
+        invoke($gateway, 'retryPaymentNotices');
+        check(count($attempted) === 100, 'The first failing batch is bounded to 100 notices');
+        pendingNotice('ae_stripe_attempt_review');
+        $new = App\Models\Audit::where('event', 'ae_stripe_attempt_review')->latest('id')->first();
+        $values = $new->new_values; $values['notices'][0]['title'] = 'New payment notice';
+        $new->update(['new_values' => $values]);
+        invoke($gateway, 'retryPaymentNotices');
+        check(count($attempted) === 102 && in_array('New payment notice', $attempted, true),
+            '101 persistently failing notices cannot starve a new notice');
+        $pending = App\Models\Audit::where('event', 'ae_stripe_attempt_review')->get();
+        check($pending->every(fn ($audit) => !$audit->new_values['notice_sent']
+            && ($audit->new_values['notice_retry_at'] ?? 0) > time()), 'Every failed delivery retains a future retry time');
+        invoke($gateway, 'retryPaymentNotices');
+        check(count($attempted) === 102, 'Notices in backoff are not attempted again before their retry time');
+        foreach ($pending as $audit) $audit->update(['new_values' => array_replace($audit->new_values, ['notice_retry_at' => time() - 1])]);
+        invoke($gateway, 'retryPaymentNotices');
+        check(count($attempted) === 202, 'Due failures get another bounded batch after their retry time');
+        return 'retried';
+    }, 'b' => fn ($gateway) => settle($gateway, 592),
+    'check' => fn () => App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', false)->count() === 102
+        && DB::table('notifications')->count() === 0 && Invoice::find(592)->status === 'paid'],
     'refusal-events' => ['seed' => function () {
         customerInvoice(7, 591); customerInvoice(8, 592);
     }, 'pause' => '/^insert into `notifications`/', 'a' => function ($gateway) {
@@ -183,6 +213,9 @@ $cases = [
             $gateway->resolveChargeAttempt(Invoice::find(591), null, 'Verified no charge in the original account');
             if ($event === 'first') check(App\Models\Audit::where('event', 'ae_stripe_payment_refused')
                 ->where('new_values->notice_sent', false)->count() === 1, 'Failed refusal delivery retains its own retry marker');
+        }
+        foreach (App\Models\Audit::where('new_values->notice_sent', false)->get() as $audit) {
+            $audit->update(['new_values' => array_replace($audit->new_values, ['notice_retry_at' => 0])]);
         }
         invoke($gateway, 'retryPaymentNotices');
         invoke($gateway, 'retryPaymentNotices');
@@ -225,6 +258,9 @@ $cases = [
         invoke($gateway, 'recordReceiptReversalEvent', (object) ['id' => 're_561', 'payment_intent' => 'pi_561'], 'refund');
         check(DB::table('notifications')->count() === 0 && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')
             ->where('new_values->notice_sent', false)->count() === 1, 'Notice rollback retains the committed reversal and pending audit');
+        foreach (App\Models\Audit::where('new_values->notice_sent', false)->get() as $audit) {
+            $audit->update(['new_values' => array_replace($audit->new_values, ['notice_retry_at' => 0])]);
+        }
         pauseBefore('/^insert into `notifications`/');
         invoke($gateway, 'retryPaymentNotices');
         return 'retried';

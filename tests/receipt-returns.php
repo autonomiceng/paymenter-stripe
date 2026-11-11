@@ -59,7 +59,13 @@ $setup = function ($amount = 2000, $total = 10, $currency = 'usd') use ($owner, 
 $deliver = fn ($s) => $gateway->webhook(eventRequest($s->intent));
 $status = fn ($i, $key = 'excess') => $gateway->receiptReturnStatus($i, 'pi_return', $key);
 $inboxDown = fn () => beforeWrite('notifications', fn () => throw new RuntimeException('Inbox unavailable'));
-$inboxUp = fn () => beforeWrite('notifications', null);
+$inboxUp = function () {
+    beforeWrite('notifications', null);
+    // Reach the next retry time without sleeping in these delivery recovery tests.
+    foreach (Audit::where('new_values->notice_sent', false)->get() as $audit) {
+        $audit->update(['new_values' => array_replace($audit->new_values, ['notice_retry_at' => 0])]);
+    }
+};
 
 [$i, $s] = $setup(); $deliver($s); $deliver($s); $gateway->retryReceiptReturns();
 $a = $status($i);

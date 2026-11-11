@@ -39,7 +39,18 @@ trait PaymentNotices
                 }
                 $audit->update(['new_values' => array_replace($values, ['notice_sent' => true])]);
             });
-        } catch (\Throwable $e) { report($e); } // Roll back inserts and retain the marker for scheduled retry.
+        } catch (\Throwable $e) {
+            report($e); // The failed delivery rolled back every notification insert.
+            try {
+                DB::transaction(function () use ($id) {
+                    $audit = Audit::where('id', $id)->lockForUpdate()->firstOrFail();
+                    $values = $audit->new_values;
+                    if (!($values['notice_sent'] ?? true)) {
+                        $audit->update(['new_values' => array_replace($values, ['notice_retry_at' => time() + 300])]);
+                    }
+                });
+            } catch (\Throwable $retryError) { report($retryError); }
+        }
     }
 
     private function retryPaymentNotices(): void
@@ -48,7 +59,10 @@ trait PaymentNotices
             'ae_stripe_fee_review', 'ae_stripe_receipt_return', 'ae_stripe_receipt_reversal'];
         // The native auditable index narrows the rows before checking our events and JSON marker.
         foreach (Audit::whereIn('auditable_type', [(new Invoice)->getMorphClass(), (new Gateway)->getMorphClass()])
-            ->whereIn('event', $events)->where('new_values->notice_sent', false)->orderBy('id')->limit(100)->get() as $audit) {
+            ->whereIn('event', $events)->where('new_values->notice_sent', false)
+            ->orderBy('new_values->notice_retry_at')->orderBy('id')->limit(100)->get() as $audit) {
+            // Untried notices sort before failures; failures wait at least one scheduler interval.
+            if (($audit->new_values['notice_retry_at'] ?? 0) > time()) continue;
             if (isset($audit->new_values['notices'])) $this->deliverPaymentNotices($audit->id);
         }
     }
