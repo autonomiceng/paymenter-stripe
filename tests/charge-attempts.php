@@ -16,7 +16,7 @@ use Illuminate\Support\Facades\{DB, Http};
         $GLOBALS['fakeConsole'] = false;
         User::$row = new User(new Properties('cus_owner'));
         $invoice = new Invoice(User::$row); $invoice->id = 920; Invoice::$rows[920] = $invoice;
-        ExtensionHelper::$payments = []; Audit::$rows = []; Notification::$rows = []; Gateway::$enabled = true; DB::$tables['ae_stripe_receipt_returns'] = [];
+        ExtensionHelper::$payments = []; DB::$tables['ae_stripe_settlements'] = []; Audit::$rows = []; Notification::$rows = []; Gateway::$enabled = true; DB::$tables['ae_stripe_receipt_returns'] = [];
         ExtensionHelper::$agreements = ['pm_test' => ['id' => 4, 'user_id' => 7, 'gateway_id' => 3],
             'pm_other' => ['id' => 5, 'user_id' => 7, 'gateway_id' => 3]];
         $stripe = new class {
@@ -176,7 +176,7 @@ use Illuminate\Support\Facades\{DB, Http};
                 'confirmation_token' => 'ctoken_declined', 'save' => false]));
             check($result['status'] === 409 && $result['data']['declined'] === true
                 && $result['data']['message'] === 'Your bank declined this card. Try a different card, or contact your bank.'
-                && (ExtensionHelper::$payments['920:'.$intent->id]['status'] ?? null) === 'failed' && !$stripe->charges,
+                && (failedPaymentRowForKey('920:'.$intent->id)['status'] ?? null) === 'failed' && !$stripe->charges,
                 'A new-card refusal reaches the bank decline path and records failure instead of a generic integration 409');
         });
         $run('new-card-missing-types-open', function ($invoice, $stripe) use ($gateway) {
@@ -358,8 +358,8 @@ use Illuminate\Support\Facades\{DB, Http};
                 User::$row->props->values = []; $invoice->status = 'pending';
             }
             $gateway->pay($invoice, 20); $intent = $stripe->intents[array_key_last($stripe->intents)];
-            DB::transaction(function () use ($gateway, $invoice, $intent) {
-                check($gateway->cancelInvoicePayments($invoice) && $intent->status === 'canceled', 'Credit caller can retire the form before spending credit in its transaction');
+            check($gateway->cancelInvoicePayments($invoice) && $intent->status === 'canceled', 'Credit caller retires the form before entering the native credit transaction');
+            DB::transaction(function () use ($invoice) {
                 ExtensionHelper::$payments['920:credit'] = ['amount' => 5, 'status' => 'succeeded'];
             });
             $view = $gateway->pay($invoice, 15);
@@ -651,7 +651,7 @@ use Illuminate\Support\Facades\{DB, Http};
             $view = $gateway->pay($invoice, 20); $id = $view['data']['intent']->id;
             check(count($stripe->intents) === 1 && !$stripe->charges, 'A lost Elements create reuses its reserved identity without charging');
             $stripe->status = 'requires_action';
-            $stripe->beforeConfirm = function ($intent) { check(DB::$locked && DB::$userLocked && $intent->amount === 2000, 'Elements first confirm holds both locks and uses the current amount'); };
+            $stripe->beforeConfirm = function ($intent) { check(DB::transactionLevel() === 0 && !DB::$userLocked && $intent->amount === 2000, 'Elements confirmation HTTP runs outside every transaction with the claimed amount'); };
             $result = $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'confirmation_token' => 'ctoken_test', 'amount' => 2000]));
             check($result['data']['client_secret'] === $id . '_secret', 'Only an authentication response exposes the PaymentIntent secret');
             $gateway->pay($invoice, 20);
@@ -683,7 +683,7 @@ use Illuminate\Support\Facades\{DB, Http};
                     $response = $gateway->confirmPayment(new Request(['intent' => $id, 'save' => false, 'amount' => 2000]));
                     check($response['status'] === 409 && $response['data']['declined'] === true
                         && $response['data']['message'] === 'Your bank did not confirm this payment. You were not charged. Try again or use a different card.'
-                        && (ExtensionHelper::$payments[$invoice->id . ':' . $id]['status'] ?? null) === 'failed',
+                        && (failedPaymentRowForKey($invoice->id . ':' . $id)['status'] ?? null) === 'failed',
                         'A failed bank check reads as a decline in the dialog and is recorded at once');
                     check($intent->status === 'canceled', 'Failed Elements authentication is canceled on confirm');
                     $stripe->status = 'succeeded';
@@ -941,7 +941,7 @@ use Illuminate\Support\Facades\{DB, Http};
             };
             $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
             check(count(Notification::$rows) === 1 && str_contains(Notification::$rows[0]['body'], 'declined')
-                && ExtensionHelper::$payments['920:pi_test1']['status'] === 'failed' && !$stripe->confirms,
+                && (failedPaymentRow(920, 'pi_test1')['status'] ?? null) === 'failed' && !$stripe->confirms,
                 'A recovery decline with a Stripe intent body records failure and tells the customer without another debit');
         });
         $run('missing-refused-success', function ($invoice, $stripe) use ($gateway) {
@@ -990,7 +990,7 @@ use Illuminate\Support\Facades\{DB, Http};
             $customer = array_filter(Notification::$rows, fn ($notice) => $notice['user_id'] == $invoice->user_id);
             check(count($customer) === 1 && str_contains(reset($customer)['body'], 'declined'), 'Recovery decline tells the customer the reason once');
             check(count(Notification::$rows) === 1, 'A card decline gives staff no task');
-            check((ExtensionHelper::$payments['920:pi_test1']['status'] ?? null) === 'failed', 'Recovery records a definite decline for the native failed-payment notice');
+            check((failedPaymentRow(920, 'pi_test1')['status'] ?? null) === 'failed', 'Recovery records a definite decline for the native failed-payment notice');
             $stripe->failure = null;
             check($gateway->charge($invoice, 20, new BillingAgreement) === true, 'Recovery decline leaves the invoice payable');
         });
@@ -1003,7 +1003,7 @@ use Illuminate\Support\Facades\{DB, Http};
                 throw new RequestException(402, ['error' => ['type' => 'card_error', 'code' => 'card_declined']]);
             };
             paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
-            check((ExtensionHelper::$payments['920:pi_test1']['status'] ?? null) === 'failed', 'A saved-card refusal records a Failed payment');
+            check((failedPaymentRow(920, 'pi_test1')['status'] ?? null) === 'failed', 'A saved-card refusal records a Failed payment');
             $stripe->failure = null;
             check($gateway->charge($invoice, 20, new BillingAgreement) === true && count($stripe->intents) === 1, 'The next saved-card Pay confirms the same intent');
             $statuses = array_count_values(array_column(ExtensionHelper::$payments, 'status'));
@@ -1133,7 +1133,7 @@ use Illuminate\Support\Facades\{DB, Http};
                 User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
             }
             $stripe->beforeConfirm = null; $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
-            check(!$stripe->charges && count(Notification::$rows) === 1 && (ExtensionHelper::$payments['920:pi_test1']['status'] ?? null) === 'failed', 'A definite failure after an unknown confirm never retries a failed saved debit, including older records');
+            check(!$stripe->charges && count(Notification::$rows) === 1 && (failedPaymentRow(920, 'pi_test1')['status'] ?? null) === 'failed', 'A definite failure after an unknown confirm never retries a failed saved debit, including older records');
         });
         $run('unknown-debit-release', function ($invoice, $stripe) use ($gateway) {
             $stripe->loseConfirm = true; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
@@ -1205,7 +1205,7 @@ use Illuminate\Support\Facades\{DB, Http};
         });
         $run('between-locks', function ($invoice, $stripe) use ($gateway) {
             $stripe->beforeCreate = function () use ($invoice) { $invoice->total = 12; };
-            $stripe->beforeConfirm = function ($intent) { check(DB::$locked && DB::$userLocked && $intent->amount === 1200, 'Confirmation holds user and invoice locks with the rechecked balance'); };
+            $stripe->beforeConfirm = function ($intent) { check(DB::transactionLevel() === 0 && !DB::$userLocked && $intent->amount === 1200, 'Confirmation HTTP runs outside every transaction with the rechecked balance'); };
             $gateway->charge($invoice, 20, new BillingAgreement);
             check($stripe->charges[0][1] === 1200, 'Balance changes between creation and confirmation cannot overcharge');
         });
@@ -1496,7 +1496,8 @@ use Illuminate\Support\Facades\{DB, Http};
             paymentStops(fn () => $gateway->pay($invoice, 20));
             $view = $gateway->pay($invoice, 20);
             check($view['data']['intent']->amount === 1000 && $stripe->intents['pi_test1']->status === 'canceled'
-                && $keys === [null, null] && !$stripe->charges, 'A failed cancellation is retried without replaying a cached failure or charging');
+                && count($keys) === 2 && is_string($keys[0]) && $keys[0] !== '' && is_string($keys[1]) && $keys[1] !== ''
+                && $keys[0] !== $keys[1] && !$stripe->charges, 'A failed cancellation is retried without replaying a cached failure or charging');
         });
         $run('confirm-lookup-outage', function ($invoice, $stripe) use ($gateway) {
             invoke($gateway, 'checkoutIntent', $invoice, invoke($gateway, 'checkoutPaymentData', $invoice, 2000, 'cus_owner'));

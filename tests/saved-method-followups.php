@@ -16,6 +16,7 @@ Gateway::$deleted = false;
 BillingAgreement::$snapshot = null;
 DB::$tables['services'] = [];
 ExtensionHelper::$payments = [];
+DB::$tables['ae_stripe_settlements'] = [];
 $gateway = new AeStripe(['stripe_secret_key' => 'fake-secret', 'stripe_webhook_secret' => 'whsec_test']);
 $card = fn ($id) => (object) ['id' => $id, 'customer' => 'cus_owner', 'type' => 'card', 'allow_redisplay' => 'limited',
     'card' => (object) ['fingerprint' => 'fp_same', 'brand' => 'visa', 'last4' => '4242', 'exp_month' => 5, 'exp_year' => 2030]];

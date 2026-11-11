@@ -129,6 +129,46 @@ function pendingNotice(string $event, string $type = Invoice::class): void
         ]]]]);
 }
 $cases = [
+    'outbox-confirm-http' => ['seed' => function () {
+        customerInvoice(7, 401)->user->properties()->create(['key' => 'ae_stripe_checkout_401', 'value' => json_encode([
+            'version' => 2, 'key' => 'checkout_401', 'created' => time(), 'intent' => 'pi_401'])]);
+    }, 'pause' => '#^POST /payment_intents/pi_401/confirm$#',
+        'a' => function ($gateway) {
+            $handler = $GLOBALS['stripeHandler']; $levels = [];
+            $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($handler, &$levels) {
+                if ($verb === 'post' && str_starts_with($path, '/payment_intents/pi_401')) $levels[] = DB::transactionLevel();
+                return $handler($verb, $path, $data, $request);
+            };
+            try { invoke($gateway, 'confirmAttempt', Invoice::find(401), 'pi_401', ['payment_method' => 'pm_401'], null, 2000, 'usd'); }
+            catch (Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException $e) { return ['declined' => $e->getMessage(), 'levels' => $levels]; }
+            return 'not declined';
+        }, 'b' => fn () => User::where('id', 7)->update(['first_name' => 'Updated']),
+        'check' => fn ($results) => $results['a']['ok']['levels'] === [0, 0]
+            && $results['a']['ok']['declined'] === 'Insufficient funds. Try a different card, or contact your bank.'
+            && $rows(401) === [[20.0, 'failed', false]] && User::find(7)->first_name === 'Updated'],
+    'outbox-action-http' => ['seed' => function () {
+        customerInvoice(7, 931)->user->properties()->create(['key' => 'ae_stripe_checkout_931', 'value' => json_encode([
+            'version' => 2, 'key' => 'checkout_931', 'created' => time(), 'intent' => 'pi_931'])]);
+    }, 'pause' => '#^POST /payment_intents/pi_931/cancel$#',
+        'a' => function ($gateway) {
+            $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) {
+                check(DB::transactionLevel() === 0, 'Cancellation HTTP runs outside every transaction');
+                if ($verb === 'get') return intentOf(931, 'requires_payment_method', 0);
+                $claim = json_decode(User::find(7)->properties()->where('key', 'ae_stripe_checkout_931')->value('value'), true)['action'];
+                check($request->header('Idempotency-Key')[0] === $claim['key'], 'Cancellation uses its committed key');
+                return intentOf(931, 'canceled', 0);
+            };
+            return $gateway->cancelInvoicePayments(Invoice::find(931));
+        }, 'b' => fn () => User::where('id', 7)->update(['first_name' => 'Updated']),
+        'check' => fn ($results) => $results['a']['ok'] === true && empty($attempt(7, 931)['action'])
+            && DB::table('invoice_transactions')->count() === 0 && User::find(7)->first_name === 'Updated'],
+    'outbox-settlement-stale-snapshot' => ['seed' => fn () => customerInvoice(7, 941), 'waits' => true,
+        'pause' => '/^insert into `invoice_transactions`/', 'a' => fn ($gateway) => settle($gateway, 941),
+        'b' => fn ($gateway) => DB::transaction(function () use ($gateway) {
+            DB::table('invoice_transactions')->count();
+            return settle($gateway, 941);
+        }), 'check' => fn () => $rows(941) === [[20.0, 'succeeded', false]] && Invoice::find(941)->status === 'paid'
+            && DB::table('ae_stripe_settlements')->where('payment_intent_id', 'pi_941')->count() === 1],
     'outbox-credit-status' => ['seed' => fn () => customerInvoice(7, 904),
         'pause' => '/^select .* from `invoices`.*for update$/',
         'a' => function ($gateway) { auth()->login(User::find(7)); return $gateway->cancelInvoicePayments(Invoice::find(904), true); },
@@ -566,6 +606,16 @@ foreach (['owner', 'gateway', 'deleted', 'same'] as $conflict) {
         },
     ];
 }
+$cases['outbox-credit-after-http'] = ['seed' => function () {
+    customerInvoice(7, 968)->user->properties()->create(['key' => 'ae_stripe_checkout_968', 'value' => json_encode([
+        'version' => 2, 'key' => 'checkout_968', 'created' => time(), 'intent' => 'pi_968'])]);
+}, 'pause' => '#^POST /payment_intents/pi_968/cancel$#', 'a' => function ($gateway) {
+    auth()->login(User::find(7));
+    $GLOBALS['stripeHandler'] = fn ($verb) => intentOf(968, $verb === 'get' ? 'requires_payment_method' : 'canceled', 0);
+    return $gateway->cancelInvoicePayments(Invoice::find(968), true);
+}, 'b' => fn () => Invoice::where('id', 968)->update(['status' => 'paid']),
+    'check' => fn ($results) => $results['a']['ok'] === false && Invoice::find(968)->status === 'paid' && DB::table('invoice_transactions')->count() === 0];
+
 if (($argv[1] ?? null) === 'worker') {
     $case = $cases[$argv[2]];
     if ($argv[3] === 'b' && !empty($case['prepared_b'])) {
@@ -596,8 +646,8 @@ $php = getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY;
 foreach ($cases as $name => $case) {
     if (getenv('PAY_MARIADB_CASE') && !in_array($name, explode(',', getenv('PAY_MARIADB_CASE')), true)) continue;
     DB::statement('set foreign_key_checks = 0');
-    foreach (['ae_stripe_locks', 'invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
-        'billing_agreements', 'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users', 'roles'] as $table) { if ($table === 'ae_stripe_locks' && !Illuminate\Support\Facades\Schema::hasTable($table)) continue; DB::table($table)->truncate(); }
+    foreach (['ae_stripe_settlements', 'ae_stripe_locks', 'invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
+        'billing_agreements', 'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users', 'roles'] as $table) { if (in_array($table, ['ae_stripe_locks', 'ae_stripe_settlements'], true) && !Illuminate\Support\Facades\Schema::hasTable($table)) continue; DB::table($table)->truncate(); }
     DB::statement('set foreign_key_checks = 1');
     DB::table('settings')->where('key', 'ae_stripe_webhook_continuity')->delete();
     DB::table('settings')->where('key', 'ae_stripe_webhook_events')->update(['value' => 'ready']);

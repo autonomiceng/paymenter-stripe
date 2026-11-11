@@ -433,29 +433,30 @@ namespace App\Models {
             $prior = self::$eventsSuppressed; self::$eventsSuppressed = true;
             try { return $callback(); } finally { self::$eventsSuppressed = $prior; }
         }
-        public static function where($key, $value) { return new class($value) {
+        public static function where($key, $value, $pattern = null) { return new class($pattern ?? $value, $pattern !== null) {
             private $status, $currentRead = false;
-            public function __construct(private $id) {}
+            public function __construct(private $id, private bool $prefix) {}
+            private function matches($key) { $id = substr($key, strpos($key, ':') + 1); return $this->prefix ? str_starts_with($id, str_replace(['\\_', '\\%'], ['_', '%'], rtrim($this->id, '%'))) : $id === $this->id; }
             public function lockForUpdate() { $this->currentRead = true; \Illuminate\Support\Facades\DB::$modelLocks[] = InvoiceTransaction::class; return $this; }
             public function first() {
                 if ($this->status && !$this->currentRead) throw new \RuntimeException('Settlement guard must use a current read');
                 foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
-                if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return (object) [...$row, 'id' => crc32($key), 'invoice' => Invoice::findOrFail(explode(':', $key)[0]), 'gateway' => (object) ['extension' => $row['gateway']]];
+                if ($this->matches($key) && (!$this->status || $row['status'] === $this->status)) return (object) [...$row, 'id' => crc32($key), 'invoice' => Invoice::findOrFail(explode(':', $key)[0]), 'gateway' => (object) ['extension' => $row['gateway']]];
             } return null; }
             public function where($key, $value) { if ($key === 'status') $this->status = $value; return $this; }
             public function pluck($field) {
                 // A plain settlement read sees every payment only under the owner lock that every payment writer holds.
                 if ($this->status && !\Illuminate\Support\Facades\DB::$userLocked) throw new \RuntimeException('Settlement guard needs the owner lock');
                 return new PluckedIds(array_map('crc32', array_keys(array_filter(\App\Helpers\ExtensionHelper::$payments,
-                    fn ($row, $key) => str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status), ARRAY_FILTER_USE_BOTH))));
+                    fn ($row, $key) => $this->matches($key) && (!$this->status || $row['status'] === $this->status), ARRAY_FILTER_USE_BOTH))));
             }
             public function exists() { foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
-                if (str_ends_with($key, ':' . $this->id) && (!$this->status || $row['status'] === $this->status)) return true;
+                if ($this->matches($key) && (!$this->status || $row['status'] === $this->status)) return true;
             } return false; }
             public function update(array $values) {
                 $count = 0;
                 foreach (\App\Helpers\ExtensionHelper::$payments as $key => $row) {
-                    if (!str_ends_with($key, ':' . $this->id) || $this->status && $row['status'] !== $this->status) continue;
+                    if (!$this->matches($key) || $this->status && $row['status'] !== $this->status) continue;
                     unset(\App\Helpers\ExtensionHelper::$payments[$key]);
                     \App\Helpers\ExtensionHelper::$payments[explode(':', $key)[0] . ':' . ($values['transaction_id'] ?? $this->id)] = $row;
                     ++$count;
@@ -594,7 +595,7 @@ namespace Illuminate\Support\Facades {
         public static $tables = [], $locks = [], $updates = [];
         public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } }; }
         public static $concurrentAgreements = [], $concurrentPayments = [];
-        public static function table($name) { return match ($name) { 'ae_stripe_locks' => new \ExtensionLockQuery, 'invoice_transactions' => new \TransactionClassificationQuery, 'ae_stripe_receipt_returns' => new \ReceiptReturnQuery, 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
+        public static function table($name) { return match ($name) { 'ae_stripe_settlements' => new \SettlementQuery, 'ae_stripe_locks' => new \ExtensionLockQuery, 'invoice_transactions' => new \TransactionClassificationQuery, 'ae_stripe_receipt_returns' => new \ReceiptReturnQuery, 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
         public static $beforeUserLock = null, $beforeServiceLock = null, $afterTransaction = null;
         public static function transactionLevel() { return self::$locked ? 1 : 0; }
         private static $afterCommit = [];
@@ -659,6 +660,24 @@ namespace Carbon {
 namespace {
     $GLOBALS['fakeConfig']['cache.default'] = 'database';
     $GLOBALS['fakeConfig']['cache.stores.database.driver'] = 'database';
+    function failedPaymentRowForKey(string $key): ?array {
+        [$invoice, $id] = explode(':', $key, 2);
+        return failedPaymentRow((int) $invoice, $id);
+    }
+    function failedPaymentRow(int $invoice, string $id): ?array {
+        $rows = array_filter(\App\Helpers\ExtensionHelper::$payments, function ($row, $key) use ($invoice, $id) {
+            return ($row['status'] ?? null) === 'failed' && ($key === $invoice . ':' . $id || str_starts_with($key, $invoice . ':' . $id . ':'));
+        }, ARRAY_FILTER_USE_BOTH);
+        return count($rows) === 1 ? array_values($rows)[0] : null;
+    }
+    class SettlementQuery {
+        public function insertOrIgnore(array $row) {
+            $key = $row['payment_intent_id'];
+            if (isset(\Illuminate\Support\Facades\DB::$tables['ae_stripe_settlements'][$key])) return 0;
+            \Illuminate\Support\Facades\DB::$tables['ae_stripe_settlements'][$key] = $row;
+            return 1;
+        }
+    }
     class ExtensionLockQuery {
         private ?string $scope = null;
         public function insertOrIgnore(array $row) {

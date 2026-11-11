@@ -103,6 +103,10 @@ trait SavedMethods
         }
         $snapshot = ExtensionLocks::transaction('user:' . $agreement->user_id, function () use ($agreement, $gateway) {
             $user = User::where('id', $agreement->user_id)->firstOrFail();
+            foreach ($this->lockedUserProperties($user, 'ae_stripe_checkout_') as $property) {
+                $attempt = json_decode($property->value, true);
+                if (in_array($attempt['confirmation']['phase'] ?? null, ['reserved', 'sending'], true)) return null;
+            }
             $current = BillingAgreement::withTrashed()->where('external_reference', $agreement->external_reference)->first();
             if (!$current || $current->id != $agreement->id || $current->user_id != $user->id || $current->gateway_id != $gateway->id) return null;
             return [$user, $current, $user->properties()->where('key', 'stripe_id')->first()?->value,

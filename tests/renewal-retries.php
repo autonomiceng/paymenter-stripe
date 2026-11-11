@@ -230,10 +230,10 @@ try {
     $run('renewal-credit-contract', function ($invoice, $stripe) use ($gateway, $renewalFixture, $dueRetry, $initialRefusal) {
         $renewalFixture($invoice, $stripe); $initialRefusal($invoice);
         $original = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['renewal'];
-        DB::transaction(function () use ($gateway, $invoice) {
+        check($gateway->cancelInvoicePayments($invoice), 'Credit retires the refused payable intent');
+        DB::transaction(function () use ($invoice) {
             User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
             \App\Models\Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
-            check($gateway->cancelInvoicePayments($invoice), 'Credit retires the refused payable intent');
             ExtensionHelper::addPayment($invoice, null, 5, null, 'credit', isCreditTransaction: true);
         });
         $after = json_decode(User::$row->props->values['ae_stripe_checkout_920'] ?? 'null', true);
@@ -246,10 +246,10 @@ try {
     $run('renewal-full-credit-contract', function ($invoice, $stripe) use ($gateway, $renewalFixture, $initialRefusal) {
         $renewalFixture($invoice, $stripe); $initialRefusal($invoice);
         ExtensionHelper::$simulateNativeListeners = true;
-        DB::transaction(function () use ($gateway, $invoice) {
+        check($gateway->cancelInvoicePayments($invoice), 'Full credit safely retires the refused payable intent');
+        DB::transaction(function () use ($invoice) {
             User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
             \App\Models\Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
-            check($gateway->cancelInvoicePayments($invoice), 'Full credit safely retires the refused payable intent');
             ExtensionHelper::addPayment($invoice, null, 20, null, 'credit', isCreditTransaction: true);
         });
         ExtensionHelper::$simulateNativeListeners = false;

@@ -130,6 +130,10 @@ trait RenewalRetry
     private function advanceRenewalRetry($invoice): ?array
     {
         $domains = $this->retainedRenewalInvoice($invoice) ? $this->domainsRenewalContext($invoice) : null;
+        $before = $this->withPaymentLock($invoice, fn ($user, $current) => $this->readPaymentAttempt($user, $current));
+        if (($before['renewal']['state'] ?? null) === 'waiting' && ($before['renewal']['next_at'] ?? PHP_INT_MAX) <= time()
+            && empty($before['funds_pending']) && empty($before['confirmation']) && empty($before['agreement_id'])
+            && !$this->cancelInvoicePayments($invoice, expectedAttemptKey: $before['key'])) return null;
         return $this->withPaymentLock($invoice, function ($user, $current) use ($domains) {
             $attempt = $this->readPaymentAttempt($user, $current);
             $renewal = $attempt['renewal'] ?? null;

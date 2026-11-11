@@ -12,7 +12,7 @@ InvoiceTransaction::saved(function () use (&$applications) { ++$applications; })
 $activations = 0;
 Invoice::updated(function ($invoice) use (&$activations) { if ($invoice->wasChanged('status') && $invoice->status === 'paid') ++$activations; });
 $reset = function () use ($owner) {
-    foreach (['invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices', 'services'] as $table) DB::table($table)->delete();
+    foreach (['ae_stripe_settlements', 'invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices', 'services'] as $table) DB::table($table)->delete();
     $owner->properties()->where('key', '!=', 'stripe_id')->delete();
 };
 $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();

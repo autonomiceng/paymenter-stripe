@@ -16,7 +16,7 @@ $activations = 0;
 Invoice::updated(function ($invoice) use (&$activations) { if ($invoice->wasChanged('status') && $invoice->status === 'paid') ++$activations; });
 $setup = function ($amount = 2000, $total = 10, $currency = 'usd') use ($owner, $nativeGateway) {
     beforeWrite('ae_stripe_receipt_returns', null); beforeWrite('notifications', null);
-    foreach (['invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices'] as $table) DB::table($table)->delete();
+    foreach (['ae_stripe_settlements', 'invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices'] as $table) DB::table($table)->delete();
     $owner->properties()->where('key', '!=', 'stripe_id')->delete();
     $owner->properties()->updateOrCreate(['key' => 'stripe_id'], ['value' => 'cus_owner']);
     $owner->forceFill(['role_id' => null])->save();
