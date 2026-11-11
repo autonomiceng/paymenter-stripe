@@ -66,7 +66,8 @@ trait ReceiptReturns
     private function readReceipt($user, string $id): ?array
     {
         $receipt = null;
-        foreach ($this->receiptRows()->where('payment_intent_id', $id)->lockForUpdate()->get() as $row) {
+        foreach ($this->receiptRows()->where('payment_intent_id', $id)->get() as $row) {
+            if (!$row = $this->lockedReceiptRow($id, $row->allocation_key)) continue;
             abort_unless((int) $row->user_id === (int) $user->id, 409);
             $binding = ['invoice_id' => (int) $row->invoice_id, 'payment_intent_id' => $id,
                 'customer' => $row->customer, 'currency' => $row->currency, 'received_minor' => (int) $row->received_minor,
@@ -83,6 +84,18 @@ trait ReceiptReturns
         return $receipt;
     }
 
+    /**
+     * One receipt row, read under the owner's user row lock: every insert of these rows holds it, so a plain read sees
+     * the latest rows, and only a row that exists is then locked by its full key. A locking read of a missing row, or of
+     * all rows of a payment, would lock an index gap shared with other customers' payments, and the row inserted next
+     * goes into that gap: two settlements doing this at once deadlock.
+     */
+    private function lockedReceiptRow(string $id, string $key): ?object
+    {
+        $row = fn () => $this->receiptRows()->where('payment_intent_id', $id)->where('allocation_key', $key);
+        return $row()->first() ? $row()->lockForUpdate()->first() : null;
+    }
+
     private function receiptNotice(array $a): string
     {
         return $a['state'] . ':' . ($a['reason'] ?? '');
@@ -91,7 +104,7 @@ trait ReceiptReturns
     private function writeReceipt($user, string $id, array $receipt, string $key): void
     {
         $a = $receipt['allocations'][$key];
-        $previous = $this->receiptRows()->where('payment_intent_id', $id)->where('allocation_key', $key)->lockForUpdate()->first();
+        $previous = $this->lockedReceiptRow($id, $key);
         $this->receiptRows()->updateOrInsert(['payment_intent_id' => $id, 'allocation_key' => $key], [
             'user_id' => $user->id, 'invoice_id' => $receipt['invoice_id'], 'customer' => $receipt['customer'],
             'currency' => $receipt['currency'], 'received_minor' => $receipt['received_minor'], 'closed_invoice' => $receipt['closed_invoice'],

@@ -6,9 +6,9 @@
 // index entry, and an insert into a gap waits for every other transaction that locked it. Two transactions that each
 // lock one gap and then insert into it wait on each other, which MariaDB reports as deadlock SQLSTATE 40001.
 // A locking `like` read of a key prefix scans and locks every customer's keys in that range, with the gaps between them
-// and the gap after the last. The same rule is modelled on the audits index (auditable_type, auditable_id), where a
-// locking read always locks the gap after the invoice's records and a new record goes into it. Its gaps are named
-// "audits:N".
+// and the gap after the last. The same rule is modelled on two more indexes: audits (auditable_type, auditable_id), where
+// a locking read always locks the gap after the invoice's records and a new record goes into it, and the receipt
+// returns unique index (payment_intent_id, allocation_key). Their gaps are named "audits:N" and "receipts:N".
 use App\Models\{Invoice, User};
 use Illuminate\Database\Events\TransactionBeginning;
 use Illuminate\Support\Facades\{DB, Event};
@@ -23,7 +23,7 @@ function gapOf(array $entry): int
     $order = fn ($a, $b) => [$a[0], (int) $a[1], $a[2]] <=> [$b[0], (int) $b[1], $b[2]];
     return count(array_filter($GLOBALS['gapIndex'], fn ($row) => $order($row, $entry) < 0));
 }
-$GLOBALS['gapAudits'] = [];
+$GLOBALS['gapAudits'] = $GLOBALS['gapReceipts'] = [];
 /** Number of entries of an index snapshot that sort before the entry, or with it when $inclusive. */
 function gapCount(array $index, array $entry, bool $inclusive = false): int
 {
@@ -32,7 +32,7 @@ function gapCount(array $index, array $entry, bool $inclusive = false): int
 DB::connection()->beforeExecuting(function ($sql, $bindings) use (&$transaction) {
     if (!is_array($GLOBALS['gapTrace']) || DB::transactionLevel() === 0) return;
     $trace = function ($kind, $gap, $label) use (&$transaction) { $GLOBALS['gapTrace'][] = [$transaction, $kind, $gap, $label]; };
-    if (preg_match('/^select .* from "(properties|audits)" where (.*) \/\* for update \*\/$/', $sql, $where)
+    if (preg_match('/^select .* from "(properties|audits|ae_stripe_receipt_returns)" where (.*) \/\* for update \*\/$/', $sql, $where)
         && preg_match_all('/"([a-z_]+)" (=|like) \?/', $where[2], $columns, PREG_SET_ORDER)) {
         $values = [];
         foreach ($columns as $index => $column) $values[$column[1]] = [$column[2], $bindings[$index]];
@@ -40,6 +40,22 @@ DB::connection()->beforeExecuting(function ($sql, $bindings) use (&$transaction)
             if (!isset($values['auditable_type'], $values['auditable_id'])) return;
             $entry = [$values['auditable_type'][1], (int) $values['auditable_id'][1]];
             $trace('lock', 'audits:' . gapCount($GLOBALS['gapAudits'], $entry, true), 'audit');
+            return;
+        }
+        if ($where[1] === 'ae_stripe_receipt_returns') {
+            if (!isset($values['payment_intent_id'])) return;
+            $intent = $values['payment_intent_id'][1];
+            if (isset($values['allocation_key'])) {
+                $entry = [$intent, $values['allocation_key'][1]];
+                if (!DB::table('ae_stripe_receipt_returns')->where('payment_intent_id', $entry[0])->where('allocation_key', $entry[1])->exists()) {
+                    $trace('lock', 'receipts:' . gapCount($GLOBALS['gapReceipts'], $entry), 'receipt');
+                }
+                return;
+            }
+            // A read of all rows of a payment locks each of its rows, the gaps before them and the gap after the last.
+            $from = gapCount($GLOBALS['gapReceipts'], [$intent, '']);
+            $to = count(array_filter($GLOBALS['gapReceipts'], fn ($row) => strcmp($row[0], $intent) <= 0));
+            for ($gap = $from; $gap <= $to; ++$gap) $trace('lock', 'receipts:' . $gap, 'receipt');
             return;
         }
         if (!isset($values['key'], $values['model_id'], $values['model_type'])) return;
@@ -60,6 +76,9 @@ DB::connection()->beforeExecuting(function ($sql, $bindings) use (&$transaction)
     [$table, $row] = $write;
     if ($table === 'properties') $trace('insert', gapOf([$row['key'], $row['model_id'], $row['model_type']]), $row['key']);
     if ($table === 'audits') $trace('insert', 'audits:' . gapCount($GLOBALS['gapAudits'], [$row['auditable_type'], (int) $row['auditable_id']], true), 'audit');
+    if ($table === 'ae_stripe_receipt_returns') {
+        $trace('insert', 'receipts:' . gapCount($GLOBALS['gapReceipts'], [$row['payment_intent_id'], $row['allocation_key']]), 'receipt');
+    }
 });
 /** Gaps a request's transaction locked while missing a row and then inserted into, as gap => key. */
 function lockedThenInserted(array $trace): array
@@ -194,6 +213,7 @@ function traced(callable $request): array
 $indexNow = function () {
     $GLOBALS['gapIndex'] = DB::table('properties')->get(['key', 'model_id', 'model_type'])->map(fn ($row) => [$row->key, $row->model_id, $row->model_type])->all();
     $GLOBALS['gapAudits'] = DB::table('audits')->get(['auditable_type', 'auditable_id'])->map(fn ($row) => [$row->auditable_type, (int) $row->auditable_id])->all();
+    $GLOBALS['gapReceipts'] = DB::table('ae_stripe_receipt_returns')->get(['payment_intent_id', 'allocation_key'])->map(fn ($row) => [$row->payment_intent_id, $row->allocation_key])->all();
 };
 $insertedKey = fn ($trace, $prefix) => (bool) array_filter($trace, fn ($event) => $event[1] === 'insert' && str_starts_with($event[3], $prefix));
 $customer(11, 'cus_11');
@@ -323,3 +343,48 @@ check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapW
     'Two held payments going to staff review at once never deadlock on their review records');
 invoke($gateway, 'sendAttemptReview', Invoice::findOrFail(351));
 check(App\Models\Audit::where('event', 'ae_stripe_attempt_review')->where('auditable_id', 351)->count() === 1, 'A repeated review check records nothing more');
+
+// Two customers overpay neighbouring invoices at once: each settlement reserves its excess as a receipt return. Both
+// payments sort into one receipt returns index gap.
+$nativeGateway->update(['enabled' => false]); // Returns are sent after commit; this case covers only the reservation.
+$overpaid = fn (int $invoiceId, int $userId) => (object) ['id' => 'pi_over_' . $invoiceId, 'status' => 'succeeded', 'amount' => 2500,
+    'amount_received' => 2500, 'currency' => 'usd', 'customer' => 'cus_' . $userId, 'latest_charge' => null,
+    'metadata' => (object) ['invoice_id' => (string) $invoiceFor($invoiceId, $userId)->id]];
+$firstPayment = $overpaid(361, 11);
+$secondPayment = $overpaid(362, 12);
+$indexNow();
+$firstTrace = traced(fn () => invoke($gateway, 'recordIntentPayment', $firstPayment, 'succeeded', false));
+$secondTrace = traced(fn () => invoke($gateway, 'recordIntentPayment', $secondPayment, 'succeeded', false));
+$nativeGateway->update(['enabled' => true]);
+$returns = tableRows('ae_stripe_receipt_returns', ['payment_intent_id', 'allocation_key']);
+check(($returns['pi_over_361:excess']['amount_minor'] ?? null) == 500 && ($returns['pi_over_362:excess']['amount_minor'] ?? null) == 500
+    && (moneyRows()['payments']['361:pi_over_361'] ?? 0) === 1 && (moneyRows()['payments']['362:pi_over_362'] ?? 0) === 1,
+    'Each overpayment is recorded once and its excess reserved for return');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
+    'Two overpayments settling at once never deadlock on their receipt returns');
+
+// Stripe reports a dispute on two customers' neighbouring payments at once. Each event checks for a staff resolution,
+// then records the dispute beside the receipt and a staff record on the invoice. Both payments sort into one receipt
+// returns gap and both invoices into one audits gap.
+$disputed = [];
+foreach ([11 => 391, 12 => 392] as $userId => $invoiceId) {
+    $disputed[$invoiceId] = (object) ['id' => 'pi_rev' . $invoiceId, 'status' => 'succeeded', 'amount' => 2000, 'amount_received' => 2000,
+        'currency' => 'usd', 'customer' => 'cus_' . $userId, 'latest_charge' => null, 'metadata' => (object) ['invoice_id' => (string) $invoiceFor($invoiceId, $userId)->id]];
+    invoke($gateway, 'recordIntentPayment', $disputed[$invoiceId], 'succeeded', false);
+}
+$GLOBALS['stripeHandler'] = function ($verb, $path) use ($disputed) {
+    if ($verb === 'get' && preg_match('#^/payment_intents/pi_rev([0-9]+)$#', $path, $id)) return $disputed[$id[1]];
+    if ($verb === 'get' && preg_match('#^/disputes/dp_rev_([0-9]+)$#', $path, $id)) return ['id' => 'dp_rev_' . $id[1], 'payment_intent' => 'pi_rev' . $id[1],
+        'currency' => 'usd', 'amount' => 2000, 'status' => 'needs_response', 'created' => time()];
+    throw new RuntimeException('Unexpected dispute request: ' . $verb . ' ' . $path);
+};
+$indexNow();
+$dispute = fn (int $invoiceId) => traced(fn () => invoke($gateway, 'recordReceiptReversalEvent', (object) ['id' => 'dp_rev_' . $invoiceId, 'payment_intent' => 'pi_rev' . $invoiceId], 'dispute'));
+$firstTrace = $dispute(391);
+$secondTrace = $dispute(392);
+$returns = tableRows('ae_stripe_receipt_returns', ['payment_intent_id', 'allocation_key']);
+check(($returns['pi_rev391:stripe:dispute:dp_rev_391']['state'] ?? null) === 'open' && ($returns['pi_rev392:stripe:dispute:dp_rev_392']['state'] ?? null) === 'open'
+    && App\Models\Audit::where('event', 'ae_stripe_receipt_reversal')->whereIn('auditable_id', [391, 392])->count() === 2,
+    'Each dispute is recorded once beside its receipt, with one staff record');
+check(!gapDeadlock($firstTrace, $secondTrace) && !gapWaits($firstTrace) && !gapWaits($secondTrace),
+    'Two disputes reported at once never deadlock on their receipt rows or staff records');

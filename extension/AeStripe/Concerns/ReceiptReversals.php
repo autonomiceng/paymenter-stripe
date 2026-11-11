@@ -181,7 +181,7 @@ trait ReceiptReversals
                 : match ($latest->status ?? '') { 'won' => 'won', 'lost' => 'lost', 'warning_closed' => 'cleared',
                     'warning_needs_response', 'warning_under_review' => 'inquiry', default => 'open' };
             $key = 'stripe:' . $kind . ':' . $id;
-            $previous = $this->receiptRows()->where('payment_intent_id', $paymentId)->where('allocation_key', $key)->lockForUpdate()->first();
+            $previous = $this->lockedReceiptRow($paymentId, $key);
             $created = !empty($previous->provider_created_at) ? (int) $previous->provider_created_at : $this->providerCreatedAt($latest);
             if ($previous) {
                 abort_unless((int) $previous->amount_minor === $latest->amount, 409);

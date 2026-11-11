@@ -48,7 +48,10 @@ trait ReversalReview
     {
         $query = $this->receiptRows()->where('payment_intent_id', $row->payment_intent_id);
         $rows = [];
-        foreach (($locked ? $query->lockForUpdate() : $query)->get() as $sibling) $rows[$sibling->allocation_key] = $sibling;
+        foreach ($query->get() as $sibling) {
+            if ($locked && !$sibling = $this->lockedReceiptRow($sibling->payment_intent_id, $sibling->allocation_key)) continue;
+            $rows[$sibling->allocation_key] = $sibling;
+        }
         $rows[$row->allocation_key] = $row; // Also supports a canonical event before its observation is written.
         ksort($rows);
         $safe = str_starts_with($row->allocation_key, 'stripe:refund:') && $row->state === 'refunded';
@@ -92,7 +95,8 @@ trait ReversalReview
         if (!$cleared && ($locked || Schema::hasTable('audits'))) {
             $query = Audit::where('auditable_type', $invoice->getMorphClass())->where('auditable_id', $invoice->id)
                 ->where('event', 'ae_stripe_reversal_resolved')->where('new_values->review_key', $reviewKey);
-            $resolution = ($locked ? $query->lockForUpdate() : $query)->first();
+            // Locked callers hold the owner lock that every resolution writer holds (see invoiceAuditExists).
+            $resolution = $query->first();
         }
         return ['needs_review' => !$cleared && !$resolution, 'review_key' => $reviewKey,
             'review_status' => $cleared ? 'cleared' : ($resolution ? 'resolved' : 'needs_review')];
