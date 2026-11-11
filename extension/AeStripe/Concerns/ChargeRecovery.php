@@ -170,7 +170,7 @@ trait ChargeRecovery
                 return;
             }
             if (!empty($attempt['failure_notified'])) return;
-            $this->queueRefusalNotice($current, $reason, $attempt['key'] ?? '');
+            $this->queueRefusalNotice($current, $reason, $attempt['refusal_key'] ?? $attempt['key'] ?? '');
             if (!empty($attempt['notice_only'])) $user->properties()->where('key', 'ae_stripe_checkout_' . $current->id)->delete();
             else $this->writePaymentAttempt($user, $current, array_replace($attempt, [
                 'agreement_id' => null, 'confirmation' => null, 'failure_reason' => $reason, 'failure_notified' => true, 'retry' => false,

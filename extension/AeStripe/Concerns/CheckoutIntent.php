@@ -499,6 +499,8 @@ trait CheckoutIntent
                 if (!empty($attempt['confirmation'])) return $attempt; // Resume the claimed instruction, never replace its identity.
             }
             $attempt['confirmation'] = ['key' => 'confirm_' . bin2hex(random_bytes(16)), 'params' => $params, 'agreement' => $agreement?->id, 'amount' => $expectedAmount, 'currency' => $expectedCurrency, 'previous_charge' => $attempt['latest_charge'] ?? null];
+            // Keep this identity after the confirmation is cleared; another Pay can reuse the checkout attempt.
+            $attempt['refusal_key'] = $attempt['confirmation']['key'];
             unset($attempt['agreement_pending']); // The confirmation now owns this instruction.
             $attempt['retry'] = true;
             $attempt['failure_reason'] = null;

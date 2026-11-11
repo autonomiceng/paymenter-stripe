@@ -417,6 +417,36 @@ use Illuminate\Support\Facades\{DB, Http};
             $gateway->finishPayment(new Request(['payment_intent' => $intent->id, 'payment_intent_client_secret' => $intent->client_secret]));
             check(count($stripe->charges) === 1 && isset(ExtensionHelper::$payments['920:' . $intent->id]), 'A bound bank return can finish its original manual payment');
         });
+        $run('recovery-refusal-saved-retry', function ($invoice, $stripe) use ($gateway) {
+            $stripe->status = 'requires_payment_method';
+            $stripe->beforeConfirm = fn ($intent) => $intent->last_payment_error = (object) ['code' => 'card_declined'];
+            $key = null;
+            foreach ([new BillingAgreement, new BillingAgreement(['id' => 5, 'external_reference' => 'pm_other'])] as $index => $agreement) {
+                $stripe->loseConfirm = true;
+                paymentStops(fn () => $gateway->charge($invoice, 20, $agreement));
+                $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                $key ??= $attempt['key'];
+                check($attempt['key'] === $key && $attempt['intent'] === 'pi_test1',
+                    'Another saved method confirms the same checkout attempt and Stripe payment');
+                $gateway->retryChargeAttempts();
+                check(count(Notification::$rows) === $index + 1
+                    && Notification::$rows[$index]['title'] === 'Payment not completed'
+                    && Notification::$rows[$index]['user_id'] === 7
+                    && !empty(Notification::$rows[$index]['url']),
+                    'Recovered decline ' . ($index + 1) . ' on the same checkout attempt sends its own linked customer notice');
+                $intent = $stripe->intents['pi_test1'];
+                $gateway->webhook(eventRequest($intent, type: 'payment_intent.payment_failed'));
+                $gateway->retryChargeAttempts();
+                $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                invoke($gateway, 'notifyRecoveryRefusal', $invoice, $attempt['failure_reason'], true);
+                check(count(Notification::$rows) === $index + 1,
+                    'Replayed decline, recovery and stored refusal deliver only one notice for that decline');
+            }
+            check(Notification::$rows[0]['body'] === Notification::$rows[1]['body']
+                && count(array_filter(Audit::$rows, fn ($audit) => $audit['event'] === 'ae_stripe_payment_refused')) === 2
+                && count($stripe->confirms) === 2 && !$stripe->charges,
+                'Identical refusal text has two durable notices for two confirmations without a debit replay');
+        });
         $run('recovery-refusals', function ($invoice, $stripe) use ($gateway) {
             $stripe->loseCreate = true; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
             $stripe->failure = fn ($verb, $path) => $path === '/payment_intents' ? throw new RequestException(400) : null;
