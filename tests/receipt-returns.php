@@ -39,7 +39,7 @@ $setup = function ($amount = 2000, $total = 10, $currency = 'usd') use ($owner, 
             }
             if ($path === '/refunds' && $verb === 'get') return (object) ['data' => array_values($this->refunds), 'has_more' => false];
             if ($path !== '/refunds' || $verb !== 'post') throw new RuntimeException('Unexpected return fixture request: ' . $path);
-            check(holdsLock('ae_stripe_locks') && holdsLock('invoices'), 'Return sends serialize with invoice payments');
+            check(DB::transactionLevel() === 0, 'Refund HTTP runs outside every transaction');
             $key = idempotencyKey($request);
             $stored = tableRows('ae_stripe_receipt_returns', ['payment_intent_id', 'allocation_key']);
             check(!empty($stored[array_key_last($stored)]['sent_at']), 'First-send marker survives outside the external-write transaction');

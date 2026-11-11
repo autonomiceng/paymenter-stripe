@@ -129,6 +129,35 @@ function pendingNotice(string $event, string $type = Invoice::class): void
         ]]]]);
 }
 $cases = [
+    'outbox-refund-http' => ['seed' => fn () => customerInvoice(7, 601),
+        'pause' => '#^POST /refunds$#', 'a' => function ($gateway) {
+            $handler = $GLOBALS['stripeHandler'];
+            $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($handler) {
+                if ($verb === 'post' && $path === '/refunds') {
+                    check(DB::transactionLevel() === 0, 'Receipt HTTP runs outside every transaction');
+                    $row = DB::table('ae_stripe_receipt_returns')->where('return_key', $data['metadata']['ae_stripe_return'])->first();
+                    check($row->sent_at !== null && $request->header('Idempotency-Key')[0] === $row->return_key,
+                        'Refund uses its committed reservation and key');
+                }
+                return $handler($verb, $path, $data, $request);
+            };
+            return settle($gateway, 601, 3000);
+        }, 'b' => fn () => User::where('id', 7)->update(['first_name' => 'Updated']),
+        'check' => fn () => $rows(601) === [[30.0, 'succeeded', false], [-10.0, 'succeeded', true]]
+            && (float) DB::table('credits')->where('user_id', 7)->value('amount') === 10.0
+            && DB::table('notifications')->where('title', 'Payment return')->count() === 1 && User::find(7)->first_name === 'Updated'],
+    'outbox-reversal-http' => ['seed' => function () use ($gateway) { customerInvoice(7, 561); settle($gateway, 561); },
+        'pause' => '#^GET /refunds/re_561$#', 'a' => function ($gateway) {
+            $handler = $GLOBALS['stripeHandler'];
+            $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($handler) {
+                if ($path === '/refunds/re_561') check(DB::transactionLevel() === 0, 'Reversal observations run outside every transaction');
+                return $handler($verb, $path, $data, $request);
+            };
+            return invoke($gateway, 'recordReceiptReversalEvent', (object) ['id' => 're_561', 'payment_intent' => 'pi_561'], 'refund') ?? 'recorded';
+        }, 'b' => fn () => User::where('id', 7)->update(['first_name' => 'Updated']),
+        'check' => fn () => DB::table('ae_stripe_receipt_returns')->where('allocation_key', 'stripe:refund:re_561')->value('state') === 'refunded'
+            && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')->count() === 1
+            && $rows(561) === [[20.0, 'succeeded', false]] && User::find(7)->first_name === 'Updated'],
     'outbox-confirm-http' => ['seed' => function () {
         customerInvoice(7, 401)->user->properties()->create(['key' => 'ae_stripe_checkout_401', 'value' => json_encode([
             'version' => 2, 'key' => 'checkout_401', 'created' => time(), 'intent' => 'pi_401'])]);
