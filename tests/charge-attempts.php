@@ -1244,6 +1244,32 @@ use Illuminate\Support\Facades\{DB, Http};
             check(count(Notification::$rows) === 1, 'A card decline gives staff no task');
             check(array_column(DB::$tables['ae_stripe_outbox'], 'source') === ['ch_recovery_decline'], 'A declined charge supplies its natural notice identity');
             check((failedPaymentRow(920, 'pi_test1')['status'] ?? null) === 'failed', 'Recovery records a definite decline for the native failed-payment notice');
+            $firstDecline = clone $stripe->intents['pi_test1'];
+            $stripe->failure = null;
+            $stripe->beforeConfirm = fn () => throw new ConnectionException('Second confirm not sent');
+            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $stripe->beforeConfirm = null;
+            $stripe->failure = function ($verb, $path) use ($stripe) {
+                if (!str_ends_with($path, '/confirm')) return;
+                $current = $stripe->intents['pi_test1'];
+                $current->latest_charge = 'ch_second_decline';
+                $current->last_payment_error = (object) ['code' => 'card_declined'];
+                throw new RequestException(402, ['error' => ['code' => 'card_declined']]);
+            };
+            $gateway->retryChargeAttempts();
+            $secondDecline = clone $stripe->intents['pi_test1'];
+            $beforeReplay = [ExtensionHelper::$payments, Audit::$rows, Notification::$rows];
+            foreach ([$firstDecline, $secondDecline, $firstDecline, $secondDecline] as $decline) {
+                $gateway->webhook(eventRequest($decline, type: 'payment_intent.payment_failed'));
+            }
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            check(count(ExtensionHelper::$payments) === 2
+                && isset(ExtensionHelper::$payments['920:pi_test1:ch_recovery_decline'], ExtensionHelper::$payments['920:pi_test1:ch_second_decline'])
+                && array_column(DB::$tables['ae_stripe_outbox'], 'source') === ['ch_recovery_decline', 'ch_second_decline']
+                && count(Notification::$rows) === 2 && count(Audit::$rows) === 2
+                && [ExtensionHelper::$payments, Audit::$rows, Notification::$rows] === $beforeReplay && !$stripe->charges,
+                'Two distinct declined charges each retain one failed row and notice across replays of both identities');
+
             $stripe->failure = null;
             check($gateway->charge($invoice, 20, new BillingAgreement) === true, 'Recovery decline leaves the invoice payable');
         });
