@@ -10,6 +10,70 @@ use App\Models\{Invoice, User};
 use Illuminate\Database\Events\TransactionBeginning;
 use Illuminate\Support\Facades\{DB, Event};
 
+// Deferred retirement belongs to the attempt observed before the core transaction committed.
+if (!getenv('PAY_OUTBOX_CASE') || getenv('PAY_OUTBOX_CASE') === 'cancel') (function () use ($gateway, $owner) {
+    $invoice = nativeInvoice(9981);
+    $property = $owner->properties()->create(['key' => 'ae_stripe_checkout_9981', 'value' => json_encode([
+        'version' => 2, 'key' => 'original', 'intent' => 'pi_original', 'created' => time()])]);
+    $replacement = ['version' => 2, 'key' => 'replacement', 'intent' => 'pi_replacement', 'created' => time()];
+    $calls = 0;
+    $GLOBALS['stripeHandler'] = function ($verb, $path) use (&$calls) {
+        ++$calls;
+        return ['id' => 'pi_replacement', 'status' => str_ends_with($path, '/cancel') ? 'canceled' : 'requires_payment_method',
+            'amount_received' => 0, 'customer' => 'cus_owner', 'currency' => 'usd'];
+    };
+    DB::transaction(function () use ($gateway, $invoice, $property, $replacement) {
+        DB::afterCommit(fn () => $property->update(['value' => json_encode($replacement)]));
+        check(!$gateway->cancelInvoicePayments($invoice), 'Core transaction defers provider retirement');
+    });
+    check(json_decode($property->fresh()?->value ?? 'null', true) === $replacement && $calls === 0,
+        'Deferred retirement preserves a replacement payment form without provider cancellation');
+    $property->delete();
+})();
+
+// A second saved-card caller cannot take over a confirmation whose provider response is pending.
+if (!getenv('PAY_OUTBOX_CASE') || getenv('PAY_OUTBOX_CASE') === 'caller') (function () use ($gateway, $owner) {
+    Illuminate\Support\Facades\Route::get('/fixture/payment-return', fn () => null)->name('extensions.gateways.ae-stripe.payment-return');
+    Illuminate\Support\Facades\Route::getRoutes()->refreshNameLookups();
+    $invoice = nativeInvoice(9982);
+    $first = nativeAgreement(9981, 'pm_first'); $second = nativeAgreement(9982, 'pm_second');
+    $intent = (object) ['id' => 'pi_overlap', 'status' => 'requires_payment_method', 'amount' => 2000,
+        'amount_received' => 0, 'currency' => 'usd', 'customer' => 'cus_owner', 'confirmation_method' => 'manual'];
+    $property = $owner->properties()->create(['key' => 'ae_stripe_checkout_9982', 'value' => json_encode([
+        'version' => 2, 'key' => 'overlap', 'intent' => $intent->id, 'created' => time(), 'agreement_id' => $first->id])]);
+    $params = ['payment_method' => $first->external_reference, 'return_url' => '/return', 'use_stripe_sdk' => 'true'];
+    $posts = []; $reservationBlocked = $confirmationBlocked = $paramsBlocked = false; $during = null;
+    $GLOBALS['stripeHandler'] = function ($verb, $path, $data) use ($gateway, $invoice, $intent, $first, $second, $params, $property, &$posts, &$reservationBlocked, &$confirmationBlocked, &$paramsBlocked, &$during) {
+        if ($verb === 'get' && str_starts_with($path, '/payment_methods/')) return nativeCard(basename($path));
+        if ($verb === 'get') return $intent;
+        $posts[] = [$path, $data];
+        if (str_ends_with($path, '/confirm') && count($posts) === 2) {
+            try {
+                invoke($gateway, 'reservePaymentAttempt', $invoice, ['customer' => 'cus_owner', 'agreement_id' => $second->id, 'renewal_start' => false]);
+            } catch (Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException $e) { $reservationBlocked = true; }
+            try {
+                invoke($gateway, 'confirmAttempt', $invoice, $intent->id,
+                    ['payment_method' => $second->external_reference, 'return_url' => '/return', 'use_stripe_sdk' => 'true'], $second, 2000, 'usd');
+            } catch (Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException $e) { $confirmationBlocked = true; }
+            try {
+                invoke($gateway, 'confirmAttempt', $invoice, $intent->id, array_replace($params, ['return_url' => '/changed-return']), $first, 2000, 'usd');
+            } catch (Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException $e) { $paramsBlocked = true; }
+            $during = json_decode($property->fresh()->value, true);
+        }
+        return (object) array_replace((array) $intent, ['status' => str_ends_with($path, '/confirm') ? 'requires_action' : 'requires_payment_method']);
+    };
+    $result = invoke($gateway, 'confirmAttempt', $invoice, $intent->id, $params, $first, 2000, 'usd');
+    $stored = json_decode($property->fresh()->value, true);
+    check($reservationBlocked && $confirmationBlocked && $paramsBlocked && count($posts) === 2 && $during['agreement_id'] === $first->id,
+        'Overlapping Pay with a different card cannot send or replace the first instruction');
+    check($result->status === 'requires_action' && $stored['confirmation']['agreement'] === $first->id
+        && $stored['confirmation']['params']['payment_method'] === $first->external_reference && !payments(),
+        'Authentication recovery stays bound to the card that was actually confirmed');
+    $property->delete(); $first->forceDelete(); $second->forceDelete();
+})();
+if (getenv('PAY_OUTBOX_CASE')) return;
+$GLOBALS['stripeCalls'] = [];
+
 // The mutex must belong to the row's owner; gateway and unrelated customers do not qualify.
 $guardInvoice = nativeInvoice(9991);
 foreach (['gateway', 'user:8', 'user:7'] as $scope) {

@@ -410,6 +410,43 @@ check($status($i)['state'] === 'credited'
     && Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class)->count() === 2
     && $mailRows()->count() === 2,
     'A real later change to account credit sends one different completion email');
+// New staff instructions within one state are delivered once without repeating customer notices or mail.
+if (!getenv('PAY_OUTBOX_CASE') || getenv('PAY_OUTBOX_CASE') === 'reason') {
+    [$i, $s] = $setup(); $s->status = 'pending'; $deliver($s);
+    $baseline = count(notices());
+    foreach (['First instructions', 'Changed instructions', 'Changed instructions'] as $reason) {
+        $setReturn('pi_return:excess', ['reason' => $reason]);
+        invoke($gateway, 'notifyReceiptReturn', $i, 'pi_return', 'excess');
+    }
+    $sent = array_slice(notices(), $baseline);
+    check(count($sent) === 2 && array_column($sent, 'user_id') === [99, 99],
+        'Changed same-state return instructions reach staff once per detail without repeating the customer notice');
+    check(count($s->posts) === 1 && !credits() && $status($i)['state'] === 'pending',
+        'Instruction notices cannot change the return money or state');
+}
+
+// A failed bell delivery and an accepted mail job must both recheck the invoice owner on retry.
+if (!getenv('PAY_OUTBOX_CASE') || getenv('PAY_OUTBOX_CASE') === 'recipient') {
+    foreach (['return', 'refusal', 'legacy'] as $case) {
+        Illuminate\Support\Facades\Mail::fake(); DB::table('email_logs')->delete();
+        [$i, $s] = $setup(); $inboxDown();
+        if ($case === 'return') $deliver($s);
+        else {
+            $audit = invoke($gateway, 'withPaymentLock', $i, fn () => Audit::create([
+                'event' => 'ae_stripe_payment_refused', 'auditable_type' => $i->getMorphClass(), 'auditable_id' => $i->id,
+                'old_values' => [], 'new_values' => ['notice_sent' => false, 'notice_source' => 'ownership-' . $case,
+                    'notices' => [['user_id' => 7, 'title' => 'Payment not completed', 'body' => 'Fixture', 'url' => route('invoices.show', $i)]]]]));
+            if ($case === 'legacy') $gateway->backfillPaymentNotices();
+            else DB::transaction(fn () => invoke($gateway, 'queuePaymentNotices', $audit, $audit->new_values['notices']));
+        }
+        check(DB::table('ae_stripe_outbox')->where('state', 'pending')->exists(), 'Recipient check starts with undelivered work');
+        $i->update(['user_id' => 99]); $inboxUp();
+        invoke($gateway, 'retryPaymentNotices'); $drainReturnMail(); invoke($gateway, 'retryPaymentNotices');
+        check(!notices() && Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class)->isEmpty()
+            && DB::table('email_logs')->count() === 0 && !DB::table('ae_stripe_outbox')->where('state', 'sent')->exists(),
+            'Reassigned invoice skips old-owner bell and queued mail delivery: ' . $case);
+    }
+}
 config(['queue.default' => 'sync']);
 
 require __DIR__ . '/receipt-reversals.php';

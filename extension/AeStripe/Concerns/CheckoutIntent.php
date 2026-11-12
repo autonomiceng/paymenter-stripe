@@ -180,6 +180,15 @@ trait CheckoutIntent
             $amount = $this->paymentBalance($current);
             if ($current->status !== 'pending' || $amount <= 0) throw new DisplayException('This invoice has no payment due. Refresh the invoice.');
             $attempt = $this->readPaymentAttempt($user, $current);
+            if (in_array($attempt['confirmation']['phase'] ?? null, ['reserved', 'sending'], true)) {
+                $claim = $attempt['confirmation'];
+                if (isset($data['agreement_id']) && $data['agreement_id'] != ($claim['agreement'] ?? null)
+                    || isset($data['accepted_amount'], $claim['amount']) && $data['accepted_amount'] !== $claim['amount']
+                    || isset($data['accepted_currency'], $claim['currency']) && strtolower($data['accepted_currency']) !== strtolower($claim['currency'])) {
+                    $this->paymentPending('We are checking the earlier payment. Refresh the invoice for its status.');
+                }
+                return $attempt + ['due_amount' => $amount];
+            }
             $customerPay = $elements || array_key_exists('renewal_start', $data) && !$data['renewal_start'];
             $context = array_intersect_key($attempt ?? $data, array_flip(['renewal', 'automatic_renewal', 'customer_payment', 'accepted_amount', 'accepted_currency', 'auto_pay_agreement']));
             foreach (['accepted_amount', 'accepted_currency', 'auto_pay_agreement'] as $key) {
@@ -512,6 +521,15 @@ trait CheckoutIntent
         return false;
     }
 
+    private function confirmationMatchesCaller(array $claim, array $params, ?BillingAgreement $agreement, ?int $amount, ?string $currency): bool
+    {
+        // Recovery supplies stored confirm fields; callers may also supply the complete instruction.
+        $frozen = array_replace($claim['params'], array_intersect_key($claim['updates'] ?? [], array_flip(['metadata', 'setup_future_usage'])));
+        return ($claim['agreement'] ?? null) == $agreement?->id && ($frozen == $params || $claim['params'] == $params)
+            && (!isset($claim['amount'], $amount) || $claim['amount'] === $amount)
+            && (!isset($claim['currency'], $currency) || strtolower($claim['currency']) === strtolower($currency));
+    }
+
     private function confirmAttempt($invoice, string $intentId, array $params, ?BillingAgreement $agreement = null, ?int $expectedAmount = null, ?string $expectedCurrency = null)
     {
         // Commit the confirmation identity before HTTP. Other extension paths honor this claim until its answer is recorded.
@@ -521,6 +539,10 @@ trait CheckoutIntent
             $expectedAmount = $attempt['accepted_amount'] ?? $expectedAmount;
             $expectedCurrency = $attempt['accepted_currency'] ?? $expectedCurrency
                 ?? $attempt['confirmation']['currency'] ?? $attempt['params']['currency'] ?? null;
+            if (!empty($attempt['confirmation']) && (($attempt['confirmation']['phase'] ?? null) === 'sending' || !empty($attempt['automatic_renewal']))
+                && !$this->confirmationMatchesCaller($attempt['confirmation'], $params, $agreement, $expectedAmount, $expectedCurrency)) {
+                $this->paymentPending('We are checking the earlier payment. Refresh the invoice for its status.');
+            }
             if (!empty($attempt['automatic_renewal'])) {
                 if (($attempt['renewal']['state'] ?? null) !== 'active') throw new DisplayException('Auto Pay stopped for this renewal. Open the invoice to pay the amount due.');
                 if (!empty($attempt['confirmation'])) return $attempt; // Resume the claimed instruction, never replace its identity.
@@ -538,12 +560,9 @@ trait CheckoutIntent
             $this->writePaymentAttempt($user, $current, $attempt);
             return $attempt;
         });
-        $expectedAmount = $attempt['accepted_amount'] ?? $expectedAmount;
         $expectedCurrency = $attempt['confirmation']['currency'] ?? $attempt['params']['currency'] ?? null;
-        if (!empty($attempt['automatic_renewal'])) {
-            $params = $attempt['confirmation']['params'];
-            $expectedAmount = $attempt['confirmation']['amount'];
-        }
+        $params = array_replace($attempt['confirmation']['params'], array_intersect_key($attempt['confirmation']['updates'] ?? [], array_flip(['metadata', 'setup_future_usage'])));
+        $expectedAmount = $attempt['confirmation']['amount'];
         $writeStarted = false;
         $previous = null;
         // Records Stripe's answer: a proven refusal ends this confirmation, and a declined renewal is recorded as failed.
@@ -608,6 +627,8 @@ trait CheckoutIntent
                         || $active->external_reference !== $params['payment_method']) {
                         return new DisplayException('This payment method was removed. Choose another payment method.');
                     }
+                    $index = $this->savedMethodIndex($user, $active->external_reference, $intent->customer, $active->gateway);
+                    if (!empty($index['removing']) || !empty($index['removed'])) return new DisplayException('This payment method was removed. Choose another payment method.');
                     if (($method->customer ?? null) !== $intent->customer) return new DisplayException('This payment method is no longer saved. Choose another payment method.');
                 }
                 if ($intent->customer !== $user->properties()->where('key', 'stripe_id')->first()?->value) return new DisplayException('The payment account changed. Refresh the invoice before paying.');
@@ -667,8 +688,8 @@ trait CheckoutIntent
             // Bank verification may finish days later, without a browser return. The consumed
             // token must not be replayed; Stripe already holds the authenticated payment method.
             $resumeParams = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id]), 'use_stripe_sdk' => 'true'];
-            if ($agreement) $resumeParams['payment_method'] = $agreement->external_reference;
-            $resume = ['key' => $attempt['confirmation']['key'], 'params' => $resumeParams, 'agreement' => $agreement?->id, 'amount' => $expectedAmount ?? $result->amount, 'currency' => $expectedCurrency ?? $result->currency, 'phase' => 'observed'];
+            if (!empty($attempt['confirmation']['params']['payment_method'])) $resumeParams['payment_method'] = $attempt['confirmation']['params']['payment_method'];
+            $resume = ['key' => $attempt['confirmation']['key'], 'params' => $resumeParams, 'agreement' => $attempt['confirmation']['agreement'], 'amount' => $expectedAmount ?? $result->amount, 'currency' => $expectedCurrency ?? $result->currency, 'phase' => 'observed'];
         }
         $this->storePaymentAttempt($invoice, $attempt, ['retry' => !($result instanceof DisplayException)
             && in_array($result->status, ['succeeded', 'processing', 'requires_capture', 'requires_action'], true), 'confirmation' => $resume, 'agreement_id' => null, 'funds_pending' => !($result instanceof DisplayException)

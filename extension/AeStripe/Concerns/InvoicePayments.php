@@ -46,7 +46,7 @@ trait InvoicePayments
         if (is_bool($attempt)) return $attempt;
         // A core transaction cannot be suspended for HTTP. Its committed retirement is completed after commit.
         if (\Illuminate\Support\Facades\DB::transactionLevel() > 0) {
-            \Illuminate\Support\Facades\DB::afterCommit(fn () => $this->cancelInvoicePayments($invoice));
+            \Illuminate\Support\Facades\DB::afterCommit(fn () => $this->cancelInvoicePayments($invoice, expectedAttemptKey: $attempt['key']));
             return false;
         }
         if (empty($attempt['intent'])) {

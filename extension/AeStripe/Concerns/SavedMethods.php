@@ -76,6 +76,18 @@ trait SavedMethods
         return $index;
     }
 
+    private function savedMethodCopiesInUse($user, array $copies): bool
+    {
+        foreach ($this->lockedUserProperties($user, 'ae_stripe_checkout_') as $property) {
+            $attempt = json_decode($property->value, true);
+            $claim = $attempt['confirmation'] ?? [];
+            if (!in_array($claim['phase'] ?? null, ['reserved', 'sending'], true)) continue;
+            if (isset($claim['params']['payment_method']) && array_key_exists($claim['params']['payment_method'], $copies)
+                || !empty($claim['agreement']) && in_array($claim['agreement'], array_values($copies))) return true;
+        }
+        return false;
+    }
+
     private function removeSavedMethodCopies(BillingAgreement $agreement): bool
     {
         $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
@@ -103,10 +115,6 @@ trait SavedMethods
         }
         $snapshot = ExtensionLocks::transaction('user:' . $agreement->user_id, function () use ($agreement, $gateway) {
             $user = User::where('id', $agreement->user_id)->firstOrFail();
-            foreach ($this->lockedUserProperties($user, 'ae_stripe_checkout_') as $property) {
-                $attempt = json_decode($property->value, true);
-                if (in_array($attempt['confirmation']['phase'] ?? null, ['reserved', 'sending'], true)) return null;
-            }
             $current = BillingAgreement::withTrashed()->where('external_reference', $agreement->external_reference)->first();
             if (!$current || $current->id != $agreement->id || $current->user_id != $user->id || $current->gateway_id != $gateway->id) return null;
             return [$user, $current, $user->properties()->where('key', 'stripe_id')->first()?->value,
@@ -174,6 +182,9 @@ trait SavedMethods
                     $row = BillingAgreement::withTrashed()->where('external_reference', $match->external_reference)->first();
                     if (!$row || $row->id != $match->id) return false;
                 }
+                $references = array_fill_keys(array_keys($copies), null);
+                foreach ($matched as $match) $references[$match->external_reference] = $match->id;
+                if ($this->savedMethodCopiesInUse($user, $references)) return false;
                 $old = json_decode($this->lockedUserProperty($user, $journalKey)?->value ?? 'null', true);
                 $journal = ['user_id' => $user->id, 'gateway_id' => $gateway->id, 'customer' => $customer,
                     'identity' => $identity, 'copies' => [], 'detached' => []];
@@ -198,6 +209,7 @@ trait SavedMethods
             unset($copies[$current->external_reference]);
             $copies[$current->external_reference] = $visible;
             foreach ($copies as $reference => $remote) {
+                if (ExtensionLocks::transaction('user:' . $user->id, fn () => $this->savedMethodCopiesInUse($user, $journal['copies']))) return false;
                 if (($remote->customer ?? null) === $customer) $this->request('post', '/payment_methods/' . $reference . '/detach');
                 $journal['detached'][$reference] = true;
                 ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $gateway, $customer, $reference, $journalKey, $journal) {

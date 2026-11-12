@@ -1712,6 +1712,25 @@ use Illuminate\Support\Facades\{DB, Http};
             check(str_contains($gateway->finishPayment(new Request(['payment_intent' => $intent->id, 'payment_intent_client_secret' => $intent->client_secret])), 'checkPayment=true')
                 && count($stripe->confirms) === 1, 'An automatic redirect reads settlement without confirming again');
         });
+        $run('elements-lost-confirm-recovery', function ($invoice, $stripe) use ($gateway) {
+            $gateway->pay($invoice, 20);
+            $stripe->beforeConfirm = fn () => throw new ConnectionException('Confirmation never reached Stripe');
+            $response = $gateway->confirmPayment(new Request(['intent' => 'pi_test1', 'save' => false,
+                'confirmation_token' => 'ctoken_recovery', 'amount' => 2000]));
+            $claim = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['confirmation'];
+            check($response['status'] === 409 && !$stripe->confirms && !$stripe->charges
+                && $stripe->intents['pi_test1']->status === 'requires_payment_method',
+                'An interrupted Elements confirmation retains recovery without taking money');
+            $stripe->beforeConfirm = null;
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            check(count($stripe->confirms) === 1 && $stripe->confirms[0][0] === $claim['key']
+                && $stripe->confirms[0][1]['confirmation_token'] === 'ctoken_recovery',
+                'Elements recovery confirms the original token once with its original idempotency key');
+            check(count($stripe->charges) === 1 && $stripe->charges[0][1] === 2000
+                && (ExtensionHelper::$payments['920:pi_test1']['status'] ?? null) === 'succeeded'
+                && ExtensionHelper::$payments['920:pi_test1']['amount'] === 20.0,
+                'Elements recovery settles exactly one authorized payment without another customer submit');
+        });
         $run('checkout-consent', function ($invoice, $stripe) use ($gateway) {
             $gateway->pay($invoice, 20);
             $stripe->beforeConfirm = function ($intent, $params) {
