@@ -539,7 +539,7 @@ trait CheckoutIntent
             $expectedAmount = $attempt['accepted_amount'] ?? $expectedAmount;
             $expectedCurrency = $attempt['accepted_currency'] ?? $expectedCurrency
                 ?? $attempt['confirmation']['currency'] ?? $attempt['params']['currency'] ?? null;
-            if (!empty($attempt['confirmation']) && (($attempt['confirmation']['phase'] ?? null) === 'sending' || !empty($attempt['automatic_renewal']))
+            if (!empty($attempt['confirmation']) && (in_array($attempt['confirmation']['phase'] ?? null, ['reserved', 'sending'], true) || !empty($attempt['automatic_renewal']))
                 && !$this->confirmationMatchesCaller($attempt['confirmation'], $params, $agreement, $expectedAmount, $expectedCurrency)) {
                 $this->paymentPending('We are checking the earlier payment. Refresh the invoice for its status.');
             }
@@ -547,7 +547,7 @@ trait CheckoutIntent
                 if (($attempt['renewal']['state'] ?? null) !== 'active') throw new DisplayException('Auto Pay stopped for this renewal. Open the invoice to pay the amount due.');
                 if (!empty($attempt['confirmation'])) return $attempt; // Resume the claimed instruction, never replace its identity.
             }
-            if (!empty($attempt['confirmation']) && ($attempt['confirmation']['phase'] ?? null) === 'sending') return $attempt;
+            if (in_array($attempt['confirmation']['phase'] ?? null, ['reserved', 'sending'], true)) return $attempt;
             $attempt['confirmation'] = ['key' => 'confirm_' . bin2hex(random_bytes(16)), 'params' => $params, 'agreement' => $agreement?->id, 'amount' => $expectedAmount, 'currency' => $expectedCurrency, 'previous_charge' => $attempt['latest_charge'] ?? null, 'phase' => 'reserved'];
             // Keep this identity after the confirmation is cleared; another Pay can reuse the checkout attempt.
             $attempt['refusal_key'] = $attempt['confirmation']['key'];

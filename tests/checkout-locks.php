@@ -31,45 +31,83 @@ if (!getenv('PAY_OUTBOX_CASE') || getenv('PAY_OUTBOX_CASE') === 'cancel') (funct
     $property->delete();
 })();
 
-// A second saved-card caller cannot take over a confirmation whose provider response is pending.
-if (!getenv('PAY_OUTBOX_CASE') || getenv('PAY_OUTBOX_CASE') === 'caller') (function () use ($gateway, $owner) {
+// A second caller cannot take over a confirmation during provider reads or while its response is pending.
+if (!getenv('PAY_OUTBOX_CASE') || getenv('PAY_OUTBOX_CASE') === 'caller') foreach (['reserved', 'sending'] as $phase) (function () use ($gateway, $owner, $phase) {
     Illuminate\Support\Facades\Route::get('/fixture/payment-return', fn () => null)->name('extensions.gateways.ae-stripe.payment-return');
     Illuminate\Support\Facades\Route::getRoutes()->refreshNameLookups();
-    $invoice = nativeInvoice(9982);
+    $invoice = nativeInvoice($phase === 'reserved' ? 9982 : 9984);
     $first = nativeAgreement(9981, 'pm_first'); $second = nativeAgreement(9982, 'pm_second');
     $intent = (object) ['id' => 'pi_overlap', 'status' => 'requires_payment_method', 'amount' => 2000,
         'amount_received' => 0, 'currency' => 'usd', 'customer' => 'cus_owner', 'confirmation_method' => 'manual'];
-    $property = $owner->properties()->create(['key' => 'ae_stripe_checkout_9982', 'value' => json_encode([
+    $property = $owner->properties()->create(['key' => 'ae_stripe_checkout_' . $invoice->id, 'value' => json_encode([
         'version' => 2, 'key' => 'overlap', 'intent' => $intent->id, 'created' => time(), 'agreement_id' => $first->id])]);
     $params = ['payment_method' => $first->external_reference, 'return_url' => '/return', 'use_stripe_sdk' => 'true'];
-    $posts = []; $reservationBlocked = $confirmationBlocked = $paramsBlocked = false; $during = null;
-    $GLOBALS['stripeHandler'] = function ($verb, $path, $data) use ($gateway, $invoice, $intent, $first, $second, $params, $property, &$posts, &$reservationBlocked, &$confirmationBlocked, &$paramsBlocked, &$during) {
-        if ($verb === 'get' && str_starts_with($path, '/payment_methods/')) return nativeCard(basename($path));
-        if ($verb === 'get') return $intent;
-        $posts[] = [$path, $data];
-        if (str_ends_with($path, '/confirm') && count($posts) === 2) {
+    $posts = []; $reservationBlocked = $confirmationBlocked = $paramsBlocked = false; $during = $claim = null;
+    $interleaved = false;
+    $GLOBALS['stripeHandler'] = function ($verb, $path, $data) use ($gateway, $invoice, $intent, $first, $second, $params, $property, $phase, &$posts, &$reservationBlocked, &$confirmationBlocked, &$paramsBlocked, &$during, &$claim, &$interleaved) {
+        if (!$interleaved && ($phase === 'reserved' && $verb === 'get' && $path === '/payment_intents/' . $intent->id
+            || $phase === 'sending' && str_ends_with($path, '/confirm'))) {
+            $interleaved = true;
+            $claim = json_decode($property->fresh()->value, true)['confirmation'];
+            check($claim['phase'] === $phase, 'The competing caller enters during the requested confirmation phase');
             try {
                 invoke($gateway, 'reservePaymentAttempt', $invoice, ['customer' => 'cus_owner', 'agreement_id' => $second->id, 'renewal_start' => false]);
             } catch (Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException $e) { $reservationBlocked = true; }
             try {
                 invoke($gateway, 'confirmAttempt', $invoice, $intent->id,
                     ['payment_method' => $second->external_reference, 'return_url' => '/return', 'use_stripe_sdk' => 'true'], $second, 2000, 'usd');
-            } catch (Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException $e) { $confirmationBlocked = true; }
+            } catch (App\Exceptions\DisplayException $e) { $confirmationBlocked = $e instanceof Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException; }
             try {
                 invoke($gateway, 'confirmAttempt', $invoice, $intent->id, array_replace($params, ['return_url' => '/changed-return']), $first, 2000, 'usd');
             } catch (Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException $e) { $paramsBlocked = true; }
             $during = json_decode($property->fresh()->value, true);
+            check($reservationBlocked && $confirmationBlocked && $paramsBlocked && $during['confirmation'] === $claim,
+                'A competing caller preserves the original confirmation while ' . $phase);
         }
+        if ($verb === 'get' && str_starts_with($path, '/payment_methods/')) return nativeCard(basename($path));
+        if ($verb === 'get') return $intent;
+        $posts[] = [$path, $data];
         return (object) array_replace((array) $intent, ['status' => str_ends_with($path, '/confirm') ? 'requires_action' : 'requires_payment_method']);
     };
     $result = invoke($gateway, 'confirmAttempt', $invoice, $intent->id, $params, $first, 2000, 'usd');
     $stored = json_decode($property->fresh()->value, true);
-    check($reservationBlocked && $confirmationBlocked && $paramsBlocked && count($posts) === 2 && $during['agreement_id'] === $first->id,
-        'Overlapping Pay with a different card cannot send or replace the first instruction');
+    check($reservationBlocked && $confirmationBlocked && $paramsBlocked && count($posts) === 2 && $during['agreement_id'] === $first->id
+        && $during['confirmation'] === $claim,
+        'Overlapping Pay cannot send or replace the first instruction while ' . $phase);
     check($result->status === 'requires_action' && $stored['confirmation']['agreement'] === $first->id
         && $stored['confirmation']['params']['payment_method'] === $first->external_reference && !payments(),
         'Authentication recovery stays bound to the card that was actually confirmed');
     $property->delete(); $first->forceDelete(); $second->forceDelete();
+})();
+
+// Recovery after a failed provider read must retain the already committed confirmation key.
+if (!getenv('PAY_OUTBOX_CASE') || getenv('PAY_OUTBOX_CASE') === 'caller') (function () use ($gateway, $owner) {
+    $invoice = nativeInvoice(9983);
+    $agreement = nativeAgreement(9983, 'pm_reserved');
+    $intent = (object) ['id' => 'pi_reserved', 'status' => 'requires_payment_method', 'amount' => 2000,
+        'amount_received' => 0, 'currency' => 'usd', 'customer' => 'cus_owner', 'confirmation_method' => 'manual'];
+    $params = ['payment_method' => $agreement->external_reference, 'return_url' => '/return', 'use_stripe_sdk' => 'true'];
+    $property = $owner->properties()->create(['key' => 'ae_stripe_checkout_9983', 'value' => json_encode([
+        'version' => 2, 'key' => 'reserved', 'intent' => $intent->id, 'created' => time(), 'agreement_id' => $agreement->id])]);
+    $claim = null; $failRead = true; $keys = [];
+    $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($intent, $property, &$claim, &$failRead, &$keys) {
+        if ($failRead) {
+            $failRead = false;
+            $claim = json_decode($property->fresh()->value, true)['confirmation'];
+            throw new Illuminate\Http\Client\ConnectionException('Provider read interrupted');
+        }
+        if ($verb === 'get') return str_starts_with($path, '/payment_methods/') ? nativeCard(basename($path)) : $intent;
+        $keys[] = idempotencyKey($request);
+        return (object) array_replace((array) $intent, ['status' => str_ends_with($path, '/confirm') ? 'requires_action' : 'requires_payment_method']);
+    };
+    try { invoke($gateway, 'confirmAttempt', $invoice, $intent->id, $params, $agreement, 2000, 'usd'); }
+    catch (Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException $e) {}
+    check($claim['phase'] === 'reserved' && !$keys, 'An interrupted read commits a reservation without sending a payment');
+    $result = invoke($gateway, 'confirmAttempt', $invoice, $intent->id, $params, $agreement, 2000, 'usd');
+    check($result->status === 'requires_action' && $keys === [$claim['key'] . '_update', $claim['key']]
+        && json_decode($property->fresh()->value, true)['confirmation']['key'] === $claim['key'],
+        'The matching caller resumes the reserved confirmation under its original keys');
+    $property->delete(); $agreement->forceDelete();
 })();
 if (getenv('PAY_OUTBOX_CASE')) return;
 $GLOBALS['stripeCalls'] = [];
