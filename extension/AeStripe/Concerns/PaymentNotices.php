@@ -11,7 +11,7 @@ require_once __DIR__ . '/../DeliverReturnMail.php';
 
 trait PaymentNotices
 {
-    private function noticeIdentity($audit): array
+    private function noticeIdentity($audit, bool $staff = false): array
     {
         $v = $audit->new_values;
         if (isset($v['notice_identity'])) return $v['notice_identity'];
@@ -26,16 +26,22 @@ trait PaymentNotices
             default => null,
         };
         if (in_array($kind, ['ae_stripe_receipt_return', 'ae_stripe_receipt_reversal'], true)) $kind .= ':' . ($v['state'] ?? $v['status'] ?? 'review');
+        if ($staff && $audit->event === 'ae_stripe_receipt_return') $kind .= ':detail:' . hash('sha256', $v['reason'] ?? '');
         return ['kind' => $kind, 'source' => (string) ($source ?: 'audit_' . $audit->id)];
     }
 
     // Runs in the transaction recording the event. Delivery acquires only its own outbox row.
     private function queuePaymentNotices($audit, array $notices, ?array $identity = null): void
     {
-        $identity ??= $this->noticeIdentity($audit);
-        $this->storePaymentNotices($identity, $notices);
-        DB::afterCommit(function () use ($identity) {
-            foreach (DB::table('ae_stripe_outbox')->where('source', $identity['source'])
+        $identities = [];
+        foreach ($notices as $notice) {
+            if (!isset($notice['staff_scope'])) $notice['invoice_id'] = $audit->auditable_type === (new Invoice)->getMorphClass() ? (int) $audit->auditable_id : null;
+            $key = $identity ?? $this->noticeIdentity($audit, isset($notice['staff_scope']));
+            $this->storePaymentNotices($key, [$notice]);
+            $identities[$key['kind'] . ':' . $key['source']] = $key;
+        }
+        DB::afterCommit(function () use ($identities) {
+            foreach ($identities as $identity) foreach (DB::table('ae_stripe_outbox')->where('source', $identity['source'])
                 ->whereIn('kind', [$identity['kind'] . ':staff', $identity['kind'] . ':customer'])->get() as $row) {
                 $this->deliverPaymentNotices($row->id);
             }
@@ -85,9 +91,10 @@ trait PaymentNotices
                 if (isset($notice['staff_scope'])) {
                     $audience = array_map(fn ($staff) => (int) $staff->id, $this->noticeStaff($notice['staff_scope']));
                     $live = $live && in_array((int) $row->recipient_id, $audience, true);
-                }
+                } else $live = $live && isset($notice['invoice_id']) && Invoice::where('id', $notice['invoice_id'])
+                    ->where('user_id', $row->recipient_id)->exists();
                 if ($live) {
-                    unset($notice['staff_scope']);
+                    unset($notice['staff_scope'], $notice['invoice_id']);
                     if ($isMail) {
                         $mail = new SystemMail(['subject' => $notice['title'], 'body' => '<p>' . e($notice['body'])
                             . '</p><p><a href="' . e($notice['url']) . '">Open invoice</a></p>']);
@@ -144,9 +151,10 @@ trait PaymentNotices
                             'ae_stripe_fee_review' => Invoice::find($audit->auditable_id) ? 'invoice' : 'audit',
                             default => 'invoice',
                         };
+                        if ($customer) $notice['invoice_id'] = $audit->auditable_type === (new Invoice)->getMorphClass() ? (int) $audit->auditable_id : null;
+                        $this->storePaymentNotices($this->noticeIdentity($audit, !$customer), [$notice]);
                     }
                     unset($notice);
-                    $this->storePaymentNotices($this->noticeIdentity($audit), $notices);
                 });
             });
         // Old property markers are converted once during cutover, outside the normal worker scan.

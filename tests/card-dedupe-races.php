@@ -16,6 +16,33 @@ $handler = nativeMethodHandler($methods, $setup);
 $GLOBALS['stripeHandler'] = $handler;
 $change = fn (string $reference, array $values) => DB::table('billing_agreements')->where('external_reference', $reference)->update($values);
 
+// Pending confirmation protects only its card and verified copies, including a late claim.
+foreach (['unrelated', 'active', 'duplicate', 'late duplicate'] as $case) {
+    resetSavedMethods();
+    $methods = ['pm_old' => nativeCard('pm_old', 'fp_active'),
+        'pm_new' => nativeCard('pm_new', $case === 'unrelated' ? 'fp_other' : 'fp_active')];
+    $active = nativeAgreement(19, 'pm_old'); $removing = nativeAgreement(20, 'pm_new');
+    $claim = fn () => $owner->properties()->create(['key' => 'ae_stripe_checkout_9983', 'value' => json_encode([
+        'confirmation' => ['phase' => 'sending', 'agreement' => $active->id, 'params' => ['payment_method' => $active->external_reference]]])]);
+    if ($case !== 'late duplicate') $claim();
+    $late = false;
+    $GLOBALS['stripeHandler'] = function ($verb, $path, $data) use ($handler, $case, $claim, &$late) {
+        $answer = $handler($verb, $path, $data);
+        if ($case === 'late duplicate' && !$late && $verb === 'get') { $late = true; $claim(); }
+        return $answer;
+    };
+    $start = count($GLOBALS['stripeCalls']);
+    $removed = invoke($gateway, 'removeSavedMethodCopies', $case === 'active' ? $active : $removing);
+    $detaches = array_filter(array_slice($GLOBALS['stripeCalls'], $start), fn ($c) => str_ends_with($c[1], '/detach'));
+    check($case === 'unrelated' ? $removed && count($detaches) === 1 && $methods['pm_new']->customer === null
+        : !$removed && !$detaches && $methods['pm_new']->customer === 'cus_owner',
+        'Removal permits an unrelated card and protects the active card and copies: ' . $case);
+    check($methods['pm_old']->customer === 'cus_owner' && agreements()['pm_old']['deleted_at'] === null,
+        'Card removal preserves the sending confirmation method');
+}
+resetSavedMethods(); $methods = ['pm_old' => nativeCard('pm_old'), 'pm_new' => nativeCard('pm_new')];
+$GLOBALS['stripeHandler'] = $handler;
+
 // A removed comparison agreement cannot be written through a stale plan.
 resetSavedMethods();
 nativeAgreement(19, 'pm_old');
