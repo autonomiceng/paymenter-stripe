@@ -24,14 +24,20 @@ trait SubscriptionPayments
     {
         ExtensionLocks::provider('subscription:' . $service->user_id, function () use ($stripeInvoice, $service) {
             if (!$this->bindSubscriptionInvoice($stripeInvoice, $service)) return;
-            $active = ExtensionLocks::transaction('user:' . $service->user_id, function () use ($service) {
-                $fresh = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
-                return $fresh->user_id === $service->user_id && $fresh->subscription_id === $service->subscription_id
-                    && $fresh->subscription_id !== null && $fresh->status !== Service::STATUS_CANCELLED;
-            });
-            if (!$active) return;
+            if (!$this->subscriptionCanCollect($service)) return;
             $this->request('post', '/invoices/' . $stripeInvoice->id . '/finalize', [], 'finalize_' . $stripeInvoice->id);
+            if (!$this->subscriptionCanCollect($service)) return;
             $this->request('post', '/invoices/' . $stripeInvoice->id . '/pay', [], 'pay_' . $stripeInvoice->id);
+        });
+    }
+
+    private function subscriptionCanCollect(Service $service): bool
+    {
+        return ExtensionLocks::transaction('user:' . $service->user_id, function () use ($service) {
+            $fresh = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
+            return $fresh->user_id === $service->user_id && $fresh->subscription_id === $service->subscription_id
+                && $fresh->subscription_id !== null && $fresh->status !== Service::STATUS_CANCELLED
+                && !$fresh->cancellation()->exists();
         });
     }
 
@@ -42,7 +48,7 @@ trait SubscriptionPayments
         $claim = ExtensionLocks::transaction('user:' . $service->user_id, function () use ($stripeInvoice, $service, $current, $property) {
             $fresh = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
             abort_unless($fresh->user_id === $service->user_id && $fresh->subscription_id === $service->subscription_id, 409);
-            if (!$fresh->subscription_id || $fresh->status === Service::STATUS_CANCELLED) return null;
+            if (!$fresh->subscription_id || $fresh->status === Service::STATUS_CANCELLED || $fresh->cancellation()->exists()) return null;
             $user = User::findOrFail($service->user_id);
             $stored = $user->properties()->where('key', $property)->first();
             $claim = $stored ? json_decode($stored->value, true, flags: JSON_THROW_ON_ERROR) : null;

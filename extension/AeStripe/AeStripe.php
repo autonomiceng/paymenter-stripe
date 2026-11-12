@@ -130,6 +130,9 @@ class AeStripe extends Gateway
         $this->configureStaffAutoPay();
         $this->configureSecretSettings();
         if (app()->runningInConsole()) {
+            // Each deletion owns its provider guard. Recovery must also run on file-cache installations.
+            app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retrySubscriptionCancellations())
+                ->name('ae-stripe:subscription-cancellations')->everyFiveMinutes());
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryAutoPayInheritance())
                 ->name('ae-stripe:auto-pay-inheritance')->everyMinute()->onOneServer()->withoutOverlapping(5));
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(function () {
@@ -212,11 +215,8 @@ class AeStripe extends Gateway
             }
             // Check if the service is canceled
             if ($event->service->isDirty('status') && $event->service->status === Service::STATUS_CANCELLED) {
-                try {
-                    $this->cancelSubscription($event->service);
-                } catch (Exception $e) {
-                    \Illuminate\Support\Facades\Log::warning('AeStripe subscription sync failed', ['service_id' => $event->service->id]);
-                }
+                $id = $event->service->id;
+                \Illuminate\Support\Facades\DB::afterCommit(fn () => $this->attemptSubscriptionCancellation($id));
             }
         });
 
@@ -226,11 +226,8 @@ class AeStripe extends Gateway
                 // If the service is not a stripe subscription, skip
                 return;
             }
-            try {
-                $this->cancelSubscription($service);
-            } catch (Exception $e) {
-                \Illuminate\Support\Facades\Log::warning('AeStripe subscription sync failed', ['service_id' => $service->id]);
-            }
+            $id = $service->id;
+            \Illuminate\Support\Facades\DB::afterCommit(fn () => $this->attemptSubscriptionCancellation($id));
         });
     }
 
@@ -633,17 +630,51 @@ class AeStripe extends Gateway
             return;
         }
         return ExtensionLocks::provider('subscription:' . $service->user_id, function () use ($service) {
-            if (!$service->subscription_id) return;
-            $subscription = $service->subscription_id;
-            $this->request('delete', '/subscriptions/' . $subscription);
+            $subscription = ExtensionLocks::transaction('user:' . $service->user_id, function () use ($service) {
+                $fresh = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
+                abort_unless($fresh->user_id === $service->user_id, 409);
+                return $fresh->subscription_id;
+            });
+            if (!$subscription) return;
+            try { $cancelled = $this->request('delete', '/subscriptions/' . $subscription); }
+            catch (\Illuminate\Http\Client\ConnectionException | RequestException $e) {
+                // A lost DELETE response or a repeated DELETE is not proof. Retrieve the same subscription.
+                $cancelled = $this->request('get', '/subscriptions/' . $subscription);
+            }
+            abort_unless(($cancelled->id ?? null) === $subscription && ($cancelled->status ?? null) === 'canceled', 409);
             ExtensionLocks::transaction('user:' . $service->user_id, function () use ($service, $subscription) {
-                // Keep cancellation and binding on the same user scope, after the provider guard.
-                if ($service->subscription_id !== $subscription) return;
-                $service->update(['subscription_id' => null]);
-                $service->properties()->where('key', 'has_stripe_subscription')->delete();
+                $fresh = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
+                if ($fresh->user_id !== $service->user_id || $fresh->subscription_id !== $subscription) return;
+                $fresh->update(['subscription_id' => null]);
+                $fresh->properties()->where('key', 'has_stripe_subscription')->delete();
             });
             return true;
-        });
+        }, cancellation: true);
+    }
+
+    private function attemptSubscriptionCancellation(int $id): void
+    {
+        try {
+            if (!$this->bundledInactive(requireAbsent: true)) return;
+            $service = Service::where('id', $id)->first();
+            if (!$service || !$service->subscription_id
+                || $service->properties()->where('key', 'has_stripe_subscription')->first()?->value !== '1'
+                || ($service->status !== Service::STATUS_CANCELLED && !$service->cancellation()->exists())) return;
+            $this->cancelSubscription($service);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('AeStripe subscription cancellation will retry', ['service_id' => $id]);
+        }
+    }
+
+    public function retrySubscriptionCancellations(): void
+    {
+        if (!$this->bundledInactive(requireAbsent: true)) return;
+        Service::whereNotNull('subscription_id')
+            ->whereHas('properties', fn ($query) => $query->where('key', 'has_stripe_subscription')->where('value', '1'))
+            ->where(fn ($query) => $query->where('status', Service::STATUS_CANCELLED)->orWhereHas('cancellation'))
+            ->chunkById(100, function ($services) {
+                foreach ($services as $service) $this->attemptSubscriptionCancellation($service->id);
+            });
     }
 
     public function supportsBillingAgreements(): bool

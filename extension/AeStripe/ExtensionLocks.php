@@ -16,13 +16,16 @@ final class ExtensionLocks
     }
 
     /** Serialize remote writes through finalization without holding database row locks over HTTP. */
-    public static function provider(string $scope, callable $callback): mixed
+    public static function provider(string $scope, callable $callback, bool $cancellation = false): mixed
     {
         $driver = config('cache.stores.' . config('cache.default') . '.driver');
-        if (!in_array($driver, ['database', 'redis', 'memcached', 'dynamodb'], true)) {
+        $shared = in_array($driver, ['database', 'redis', 'memcached', 'dynamodb'], true);
+        if (!$shared && !($cancellation && in_array($driver, ['file', 'array'], true))) {
             throw new \App\Exceptions\DisplayException('Stripe updates need a shared cache store. Contact support.');
         }
         abort_unless(DB::transactionLevel() === 0, 409);
+        // These stores cannot finalize invoices. Only deletion may proceed without their provider mutex.
+        if (!$shared) return $callback();
         $lock = \Illuminate\Support\Facades\Cache::lock('ae-stripe-provider-' . $scope, 600);
         try { $lock->block(5); }
         catch (\Illuminate\Contracts\Cache\LockTimeoutException $e) {

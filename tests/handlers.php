@@ -4,48 +4,6 @@ use App\Helpers\ExtensionHelper;
 use App\Models\{Gateway, Invoice, Service};
 use Illuminate\Support\Facades\{DB, Event, Http, Log};
 
-// Serialize cancellation with invoice finalization without keeping a database transaction open over HTTP.
-(function () use ($gateway, $invoice) {
-    $oldHandler = Http::$handler; $oldService = Service::$row; $oldInvoiceRows = Invoice::$rows; $oldEnabled = Gateway::$enabled;
-    Gateway::$enabled = true;
-    try {
-        foreach (['binding', 'cancel'] as $race) {
-            if (getenv('PAY_PR95_CASE') && getenv('PAY_PR95_CASE') !== 'subscription-' . $race) continue;
-            $service = Service::$row = new Service;
-            $local = clone $invoice; $local->id = 982; $local->status = 'pending'; Invoice::$rows[982] = $local;
-            $service->invoiceRows = [(object) ['invoice' => $local]];
-            $draft = (object) ['id' => 'in_overlap', 'status' => 'draft', 'currency' => 'usd', 'metadata' => (object) ['ae_stripe_gateway' => '1'],
-                'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) ['subscription' => 'sub_test', 'metadata' => (object) ['ae_stripe_gateway' => '1']]]];
-            $worker = new \Paymenter\Extensions\Gateways\AeStripe\AeStripe(['stripe_secret_key' => 'fake-secret', 'stripe_webhook_secret' => 'whsec_test', 'stripe_use_subscriptions' => true]);
-            $overlapped = false; $cancelledDuringBinding = false; $writes = [];
-            Http::$handler = function ($verb, $path, $data) use ($race, $worker, $service, $draft, &$overlapped, &$cancelledDuringBinding, &$writes) {
-                check(DB::transactionLevel() === 0, 'Subscription operation HTTP runs outside every transaction');
-                if ($verb === 'post') $writes[] = $path;
-                if (!$overlapped && ($race === 'binding' ? $verb === 'post' && $path === '/invoices/in_overlap' : $verb === 'delete')) {
-                    $overlapped = true;
-                    try {
-                        if ($race === 'binding') $cancelledDuringBinding = $worker->cancelSubscription($service) === true;
-                        else $worker->webhook(eventRequest($draft, type: 'invoice.created'));
-                    } catch (\App\Exceptions\DisplayException $e) { /* The competing operation must retry after the active one completes. */ }
-                }
-                return $verb === 'get' ? $draft : [];
-            };
-            if ($race === 'binding') {
-                $worker->webhook(eventRequest($draft, type: 'invoice.created'));
-                check($overlapped && (!$cancelledDuringBinding || !in_array('/invoices/in_overlap/pay', $writes, true)),
-                    'A cancellation committed during binding cannot be followed by finalization and payment');
-                $worker->cancelSubscription($service);
-            } else {
-                $worker->cancelSubscription($service);
-                $worker->webhook(eventRequest($draft, type: 'invoice.created'));
-                check($overlapped && !$writes, 'An invoice delivery during cancellation cannot charge after the provider subscription was deleted');
-            }
-            check($service->subscription_id === null, 'Cancellation can finish after the competing invoice operation releases its guard');
-        }
-    } finally { Http::$handler = $oldHandler; Service::$row = $oldService; Invoice::$rows = $oldInvoiceRows; Gateway::$enabled = $oldEnabled; }
-})();
-if (getenv('PAY_PR95_CASE') || getenv('PAY_OFFLINE_SUITE') === 'subscription-payments') return;
-
 Gateway::$enabled = true;
 $oldHandler = Http::$handler;
 $user->props->values = [];

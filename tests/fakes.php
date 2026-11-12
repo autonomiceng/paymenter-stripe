@@ -276,6 +276,7 @@ namespace App\Models {
         public static function where($key, $value) { return new Query(self::$row && self::$row->$key === $value ? self::$row : null, Service::class); }
         public function update($values) { foreach ($values as $key => $value) $this->$key = $value; }
         public function properties() { return $this->properties; }
+        public function cancellation() { return new Query($this->cancellation); }
         public function invoiceItems() { return new class($this->invoiceRows) {
             public function __construct(private $rows) {}
             public function where($key, $value) {
