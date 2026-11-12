@@ -89,6 +89,9 @@ class AeStripe extends Gateway
     use Concerns\PaymentActions, Concerns\PaymentNotices, Concerns\SavedMethodNotices, Concerns\AutoPayInheritance, Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, Concerns\SavedMethods, Concerns\SavedMethodBindings, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
+    private const HTTP_TIMEOUT_SECONDS = 5;
+    private const CUSTOMER_POST_CUTOFF_SECONDS = 23 * 3600;
+    private const CUSTOMER_RECOVERY_AFTER_SECONDS = 25 * 3600;
 
     private function adminInvoiceUrl(Invoice $invoice): string
     {
@@ -109,13 +112,11 @@ class AeStripe extends Gateway
             'audit' => ['admin.audit.viewAny'],
             'gateway' => ['admin.gateways.viewAny', 'admin.gateways.update'],
         };
-        $staff = []; $recipients = [];
+        $recipients = [];
         foreach (User::whereNotNull('role_id')->get() as $candidate) {
-            $staff[] = $candidate;
             if (!array_filter($permissions, fn ($permission) => !$candidate->hasPermission($permission))) $recipients[] = $candidate;
         }
-        // Keep the pre-filter audience rather than lose a warning when no staff can open its link.
-        return $recipients ?: $staff;
+        return $recipients;
     }
 
     private function invoiceNoticeBody(string $type, string $short, string $details): string
@@ -403,7 +404,7 @@ class AeStripe extends Gateway
             'Stripe-Version' => self::API_VERSION,
         ];
         if ($idempotencyKey !== null) $headers['Idempotency-Key'] = $idempotencyKey;
-        return $this->readStripeObject(Http::withHeaders($headers)->asForm()->connectTimeout(2)->timeout(5)->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object());
+        return $this->readStripeObject(Http::withHeaders($headers)->asForm()->connectTimeout(2)->timeout(self::HTTP_TIMEOUT_SECONDS)->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object());
     }
 
     private function setupSubscription($setupIntent)
@@ -691,8 +692,15 @@ class AeStripe extends Gateway
      */
     private function createOrGetStripeCustomer($user, $includeDetails = true)
     {
-        $previous = ExtensionLocks::transaction('user:' . $user->id,
-            fn () => $this->lockedUserProperty($user, 'stripe_id')?->value);
+        $previous = ExtensionLocks::transaction('user:' . $user->id, function () use ($user) {
+            $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
+            if ($stored) {
+                $age = time() - json_decode($stored->value, true, flags: JSON_THROW_ON_ERROR)['created'];
+                // The quiet interval also excludes provider reads of the previous binding.
+                abort_unless($age < self::CUSTOMER_POST_CUTOFF_SECONDS || $age >= self::CUSTOMER_RECOVERY_AFTER_SECONDS, 409);
+            }
+            return $this->lockedUserProperty($user, 'stripe_id')?->value;
+        });
         if ($previous) {
             try {
                 $customer = $this->request('get', '/customers/' . $previous);
@@ -705,22 +713,77 @@ class AeStripe extends Gateway
             abort_unless($this->lockedUserProperty($user, 'stripe_id')?->value === $previous, 409);
             $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
             if ($stored) return json_decode($stored->value, true, flags: JSON_THROW_ON_ERROR);
-            $claim = ['key' => 'customer_' . bin2hex(random_bytes(16)), 'previous' => $previous,
-                'created' => time(), 'payload' => $this->customerPayload($user, $includeDetails)];
+            $claim = $this->customerCreationClaim($user, $includeDetails, $previous);
             $user->properties()->updateOrCreate(['key' => 'ae_stripe_customer_create'], ['value' => json_encode($claim, JSON_THROW_ON_ERROR)]);
             return $claim;
         });
-        abort_unless($claim['previous'] === $previous && time() - $claim['created'] < 23 * 3600, 409);
-        $customer = $this->request('post', '/customers', $claim['payload'], $claim['key']);
+        abort_unless($claim['previous'] === $previous, 409);
+        $customer = null;
+        $age = time() - $claim['created'];
+        if ($age >= self::CUSTOMER_POST_CUTOFF_SECONDS) {
+            // Stripe can finish a POST after our client timeout. Allow a two-hour gap before recovery;
+            // only Stripe processing delayed beyond two hours could still duplicate a customer.
+            abort_unless($age >= self::CUSTOMER_RECOVERY_AFTER_SECONDS, 409);
+            $customer = $this->recoverCustomerCreation($user, $claim);
+            $claim = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $previous, $claim, $customer, $includeDetails) {
+                abort_unless($this->lockedUserProperty($user, 'stripe_id')?->value === $previous, 409);
+                $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
+                abort_unless($stored && json_decode($stored->value, true)['key'] === $claim['key'], 409);
+                if ($customer) return $claim;
+                // A complete listing found no customer from this claim. Never replay its expired key.
+                $next = $this->customerCreationClaim($user, $includeDetails, $previous);
+                $stored->update(['value' => json_encode($next, JSON_THROW_ON_ERROR)]);
+                return $next;
+            });
+        }
+        if (!$customer) {
+            // Recheck immediately before sending, including when the earlier age check was still before expiry.
+            abort_unless(time() - $claim['created'] < self::CUSTOMER_POST_CUTOFF_SECONDS, 409);
+            $customer = $this->request('post', '/customers', $claim['payload'], $claim['key']);
+        }
         return ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $previous, $claim, $customer) {
             $current = $this->lockedUserProperty($user, 'stripe_id')?->value;
             abort_unless(in_array($current, [$previous, $customer->id], true), 409);
             $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
-            if ($stored) abort_unless(json_decode($stored->value, true)['key'] === $claim['key'], 409);
+            abort_unless($stored ? json_decode($stored->value, true)['key'] === $claim['key'] : $current === $customer->id, 409);
             $user->properties()->updateOrCreate(['key' => 'stripe_id'], ['value' => $customer->id]);
             $user->properties()->where('key', 'ae_stripe_customer_create')->delete();
             return $customer;
         });
+    }
+
+    private function customerCreationClaim($user, bool $includeDetails, ?string $previous): array
+    {
+        $key = 'customer_' . bin2hex(random_bytes(16));
+        $payload = $this->customerPayload($user, $includeDetails);
+        $payload['metadata']['ae_stripe_customer_claim'] = $key;
+        return ['key' => $key, 'previous' => $previous, 'created' => time(), 'payload' => $payload];
+    }
+
+    private function recoverCustomerCreation($user, array $claim): ?object
+    {
+        // Search is eventually consistent. Enumerate the entire customer list before declaring creation absent.
+        // Old claims lack a marker: only a unique customer with this owner, excluding the old binding, is safe.
+        $marker = $claim['payload']['metadata']['ae_stripe_customer_claim'] ?? null;
+        $params = ['limit' => 100];
+        $matches = [];
+        do {
+            $page = $this->request('get', '/customers', $params);
+            abort_unless(is_array($page->data ?? null) && is_bool($page->has_more ?? null), 409);
+            foreach ($page->data as $candidate) {
+                if (($candidate->deleted ?? false) || $candidate->id === $claim['previous']
+                    || (string) ($candidate->metadata->user_id ?? '') !== (string) $user->id) continue;
+                if ($marker !== null && ($candidate->metadata->ae_stripe_customer_claim ?? null) !== $marker) continue;
+                $matches[$candidate->id] = $candidate;
+            }
+            if ($page->has_more) {
+                $last = end($page->data)->id ?? null;
+                abort_unless($last && $last !== ($params['starting_after'] ?? null), 409);
+                $params['starting_after'] = $last;
+            }
+        } while ($page->has_more);
+        abort_unless(count($matches) <= 1, 409);
+        return $matches ? reset($matches) : null;
     }
 
     private function customerPayload($user, bool $includeDetails): array

@@ -114,6 +114,94 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        $run('customer-claim-expiry', function () use ($gateway) {
+            $owner = User::$row;
+            $owner->props = new Properties('');
+            $created = time();
+            $claim = ['key' => 'customer_boundary', 'previous' => null, 'created' => $created,
+                'payload' => ['metadata' => ['user_id' => $owner->id, 'ae_stripe_customer_claim' => 'customer_boundary']]];
+            $owner->props->values['ae_stripe_customer_create'] = json_encode($claim);
+            $posts = $lists = $reads = 0; $remote = []; $pending = null; $blocked = [];
+            $attempt = function () use ($gateway, $owner) {
+                try { return invoke($gateway, 'createOrGetStripeCustomer', $owner, false); }
+                catch (\Throwable $error) { return $error; }
+            };
+            Http::$handler = function ($verb, $path, $data) use ($created, &$posts, &$lists, &$reads, &$remote, &$pending) {
+                check(DB::transactionLevel() === 0, 'Customer expiry HTTP holds no database transaction');
+                if ($verb === 'get' && $path === '/customers') {
+                    ++$lists;
+                    return ['data' => array_values($remote), 'has_more' => false];
+                }
+                if ($verb === 'post' && $path === '/customers') {
+                    ++$posts;
+                    $id = 'cus_boundary_' . $posts;
+                    $customer = (object) ['id' => $id, 'metadata' => (object) $data['metadata']];
+                    if ($posts === 1) {
+                        // The client times out, but Stripe keeps processing this 22h59 POST until 24h.
+                        $pending = $customer;
+                        $GLOBALS['fakeCustomerTime'] = $created + 23 * 3600 - 55;
+                        throw new ConnectionException('Customer request timed out');
+                    }
+                    return $remote[$id] = $customer;
+                }
+                if ($verb === 'get' && isset($remote[basename($path)])) { ++$reads; return $remote[basename($path)]; }
+                throw new RuntimeException('Unexpected customer expiry request');
+            };
+            try {
+                $GLOBALS['fakeCustomerTime'] = $created + 23 * 3600 - 60;
+                $first = $attempt();
+                foreach ([23 * 3600, 23 * 3600 + 10, 24 * 3600, 25 * 3600 - 1] as $age) {
+                    $GLOBALS['fakeCustomerTime'] = $created + $age;
+                    if ($age === 24 * 3600) $remote[$pending->id] = $pending;
+                    $blocked[] = $attempt();
+                }
+                check($first instanceof ConnectionException && $posts === 1 && $lists === 0 && $reads === 0
+                    && count(array_filter($blocked, fn ($result) => $result instanceof \Throwable)) === 4
+                    && json_decode($owner->props->values['ae_stripe_customer_create'], true)['key'] === $claim['key'],
+                    'A 22h59 POST finishing at 24h is not duplicated or looked up before 25h: ' . json_encode(['posts' => $posts, 'lists' => $lists, 'reads' => $reads]));
+                $GLOBALS['fakeCustomerTime'] = $created + 25 * 3600;
+                $recovered = $attempt();
+                check(!($recovered instanceof \Throwable) && $posts === 1 && $lists === 1 && count($remote) === 1
+                    && $owner->props->customer === $recovered->id && !isset($owner->props->values['ae_stripe_customer_create']),
+                    'At 25h recovery binds the delayed customer without another POST or a permanent block');
+            } finally { unset($GLOBALS['fakeCustomerTime']); }
+        });
+        $run('customer-claim-recovery-gap', function () use ($gateway) {
+            $owner = User::$row;
+            $owner->props = new Properties('cus_previous');
+            $created = time();
+            $claim = ['key' => 'customer_bound_gap', 'previous' => 'cus_previous', 'created' => $created, 'payload' => []];
+            $owner->props->values['ae_stripe_customer_create'] = json_encode($claim);
+            $calls = 0; $blocked = 0;
+            Http::$handler = function () use (&$calls) { ++$calls; return ['id' => 'cus_previous']; };
+            try {
+                foreach ([23 * 3600, 24 * 3600, 25 * 3600 - 1] as $age) {
+                    $GLOBALS['fakeCustomerTime'] = $created + $age;
+                    try { invoke($gateway, 'createOrGetStripeCustomer', $owner, false); }
+                    catch (\Throwable $error) { ++$blocked; }
+                }
+                check($blocked === 3 && !$calls && isset($owner->props->values['ae_stripe_customer_create']),
+                    'The recovery gap also forbids provider reads of a previous binding: calls=' . $calls);
+            } finally { unset($GLOBALS['fakeCustomerTime']); }
+        });
+        $run('customer-claim-expiry-send', function () use ($gateway) {
+            $owner = User::$row;
+            $owner->props = new Properties('');
+            $expiry = time() + 100;
+            $claim = ['key' => 'customer_delayed_send', 'previous' => null, 'created' => $expiry - 23 * 3600,
+                'payload' => ['metadata' => ['user_id' => $owner->id]]];
+            $owner->props->values['ae_stripe_customer_create'] = json_encode($claim);
+            $reads = $posts = 0;
+            $GLOBALS['fakeCustomerTime'] = function () use ($expiry, &$reads) { return ++$reads === 1 ? $expiry - 1 : $expiry; };
+            Http::$handler = function () use (&$posts) { ++$posts; return ['id' => 'cus_delayed_send']; };
+            try {
+                try { $result = invoke($gateway, 'createOrGetStripeCustomer', $owner, false); }
+                catch (\Throwable $error) { $result = $error; }
+                check($result instanceof \Throwable && !$posts
+                    && isset($owner->props->values['ae_stripe_customer_create']) && $owner->props->customer === '',
+                    'A request crossing expiry after the recovery decision cannot start its old-key POST: posts=' . $posts);
+            } finally { unset($GLOBALS['fakeCustomerTime']); }
+        });
         foreach ([false, true] as $enclosing) {
             $run('partial-payment-snapshot-' . ($enclosing ? 'enclosing' : 'top-level'), function ($invoice, $stripe) use ($gateway, $enclosing) {
                 $invoice->total = 100;
@@ -623,11 +711,11 @@ use Illuminate\Support\Facades\{DB, Http};
             try {
                 $stripe->failure = fn () => throw new RequestException(401);
                 $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
-                check(array_column(Notification::$rows, 'user_id') === [98], 'An access refusal still reaches staff when nobody can open its destination');
+                check(!Notification::$rows && Audit::$rows && !pendingOutbox(), 'No authorized staff means no recipient entries, while the refusal audit survives');
                 $staff->permissions[] = 'admin.gateways.viewAny';
                 $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
                 check(array_column(Notification::$rows, 'user_id') === [98] && !$stripe->charges,
-                    'Restoring staff access preserves the same-key warning dedupe without sending a charge');
+                    'Restoring staff access delivers one authorized warning without sending a charge');
             } finally { User::$noticeStaff = null; }
         });
         $run('replacement-renewal', function ($invoice, $stripe) use ($gateway) {

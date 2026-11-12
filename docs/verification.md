@@ -142,6 +142,24 @@ After a resumed payment declines, the form requires a refresh before accepting a
 the refreshed checkout retires the unfunded old payment before preparing a replacement. Card/Link saving consent remains explicit and method-specific.
 The GET payment return compares Stripe's redirect secret before any write. Missing or wrong secrets show read-only status with an invoice link; the webhook, recovery or authenticated payment form can still finish it.
 
+Customer creation commits its immutable payload and retry key before HTTP. An old-key
+POST may start only while the claim is younger than `CUSTOMER_POST_CUTOFF_SECONDS`
+(23 hours). The claim counts as expired for listing, binding or replacement only at
+`CUSTOMER_RECOVERY_AFTER_SECONDS` (25 hours). Stripe can keep processing after our
+client timeout: the two-hour gap allows that delayed creation to finish. Residual:
+only a Stripe processing delay above two hours could still duplicate a customer.
+Between 23 and 25 hours, Pay and Add payment method retain the claim and return the
+existing retry message without any provider call, including previous-customer lookup.
+At 25 hours, recovery resumes so abandoned claims do not block forever.
+Pay and Add payment method enumerate all customer-list pages outside database locks,
+matching owner metadata and the new claim's `ae_stripe_customer_claim` marker. A unique
+match is bound; a complete listing with no match permits a fresh claim. An empty search
+result is never used. Legacy claims without a marker match the unique owner-metadata
+customer other than the previous binding. Claim and binding ownership are rechecked
+under the same user scope before replacement or finalization. Lookup failures preserve
+the claim for retry. Multiple matches require reconciliation of that property's customer
+binding: the system cannot infer which of several legacy customers owns the lost response.
+
 Customer setup failures stop checkout with a plain retry message. A rejected Customer
 Session request logs only the invoice ID and HTTP status; checkout still accepts a
 new payment method without saved-method redisplay. Permanent saved-method customer
@@ -272,18 +290,18 @@ settled; leave credit unapplied and refresh the invoice after settlement. Except
 also mean do not apply credit. No processing payment is cancelled. Successes use the
 existing settlement/late-money handler.
 
-For an explicit credit action, lock the user then invoice in the same database
-transaction as spending credit, call the gateway, and apply credit only on `true`:
+For an explicit credit action, retire payments before starting the core credit
+transaction. The gateway takes its own user scope, invoice and user locks. Holding
+core user or invoice locks before calling it can deadlock with Pay on another invoice
+of the same customer. Apply credit only on `true`:
 
 ```php
-$applied = DB::transaction(function () use ($invoice, $gateway) {
-    User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
-    $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
-    if (ExtensionHelper::call($gateway, 'cancelInvoicePayments', [$current]) !== true) return false;
-    // Re-read the remaining balance and apply the requested credit here.
-    return true;
-});
-// On false, tell the customer payment is being checked and refresh; do not spend credit.
+if (ExtensionHelper::call($gateway, 'cancelInvoicePayments', [$invoice]) !== true) {
+    // Tell the customer payment is being checked and refresh; do not spend credit.
+    return false;
+}
+// Continue into the native credit transaction, retaining its locked credit balance
+// recheck and current remaining invoice balance. Never spend a pre-retirement quote.
 ```
 
 `$gateway` is the native `App\Models\Gateway` row for `AeStripe`. This is a server

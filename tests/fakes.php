@@ -1,5 +1,11 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
+namespace Paymenter\Extensions\Gateways\AeStripe {
+    function time(): int {
+        $clock = $GLOBALS['fakeCustomerTime'] ?? null;
+        return is_callable($clock) ? $clock() : ($clock ?? \time());
+    }
+}
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns {
     function time(): int { return $GLOBALS['fakeStripeTime'] ?? \time(); }
 }
@@ -113,7 +119,14 @@ namespace App\Models {
                 return new class($rows) { public function __construct(private $rows) {} public function lockForUpdate() { return $this; } public function get() { return $this->rows; } };
             }
             $stored = $value === 'stripe_id' ? $this->customer : ($this->values[$value] ?? null);
-            return new class($stored ? (object) ['key' => $value, 'value' => $stored] : null, $this, $value) extends Query {
+            $record = $stored ? new class($value, $stored, $this) {
+                public function __construct(public string $key, public $value, private Properties $properties) {}
+                public function update(array $data) {
+                    $this->value = $data['value'];
+                    $this->properties->updateOrCreate(['key' => $this->key], $data);
+                }
+            } : null;
+            return new class($record, $this, $value) extends Query {
                 public function __construct($stored, private Properties $properties, private string $key) { parent::__construct($stored); }
                 public function delete() { unset($this->properties->values[$this->key]); }
             };

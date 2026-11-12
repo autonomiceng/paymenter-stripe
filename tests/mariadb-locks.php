@@ -389,8 +389,11 @@ $cases = [
     }, 'b' => fn ($gateway) => settle($gateway, 592),
     'check' => fn () => App\Models\Audit::where('event', 'updated')->where('new_values->notice_sent', false)->count() === 100
         && App\Models\Audit::where('auditable_type', User::class)->where('event', 'ae_stripe_attempt_review')->where('new_values->notice_sent', false)->count() === 1
-        && DB::table('ae_stripe_outbox')->where('state', 'sent')->count() === 7
-        && DB::table('notifications')->count() === 7 && Invoice::find(592)->status === 'paid'],
+        && DB::table('ae_stripe_outbox')->count() === 7
+        && DB::table('ae_stripe_outbox')->where('state', 'sent')->count() === 6
+        // The seeded role can open invoices, but must not receive a gateway-access notice.
+        && DB::table('ae_stripe_outbox')->where('kind', 'ae_stripe_access_refused:staff')->where('recipient_id', 7)->value('state') === 'skipped'
+        && DB::table('notifications')->count() === 6 && Invoice::find(592)->status === 'paid'],
     'notice-retry-fairness' => ['seed' => function () {
         customerInvoice(7, 591); customerInvoice(8, 592);
         foreach (range(1, 101) as $unused) pendingNotice('ae_stripe_attempt_review');
@@ -765,7 +768,7 @@ foreach (['role', 'permission', 'fallback'] as $change) {
         elseif ($change === 'permission') App\Models\Role::find(User::find(7)->role_id)->update(['permissions' => []]);
         else foreach (App\Models\Role::all() as $role) $role->update(['permissions' => []]);
         return 'changed';
-    }, 'check' => fn () => DB::table('notifications')->where('title', 'Staff review')->orderBy('user_id')->pluck('user_id')->all() === ($change === 'fallback' ? [7, 8] : [8])
+    }, 'check' => fn () => DB::table('notifications')->where('title', 'Staff review')->orderBy('user_id')->pluck('user_id')->all() === ($change === 'fallback' ? [] : [8])
         && DB::table('notifications')->where('title', 'Payment not completed')->pluck('user_id')->all() === [7]
         && DB::table('invoice_transactions')->count() === 0 && Invoice::find(965)->status === 'pending'];
 }
