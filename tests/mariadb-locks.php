@@ -765,7 +765,7 @@ foreach (['role', 'permission', 'fallback'] as $change) {
         elseif ($change === 'permission') App\Models\Role::find(User::find(7)->role_id)->update(['permissions' => []]);
         else foreach (App\Models\Role::all() as $role) $role->update(['permissions' => []]);
         return 'changed';
-    }, 'check' => fn () => DB::table('notifications')->where('title', 'Staff review')->orderBy('user_id')->pluck('user_id')->all() === ($change === 'fallback' ? [7, 8] : [8])
+    }, 'check' => fn () => DB::table('notifications')->where('title', 'Staff review')->orderBy('user_id')->pluck('user_id')->all() === ($change === 'fallback' ? [] : [8])
         && DB::table('notifications')->where('title', 'Payment not completed')->pluck('user_id')->all() === [7]
         && DB::table('invoice_transactions')->count() === 0 && Invoice::find(965)->status === 'pending'];
 }

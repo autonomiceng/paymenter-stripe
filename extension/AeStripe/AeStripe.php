@@ -109,13 +109,11 @@ class AeStripe extends Gateway
             'audit' => ['admin.audit.viewAny'],
             'gateway' => ['admin.gateways.viewAny', 'admin.gateways.update'],
         };
-        $staff = []; $recipients = [];
+        $recipients = [];
         foreach (User::whereNotNull('role_id')->get() as $candidate) {
-            $staff[] = $candidate;
             if (!array_filter($permissions, fn ($permission) => !$candidate->hasPermission($permission))) $recipients[] = $candidate;
         }
-        // Keep the pre-filter audience rather than lose a warning when no staff can open its link.
-        return $recipients ?: $staff;
+        return $recipients;
     }
 
     private function invoiceNoticeBody(string $type, string $short, string $details): string
@@ -705,22 +703,69 @@ class AeStripe extends Gateway
             abort_unless($this->lockedUserProperty($user, 'stripe_id')?->value === $previous, 409);
             $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
             if ($stored) return json_decode($stored->value, true, flags: JSON_THROW_ON_ERROR);
-            $claim = ['key' => 'customer_' . bin2hex(random_bytes(16)), 'previous' => $previous,
-                'created' => time(), 'payload' => $this->customerPayload($user, $includeDetails)];
+            $claim = $this->customerCreationClaim($user, $includeDetails, $previous);
             $user->properties()->updateOrCreate(['key' => 'ae_stripe_customer_create'], ['value' => json_encode($claim, JSON_THROW_ON_ERROR)]);
             return $claim;
         });
-        abort_unless($claim['previous'] === $previous && time() - $claim['created'] < 23 * 3600, 409);
-        $customer = $this->request('post', '/customers', $claim['payload'], $claim['key']);
+        abort_unless($claim['previous'] === $previous, 409);
+        $customer = null;
+        if (time() - $claim['created'] >= 23 * 3600) {
+            $customer = $this->recoverCustomerCreation($user, $claim);
+            $claim = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $previous, $claim, $customer, $includeDetails) {
+                abort_unless($this->lockedUserProperty($user, 'stripe_id')?->value === $previous, 409);
+                $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
+                abort_unless($stored && json_decode($stored->value, true)['key'] === $claim['key'], 409);
+                if ($customer) return $claim;
+                // A complete listing found no customer from this claim. Never replay its expired key.
+                $next = $this->customerCreationClaim($user, $includeDetails, $previous);
+                $stored->update(['value' => json_encode($next, JSON_THROW_ON_ERROR)]);
+                return $next;
+            });
+        }
+        $customer ??= $this->request('post', '/customers', $claim['payload'], $claim['key']);
         return ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $previous, $claim, $customer) {
             $current = $this->lockedUserProperty($user, 'stripe_id')?->value;
             abort_unless(in_array($current, [$previous, $customer->id], true), 409);
             $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
-            if ($stored) abort_unless(json_decode($stored->value, true)['key'] === $claim['key'], 409);
+            abort_unless($stored ? json_decode($stored->value, true)['key'] === $claim['key'] : $current === $customer->id, 409);
             $user->properties()->updateOrCreate(['key' => 'stripe_id'], ['value' => $customer->id]);
             $user->properties()->where('key', 'ae_stripe_customer_create')->delete();
             return $customer;
         });
+    }
+
+    private function customerCreationClaim($user, bool $includeDetails, ?string $previous): array
+    {
+        $key = 'customer_' . bin2hex(random_bytes(16));
+        $payload = $this->customerPayload($user, $includeDetails);
+        $payload['metadata']['ae_stripe_customer_claim'] = $key;
+        return ['key' => $key, 'previous' => $previous, 'created' => time(), 'payload' => $payload];
+    }
+
+    private function recoverCustomerCreation($user, array $claim): ?object
+    {
+        // Search is eventually consistent. Enumerate the entire customer list before declaring creation absent.
+        // Old claims lack a marker: only a unique customer with this owner, excluding the old binding, is safe.
+        $marker = $claim['payload']['metadata']['ae_stripe_customer_claim'] ?? null;
+        $params = ['limit' => 100];
+        $matches = [];
+        do {
+            $page = $this->request('get', '/customers', $params);
+            abort_unless(is_array($page->data ?? null) && is_bool($page->has_more ?? null), 409);
+            foreach ($page->data as $candidate) {
+                if (($candidate->deleted ?? false) || $candidate->id === $claim['previous']
+                    || (string) ($candidate->metadata->user_id ?? '') !== (string) $user->id) continue;
+                if ($marker !== null && ($candidate->metadata->ae_stripe_customer_claim ?? null) !== $marker) continue;
+                $matches[$candidate->id] = $candidate;
+            }
+            if ($page->has_more) {
+                $last = end($page->data)->id ?? null;
+                abort_unless($last && $last !== ($params['starting_after'] ?? null), 409);
+                $params['starting_after'] = $last;
+            }
+        } while ($page->has_more);
+        abort_unless(count($matches) <= 1, 409);
+        return $matches ? reset($matches) : null;
     }
 
     private function customerPayload($user, bool $includeDetails): array

@@ -514,3 +514,75 @@ try {
 check($victims === 0 && $view === 'App\Exceptions\DisplayException: Could not prepare your payment. Try again.' && $created === 0
     && DB::transactionLevel() === 0 && !User::find(11)->properties()->where('key', 'ae_stripe_checkout_372')->exists(),
     'A Pay that loses every attempt to a deadlock asks the customer to try again: ' . $view);
+
+// Expired customer claims: remote success is recovered, failed creation can be retried, and stale readers cannot bind.
+if (getenv('AE_STRIPE_BLOCKER_CASE') !== 'staff') (function () use ($gateway, $customer) {
+    $failures = [];
+    foreach (['lost', 'failed', 'legacy', 'incomplete', 'ambiguous', 'replaced'] as $case) {
+        try {
+            $owner = $customer(100 + array_search($case, ['lost', 'failed', 'legacy', 'incomplete', 'ambiguous', 'replaced']), null);
+            $claim = ['key' => 'customer_expired_' . $case, 'previous' => null, 'created' => time() - 25 * 3600,
+                'payload' => ['email' => $owner->email, 'name' => $owner->name, 'metadata' => ['user_id' => $owner->id]]];
+            if ($case !== 'legacy') $claim['payload']['metadata']['ae_stripe_customer_claim'] = $claim['key'];
+            $owner->properties()->create(['key' => 'ae_stripe_customer_create', 'value' => json_encode($claim)]);
+            $posts = $pages = 0;
+            $GLOBALS['stripeHandler'] = function ($verb, $path, $data) use ($owner, $claim, $case, &$posts, &$pages) {
+                check(DB::transactionLevel() === 0, 'Customer recovery HTTP holds no database locks');
+                if ($verb === 'get' && $path === '/customers') {
+                    ++$pages;
+                    if ($pages === 1) return ['data' => [['id' => 'cus_unrelated', 'metadata' => ['user_id' => 999]]], 'has_more' => true];
+                    check(($data['starting_after'] ?? null) === 'cus_unrelated', 'Customer recovery reads beyond an unrelated first page');
+                    if ($case === 'incomplete') throw new RuntimeException('Customer list unavailable');
+                    if ($case === 'replaced') $owner->properties()->where('key', 'ae_stripe_customer_create')->update(['value' => json_encode(array_replace($claim, ['key' => 'customer_new_owner']))]);
+                    $matches = $case === 'failed' ? [] : [['id' => 'cus_recovered', 'metadata' => $claim['payload']['metadata']]];
+                    if ($case === 'ambiguous') $matches[] = ['id' => 'cus_duplicate', 'metadata' => $claim['payload']['metadata']];
+                    return ['data' => $matches, 'has_more' => false];
+                }
+                if ($verb === 'post' && $path === '/customers') {
+                    ++$posts;
+                    check($case === 'failed' && $data['metadata']['ae_stripe_customer_claim'] !== $claim['key'], 'Only fully listed absent claims get a new creation marker');
+                    return ['id' => 'cus_replacement'];
+                }
+                throw new RuntimeException('Unexpected customer recovery HTTP');
+            };
+            try { $result = invoke($gateway, 'createOrGetStripeCustomer', $owner, false); $error = null; }
+            catch (Throwable $e) { $error = $e; }
+            if (in_array($case, ['incomplete', 'ambiguous', 'replaced'], true)) {
+                check($error !== null && $pages === 2 && !$posts && !$owner->properties()->where('key', 'stripe_id')->exists()
+                    && $owner->properties()->where('key', 'ae_stripe_customer_create')->exists(), 'Incomplete, ambiguous or superseded recovery cannot replace or bind a claim: ' . $case);
+            } else {
+                check($error === null && $pages === 2 && $posts === ($case === 'failed' ? 1 : 0)
+                    && $owner->properties()->where('key', 'stripe_id')->value('value') === $result->id
+                    && !$owner->properties()->where('key', 'ae_stripe_customer_create')->exists(), 'Expired customer claim recovers without blocking or duplicate creation: ' . $case);
+            }
+        } catch (Throwable $e) { $failures[] = $case . ': ' . $e->getMessage(); }
+    }
+    check(!$failures, implode('; ', $failures));
+})();
+
+// Staff creation and delivery must both preserve invoice permissions, including an empty authorized audience.
+if (getenv('AE_STRIPE_BLOCKER_CASE') !== 'customer') (function () use ($gateway) {
+    $staff = User::findOrFail(7);
+    $permissions = ['admin.invoices.viewAny', 'admin.invoices.view', 'admin.invoices.update'];
+    $role = App\Models\Role::create(['name' => 'Privacy fixture', 'permissions' => $permissions]);
+    foreach (App\Models\User::whereNotNull('role_id')->get() as $candidate) $candidate->update(['role_id' => null]);
+    $staff->update(['role_id' => $role->id]);
+    $notice = ['title' => 'Private staff review', 'body' => 'Private invoice', 'url' => '/admin/invoices'];
+    $audit = invoke($gateway, 'withPaymentLock', Invoice::findOrFail(372), fn () => App\Models\Audit::create([
+        'event' => 'ae_stripe_attempt_review', 'auditable_type' => Invoice::class,
+        'auditable_id' => 372, 'old_values' => [], 'new_values' => ['attempt_key' => 'customer_privacy']]));
+    $role->update(['permissions' => []]);
+    DB::transaction(fn () => invoke($gateway, 'queuePaymentNotices', $audit, invoke($gateway, 'staffPaymentNotices', 'invoice', $notice)));
+    $creationSafe = !DB::table('ae_stripe_outbox')->where('source', 'customer_privacy')->exists()
+        && App\Models\Audit::find($audit->id);
+    $role->update(['permissions' => $permissions]);
+    $queued = invoke($gateway, 'staffPaymentNotices', 'invoice', $notice);
+    check(count($queued) === 1, 'An authorized recipient can be queued');
+    DB::transaction(fn () => invoke($gateway, 'storePaymentNotices', ['kind' => $audit->event, 'source' => 'revoked_privacy'], $queued));
+    $role->update(['permissions' => []]);
+    $row = DB::table('ae_stripe_outbox')->where('source', 'revoked_privacy')->first();
+    invoke($gateway, 'deliverPaymentNotices', $row->id);
+    $deliverySafe = DB::table('ae_stripe_outbox')->where('id', $row->id)->value('state') === 'skipped'
+        && !App\Models\Notification::where('title', $notice['title'])->exists();
+    check($creationSafe && $deliverySafe, 'Private staff notice creation authorized: ' . (int) $creationSafe . '; delivery after revocation authorized: ' . (int) $deliverySafe);
+})();

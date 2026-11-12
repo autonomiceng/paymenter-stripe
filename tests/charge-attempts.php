@@ -623,11 +623,11 @@ use Illuminate\Support\Facades\{DB, Http};
             try {
                 $stripe->failure = fn () => throw new RequestException(401);
                 $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
-                check(array_column(Notification::$rows, 'user_id') === [98], 'An access refusal still reaches staff when nobody can open its destination');
+                check(!Notification::$rows && Audit::$rows && !pendingOutbox(), 'No authorized staff means no recipient entries, while the refusal audit survives');
                 $staff->permissions[] = 'admin.gateways.viewAny';
                 $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
                 check(array_column(Notification::$rows, 'user_id') === [98] && !$stripe->charges,
-                    'Restoring staff access preserves the same-key warning dedupe without sending a charge');
+                    'Restoring staff access delivers one authorized warning without sending a charge');
             } finally { User::$noticeStaff = null; }
         });
         $run('replacement-renewal', function ($invoice, $stripe) use ($gateway) {
