@@ -15,6 +15,8 @@ final class ConvertFromStripeSavedCommand extends Command
     public function handle(): int
     {
         try {
+            // Legacy installs have no AE Stripe mutex table. Bootstrap only that schema before taking its lock.
+            (require __DIR__ . '/database/migrations/2026_11_11_000001_create_ae_stripe_locks.php')->up();
             $plan = ExtensionLocks::transaction('gateway', function () {
                 return $this->plan();
             });
