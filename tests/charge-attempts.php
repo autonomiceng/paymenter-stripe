@@ -241,6 +241,41 @@ use Illuminate\Support\Facades\{DB, Http};
                 DB::$driver = 'sqlite'; DB::$trackPaymentSnapshot = false; DB::$paymentSnapshot = null;
             }
         });
+        foreach (['requires_payment_method', 'requires_action'] as $state) {
+            $run('cancel-after-amount-timeout-' . $state, function ($invoice, $stripe) use ($gateway, $state) {
+                $intent = $gateway->pay($invoice, 20)['data']['intent'];
+                $invoice->total = 15;
+                $amountKey = null; $cancelKeys = [];
+                $stripe->failure = function ($verb, $path) use ($invoice, &$amountKey) {
+                    if ($verb !== 'post') return;
+                    $action = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['action'];
+                    $amountKey = $action['key'];
+                    throw new ConnectionException('Amount acknowledgement lost');
+                };
+                try { invoke($gateway, 'sendPaymentAction', $invoice, $intent, 'amount'); }
+                catch (ConnectionException $error) {}
+                check(is_string($amountKey), 'Timed-out amount has a durable key');
+                $stripe->intents[$intent->id]->status = $state;
+                $stripe->failure = function ($verb, $path) use (&$cancelKeys, &$amountKey) {
+                    if ($verb !== 'post') return;
+                    check(!DB::$locked && str_ends_with($path, '/cancel'), 'Cancellation sends no amount replay or HTTP under row locks');
+                    $action = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['action'];
+                    check($action['kind'] === 'cancel' && $action['superseded_amount']['key'] === $amountKey,
+                        'Cancellation preserves the timed-out amount claim');
+                    $cancelKeys[] = end(Http::$calls)[3]['Idempotency-Key'];
+                    if (count($cancelKeys) === 1) throw new ConnectionException('Cancel acknowledgement lost');
+                };
+                $cancel = function () use ($gateway, $invoice, $stripe, $intent, $state) {
+                    return $state === 'requires_action'
+                        ? invoke($gateway, 'sendPaymentAction', $invoice, clone $stripe->intents[$intent->id], 'amount')->status === 'canceled'
+                        : $gateway->cancelInvoicePayments($invoice);
+                };
+                try { $cancel(); } catch (ConnectionException $error) {}
+                check($cancel() && count($cancelKeys) === 2 && $cancelKeys[0] === $cancelKeys[1] && $cancelKeys[0] !== $amountKey,
+                    'Cancellation recovers with its own stable key after a timed-out amount change');
+                check(!$stripe->charges && $stripe->intents[$intent->id]->status === 'canceled', 'Retirement creates no debit');
+            });
+        }
         $run('sending-amount-changed-after-read', function ($invoice, $stripe) use ($gateway) {
             $invoice->total = 100;
             $stripe->failure = function ($verb, $path) {

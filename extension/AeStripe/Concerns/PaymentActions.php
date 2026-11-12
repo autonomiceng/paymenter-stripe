@@ -27,6 +27,12 @@ trait PaymentActions
             if ($attempt && ($attempt['intent'] ?? null) !== $intent->id) $this->paymentPending('Payment changed. Refresh the invoice to check its status.');
             if ($kind !== 'cancel' && in_array($attempt['confirmation']['phase'] ?? null, ['reserved', 'sending'], true)
                 && !$this->paymentAttemptFailed($attempt, $intent)) $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
+            $superseded = null;
+            if (($attempt['action']['kind'] ?? null) === 'amount' && $kind === 'cancel') {
+                // Amount changes cannot debit or reopen a canceled intent. Keep the old claim for recovery history.
+                $superseded = $attempt['action'];
+                unset($attempt['action']);
+            }
             if (!empty($attempt['action'])) {
                 if ($attempt['action']['kind'] !== $kind) $this->paymentPending('Payment changed. Refresh the invoice to check its status.');
                 // A fresh canonical read still proves this cancel/amount operation is safe. A Stripe 500 may be cached
@@ -41,6 +47,7 @@ trait PaymentActions
             $attempt ??= ['version' => 2, 'key' => 'retire_' . $intent->id, 'created' => time(), 'intent' => $intent->id];
             $action = ['kind' => $kind, 'key' => 'action_' . bin2hex(random_bytes(16)), 'intent' => $intent->id,
                 'params' => $kind === 'amount' ? ['amount' => $this->paymentBalance($current)] : []];
+            if ($superseded) $action['superseded_amount'] = $superseded;
             $this->writePaymentAttempt($user, $current, array_replace($attempt, ['action' => $action, 'retry' => true]));
             return $action;
         });
