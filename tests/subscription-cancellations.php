@@ -57,6 +57,18 @@ function recoverCancellations(): void
 }
 
 $cases = [];
+$cases['subscription-active'] = function () {
+    $service = cancellationService('active', [nativeInvoice(800)]);
+    $draft = subscriptionDraft($service);
+    $GLOBALS['stripeHandler'] = function ($verb) use ($draft) {
+        check(DB::transactionLevel() === 0, 'Subscription operation HTTP runs outside every transaction');
+        return $verb === 'get' ? $draft : [];
+    };
+    subscriptionWorker()->webhook(eventRequest($draft, type: 'invoice.created'));
+    $path = '/invoices/' . $draft->id;
+    check(array_column(subscriptionWrites(), 1) === [$path, $path . '/finalize', $path . '/pay'],
+        'An active subscription still binds, finalizes and pays in order');
+};
 foreach (['updated', 'created'] as $event) foreach (['commit', 'rollback'] as $outcome) {
     $cases[$event . '-' . $outcome] = function () use ($event, $outcome) {
         $service = cancellationService($event . '_' . $outcome);
@@ -166,6 +178,7 @@ foreach (['binding', 'cancel', 'finalize'] as $race) {
         $worker = subscriptionWorker();
         $overlapped = false;
         $GLOBALS['stripeHandler'] = function ($verb, $path) use ($race, $service, $draft, $worker, &$overlapped) {
+            check(DB::transactionLevel() === 0, 'Subscription operation HTTP runs outside every transaction');
             $trigger = $race === 'cancel' ? $verb === 'delete'
                 : $verb === 'post' && $path === '/invoices/' . $draft->id . ($race === 'finalize' ? '/finalize' : '');
             if (!$overlapped && $trigger) {
