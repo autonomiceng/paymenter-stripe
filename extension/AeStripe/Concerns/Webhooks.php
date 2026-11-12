@@ -126,11 +126,7 @@ trait Webhooks
                 if ($invoice->status === 'draft' && ($invoice->parent->type ?? null) === 'subscription_details') {
                     $service = Service::where('subscription_id', $invoice->parent->subscription_details->subscription)->first();
 
-                    if ($service && $this->bindSubscriptionInvoice($invoice, $service)) {
-                        $this->request('post', '/invoices/' . $invoice->id . '/finalize');
-                        // Pay the invoice using Stripe
-                        $this->request('post', '/invoices/' . $invoice->id . '/pay');
-                    }
+                    if ($service) $this->finalizeSubscriptionInvoice($invoice, $service);
                 }
                 break;
             case 'invoice.payment_succeeded':

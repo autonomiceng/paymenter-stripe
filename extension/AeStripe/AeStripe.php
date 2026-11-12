@@ -130,6 +130,9 @@ class AeStripe extends Gateway
         $this->configureStaffAutoPay();
         $this->configureSecretSettings();
         if (app()->runningInConsole()) {
+            // Each deletion owns its provider guard. Recovery must also run on file-cache installations.
+            app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retrySubscriptionCancellations())
+                ->name('ae-stripe:subscription-cancellations')->everyFiveMinutes());
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryAutoPayInheritance())
                 ->name('ae-stripe:auto-pay-inheritance')->everyMinute()->onOneServer()->withoutOverlapping(5));
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(function () {
@@ -142,11 +145,13 @@ class AeStripe extends Gateway
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryPaymentFees())
                 ->name('ae-stripe:payment-fees')->hourly()->onOneServer()->withoutOverlapping(55));
             require_once __DIR__ . '/ResolveChargeCommand.php';
+            require_once __DIR__ . '/BackfillOutboxCommand.php';
             require_once __DIR__ . '/DeduplicateCardsCommand.php';
             require_once __DIR__ . '/AdoptBundledCommand.php';
             require_once __DIR__ . '/ConvertFromStripeSavedCommand.php';
             \Illuminate\Console\Application::starting(function ($artisan) {
                 $artisan->resolve(ResolveChargeCommand::class);
+                $artisan->resolve(BackfillOutboxCommand::class);
                 $artisan->resolve(DeduplicateCardsCommand::class);
                 $artisan->resolve(AdoptBundledCommand::class);
                 $artisan->resolve(ConvertFromStripeSavedCommand::class);
@@ -210,11 +215,8 @@ class AeStripe extends Gateway
             }
             // Check if the service is canceled
             if ($event->service->isDirty('status') && $event->service->status === Service::STATUS_CANCELLED) {
-                try {
-                    $this->cancelSubscription($event->service);
-                } catch (Exception $e) {
-                    \Illuminate\Support\Facades\Log::warning('AeStripe subscription sync failed', ['service_id' => $event->service->id]);
-                }
+                $id = $event->service->id;
+                \Illuminate\Support\Facades\DB::afterCommit(fn () => $this->attemptSubscriptionCancellation($id));
             }
         });
 
@@ -224,11 +226,8 @@ class AeStripe extends Gateway
                 // If the service is not a stripe subscription, skip
                 return;
             }
-            try {
-                $this->cancelSubscription($service);
-            } catch (Exception $e) {
-                \Illuminate\Support\Facades\Log::warning('AeStripe subscription sync failed', ['service_id' => $service->id]);
-            }
+            $id = $service->id;
+            \Illuminate\Support\Facades\DB::afterCommit(fn () => $this->attemptSubscriptionCancellation($id));
         });
     }
 
@@ -630,14 +629,52 @@ class AeStripe extends Gateway
         if (!$service->subscription_id) {
             return;
         }
-        $this->request('delete', '/subscriptions/' . $service->subscription_id);
+        return ExtensionLocks::provider('subscription:' . $service->user_id, function () use ($service) {
+            $subscription = ExtensionLocks::transaction('user:' . $service->user_id, function () use ($service) {
+                $fresh = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
+                abort_unless($fresh->user_id === $service->user_id, 409);
+                return $fresh->subscription_id;
+            });
+            if (!$subscription) return;
+            try { $cancelled = $this->request('delete', '/subscriptions/' . $subscription); }
+            catch (\Illuminate\Http\Client\ConnectionException | RequestException $e) {
+                // A lost DELETE response or a repeated DELETE is not proof. Retrieve the same subscription.
+                $cancelled = $this->request('get', '/subscriptions/' . $subscription);
+            }
+            abort_unless(($cancelled->id ?? null) === $subscription && ($cancelled->status ?? null) === 'canceled', 409);
+            ExtensionLocks::transaction('user:' . $service->user_id, function () use ($service, $subscription) {
+                $fresh = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
+                if ($fresh->user_id !== $service->user_id || $fresh->subscription_id !== $subscription) return;
+                $fresh->update(['subscription_id' => null]);
+                $fresh->properties()->where('key', 'has_stripe_subscription')->delete();
+            });
+            return true;
+        }, cancellation: true);
+    }
 
-        // Remove subscription id from service
-        $service->update(['subscription_id' => null]);
-        // Remove has_stripe_subscription property
-        $service->properties()->where('key', 'has_stripe_subscription')->delete();
+    private function attemptSubscriptionCancellation(int $id): void
+    {
+        try {
+            if (!$this->bundledInactive(requireAbsent: true)) return;
+            $service = Service::where('id', $id)->first();
+            if (!$service || !$service->subscription_id
+                || $service->properties()->where('key', 'has_stripe_subscription')->first()?->value !== '1'
+                || ($service->status !== Service::STATUS_CANCELLED && !$service->cancellation()->exists())) return;
+            $this->cancelSubscription($service);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('AeStripe subscription cancellation will retry', ['service_id' => $id]);
+        }
+    }
 
-        return true;
+    public function retrySubscriptionCancellations(): void
+    {
+        if (!$this->bundledInactive(requireAbsent: true)) return;
+        Service::whereNotNull('subscription_id')
+            ->whereHas('properties', fn ($query) => $query->where('key', 'has_stripe_subscription')->where('value', '1'))
+            ->where(fn ($query) => $query->where('status', Service::STATUS_CANCELLED)->orWhereHas('cancellation'))
+            ->chunkById(100, function ($services) {
+                foreach ($services as $service) $this->attemptSubscriptionCancellation($service->id);
+            });
     }
 
     public function supportsBillingAgreements(): bool
@@ -654,29 +691,40 @@ class AeStripe extends Gateway
      */
     private function createOrGetStripeCustomer($user, $includeDetails = true)
     {
-        return ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $includeDetails) {
-            User::where('id', $user->id)->firstOrFail();
-            return $this->lockedStripeCustomer($user, $includeDetails);
+        $previous = ExtensionLocks::transaction('user:' . $user->id,
+            fn () => $this->lockedUserProperty($user, 'stripe_id')?->value);
+        if ($previous) {
+            try {
+                $customer = $this->request('get', '/customers/' . $previous);
+                if (($customer->deleted ?? false) !== true) return $customer;
+            } catch (RequestException $e) {
+                if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') throw $e;
+            }
+        }
+        $claim = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $includeDetails, $previous) {
+            abort_unless($this->lockedUserProperty($user, 'stripe_id')?->value === $previous, 409);
+            $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
+            if ($stored) return json_decode($stored->value, true, flags: JSON_THROW_ON_ERROR);
+            $claim = ['key' => 'customer_' . bin2hex(random_bytes(16)), 'previous' => $previous,
+                'created' => time(), 'payload' => $this->customerPayload($user, $includeDetails)];
+            $user->properties()->updateOrCreate(['key' => 'ae_stripe_customer_create'], ['value' => json_encode($claim, JSON_THROW_ON_ERROR)]);
+            return $claim;
+        });
+        abort_unless($claim['previous'] === $previous && time() - $claim['created'] < 23 * 3600, 409);
+        $customer = $this->request('post', '/customers', $claim['payload'], $claim['key']);
+        return ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $previous, $claim, $customer) {
+            $current = $this->lockedUserProperty($user, 'stripe_id')?->value;
+            abort_unless(in_array($current, [$previous, $customer->id], true), 409);
+            $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
+            if ($stored) abort_unless(json_decode($stored->value, true)['key'] === $claim['key'], 409);
+            $user->properties()->updateOrCreate(['key' => 'stripe_id'], ['value' => $customer->id]);
+            $user->properties()->where('key', 'ae_stripe_customer_create')->delete();
+            return $customer;
         });
     }
 
-    private function lockedStripeCustomer($user, bool $includeDetails)
+    private function customerPayload($user, bool $includeDetails): array
     {
-        $stripeCustomerId = $this->lockedUserProperty($user, 'stripe_id');
-
-        if ($stripeCustomerId) {
-            try {
-                $customer = $this->request('get', '/customers/' . $stripeCustomerId->value);
-                if (($customer->deleted ?? false) !== true) {
-                    return $customer;
-                }
-            } catch (RequestException $e) {
-                if ($e->response->status() !== 404 || $e->response->json('error.code') !== 'resource_missing') {
-                    throw $e;
-                }
-            }
-        }
-
         // Build basic payload
         $payload = [
             'email' => $user->email,
@@ -710,11 +758,7 @@ class AeStripe extends Gateway
             }
         }
 
-        $customer = $this->request('post', '/customers', $payload);
-
-        $user->properties()->updateOrCreate(['key' => 'stripe_id'], ['value' => $customer->id]);
-
-        return $customer;
+        return $payload;
     }
 
     public function createBillingAgreement($user)

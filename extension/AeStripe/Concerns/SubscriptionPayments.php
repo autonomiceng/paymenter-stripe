@@ -20,22 +20,56 @@ trait SubscriptionPayments
         return $invoices;
     }
 
+    private function finalizeSubscriptionInvoice($stripeInvoice, Service $service): void
+    {
+        ExtensionLocks::provider('subscription:' . $service->user_id, function () use ($stripeInvoice, $service) {
+            if (!$this->bindSubscriptionInvoice($stripeInvoice, $service)) return;
+            if (!$this->subscriptionCanCollect($service)) return;
+            $this->request('post', '/invoices/' . $stripeInvoice->id . '/finalize', [], 'finalize_' . $stripeInvoice->id);
+            if (!$this->subscriptionCanCollect($service)) return;
+            $this->request('post', '/invoices/' . $stripeInvoice->id . '/pay', [], 'pay_' . $stripeInvoice->id);
+        });
+    }
+
+    private function subscriptionCanCollect(Service $service): bool
+    {
+        return ExtensionLocks::transaction('user:' . $service->user_id, function () use ($service) {
+            $fresh = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
+            return $fresh->user_id === $service->user_id && $fresh->subscription_id === $service->subscription_id
+                && $fresh->subscription_id !== null && $fresh->status !== Service::STATUS_CANCELLED
+                && !$fresh->cancellation()->exists();
+        });
+    }
+
     private function bindSubscriptionInvoice($stripeInvoice, Service $service): bool
     {
-        return ExtensionLocks::transaction('user:' . $service->user_id, function () use ($stripeInvoice, $service) {
-            Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
-            // Event snapshots are immutable: recover the current remote binding on every retry.
-            $current = $this->request('get', '/invoices/' . $stripeInvoice->id);
-            $invoices = $this->subscriptionInvoices($service);
-            $bound = $current->metadata->ae_stripe_invoice_id ?? null;
+        $current = $this->request('get', '/invoices/' . $stripeInvoice->id);
+        $property = 'ae_stripe_invoice_binding_' . $stripeInvoice->id;
+        $claim = ExtensionLocks::transaction('user:' . $service->user_id, function () use ($stripeInvoice, $service, $current, $property) {
+            $fresh = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
+            abort_unless($fresh->user_id === $service->user_id && $fresh->subscription_id === $service->subscription_id, 409);
+            if (!$fresh->subscription_id || $fresh->status === Service::STATUS_CANCELLED || $fresh->cancellation()->exists()) return null;
+            $user = User::findOrFail($service->user_id);
+            $stored = $user->properties()->where('key', $property)->first();
+            $claim = $stored ? json_decode($stored->value, true, flags: JSON_THROW_ON_ERROR) : null;
+            $invoices = $this->subscriptionInvoices($fresh);
+            $bound = $current->metadata->ae_stripe_invoice_id ?? $claim['invoice_id'] ?? null;
             $invoice = $bound ? ($invoices[$bound] ?? null) : (count($invoices) === 1 ? reset($invoices) : null);
             if (!$invoice || strtolower($invoice->currency_code) !== strtolower($stripeInvoice->currency ?? '')) {
                 Log::warning('AeStripe subscription invoice needs reconciliation', ['service_id' => $service->id]);
-                return false;
+                return null;
             }
-            if (!$bound) $this->request('post', '/invoices/' . $stripeInvoice->id, ['metadata' => ['ae_stripe_invoice_id' => $invoice->id]]);
-            return true;
+            if ($claim) abort_unless($claim['invoice_id'] === $invoice->id && $claim['service_id'] === $service->id, 409);
+            else {
+                $claim = ['key' => 'binding_' . bin2hex(random_bytes(16)), 'invoice_id' => $invoice->id, 'service_id' => $service->id];
+                $user->properties()->updateOrCreate(['key' => $property], ['value' => json_encode($claim, JSON_THROW_ON_ERROR)]);
+            }
+            return $claim;
         });
+        if (!$claim) return false;
+        if (empty($current->metadata->ae_stripe_invoice_id)) $this->request('post', '/invoices/' . $stripeInvoice->id,
+            ['metadata' => ['ae_stripe_invoice_id' => $claim['invoice_id']]], $claim['key']);
+        return true;
     }
 
     private function recordSubscriptionReview($stripeInvoice, string $reason): void

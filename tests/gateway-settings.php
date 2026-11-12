@@ -5,6 +5,8 @@
 use App\Admin\Resources\GatewayResource\Pages\EditGateway;
 use Livewire\Livewire;
 
+nativeSharedCache();
+
 // The gateway picker lists extensions from Composer's class map. List this copy as an installed one would be.
 unlink($root . '/vendor');
 mkdir($root . '/vendor/composer', 0700, true);

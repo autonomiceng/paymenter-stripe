@@ -4,6 +4,16 @@ What the gateway guarantees and how each guarantee is checked. Topic details liv
 [Auto Pay](auto-pay.md), [saved cards](saved-cards.md), [receipt returns](receipt-returns.md)
 and [migrating from bundled Stripe](migrating-from-bundled.md).
 
+Subscription cancellation, invoice finalization and webhook settings updates share provider-operation
+locks. All workers must use the same database, Redis, Memcached or DynamoDB cache store and namespace,
+as saved payment methods require. The lock spans provider calls and local finalization; database
+transactions remain short. Cancellation runs after commit and retries every five minutes from the
+service's cancelled status or cancellation request, subscription ID and marker. Unconfirmed deletion
+keeps both fields; only Stripe-confirmed cancellation of that ID clears them. Pending cancellation
+blocks finalization and payment, including end-of-period requests on active services. File and array
+cache allow deletion only; invoice finalization and settings writes still require a shared store.
+Keep Paymenter's scheduler running so interrupted or failed cancellation attempts recover.
+
 ## Offline checks
 
 Offline, with PHP 8.3+ and Python 3:

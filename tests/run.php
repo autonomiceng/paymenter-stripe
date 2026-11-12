@@ -1,9 +1,20 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 require_once __DIR__ . '/entered.php';
+if (getenv('PAY_MARIADB_CASE')) {
+    $php = getenv('PAY_MARIADB_PHP') ?: PHP_BINARY;
+    putenv('PAYMENTER_TEST_PHP=' . $php);
+    $run = proc_open([$php, '-d', 'auto_prepend_file=' . __DIR__ . '/entered.php', __DIR__ . '/mariadb-locks.php'], [], $pipes);
+    exit(proc_close($run));
+}
 // Any nonempty mode, even "0", goes to the matrix, which rejects unknown modes before starting a child.
 if (!in_array(getenv('PAY_PENDING_MATRIX'), [false, ''], true)) { require __DIR__ . '/native-pending-matrix.php'; return; }
 if (in_array('--receipt-returns', $argv, true)) putenv('PAY_NATIVE_SUITE=receipt-returns');
+if (getenv('PAY_OFFLINE_SUITE') === 'subscription-payments') putenv('PAY_NATIVE_SUITE=subscription-cancellations');
+if (getenv('PAY_NATIVE_SUITE') === 'receipt-storage') {
+    require __DIR__ . '/native-receipt-returns.php';
+    return;
+}
 if (getenv('PAY_NATIVE_SUITE') === 'conversion-bootstrap') {
     $argv[1] = getenv('PAYMENTER_TEST_APP');
     require __DIR__ . '/conversion-bootstrap.php';
@@ -90,12 +101,20 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
 // Select the existing behavior fragments without running the full offline suite.
 if ($suite = getenv('PAY_OFFLINE_SUITE')) {
     $files = match ($suite) {
-        'charge-attempts', 'agreement-persistence', 'auto-pay-consent', 'setup-intents', 'webhook-continuity' => [$suite],
+        'charge-attempts', 'agreement-persistence', 'auto-pay-consent', 'setup-intents', 'webhook-continuity', 'adoption' => [$suite],
+        'subscription-listeners' => ['subscription-listeners', 'schema-scheduler'],
         'payment-fees' => ['fee-recovery', 'fee-recovery-review'],
         'adoption-store' => ['gateway-lifecycle', 'adoption', 'adoption-store'],
         'ci-coverage' => ['native-ci-selection'],
         default => throw new RuntimeException('Unknown offline suite'),
     };
+    if ($suite === 'subscription-listeners') {
+        $bundled = Gateway::$bundled;
+        Gateway::$bundled = false;
+        $gateway->boot();
+        Gateway::$bundled = $bundled;
+    }
+    if ($suite === 'adoption') require_once __DIR__ . '/../extension/AeStripe/Adoption.php';
     foreach ($files as $file) require __DIR__ . '/' . $file . '.php';
     echo "PASS: $count $suite assertions\n";
     return;

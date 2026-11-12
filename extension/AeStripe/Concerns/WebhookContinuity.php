@@ -14,6 +14,7 @@ trait WebhookContinuity
 {
     private const WEBHOOK_STATE = 'ae_stripe_webhook_continuity';
     private const WEBHOOK_EVENTS = 'ae_stripe_webhook_events';
+    private const WEBHOOK_CLAIM = 'ae_stripe_webhook_claim';
     private const WEBHOOK_OVERLAP = 72 * 3600;
 
     private function gatewayRowForUpdate(?int $id)
@@ -32,27 +33,69 @@ trait WebhookContinuity
 
     private function reconcileWebhookSubscriptions(): void
     {
-        $id = \App\Models\Gateway::where('extension', 'AeStripe')->first()?->id;
-        ExtensionLocks::transaction('gateway', function () use ($id) {
-            $gateway = $this->gatewayRowForUpdate($id)->first();
-            if (!$gateway || $gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'ready') return;
-            try {
-                $state = $this->savedContinuityState(); $key = $this->config('stripe_secret_key'); $mode = $this->stripeKeyMode($key);
-                $account = $this->continuityRequest($key, 'get', '/account');
-                abort_unless(!empty($account->id) && ($state['account'] ?? $account->id) === $account->id && ($state['mode'] ?? $mode) === $mode, 409);
-                $url = route('extensions.gateways.ae-stripe.webhook'); $urls = [$url, str_replace('/extensions/ae-stripe/webhook', '/extensions/stripe-saved/webhook', $url)];
-                $page = $this->continuityRequest($key, 'get', '/webhook_endpoints', ['limit' => 100]);
-                abort_unless(is_array($page->data ?? null) && ($page->has_more ?? true) === false, 409);
-                $matches = array_values(array_filter($page->data, fn ($e) => $e->id === ($state['endpoint'] ?? null) || in_array($e->url, $urls, true)));
-                abort_unless(count($matches) === 1 && in_array($matches[0]->url, $urls, true) && ($state['endpoint'] ?? $matches[0]->id) === $matches[0]->id, 409);
-                $endpoint = $matches[0]; $events = $this->webhookEvents($endpoint->enabled_events);
-                if (array_diff($events, $endpoint->enabled_events)) $this->continuityRequest($key, 'post', '/webhook_endpoints/' . $endpoint->id, ['enabled_events' => $events]);
-                $status = 'ready';
-            } catch (\Throwable $e) {
-                $status = 'retry'; // No provider details or secrets in the persistent staff action.
+        $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->first();
+        if (!$gateway || $gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'ready') return;
+        ExtensionLocks::provider('gateway:' . $gateway->id, fn () => $this->reconcileWebhookSubscriptionsLocked());
+    }
+
+    private function reconcileWebhookSubscriptionsLocked(): void
+    {
+        $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->first();
+        if (!$gateway || $gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'ready') return;
+        $claim = ExtensionLocks::transaction('gateway', function () use ($gateway) {
+            if ($gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'ready') return null;
+            $stored = $gateway->settings()->where('key', self::WEBHOOK_CLAIM)->first()?->value;
+            if ($stored) {
+                $claim = json_decode($stored, true, flags: JSON_THROW_ON_ERROR);
+                return ($claim['kind'] ?? null) === 'reconcile' ? $claim : null;
             }
-            $gateway->settings()->updateOrCreate(['key' => self::WEBHOOK_EVENTS], ['value' => $status]);
+            return $this->reserveContinuity($gateway, ['kind' => 'reconcile', 'state' => $this->savedContinuityState(), 'api_key' => $this->config('stripe_secret_key')]);
         });
+        if (!$claim) return;
+        try {
+            $state = $claim['state']; $key = $claim['api_key']; $mode = $this->stripeKeyMode($key);
+            $account = $this->continuityRequest($key, 'get', '/account');
+            abort_unless(!empty($account->id) && ($state['account'] ?? $account->id) === $account->id && ($state['mode'] ?? $mode) === $mode, 409);
+            $url = route('extensions.gateways.ae-stripe.webhook'); $urls = [$url, str_replace('/extensions/ae-stripe/webhook', '/extensions/stripe-saved/webhook', $url)];
+            $page = $this->continuityRequest($key, 'get', '/webhook_endpoints', ['limit' => 100]);
+            abort_unless(is_array($page->data ?? null) && ($page->has_more ?? true) === false, 409);
+            $matches = array_values(array_filter($page->data, fn ($e) => $e->id === ($state['endpoint'] ?? null) || in_array($e->url, $urls, true)));
+            abort_unless(count($matches) === 1 && in_array($matches[0]->url, $urls, true) && ($state['endpoint'] ?? $matches[0]->id) === $matches[0]->id, 409);
+            $endpoint = $matches[0]; $events = $this->webhookEvents($endpoint->enabled_events);
+            if (array_diff($events, $endpoint->enabled_events)) $this->sendContinuityWrite($gateway, $claim, $key,
+                '/webhook_endpoints/' . $endpoint->id, ['enabled_events' => $events]);
+            $status = 'ready';
+        } catch (\Throwable $e) { $status = 'retry'; }
+        ExtensionLocks::transaction('gateway', function () use ($gateway, $claim, $status) {
+            if (!$this->ownsContinuity($gateway, $claim)) return;
+            $gateway->settings()->updateOrCreate(['key' => self::WEBHOOK_EVENTS], ['value' => $status]);
+            $gateway->settings()->where('key', self::WEBHOOK_CLAIM)->delete();
+        });
+    }
+
+    private function reserveContinuity($gateway, array $values): array
+    {
+        $claim = $values + ['key' => 'webhook_' . bin2hex(random_bytes(16)), 'created' => time()];
+        $gateway->settings()->updateOrCreate(['key' => self::WEBHOOK_CLAIM], ['value' => json_encode($claim, JSON_THROW_ON_ERROR), 'encrypted' => true]);
+        return $claim;
+    }
+
+    private function ownsContinuity($gateway, array $claim): bool
+    {
+        $stored = $gateway->settings()->where('key', self::WEBHOOK_CLAIM)->first()?->value;
+        return $stored && json_decode($stored, true, flags: JSON_THROW_ON_ERROR)['key'] === $claim['key'];
+    }
+
+    private function sendContinuityWrite($gateway, array $claim, string $key, string $path, array $data, ?string $idempotencyKey = null)
+    {
+        $idempotencyKey ??= 'webhook_write_' . hash('sha256', $claim['key'] . ':' . $path . ':' . json_encode($data, JSON_THROW_ON_ERROR));
+        ExtensionLocks::transaction('gateway', function () use ($gateway, $claim, $path, $data, $idempotencyKey) {
+            abort_unless($this->ownsContinuity($gateway, $claim), 409);
+            $stored = json_decode($gateway->settings()->where('key', self::WEBHOOK_CLAIM)->first()->value, true, flags: JSON_THROW_ON_ERROR);
+            $stored['writes'][$idempotencyKey] = ['path' => $path, 'data' => $data];
+            $gateway->settings()->updateOrCreate(['key' => self::WEBHOOK_CLAIM], ['value' => json_encode($stored, JSON_THROW_ON_ERROR), 'encrypted' => true]);
+        });
+        return $this->continuityRequest($key, 'post', $path, $data, $idempotencyKey);
     }
 
     private function continuityState(): array
@@ -124,12 +167,18 @@ trait WebhookContinuity
 
     private function updateWebhookContinuity(Extension $gateway): void
     {
+        // A claim check cannot stop an older HTTP write after a replacement claim finishes.
+        ExtensionLocks::provider('gateway:' . $gateway->id, fn () => $this->updateWebhookContinuityLocked($gateway));
+    }
+
+    private function updateWebhookContinuityLocked(Extension $gateway): void
+    {
         // The native edit page retains submitted form data, including after credential restoration.
         $page = \Livewire\Livewire::current();
         if ($page instanceof \App\Admin\Resources\GatewayResource\Pages\EditGateway && $page->getRecord()->id === $gateway->id) {
             $page->data['settings']['stripe_revoke_previous_secrets'] = false;
         }
-        $failure = ExtensionLocks::transaction('gateway', function () use ($gateway) {
+        $claim = ExtensionLocks::transaction('gateway', function () use ($gateway) {
             \App\Models\Gateway::where('extension', 'AeStripe')->where('id', $gateway->id)->firstOrFail();
             $stored = $gateway->settings()->where('key', self::WEBHOOK_STATE)->first()?->value;
             $state = $stored ? json_decode($stored, true, flags: JSON_THROW_ON_ERROR) : [];
@@ -139,8 +188,10 @@ trait WebhookContinuity
             $revokePrevious = (bool) $gateway->settings()->where('key', 'stripe_revoke_previous_secrets')->first()?->value;
             // The retry notice asks staff to save, so that save must verify even with unchanged credentials.
             $eventsRetry = $gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'retry';
-            // Compare persisted fields under the same lock as verification, not the stale form snapshot.
-            if ($state && !$revokePrevious && !$eventsRetry && !array_diff_assoc($credentials, $state['credentials'] ?? [])) return null;
+            $pending = $gateway->settings()->where('key', self::WEBHOOK_CLAIM)->first()?->value;
+            $submitted = $credentials;
+            // Compare persisted fields under the same scope, rather than the form snapshot.
+            if (!$pending && $state && !$revokePrevious && !$eventsRetry && !array_diff_assoc($credentials, $state['credentials'] ?? [])) return null;
             $gateway->settings()->updateOrCreate(['key' => 'stripe_revoke_previous_secrets'], ['value' => false]);
             // Paymenter's edit hook runs after settings writes, with its previously loaded settings
             // still supplied to this instance. Keep that snapshot on the first upgraded save too.
@@ -151,6 +202,15 @@ trait WebhookContinuity
                     break;
                 }
             }
+            if ($pending) {
+                $claim = json_decode($pending, true, flags: JSON_THROW_ON_ERROR);
+                if (($claim['submitted'] ?? null) === $submitted && ($claim['revokePrevious'] ?? false) === $revokePrevious) return $claim;
+            }
+            return $this->reserveContinuity($gateway, compact('state', 'old', 'credentials', 'submitted', 'revokePrevious') + ['kind' => 'settings']);
+        });
+        if (!$claim) return;
+        ['state' => $state, 'old' => $old, 'credentials' => $credentials, 'revokePrevious' => $revokePrevious] = $claim;
+        $failure = null;
             try {
                 $key = $credentials['stripe_secret_key'];
                 $mode = $this->stripeKeyMode($key);
@@ -192,7 +252,7 @@ trait WebhookContinuity
                     && ($endpoint->metadata->ae_stripe_create_key ?? null) === $createKey
                     && ($endpoint->created ?? 0) > time() - 23 * 3600) {
                     // Recover a lost creation response with its original key, never another endpoint.
-                    $recovered = $this->continuityRequest($key, 'post', '/webhook_endpoints', $createParams, $createKey);
+                    $recovered = $this->sendContinuityWrite($gateway, $claim, $key, '/webhook_endpoints', $createParams, $createKey);
                     if (($recovered->id ?? null) === $endpoint->id) $credentials['stripe_webhook_secret'] = $recovered->secret ?? '';
                 }
                 if ($endpoint) {
@@ -203,12 +263,12 @@ trait WebhookContinuity
                     $existingEvents = $endpoint->enabled_events ?? [];
                     $params['enabled_events'] = $this->webhookEvents($existingEvents);
                     if ($endpoint->url !== $url || !in_array('*', $existingEvents, true) && array_diff($events, $existingEvents)) {
-                        $this->continuityRequest($key, 'post', '/webhook_endpoints/' . $endpoint->id, $params);
+                        $this->sendContinuityWrite($gateway, $claim, $key, '/webhook_endpoints/' . $endpoint->id, $params);
                     }
                 } elseif ($mode !== 'test' || $credentials['stripe_webhook_secret'] === '') {
                     // Only a test-mode secret may come from Stripe CLI without a registered endpoint.
                     if ($credentials['stripe_webhook_secret'] !== '' || !empty($state['endpoint'])) throw new DisplayException('The saved Stripe webhook is missing. Restore its endpoint or verify its delivery history before changing setup.');
-                    $endpoint = $this->continuityRequest($key, 'post', '/webhook_endpoints', $createParams, $createKey);
+                    $endpoint = $this->sendContinuityWrite($gateway, $claim, $key, '/webhook_endpoints', $createParams, $createKey);
                     if (empty($endpoint->id) || empty($endpoint->secret)) throw new DisplayException('Stripe did not return the new webhook details. Save again to recover the same endpoint.');
                     $credentials['stripe_webhook_secret'] = $endpoint->secret;
                 }
@@ -223,23 +283,37 @@ trait WebhookContinuity
                 $state = ['account' => $account, 'mode' => $mode, 'endpoint' => $endpoint->id ?? null,
                     'delivery' => $endpoint ? 'endpoint' : 'stripe_cli',
                     'credentials' => $credentials, 'previous' => $previous];
-                foreach ($credentials as $name => $value) $gateway->settings()->updateOrCreate(['key' => $name], [
-                    'value' => $value, 'encrypted' => $name !== 'stripe_publishable_key',
-                ]);
+            } catch (\Throwable $e) {
+                $failure = $e instanceof DisplayException ? $e->getMessage() : 'Stripe setup could not be verified. The previous credentials were kept. Check the API key permissions and save again.';
+            }
+        ExtensionLocks::transaction('gateway', function () use ($gateway, $claim, $credentials, $state, $old, &$failure) {
+            if (!$this->ownsContinuity($gateway, $claim)) {
+                $failure = 'Stripe settings changed during verification. Save again.';
+                return;
+            }
+            // A later native form save can persist fields before its hook obtains our scope.
+            foreach ($claim['submitted'] as $name => $value) {
+                if ((string) ($gateway->settings()->where('key', $name)->first()?->value ?? '') !== $value) {
+                    $failure = 'Stripe settings changed during verification. Save again.';
+                    return;
+                }
+            }
+            $values = $failure === null ? $credentials : $old;
+            foreach ($values as $name => $value) $gateway->settings()->updateOrCreate(['key' => $name], [
+                'value' => $value, 'encrypted' => $name !== 'stripe_publishable_key',
+            ]);
+            if ($failure === null) {
+                // A signed delivery during verification may already have started a previous secret's clock.
+                $live = $this->savedContinuityState();
+                foreach ($state['previous'] as &$entry) foreach ($live['previous'] ?? [] as $current) {
+                    if ($entry['secret'] === $current['secret'] && $entry['until'] === null) $entry['until'] = $current['until'];
+                }
+                unset($entry);
                 $gateway->settings()->updateOrCreate(['key' => self::WEBHOOK_STATE], ['value' => json_encode($state, JSON_THROW_ON_ERROR), 'encrypted' => true]);
                 $gateway->settings()->updateOrCreate(['key' => self::WEBHOOK_EVENTS], ['value' => 'ready']);
                 $this->config = array_replace($this->config, $credentials, [self::WEBHOOK_STATE => json_encode($state, JSON_THROW_ON_ERROR), 'stripe_revoke_previous_secrets' => false]);
-            } catch (\Throwable $e) {
-                // The core edit has already persisted the submitted fields. Restore verified values.
-                // Do not include Stripe exception messages: they can contain request details.
-                foreach ($old as $name => $value) $gateway->settings()->updateOrCreate(['key' => $name], [
-                    'value' => $value, 'encrypted' => $name !== 'stripe_publishable_key',
-                ]);
-                $failure = $e instanceof DisplayException ? $e->getMessage() : 'Stripe setup could not be verified. The previous credentials were kept. Check the API key permissions and save again.';
             }
-            // Throw outside the transaction so restoring the previous settings is committed.
-            if (isset($failure)) return $failure;
-            return null;
+            $gateway->settings()->where('key', self::WEBHOOK_CLAIM)->delete();
         });
         if ($failure !== null) throw new DisplayException($failure);
     }

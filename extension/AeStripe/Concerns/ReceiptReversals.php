@@ -152,12 +152,19 @@ trait ReceiptReversals
             return;
         }
         $invoice = $payment?->invoice ?? Invoice::findOrFail($row->invoice_id);
-        $this->withPaymentLock($invoice, function ($user, $current) use ($id, $kind, $paymentId) {
+        $intent = $this->request('get', '/payment_intents/' . $paymentId);
+        $latest = $this->request('get', ($kind === 'refund' ? '/refunds/' : '/disputes/') . $id);
+        $latestPayment = $latest->payment_intent ?? null;
+        if (!$latestPayment && is_string($latest->charge ?? null)) {
+            $charge = $this->request('get', '/charges/' . $latest->charge);
+            abort_unless(($charge->id ?? null) === $latest->charge, 409);
+            $latestPayment = $charge->payment_intent ?? null;
+        }
+        $this->withPaymentLock($invoice, function ($user, $current) use ($id, $kind, $paymentId, $intent, $latest, $latestPayment) {
             $receipt = $this->readReceipt($user, $paymentId);
             $payment = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentId), 'succeeded')[0] ?? null;
             abort_unless($receipt || $payment, 409);
             if ($payment) abort_unless($payment->invoice->id === $current->id && ($payment->gateway->extension ?? null) === 'AeStripe', 409);
-            $intent = $this->request('get', '/payment_intents/' . $paymentId);
             abort_unless(($intent->id ?? null) === $paymentId && ($intent->status ?? null) === 'succeeded'
                 && !empty($intent->customer) && ($intent->customer ?? null) === ($receipt ? $receipt['customer'] : $user->properties()->where('key', 'stripe_id')->first()?->value)
                 && strtolower($intent->currency ?? '') === strtolower($current->currency_code)
@@ -166,13 +173,6 @@ trait ReceiptReversals
             abort_unless($receipt['invoice_id'] === $current->id && $receipt['customer'] === $intent->customer
                 && $receipt['received_minor'] === $intent->amount_received && $receipt['currency'] === strtolower($intent->currency)
                 && ($receipt['closed_invoice'] || $payment && $this->toMinorUnits($payment->amount, $receipt['currency']) === $receipt['received_minor']), 409);
-            $latest = $this->request('get', ($kind === 'refund' ? '/refunds/' : '/disputes/') . $id);
-            $latestPayment = $latest->payment_intent ?? null;
-            if (!$latestPayment && is_string($latest->charge ?? null)) {
-                $charge = $this->request('get', '/charges/' . $latest->charge);
-                abort_unless(($charge->id ?? null) === $latest->charge, 409);
-                $latestPayment = $charge->payment_intent ?? null;
-            }
             abort_unless(($latest->id ?? null) === $id && $latestPayment === $paymentId
                 && strtolower($latest->currency ?? '') === $receipt['currency'] && is_int($latest->amount ?? null)
                 && $latest->amount > 0 && $latest->amount <= $receipt['received_minor'], 409);
@@ -188,6 +188,9 @@ trait ReceiptReversals
                 if (empty($previous->provider_created_at) && $created) $this->receiptRows()
                     ->where('payment_intent_id', $paymentId)->where('allocation_key', $key)->update(['provider_created_at' => $created]);
                 if ($kind === 'dispute' && in_array($previous->state, ['won', 'lost', 'cleared'], true) && in_array($state, ['open', 'inquiry'], true)) return;
+                // A succeeded refund can later fail; neither outcome can become pending again.
+                if ($kind === 'refund' && ($previous->state === 'failed'
+                    || $previous->state === 'refunded' && $state === 'open')) return;
                 if ($previous->state === $state) return;
             }
             $values = ['user_id' => $user->id, 'invoice_id' => $current->id, 'customer' => $receipt['customer'],

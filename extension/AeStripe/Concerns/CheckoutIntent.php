@@ -364,12 +364,14 @@ trait CheckoutIntent
      * Runs $callback under the customer's extension scope and the invoice's exact primary key, and runs it again when MariaDB
      * rolls it back as a deadlock victim. With $rerun, a rolled back transaction runs again only while $rerun() is
      * true: a callback that sends a Stripe write makes it false first, so that write is never sent twice.
+     * Lock the invoice before the core user row, then do plain reads. Native payments and credit deposits
+     * committed while waiting are visible without reversing the invoice and user lock order.
      */
     private function withPaymentLock($invoice, callable $callback, ?callable $rerun = null)
     {
         $locked = function () use ($invoice, $callback) {
             $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
-            $user = User::where('id', $invoice->user_id)->firstOrFail();
+            $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
             abort_unless($current->user_id === $user->id, 403);
             return $callback($user, $current);
         };
@@ -439,8 +441,8 @@ trait CheckoutIntent
     }
 
     /**
-     * The owner's account credit in a currency, read under the user row lock that every credit change here holds, and
-     * then locked by primary key. Null when there is none; the caller inserts it without a locking read first. A locking
+     * The owner's account credit in a currency, then locked by primary key. Creation callers take the core user row
+     * before the transaction's first plain read. Null when there is none; the caller inserts without a locking read. A locking
      * read of a missing credit locks the credits user_id index gap shared with other customers, and two customers who
      * each lock that gap and then insert their credit deadlock.
      */

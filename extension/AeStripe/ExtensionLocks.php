@@ -15,6 +15,26 @@ final class ExtensionLocks
         return self::$currentReads ? $query->lockForUpdate() : $query;
     }
 
+    /** Serialize remote writes through finalization without holding database row locks over HTTP. */
+    public static function provider(string $scope, callable $callback, bool $cancellation = false): mixed
+    {
+        $driver = config('cache.stores.' . config('cache.default') . '.driver');
+        $shared = in_array($driver, ['database', 'redis', 'memcached', 'dynamodb'], true);
+        if (!$shared && !($cancellation && in_array($driver, ['file', 'array'], true))) {
+            throw new \App\Exceptions\DisplayException('Stripe updates need a shared cache store. Contact support.');
+        }
+        abort_unless(DB::transactionLevel() === 0, 409);
+        // These stores cannot finalize invoices. Only deletion may proceed without their provider mutex.
+        if (!$shared) return $callback();
+        $lock = \Illuminate\Support\Facades\Cache::lock('ae-stripe-provider-' . $scope, 600);
+        try { $lock->block(5); }
+        catch (\Illuminate\Contracts\Cache\LockTimeoutException $e) {
+            throw new \App\Exceptions\DisplayException('Another Stripe update is in progress. Try again.');
+        }
+        try { return $callback(); }
+        finally { $lock->release(); }
+    }
+
     public static function transaction(string $scope, callable $callback, int $attempts = 1): mixed
     {
         if (DB::transactionLevel() > 0 && self::$scope !== null) {

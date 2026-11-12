@@ -49,7 +49,7 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
     check(count(Http::$calls) === $calls, 'Completed fee replays do not repeat remote lookups');
     check(ExtensionHelper::$feeWrites === $writes + 1, 'Completed fee blocks webhook and task replays');
 
-    $reset = function () { DB::$tables['ae_stripe_payment_fees'] = []; };
+    $reset = function () { DB::$tables['ae_stripe_payment_fees'] = []; DB::$tables['ae_stripe_outbox'] = []; };
     $reset(); $charge->balance_transaction = $balanceId = null;
     $writes = ExtensionHelper::$feeWrites;
     check($deliver()['status'] === 200 && $row()['state'] === 'pending' && ExtensionHelper::$feeWrites === $writes,
@@ -88,9 +88,9 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
         $attempts = $row()['attempts'];
         $gateway->retryPaymentFees();
         check($row()['attempts'] === $attempts + ($limit === 'attempts' ? 1 : 0), 'Notice failure does not add collection attempts after the review commits');
-        check($row()['state'] === 'review' && count(Audit::$rows) === $audits + 1 && !end(Audit::$rows)['new_values']['notice_sent'] && count(Notification::$rows) === $notices, 'Notice failure preserves the committed review and pending delivery');
+        check($row()['state'] === 'review' && count(Audit::$rows) === $audits + 1 && count(pendingOutbox()) === 1 && count(Notification::$rows) === $notices, 'Notice failure preserves the committed review and pending delivery');
         Notification::$fail = false;
-        foreach (Audit::$rows as &$audit) $audit['new_values']['notice_retry_at'] = 0;
+        dueOutbox();
         unset($audit);
         invoke($gateway, 'retryPaymentNotices');
         $gateway->retryPaymentFees(); $deliver(); $gateway->retryPaymentFees();

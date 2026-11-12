@@ -16,7 +16,7 @@ $activations = 0;
 Invoice::updated(function ($invoice) use (&$activations) { if ($invoice->wasChanged('status') && $invoice->status === 'paid') ++$activations; });
 $setup = function ($amount = 2000, $total = 10, $currency = 'usd') use ($owner, $nativeGateway) {
     beforeWrite('ae_stripe_receipt_returns', null); beforeWrite('notifications', null);
-    foreach (['ae_stripe_settlements', 'invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices'] as $table) DB::table($table)->delete();
+    foreach (['ae_stripe_outbox', 'ae_stripe_settlements', 'invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices'] as $table) DB::table($table)->delete();
     $owner->properties()->where('key', '!=', 'stripe_id')->delete();
     $owner->properties()->updateOrCreate(['key' => 'stripe_id'], ['value' => 'cus_owner']);
     $owner->forceFill(['role_id' => null])->save();
@@ -39,7 +39,7 @@ $setup = function ($amount = 2000, $total = 10, $currency = 'usd') use ($owner, 
             }
             if ($path === '/refunds' && $verb === 'get') return (object) ['data' => array_values($this->refunds), 'has_more' => false];
             if ($path !== '/refunds' || $verb !== 'post') throw new RuntimeException('Unexpected return fixture request: ' . $path);
-            check(holdsLock('ae_stripe_locks') && holdsLock('invoices'), 'Return sends serialize with invoice payments');
+            check(DB::transactionLevel() === 0, 'Refund HTTP runs outside every transaction');
             $key = idempotencyKey($request);
             $stored = tableRows('ae_stripe_receipt_returns', ['payment_intent_id', 'allocation_key']);
             check(!empty($stored[array_key_last($stored)]['sent_at']), 'First-send marker survives outside the external-write transaction');
@@ -62,10 +62,43 @@ $inboxDown = fn () => beforeWrite('notifications', fn () => throw new RuntimeExc
 $inboxUp = function () {
     beforeWrite('notifications', null);
     // Reach the next retry time without sleeping in these delivery recovery tests.
-    foreach (Audit::where('new_values->notice_sent', false)->get() as $audit) {
-        $audit->update(['new_values' => array_replace($audit->new_values, ['notice_retry_at' => 0])]);
-    }
+    DB::table('ae_stripe_outbox')->where('state', 'pending')->update(['next_at' => 0]);
 };
+
+// A failure event commits while an older successful provider observation is in flight.
+if (!getenv('PAY_PR95_CASE') || str_starts_with(getenv('PAY_PR95_CASE'), 'refund-generation')) {
+    foreach ([false, true] as $alreadyRechecking) {
+        if (getenv('PAY_PR95_CASE') && $alreadyRechecking !== (getenv('PAY_PR95_CASE') === 'refund-generation-set')) continue;
+        [$i, $s] = $setup(); $s->status = 'pending'; $deliver($s);
+        if ($alreadyRechecking) $setReturn('pi_return:excess', ['recheck' => true]);
+        current($s->refunds)->status = 'succeeded';
+        $normal = $GLOBALS['stripeHandler']; $interleaved = false;
+        $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($normal, $gateway, $s, &$interleaved) {
+            $answer = $normal($verb, $path, $data, $request);
+            if (!$interleaved && $verb === 'get' && $path === '/refunds') {
+                $interleaved = true; $answer = unserialize(serialize($answer));
+                current($s->refunds)->status = 'failed';
+                beforeWrite('ae_stripe_receipt_returns', function ($values) {
+                    if (empty($values['recheck'])) return;
+                    beforeWrite('ae_stripe_receipt_returns', null);
+                    // The event commits its due work; its processor has not acquired the invoice yet.
+                    beforeLock('invoices', fn () => throw new RuntimeException('Failure processor deferred'));
+                });
+                $gateway->webhook(eventRequest(current($s->refunds), type: 'refund.failed'));
+            }
+            return $answer;
+        };
+        $gateway->retryReceiptReturns();
+        $GLOBALS['stripeHandler'] = $normal;
+        check($interleaved && $status($i)['recheck'] && $status($i)['state'] === 'pending',
+            'An older successful refund read preserves the newer failure recheck, including an already-set flag');
+        $gateway->retryReceiptReturns(); $gateway->retryReceiptReturns();
+        check($status($i)['state'] === 'credited' && credits()['7:usd'] === 10.0 && count($s->posts) === 1
+            && count(payments()) === 2 && moneyRows()['credits'] === ['7:usd' => 1],
+            'The durable failure recheck restores the customer money exactly once without another refund');
+    }
+}
+if (getenv('PAY_PR95_CASE')) return;
 
 [$i, $s] = $setup(); $deliver($s); $deliver($s); $gateway->retryReceiptReturns();
 $a = $status($i);
@@ -313,5 +346,65 @@ try {
     });
 } catch (RuntimeException $e) { check($e->getMessage() === 'Caller rolled back', 'Domains caller controls its transaction'); }
 check($status($i, 'domains:rollback') === null && count($s->posts) === 1, 'A rolled-back caller reservation cannot send a refund');
+
+// Customer completion mail uses a durable recipient entry and a real after-commit database queue.
+config(['settings.mail_disable' => false, 'queue.default' => 'database',
+    'queue.connections.database.connection' => 'sqlite', 'queue.connections.database.after_commit' => true]);
+Illuminate\Support\Facades\Mail::fake();
+$drainReturnMail = function () {
+    foreach (DB::table('jobs')->orderBy('id')->pluck('id') as $id) {
+        $job = Illuminate\Support\Facades\Queue::pop();
+        check($job !== null, 'A retained database job can be consumed');
+        $job->fire(); $job->delete();
+    }
+};
+$mailRows = fn () => DB::table('ae_stripe_outbox')->whereIn('kind',
+    ['ae_stripe_return_mail:refunded:customer', 'ae_stripe_return_mail:credited:customer']);
+[$i, $s] = $setup(2000, 20); $deliver($s);
+DB::table('email_logs')->delete();
+beforeWrite('jobs', function () {
+    check(DB::transactionLevel() === 0, 'The queue refuses insertion after the notice transaction commits');
+    throw new RuntimeException('Queue insertion unavailable');
+});
+$gateway->allocateReceiptReturn($i, 'pi_return', 'domains:queue-failure', 2000);
+check($status($i, 'domains:queue-failure')['state'] === 'refunded' && count($s->posts) === 1
+    && count(notices()) === 1 && DB::table('jobs')->count() === 0
+    && $mailRows()->where('state', 'pending')->count() === 1,
+    'Queue insertion failure preserves a pending completion email after refund and bell delivery commit');
+beforeWrite('jobs', null); $inboxUp();
+$gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+check(DB::table('jobs')->count() === 2, 'Repeated recovery can queue duplicate jobs for the same retained mail entry');
+$drainReturnMail();
+check(Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class, fn ($mail) =>
+    $mail->hasTo($owner->email) && str_contains($mail->mail['body'], '20.00 USD')
+    && str_contains($mail->mail['body'], 'original payment method')
+    && str_contains($mail->mail['body'], e(route('invoices.show', $i))))->count() === 1
+    && $mailRows()->where('state', 'sent')->count() === 1
+    && DB::table('email_logs')->where('user_id', $owner->id)->where('status', 'sent')->whereNotNull('sent_at')->count() === 1
+    && count($s->posts) === 1 && count(notices()) === 1,
+    'Recovered queue jobs send one customer email for the return without repeating money or the bell item');
+
+Illuminate\Support\Facades\Mail::fake();
+[$i, $s] = $setup(); $deliver($s); $drainReturnMail();
+check(Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class)->count() === 1,
+    'A completed return sends its first completion email');
+$normal = $GLOBALS['stripeHandler'];
+$GLOBALS['stripeHandler'] = fn () => throw new ConnectionException('Provider temporarily unreachable');
+$gateway->webhook(eventRequest(clone current($s->refunds), type: 'refund.updated'));
+check($status($i)['state'] === 'review', 'A replay during an outage retains the temporary review state');
+$GLOBALS['stripeHandler'] = $normal;
+$gateway->retryReceiptReturns(); $drainReturnMail();
+check($status($i)['state'] === 'refunded' && count($s->posts) === 1
+    && Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class)->count() === 1
+    && $mailRows()->count() === 1,
+    'Replay recovery reuses the completed allocation mail entry without a second completion email');
+current($s->refunds)->status = 'failed';
+$gateway->webhook(eventRequest(clone current($s->refunds), type: 'refund.failed'));
+$drainReturnMail();
+check($status($i)['state'] === 'credited'
+    && Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class)->count() === 2
+    && $mailRows()->count() === 2,
+    'A real later change to account credit sends one different completion email');
+config(['queue.default' => 'sync']);
 
 require __DIR__ . '/receipt-reversals.php';

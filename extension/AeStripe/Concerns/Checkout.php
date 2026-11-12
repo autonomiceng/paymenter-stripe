@@ -379,6 +379,7 @@ trait Checkout
             if (in_array($status, ['processing', 'failed'], true)) {
                 $attempt = $this->readPaymentAttempt($user, $invoice);
                 if (($attempt['intent'] ?? null) === $intent->id) {
+                    if ($status === 'failed') $attempt['latest_charge'] = $intent->latest_charge ?? null;
                     if ($status === 'failed') $attempt = $this->renewalRefused($invoice, $attempt, $intent);
                     $this->writePaymentAttempt($user, $invoice,
                         array_replace($attempt, ['agreement_id' => null, 'confirmation' => null, 'retry' => $status === 'processing', 'funds_pending' => $status === 'processing' || ($intent->amount_received ?? 0) > 0]));
@@ -440,7 +441,7 @@ trait Checkout
                 'Invoice ' . $this->invoiceLabel($invoice) . ', payment ' . $intentId . ': ' . $alert['reason']
                     . '. Check Stripe and choose a refund or account credit; this needs your decision.'),
         ]));
-        $alert['sent'] = true; // Delivery is now owned by the durable audit marker, independently of this property.
+        $alert['sent'] = true; // Delivery is now owned by the outbox, independently of this property.
         $invoice->user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($alert, JSON_THROW_ON_ERROR)]);
     }
 

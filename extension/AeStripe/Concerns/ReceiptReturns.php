@@ -18,7 +18,8 @@ trait ReceiptReturns
     {
         if (self::$receiptReturnSchemaReady) return;
         if (!\Illuminate\Support\Facades\Schema::hasTable('ae_stripe_receipt_returns')
-            || !\Illuminate\Support\Facades\Schema::hasColumn('ae_stripe_receipt_returns', 'provider_created_at')) {
+            || !\Illuminate\Support\Facades\Schema::hasColumn('ae_stripe_receipt_returns', 'provider_created_at')
+            || !\Illuminate\Support\Facades\Schema::hasColumn('ae_stripe_receipt_returns', 'recheck_generation')) {
             // MySQL DDL must never commit an enclosing caller/payment transaction.
             abort_unless(DB::transactionLevel() === 0, 409);
             $this->upgraded();
@@ -45,12 +46,13 @@ trait ReceiptReturns
     {
         $this->ensureReceiptReturnSchema();
         abort_unless(preg_match('/^pi_[a-zA-Z0-9]+$/D', $paymentIntentId) && $allocationKey !== 'excess' && !$this->isReceiptObservation($allocationKey) && strlen($allocationKey) <= 180 && $allocationKey !== '' && $amountMinor > 0, 409);
-        $this->withPaymentLock($invoice, function ($user, $current) use ($paymentIntentId, $allocationKey, $amountMinor) {
+        $intent = $this->receiptRows()->where('payment_intent_id', $paymentIntentId)->first()
+            ? null : $this->request('get', '/payment_intents/' . $paymentIntentId);
+        $this->withPaymentLock($invoice, function ($user, $current) use ($paymentIntentId, $allocationKey, $amountMinor, $intent) {
             $receipt = $this->readReceipt($user, $paymentIntentId);
             if (!$receipt) {
                 $payment = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $paymentIntentId), 'succeeded')[0] ?? null;
                 abort_unless($payment && $payment->invoice->id === $current->id && ($payment->gateway->extension ?? null) === 'AeStripe', 409);
-                $intent = $this->request('get', '/payment_intents/' . $paymentIntentId);
                 abort_unless(($intent->id ?? null) === $paymentIntentId && ($intent->status ?? null) === 'succeeded' && !empty($intent->customer)
                     && ($intent->customer ?? null) === $user->properties()->where('key', 'stripe_id')->first()?->value
                     && strtolower($intent->currency ?? '') === strtolower($current->currency_code)
@@ -81,7 +83,8 @@ trait ReceiptReturns
                 'state' => $row->state, 'refund_id' => $row->refund_id, 'credit_id' => $row->credit_id,
                 'provider_created_at' => $row->provider_created_at ?? null,
                 'key' => $row->return_key, 'sent_at' => $row->sent_at === null ? null : (int) $row->sent_at,
-                'reason' => $row->reason, 'notified' => $row->notified, 'recheck' => (bool) $row->recheck];
+                'reason' => $row->reason, 'notified' => $row->notified, 'recheck' => (bool) $row->recheck,
+                'recheck_generation' => (int) ($row->recheck_generation ?? 0)];
         }
         return $receipt;
     }
@@ -113,6 +116,7 @@ trait ReceiptReturns
             'refund_id' => $a['refund_id'], 'credit_id' => $a['credit_id'] ?? null, 'sent_at' => $a['sent_at'],
             'provider_created_at' => $previous->provider_created_at ?? $a['provider_created_at'] ?? null,
             'reason' => $a['reason'] ?? null, 'notified' => $a['notified'] ?? null, 'recheck' => $a['recheck'] ?? false,
+            'recheck_generation' => $a['recheck_generation'] ?? 0,
             'retry' => !in_array($a['state'], ['refunded', 'credited'], true) || !empty($a['recheck'])
                 || ($a['notified'] ?? null) !== $this->receiptNotice($a), 'updated_at' => time(),
         ]);
@@ -188,6 +192,7 @@ trait ReceiptReturns
             if ($a['state'] === 'credited') return;
             // Commit due work before HTTP, so an outage or worker crash cannot lose this event.
             $a['recheck'] = true;
+            $a['recheck_generation'] = ($a['recheck_generation'] ?? 0) + 1;
             $this->writeReceipt($user, $row->payment_intent_id, $receipt, $row->allocation_key);
             DB::afterCommit(fn () => $this->processReceiptReturns($current, $row->payment_intent_id, $row->allocation_key));
         });
@@ -202,30 +207,43 @@ trait ReceiptReturns
             $keys = $onlyKey !== null ? [$onlyKey] : $this->withPaymentLock($invoice, fn ($user) => array_keys($this->readReceipt($user, $id)['allocations'] ?? []));
             foreach ($keys as $key) {
                 // Rotate checked receipts, including failures, so one outage cannot starve the queue.
-                $this->withPaymentLock($invoice, function ($user) use ($id, $key) {
+                $snapshot = $this->withPaymentLock($invoice, function ($user) use ($id, $key) {
                     $receipt = $this->readReceipt($user, $id);
                     $this->writeReceipt($user, $id, $receipt, $key);
+                    return $receipt;
                 });
                 try {
-                    $process = function ($user, $current) use ($id, $key) {
+                    $allocation = $snapshot['allocations'][$key];
+                    if ($allocation['state'] === 'credited' || $allocation['state'] === 'refunded' && empty($allocation['recheck'])) {
+                        $this->notifyReceiptReturn($invoice, $id, $key);
+                        continue;
+                    }
+                    $intent = $this->request('get', '/payment_intents/' . $id, ['expand' => ['latest_charge']]);
+                    $invoiceMatches = $this->receiptInvoiceMatches($snapshot, $intent);
+                    $refund = $this->findReceiptRefund($snapshot, $allocation);
+                    $process = function ($user, $current) use ($id, $key, $snapshot, $intent, $invoiceMatches, &$refund) {
                         $receipt = $this->readReceipt($user, $id);
                         $a = &$receipt['allocations'][$key];
+                        // An event committed after the read owns the next observation, even if recheck was already true.
+                        if (($a['recheck_generation'] ?? 0) !== ($snapshot['allocations'][$key]['recheck_generation'] ?? 0)) return false;
                         if ($a['state'] === 'credited' || $a['state'] === 'refunded' && empty($a['recheck'])) return;
                         $payment = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $id), 'succeeded')[0] ?? null;
                         abort_unless(strtolower($current->currency_code) === $receipt['currency'] && ($receipt['closed_invoice'] || ($payment
                             && $payment->invoice->id === $current->id && ($payment->gateway->extension ?? null) === 'AeStripe'
                             && $this->toMinorUnits($payment->amount, $receipt['currency']) === $receipt['received_minor'])), 409);
-                        $intent = $this->request('get', '/payment_intents/' . $id, ['expand' => ['latest_charge']]);
+                        // Remote observations belong to the immutable receipt checked before HTTP.
+                        foreach (['customer', 'currency', 'received_minor', 'invoice_id', 'closed_invoice', 'subscription_invoice_id'] as $field) {
+                            abort_unless(($receipt[$field] ?? null) === ($snapshot[$field] ?? null), 409);
+                        }
                         abort_unless(($intent->id ?? null) === $id && ($intent->status ?? null) === 'succeeded'
                             && !empty($receipt['customer']) && $receipt['customer'] === $user->properties()->where('key', 'stripe_id')->first()?->value
                             && ($intent->customer ?? null) === $receipt['customer'] && strtolower($intent->currency ?? '') === $receipt['currency']
                             && ($intent->amount_received ?? null) === $receipt['received_minor']
-                            && $this->receiptInvoiceMatches($receipt, $intent), 409);
+                            && $invoiceMatches, 409);
                         $charge = $intent->latest_charge ?? null;
                         if (!is_object($charge) || !isset($charge->disputed) || $charge->disputed || $this->receiptHasReversalHold($id)) {
                             $a['state'] = 'review'; $a['reason'] = 'Check the original payment and any dispute in Stripe before returning money.';
                         } else {
-                            $refund = $this->findReceiptRefund($receipt, $a);
                             if (!$refund && $a['sent_at'] === null) {
                                 // Commit a send reservation only after reads prove a refund can run.
                                 $a['sent_at'] = time();
@@ -235,8 +253,7 @@ trait ReceiptReturns
                             if (!$refund && time() - $a['sent_at'] >= 23 * 3600) {
                                 $a['state'] = 'review'; $a['reason'] = 'Refund outcome missing. Check this payment in Stripe and its return key in the invoice Audit Log; do not send another refund or credit.';
                             } else {
-                                $refund ??= $this->request('post', '/refunds', ['payment_intent' => $id, 'amount' => $a['amount_minor'],
-                                    'metadata' => ['ae_stripe_return' => $a['key']]], $a['key']);
+                                if (!$refund) return true; // The committed reservation authorizes the send outside this lock.
                                 abort_unless(($refund->payment_intent ?? null) === $id && ($refund->amount ?? null) === $a['amount_minor']
                                     && strtolower($refund->currency ?? '') === $receipt['currency'] && !empty($refund->id)
                                     && ($refund->metadata->ae_stripe_return ?? null) === $a['key'], 409);
@@ -266,7 +283,11 @@ trait ReceiptReturns
                         $this->writeReceipt($user, $id, $receipt, $key);
                         return false;
                     };
-                    if ($this->withPaymentLock($invoice, $process)) $this->withPaymentLock($invoice, $process);
+                    if ($this->withPaymentLock($invoice, $process)) {
+                        $refund = $this->request('post', '/refunds', ['payment_intent' => $id, 'amount' => $allocation['amount_minor'],
+                            'metadata' => ['ae_stripe_return' => $allocation['key']]], $allocation['key']);
+                        $this->withPaymentLock($invoice, $process);
+                    }
                 } catch (\Throwable $e) {
                     report($e);
                     if ($e instanceof ConnectionException || $e instanceof RequestException
@@ -372,6 +393,11 @@ trait ReceiptReturns
                     'body' => 'Invoice ' . $this->invoiceLabel($current) . ', payment ' . $id . ': ' . $a['reason']]));
             }
             $this->queuePaymentNotices($audit, $notices);
+            if (!$this->receiptStripeUnavailable && in_array($a['state'], ['refunded', 'credited'], true)) {
+                $this->queuePaymentNotices($audit, [$notices[0]], [
+                    'kind' => 'ae_stripe_return_mail:' . $a['state'], 'source' => $a['key'],
+                ]);
+            }
             $a['notified'] = $notice;
             $this->writeReceipt($user, $id, $receipt, $key);
         });

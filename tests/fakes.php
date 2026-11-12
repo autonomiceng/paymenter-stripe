@@ -276,6 +276,7 @@ namespace App\Models {
         public static function where($key, $value) { return new Query(self::$row && self::$row->$key === $value ? self::$row : null, Service::class); }
         public function update($values) { foreach ($values as $key => $value) $this->$key = $value; }
         public function properties() { return $this->properties; }
+        public function cancellation() { return new Query($this->cancellation); }
         public function invoiceItems() { return new class($this->invoiceRows) {
             public function __construct(private $rows) {}
             public function where($key, $value) {
@@ -549,7 +550,12 @@ namespace Illuminate\Http {
         public function header($name) { return $this->signature; }
     }
 }
+namespace Illuminate\Contracts\Queue { interface ShouldQueue {} }
 namespace Illuminate\Support\Facades {
+    class Queue {
+        public static array $jobs = [];
+        public static function push($job) { self::$jobs[] = $job; }
+    }
     class Route {
         public static $routes = [], $definitions = [], $names = [];
         public static function has($name) { return isset(self::$names[$name]); }
@@ -598,7 +604,7 @@ namespace Illuminate\Support\Facades {
         public static $tables = [], $locks = [], $updates = [];
         public static function connection() { return new class { public function getDatabaseName() { return 'paymenter'; } public function getDriverName() { return DB::$driver; } }; }
         public static $concurrentAgreements = [], $concurrentPayments = [];
-        public static function table($name) { return match ($name) { 'ae_stripe_settlements' => new \SettlementQuery, 'ae_stripe_locks' => new \ExtensionLockQuery, 'invoice_transactions' => new \TransactionClassificationQuery, 'ae_stripe_receipt_returns' => new \ReceiptReturnQuery, 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
+        public static function table($name) { return match ($name) { 'ae_stripe_outbox' => new \OutboxQuery, 'ae_stripe_settlements' => new \SettlementQuery, 'ae_stripe_locks' => new \ExtensionLockQuery, 'invoice_transactions' => new \TransactionClassificationQuery, 'ae_stripe_receipt_returns' => new \ReceiptReturnQuery, 'ae_stripe_transaction_methods' => new \TransactionMethodQuery, 'ae_stripe_payment_fees' => new \FeeQuery, default => new \AdoptionQuery($name) }; }
         public static $beforeUserLock = null, $beforeServiceLock = null, $beforeInvoiceLock = null, $afterTransaction = null;
         public static string $driver = 'sqlite';
         public static bool $readCommitted = false;
@@ -686,6 +692,46 @@ namespace {
         }, ARRAY_FILTER_USE_BOTH);
         return count($rows) === 1 ? array_values($rows)[0] : null;
     }
+    class OutboxQuery {
+        private array $filters = [], $order = [];
+        private int $maximum = PHP_INT_MAX;
+        public function where($key, $op, $value = null) {
+            if (func_num_args() === 2) { $value = $op; $op = '='; }
+            $this->filters[] = [$key, $op, $value]; return $this;
+        }
+        public function whereIn($key, $values) { return $this->where($key, 'in', $values); }
+        public function orderBy($key) { $this->order[] = $key; return $this; }
+        public function limit($n) { $this->maximum = $n; return $this; }
+        public function lockForUpdate() {
+            $db = \Illuminate\Support\Facades\DB::class;
+            if (!$db::$locked || $db::$userLocked || $db::$gatewayLocked || count($this->filters) !== 1 || $this->filters[0][0] !== 'id') {
+                throw new RuntimeException('Notice delivery locks only its outbox primary key');
+            }
+            return $this;
+        }
+        public function get() {
+            $rows = array_filter(\Illuminate\Support\Facades\DB::$tables['ae_stripe_outbox'] ?? [], function ($row) {
+                foreach ($this->filters as [$key, $op, $value]) {
+                    if (!match ($op) { '=' => $row[$key] === $value, '<=' => $row[$key] <= $value, 'in' => in_array($row[$key], $value, true) }) return false;
+                }
+                return true;
+            });
+            usort($rows, function ($a, $b) { foreach ($this->order as $key) if ($a[$key] !== $b[$key]) return $a[$key] <=> $b[$key]; return 0; });
+            return array_map(fn ($row) => (object) $row, array_slice($rows, 0, $this->maximum));
+        }
+        public function first() { return $this->get()[0] ?? null; }
+        public function insertOrIgnore($row) {
+            foreach (\Illuminate\Support\Facades\DB::$tables['ae_stripe_outbox'] ?? [] as $stored) {
+                if ($stored['kind'] === $row['kind'] && $stored['source'] === $row['source'] && $stored['recipient_id'] === $row['recipient_id']) return 0;
+            }
+            $row['id'] = count(\Illuminate\Support\Facades\DB::$tables['ae_stripe_outbox'] ?? []) + 1;
+            \Illuminate\Support\Facades\DB::$tables['ae_stripe_outbox'][$row['id']] = $row;
+            return 1;
+        }
+        public function update($values) { foreach ($this->get() as $row) \Illuminate\Support\Facades\DB::$tables['ae_stripe_outbox'][$row->id] = array_replace((array) $row, $values); }
+    }
+    function pendingOutbox(): array { return array_filter(\Illuminate\Support\Facades\DB::$tables['ae_stripe_outbox'] ?? [], fn ($row) => $row['state'] === 'pending'); }
+    function dueOutbox(): void { foreach (\Illuminate\Support\Facades\DB::$tables['ae_stripe_outbox'] ?? [] as $id => $row) \Illuminate\Support\Facades\DB::$tables['ae_stripe_outbox'][$id]['next_at'] = 0; }
     class SettlementQuery {
         public function insertOrIgnore(array $row) {
             $key = $row['payment_intent_id'];

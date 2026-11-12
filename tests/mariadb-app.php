@@ -42,6 +42,12 @@ DB::statement('set session innodb_lock_wait_timeout = 20');
 if (!empty($install)) {
     Illuminate\Support\Facades\Artisan::call('migrate:fresh', ['--force' => true]);
     foreach (glob(__DIR__ . '/../extension/AeStripe/database/migrations/*.php') as $migration) (require $migration)->up();
+    // Provider operations use the same shared cache store in both worker processes.
+    foreach (['cache' => false, 'cache_locks' => true] as $table => $locks) Illuminate\Support\Facades\Schema::create($table, function ($schema) use ($locks) {
+        $schema->string('key')->primary();
+        if ($locks) $schema->string('owner'); else $schema->text('value');
+        $schema->integer('expiration');
+    });
     foreach (['default_currency' => 'USD', 'tax_enabled' => '0', 'mail_disabled' => '1'] as $key => $value) {
         App\Models\Setting::withoutEvents(fn () => App\Models\Setting::create(['key' => $key, 'value' => $value]));
     }
@@ -50,6 +56,8 @@ if (!empty($install)) {
     $installed = App\Models\Gateway::create(['name' => 'AE Stripe', 'extension' => 'AeStripe', 'type' => 'gateway', 'enabled' => true]);
     $installed->settings()->create(['key' => 'ae_stripe_webhook_events', 'value' => 'ready']);
 }
+// Core migrations use cached queries before the cache tables exist. Switch only after installation.
+config(['cache.default' => 'database']);
 require_once __DIR__ . '/../extension/AeStripe/AeStripe.php';
 App\Models\Invoice::creating(function ($invoice) { $invoice->send_create_email = false; });
 $gateway = new Paymenter\Extensions\Gateways\AeStripe\AeStripe(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key' => 'fake-secret']);
