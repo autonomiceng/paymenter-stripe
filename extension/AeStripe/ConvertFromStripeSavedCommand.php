@@ -74,7 +74,7 @@ final class ConvertFromStripeSavedCommand extends Command
         $tables = Schema::getTableListing(DB::connection()->getDatabaseName(), false);
         $renames = []; $partial = false;
         foreach ($tables as $table) {
-            if (str_starts_with($table, 'ae_stripe_')) $partial = true;
+            if ($table !== 'ae_stripe_locks' && str_starts_with($table, 'ae_stripe_')) $partial = true;
             if (str_starts_with($table, 'stripe_saved_')) {
                 $target = 'ae_stripe_' . substr($table, 13);
                 if (Schema::hasTable($target)) throw new ConversionRefusal('Both source and target tables exist: ' . $table);

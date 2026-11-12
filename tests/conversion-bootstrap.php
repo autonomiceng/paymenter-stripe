@@ -103,7 +103,11 @@ Illuminate\Support\Facades\DB::table('stripe_saved_payment_fees')->insert(['paym
 foreach ([[[], 'Dry run'], [['--apply' => true], 'Converted gateway #42'], [[], 'Already converted']] as [$parameters, $expected]) {
     $output = new Symfony\Component\Console\Output\BufferedOutput;
     $status = $artisan->call('ae-stripe:convert-from-stripe-saved', $parameters, $output);
-    if ($status !== 0 || !str_contains($output->fetch(), $expected)) throw new RuntimeException('Real legacy conversion must support dry run, apply and retry');
+    $message = $output->fetch();
+    if ($status !== 0 || !str_contains($message, $expected)) throw new RuntimeException('Real legacy conversion must support dry run, apply and retry');
+    if ($expected === 'Dry run' && str_contains($message, 'Previous apply was partial')) {
+        throw new RuntimeException('Bootstrapping the mutex must not report a partial earlier conversion');
+    }
     if (!$schema->hasTable('ae_stripe_locks') || $schema->hasTable('ae_stripe_outbox') || $schema->hasTable('ae_stripe_settlements')) {
         throw new RuntimeException('Conversion must create only its mutex, without running target migrations');
     }

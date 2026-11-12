@@ -105,6 +105,7 @@ if ($suite = getenv('PAY_OFFLINE_SUITE')) {
         'subscription-listeners' => ['subscription-listeners', 'schema-scheduler'],
         'payment-fees' => ['fee-recovery', 'fee-recovery-review'],
         'adoption-store' => ['gateway-lifecycle', 'adoption', 'adoption-store'],
+        'conversion' => ['gateway-lifecycle', 'adoption', 'adoption-store', 'conversion'],
         'ci-coverage' => ['native-ci-selection'],
         default => throw new RuntimeException('Unknown offline suite'),
     };
