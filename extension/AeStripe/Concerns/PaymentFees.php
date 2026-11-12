@@ -18,6 +18,7 @@ trait PaymentFees
     public function upgraded($oldVersion = null)
     {
         app(\Illuminate\Database\Migrations\Migrator::class)->run(base_path('extensions/Gateways/AeStripe/database/migrations'));
+        $this->backfillPaymentNotices();
     }
 
     private static bool $paymentFeeSchemaReady = false;
@@ -146,7 +147,7 @@ trait PaymentFees
             // Every insert of a fee row holds this owner lock, so a plain read finds it, and only an existing row is locked.
             // A locking read of a missing key locks the gap two payments then insert into, and they deadlock.
             $row = $this->feeRows()->where('payment_intent_id', $paymentId)->first()
-                ? $this->feeRows()->where('payment_intent_id', $paymentId)->first() : null;
+                ? $this->feeRows()->where('payment_intent_id', $paymentId)->lockForUpdate()->first() : null;
             if ($row && $row->state !== 'pending') return;
             if ($row && ($row->charge_id !== ($snapshot ? $snapshot->charge_id : $chargeId)
                 || $row->balance_transaction_id !== ($snapshot ? $snapshot->balance_transaction_id : $balanceId))) return;

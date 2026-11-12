@@ -171,7 +171,7 @@ $row = fn ($stub, $selections, $arguments, $livewire = '') => implode("\t", [$st
 $suiteRuns = array_map(fn ($suite) => $row('php', [3 => $suite], $prepend . ' -d memory_limit=512M ' . __DIR__ . '/native-suite.php'), require __DIR__ . '/native-suites.php');
 $late = [$row('php', [1 => 'notice-native'], $prepend . ' -d memory_limit=256M ' . __DIR__ . '/run.php'), $row('php', [2 => 'native'], $prepend . ' -d memory_limit=256M ' . __DIR__ . '/run.php'),
     ...array_map(fn ($file) => $row('php', [], $prepend . ' -d memory_limit=256M ' . __DIR__ . '/' . $file), ['native-transaction-method.php', 'native-receipt-returns.php', 'native-auto-pay-consent.php']),
-    $row('php', [], '-n ' . $prepend . ' ' . __DIR__ . '/conversion-bootstrap.php ' . $fixture . '/app'), ...$suiteRuns];
+    $row('php', [], $prepend . ' ' . __DIR__ . '/conversion-bootstrap.php ' . $fixture . '/app'), ...$suiteRuns];
 $livewire = $fixture . '/app/vendor/livewire/livewire/dist/livewire.js';
 $browser = [$row('php', ['final-browser'], $prepend . ' -d memory_limit=256M ' . __DIR__ . '/run.php', $livewire),
     $row('node', [], __DIR__ . '/payment-errors.mjs', $livewire), $row('node', [], __DIR__ . '/setup-modal.mjs', $livewire)];

@@ -10,6 +10,23 @@ use App\Models\{Invoice, User};
 use Illuminate\Database\Events\TransactionBeginning;
 use Illuminate\Support\Facades\{DB, Event};
 
+// The mutex must belong to the row's owner; gateway and unrelated customers do not qualify.
+$guardInvoice = nativeInvoice(9991);
+foreach (['gateway', 'user:8', 'user:7'] as $scope) {
+    Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks::transaction($scope, function () use ($scope, $guardInvoice) {
+        $read = fn () => App\Models\Audit::where('auditable_type', $guardInvoice->getMorphClass())
+            ->where('auditable_id', $guardInvoice->id)->where('event', 'fixture')->first();
+        $write = fn () => DB::table('ae_stripe_receipt_returns')->where('invoice_id', -1)->update(['user_id' => 7]);
+        if ($scope !== 'user:7') {
+            rejects($read, 'Review guard needs the owner lock');
+            rejects($write, 'Return write needs owner lock');
+        } else { $read(); $write(); check(true, 'The matching owner scope permits review reads and return writes'); }
+        $gatewayRead = fn () => App\Models\Audit::where('auditable_type', App\Models\Gateway::class)
+            ->where('auditable_id', 1)->where('event', 'fixture')->first();
+        if ($scope === 'gateway') { $gatewayRead(); check(true, 'Gateway reviews use the gateway scope'); }
+        else rejects($gatewayRead, 'Review guard needs the owner lock');
+    });
+}
 $transaction = 0;
 Event::listen(TransactionBeginning::class, function () use (&$transaction) { if (DB::transactionLevel() === 1) ++$transaction; });
 $GLOBALS['gapTrace'] = null;

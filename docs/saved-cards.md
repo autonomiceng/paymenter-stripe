@@ -1,10 +1,11 @@
 # Duplicate saved cards
 
 Account setup compares Stripe card fingerprints within one Paymenter user, Stripe
-customer and AE Stripe gateway. It keeps the oldest matching active agreement and
-updates its Stripe and local expiry from the confirmed card. Missing fingerprints
-do not match. Service bindings and Auto Pay are unchanged. A duplicate already bound to a service stays saved and is
-logged. Other method types and their mandates are unchanged.
+customer and AE Stripe gateway. It reuses the newest matching active agreement and
+refreshes expiry and consent on every verified copy. Missing fingerprints do not
+match. Service bindings and Auto Pay are unchanged. Existing duplicates stay saved
+for provider references and Auto Pay. Link saves match the full Stripe Link account
+email, ignoring case. Other method types and their mandates are unchanged.
 
 Explicit setup consent permits `allow_redisplay=always` on the retained card. A
 private user property records the duplicate and retained references before detach,

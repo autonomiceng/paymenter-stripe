@@ -358,12 +358,12 @@ $cases = [
         $queries = 0;
         DB::listen(function ($query) use (&$queries) { if (str_contains($query->sql, 'ae_stripe_outbox')) ++$queries; });
         $gateway->retryChargeAttempts(); $gateway->retryReceiptReturns(); $gateway->retryPaymentFees();
-        check($queries === 0 && DB::table('notifications')->count() === 0, 'Paused gateway never queries or delivers the notice retry queue');
+        check($queries > 0 && DB::table('notifications')->count() === 1, 'Paused collection still delivers retained notices');
         pausePoint('paused-notices-checked');
         return 'paused';
     }, 'b' => fn ($gateway) => settle($gateway, 592),
-    'check' => fn () => noticeAuditCount('ae_stripe_attempt_review', false) === 1
-        && DB::table('notifications')->count() === 0 && Invoice::find(592)->status === 'paid'],
+    'check' => fn () => noticeAuditCount('ae_stripe_attempt_review', true) === 1
+        && DB::table('notifications')->count() === 1 && Invoice::find(592)->status === 'paid'],
     'notice-retry-owner' => ['seed' => function () {
         customerInvoice(7, 591); customerInvoice(8, 592);
         pendingNotice('ae_stripe_attempt_review');

@@ -54,8 +54,8 @@ use Paymenter\Extensions\Gateways\AeStripe\ConvertFromStripeSavedCommand;
         $command = new ConvertFromStripeSavedCommand;
         check($command->handle() === 0, 'Conversion defaults to a successful dry run');
         check(DB::$tables === $before, 'Dry run preserves schema, settings and every row');
-        // The installed lock schema is already an AE Stripe table before conversion.
-        check(str_contains(implode("\n", $command->output), 'Previous apply was partial'), 'Dry run reports existing AE Stripe schema and still lists all remaining work');
+        // The mutex exists even on a first dry run, without any previous conversion.
+        check(!str_contains(implode("\n", $command->output), 'Previous apply was partial'), 'A first dry run with only the mutex never reports an earlier partial apply');
         check(str_contains(implode("\n", $command->output), 'stripe_saved_payment_fees -> ae_stripe_payment_fees'), 'Dry run describes the table rename');
         $command = new ConvertFromStripeSavedCommand;
         $command->options = ['apply' => true];

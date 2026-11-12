@@ -187,6 +187,7 @@ trait ReceiptReversals
                 abort_unless((int) $previous->amount_minor === $latest->amount, 409);
                 if (empty($previous->provider_created_at) && $created) $this->receiptRows()
                     ->where('payment_intent_id', $paymentId)->where('allocation_key', $key)->update(['provider_created_at' => $created]);
+                if ($kind === 'dispute' && $previous->state === 'open' && $state === 'inquiry') return;
                 if ($kind === 'dispute' && in_array($previous->state, ['won', 'lost', 'cleared'], true) && in_array($state, ['open', 'inquiry'], true)) return;
                 // A succeeded refund can later fail; neither outcome can become pending again.
                 if ($kind === 'refund' && ($previous->state === 'failed'

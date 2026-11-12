@@ -114,6 +114,58 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        $run('customer-claim-list-history', function () use ($gateway) {
+            $owner = User::$row;
+            foreach ([true, false] as $marked) {
+                $claim = ['previous' => null, 'created' => time() - 26 * 3600, 'payload' => ['metadata' => []]];
+                if ($marked) $claim['payload']['metadata']['ae_stripe_customer_claim'] = 'window';
+                $pages = 0;
+                Http::$handler = function ($verb, $path, $params) use ($owner, &$pages) {
+                    check(!DB::$locked && $verb === 'get' && $path === '/customers', 'Claim recovery only lists outside transactions');
+                    check(!isset($params['created']), 'Marked and legacy claims enumerate full history on every page');
+                    ++$pages;
+                    if ($pages === 1) return ['data' => [(object) ['id' => 'cus_windowpage', 'metadata' => (object) ['user_id' => 8]]], 'has_more' => true];
+                    check(($params['starting_after'] ?? null) === 'cus_windowpage', 'Historical recovery retains pagination');
+                    return ['data' => [(object) ['id' => 'cus_windowmatch', 'metadata' => (object) ['user_id' => $owner->id,
+                        'ae_stripe_customer_claim' => 'window']]], 'has_more' => false];
+                };
+                $found = invoke($gateway, 'recoverCustomerCreation', $owner, $claim);
+                check($pages === 2 && $found->id === 'cus_windowmatch', 'Recovery finds one exact claim or legacy owner across pages');
+            }
+        });
+        $run('customer-claim-clock-independent', function () use ($gateway) {
+            $owner = User::$row;
+            // Include the reported ninety-minute offset and large offsets in both directions.
+            foreach ([90 * 60, 365 * 86400, -365 * 86400] as $offset) {
+                $owner->props = new Properties('');
+                $created = time() - 26 * 3600;
+                $claim = ['key' => 'customer_clock', 'previous' => null, 'created' => $created,
+                    'payload' => ['metadata' => ['user_id' => $owner->id, 'ae_stripe_customer_claim' => 'customer_clock']]];
+                $owner->props->values['ae_stripe_customer_create'] = json_encode($claim);
+                $customer = (object) ['id' => 'cus_clockmatch', 'created' => $created - $offset,
+                    'metadata' => (object) $claim['payload']['metadata']];
+                $lists = $posts = 0;
+                Http::$handler = function ($verb, $path, $data) use ($customer, &$lists, &$posts) {
+                    check(!DB::$locked, 'Customer recovery keeps HTTP outside owner transactions');
+                    if ($verb === 'get' && $path === '/customers') {
+                        ++$lists;
+                        // Honor provider timestamps so a local-time filter really excludes the claimed customer.
+                        $included = $customer->created >= ($data['created']['gte'] ?? 0)
+                            && $customer->created <= ($data['created']['lte'] ?? PHP_INT_MAX);
+                        return ['data' => $included ? [$customer] : [], 'has_more' => false];
+                    }
+                    if ($verb === 'post' && $path === '/customers') {
+                        ++$posts;
+                        return ['id' => 'cus_clockduplicate'];
+                    }
+                    throw new RuntimeException('Unexpected clock-independent recovery request');
+                };
+                $found = invoke($gateway, 'createOrGetStripeCustomer', $owner, false);
+                check($lists === 1 && $posts === 0 && $found->id === $customer->id && $owner->props->customer === $customer->id
+                    && !isset($owner->props->values['ae_stripe_customer_create']),
+                    'Recovery finds the exact marked customer without a duplicate regardless of local clock offset');
+            }
+        });
         $run('customer-claim-expiry', function () use ($gateway) {
             $owner = User::$row;
             $owner->props = new Properties('');
@@ -192,12 +244,12 @@ use Illuminate\Support\Facades\{DB, Http};
                 'payload' => ['metadata' => ['user_id' => $owner->id]]];
             $owner->props->values['ae_stripe_customer_create'] = json_encode($claim);
             $reads = $posts = 0;
-            $GLOBALS['fakeCustomerTime'] = function () use ($expiry, &$reads) { return ++$reads === 1 ? $expiry - 1 : $expiry; };
+            $GLOBALS['fakeCustomerTime'] = function () use ($expiry, &$reads) { return ++$reads <= 2 ? $expiry - 1 : $expiry; };
             Http::$handler = function () use (&$posts) { ++$posts; return ['id' => 'cus_delayed_send']; };
             try {
                 try { $result = invoke($gateway, 'createOrGetStripeCustomer', $owner, false); }
                 catch (\Throwable $error) { $result = $error; }
-                check($result instanceof \Throwable && !$posts
+                check($result instanceof \Throwable && $reads === 3 && !$posts
                     && isset($owner->props->values['ae_stripe_customer_create']) && $owner->props->customer === '',
                     'A request crossing expiry after the recovery decision cannot start its old-key POST: posts=' . $posts);
             } finally { unset($GLOBALS['fakeCustomerTime']); }
@@ -241,6 +293,41 @@ use Illuminate\Support\Facades\{DB, Http};
                 DB::$driver = 'sqlite'; DB::$trackPaymentSnapshot = false; DB::$paymentSnapshot = null;
             }
         });
+        foreach (['requires_payment_method', 'requires_action'] as $state) {
+            $run('cancel-after-amount-timeout-' . $state, function ($invoice, $stripe) use ($gateway, $state) {
+                $intent = $gateway->pay($invoice, 20)['data']['intent'];
+                $invoice->total = 15;
+                $amountKey = null; $cancelKeys = [];
+                $stripe->failure = function ($verb, $path) use ($invoice, &$amountKey) {
+                    if ($verb !== 'post') return;
+                    $action = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['action'];
+                    $amountKey = $action['key'];
+                    throw new ConnectionException('Amount acknowledgement lost');
+                };
+                try { invoke($gateway, 'sendPaymentAction', $invoice, $intent, 'amount'); }
+                catch (ConnectionException $error) {}
+                check(is_string($amountKey), 'Timed-out amount has a durable key');
+                $stripe->intents[$intent->id]->status = $state;
+                $stripe->failure = function ($verb, $path) use (&$cancelKeys, &$amountKey) {
+                    if ($verb !== 'post') return;
+                    check(!DB::$locked && str_ends_with($path, '/cancel'), 'Cancellation sends no amount replay or HTTP under row locks');
+                    $action = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true)['action'];
+                    check($action['kind'] === 'cancel' && $action['superseded_amount']['key'] === $amountKey,
+                        'Cancellation preserves the timed-out amount claim');
+                    $cancelKeys[] = end(Http::$calls)[3]['Idempotency-Key'];
+                    if (count($cancelKeys) === 1) throw new ConnectionException('Cancel acknowledgement lost');
+                };
+                $cancel = function () use ($gateway, $invoice, $stripe, $intent, $state) {
+                    return $state === 'requires_action'
+                        ? invoke($gateway, 'sendPaymentAction', $invoice, clone $stripe->intents[$intent->id], 'amount')->status === 'canceled'
+                        : $gateway->cancelInvoicePayments($invoice);
+                };
+                try { $cancel(); } catch (ConnectionException $error) {}
+                check($cancel() && count($cancelKeys) === 2 && $cancelKeys[0] === $cancelKeys[1] && $cancelKeys[0] !== $amountKey,
+                    'Cancellation recovers with its own stable key after a timed-out amount change');
+                check(!$stripe->charges && $stripe->intents[$intent->id]->status === 'canceled', 'Retirement creates no debit');
+            });
+        }
         $run('sending-amount-changed-after-read', function ($invoice, $stripe) use ($gateway) {
             $invoice->total = 100;
             $stripe->failure = function ($verb, $path) {
@@ -1189,6 +1276,32 @@ use Illuminate\Support\Facades\{DB, Http};
             check(count(Notification::$rows) === 1, 'A card decline gives staff no task');
             check(array_column(DB::$tables['ae_stripe_outbox'], 'source') === ['ch_recovery_decline'], 'A declined charge supplies its natural notice identity');
             check((failedPaymentRow(920, 'pi_test1')['status'] ?? null) === 'failed', 'Recovery records a definite decline for the native failed-payment notice');
+            $firstDecline = clone $stripe->intents['pi_test1'];
+            $stripe->failure = null;
+            $stripe->beforeConfirm = fn () => throw new ConnectionException('Second confirm not sent');
+            paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));
+            $stripe->beforeConfirm = null;
+            $stripe->failure = function ($verb, $path) use ($stripe) {
+                if (!str_ends_with($path, '/confirm')) return;
+                $current = $stripe->intents['pi_test1'];
+                $current->latest_charge = 'ch_second_decline';
+                $current->last_payment_error = (object) ['code' => 'card_declined'];
+                throw new RequestException(402, ['error' => ['code' => 'card_declined']]);
+            };
+            $gateway->retryChargeAttempts();
+            $secondDecline = clone $stripe->intents['pi_test1'];
+            $beforeReplay = [ExtensionHelper::$payments, Audit::$rows, Notification::$rows];
+            foreach ([$firstDecline, $secondDecline, $firstDecline, $secondDecline] as $decline) {
+                $gateway->webhook(eventRequest($decline, type: 'payment_intent.payment_failed'));
+            }
+            $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+            check(count(ExtensionHelper::$payments) === 2
+                && isset(ExtensionHelper::$payments['920:pi_test1:ch_recovery_decline'], ExtensionHelper::$payments['920:pi_test1:ch_second_decline'])
+                && array_column(DB::$tables['ae_stripe_outbox'], 'source') === ['ch_recovery_decline', 'ch_second_decline']
+                && count(Notification::$rows) === 2 && count(Audit::$rows) === 2
+                && [ExtensionHelper::$payments, Audit::$rows, Notification::$rows] === $beforeReplay && !$stripe->charges,
+                'Two distinct declined charges each retain one failed row and notice across replays of both identities');
+
             $stripe->failure = null;
             check($gateway->charge($invoice, 20, new BillingAgreement) === true, 'Recovery decline leaves the invoice payable');
         });

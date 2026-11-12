@@ -17,6 +17,39 @@ $reset = function () use ($owner) {
 };
 $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
 
+// Upgrade creates the outbox before converting legacy unsent audits and property markers.
+(function () use ($gateway, $reset, $owner) {
+    $reset(); $invoice = nativeInvoice(9901);
+    if (!is_dir(base_path('extensions/Gateways/AeStripe'))) symlink(realpath(__DIR__ . '/../extension/AeStripe'), base_path('extensions/Gateways/AeStripe'));
+    DB::transaction(function () use ($invoice) {
+        foreach ([false, true] as $sent) App\Models\Audit::create(['event' => 'ae_stripe_payment_refused',
+            'auditable_type' => $invoice->getMorphClass(), 'auditable_id' => $invoice->id, 'old_values' => [],
+            'new_values' => ['notice_sent' => $sent, 'notice_source' => $sent ? 'legacy-sent' : 'legacy-unsent',
+                'notices' => [['user_id' => 7, 'title' => 'Payment declined', 'body' => 'Fixture', 'url' => '/invoices/9901']]]]);
+        App\Models\Audit::create(['event' => 'ae_stripe_payment_review', 'auditable_type' => $invoice->getMorphClass(),
+            'auditable_id' => $invoice->id, 'old_values' => [], 'new_values' => ['payment_intent_id' => 'pi_legacyalert']]);
+    });
+    $owner->properties()->create(['key' => 'ae_stripe_payment_alert_9901_pi_legacyalert',
+        'value' => json_encode(['sent' => false, 'reason' => 'Fixture review'])]);
+    Illuminate\Support\Facades\Schema::drop('ae_stripe_outbox');
+    $repository = app(Illuminate\Database\Migrations\Migrator::class)->getRepository();
+    foreach (glob(__DIR__ . '/../extension/AeStripe/database/migrations/*.php') as $file) {
+        if (!str_contains($file, 'create_ae_stripe_outbox')) $repository->log(basename($file, '.php'), 1);
+    }
+    $GLOBALS['stripeHandler'] = fn () => throw new RuntimeException('Upgrade must not call Stripe');
+    beforeWrite('notifications', fn () => throw new RuntimeException('Inbox unavailable during upgrade'));
+    try { $gateway->upgraded('legacy'); $gateway->upgraded('legacy'); }
+    finally { beforeWrite('notifications', null); }
+    check(DB::table('ae_stripe_outbox')->count() === 2 && !DB::table('ae_stripe_outbox')->where('source', 'legacy-sent')->exists(),
+        'Repeated upgrade backfills each legacy unsent notice once and excludes sent notices');
+    DB::table('ae_stripe_outbox')->update(['next_at' => 0]);
+    invoke($gateway, 'retryPaymentNotices'); invoke($gateway, 'retryPaymentNotices');
+    check(DB::table('ae_stripe_outbox')->where('state', 'sent')->count() === 2 && count(notices()) === 2
+        && json_decode($owner->properties()->where('key', 'ae_stripe_payment_alert_9901_pi_legacyalert')->value('value'), true)['sent'],
+        'Legacy property and audit notices recover after upgrade without duplicates');
+    $reset();
+})();
+
 // Subscription PaymentIntents have no checkout binding; the subscription invoice owns it.
 (function () use ($gateway, $reset, &$applications, &$activations) {
     $reset();

@@ -15,6 +15,8 @@ final class ConvertFromStripeSavedCommand extends Command
     public function handle(): int
     {
         try {
+            // Legacy installs have no AE Stripe mutex table. Bootstrap only that schema before taking its lock.
+            (require __DIR__ . '/database/migrations/2026_11_11_000001_create_ae_stripe_locks.php')->up();
             $plan = ExtensionLocks::transaction('gateway', function () {
                 return $this->plan();
             });
@@ -72,7 +74,7 @@ final class ConvertFromStripeSavedCommand extends Command
         $tables = Schema::getTableListing(DB::connection()->getDatabaseName(), false);
         $renames = []; $partial = false;
         foreach ($tables as $table) {
-            if (str_starts_with($table, 'ae_stripe_')) $partial = true;
+            if ($table !== 'ae_stripe_locks' && str_starts_with($table, 'ae_stripe_')) $partial = true;
             if (str_starts_with($table, 'stripe_saved_')) {
                 $target = 'ae_stripe_' . substr($table, 13);
                 if (Schema::hasTable($target)) throw new ConversionRefusal('Both source and target tables exist: ' . $table);

@@ -87,9 +87,10 @@ namespace App\Models {
             public function orderBy($key) { return $this; }
             public function orderByRaw($sql, $bindings = []) { $this->rawOrder = Property::$lastRawOrder = [$sql, $bindings]; return $this; }
             public function limit($n) { $this->rowLimit = $n; return $this; }
+            public function chunkById($size, $callback) { foreach (array_chunk($this->get(), $size) as $rows) $callback($rows); }
             public function get() {
                 $result = [];
-                foreach (User::$row->props->values as $key => $value) {
+                foreach (User::$row?->props->values ?? [] as $key => $value) {
                     $record = json_decode($value, true);
                     $selected = str_contains($this->pattern, 'payment_alert')
                         ? str_starts_with($key, 'ae_stripe_payment_alert_') && !($record['sent'] ?? true)
@@ -413,6 +414,7 @@ namespace App\Models {
                 });
                 return $this->maximum === null ? $rows : array_slice($rows, 0, $this->maximum);
             }
+            public function chunkById($size, $callback) { foreach (array_chunk($this->get(), $size) as $rows) $callback($rows); }
             public function firstOrFail() { return $this->first() ?? throw new \RuntimeException('Missing audit'); }
         }; }
         public static function create($row) {
@@ -830,6 +832,7 @@ namespace {
 
 namespace {
     class FeeQuery {
+        public static array $readLocks = [];
         public static $beforeRead = null;
         private $filters = [], $locked = false, $limit = 100, $order = [];
         public function where($key, $value) { $this->filters[$key] = $value; return $this; }
@@ -847,6 +850,7 @@ namespace {
         }
         public function first() {
             if ($hook = self::$beforeRead) { self::$beforeRead = null; $hook(); }
+            self::$readLocks[] = [$this->locked, (bool) ($this->get()[0] ?? null)];
             // Under the owner lock a plain read finds the fee row; only a row it found is then locked.
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Fee current read lock missing');
             return $this->get()[0] ?? null;

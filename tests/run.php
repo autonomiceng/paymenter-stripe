@@ -11,6 +11,10 @@ if (getenv('PAY_MARIADB_CASE')) {
 if (!in_array(getenv('PAY_PENDING_MATRIX'), [false, ''], true)) { require __DIR__ . '/native-pending-matrix.php'; return; }
 if (in_array('--receipt-returns', $argv, true)) putenv('PAY_NATIVE_SUITE=receipt-returns');
 if (getenv('PAY_OFFLINE_SUITE') === 'subscription-payments') putenv('PAY_NATIVE_SUITE=subscription-cancellations');
+if (getenv('PAY_NATIVE_SUITE') === 'transaction-method') {
+    require __DIR__ . '/native-transaction-method.php';
+    return;
+}
 if (getenv('PAY_NATIVE_SUITE') === 'receipt-storage') {
     require __DIR__ . '/native-receipt-returns.php';
     return;
@@ -105,6 +109,7 @@ if ($suite = getenv('PAY_OFFLINE_SUITE')) {
         'subscription-listeners' => ['subscription-listeners', 'schema-scheduler'],
         'payment-fees' => ['fee-recovery', 'fee-recovery-review'],
         'adoption-store' => ['gateway-lifecycle', 'adoption', 'adoption-store'],
+        'conversion' => ['gateway-lifecycle', 'adoption', 'adoption-store', 'conversion'],
         'ci-coverage' => ['native-ci-selection'],
         default => throw new RuntimeException('Unknown offline suite'),
     };

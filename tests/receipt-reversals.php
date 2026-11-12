@@ -144,6 +144,28 @@ foreach (['warning_needs_response', 'warning_under_review'] as $inquiry) {
     $return = $gateway->allocateReceiptReturn($i, 'pi_return', 'domains:inquiry', 500);
     check($inquiryRow['status'] === 'inquiry' && $inquiryRow['needs_review'] && $return['state'] === 'review' && !$s->posts,
         'Inquiry has its own state and still requires review/holds automatic returns without claiming money was taken');
+    $normal = $GLOBALS['stripeHandler']; $interleaved = false; $committed = null; $counts = null;
+    $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($normal, $gateway, $s, $returns, &$interleaved, &$committed, &$counts) {
+        $answer = $normal($verb, $path, $data, $request);
+        if (!$interleaved && $path === '/disputes/du_inquiry') {
+            check(DB::transactionLevel() === 0, 'Dispute HTTP finishes before the owner transaction');
+            $interleaved = true; $answer = clone $answer;
+            $s->dispute->status = 'needs_response';
+            $gateway->webhook(eventRequest($s->dispute, type: 'charge.dispute.updated'));
+            $committed = $returns()['pi_return:stripe:dispute:du_inquiry'];
+            $counts = [count(audits()), count(notices())];
+        }
+        return $answer;
+    };
+    $settled = [payments(), moneyRows(), credits()];
+    $gateway->webhook(eventRequest($s->dispute, type: 'charge.dispute.updated'));
+    $GLOBALS['stripeHandler'] = $normal;
+    $summary = $gateway->invoiceReversalSummary($i);
+    check($interleaved && $returns()['pi_return:stripe:dispute:du_inquiry'] === $committed
+        && $summary['totals']['open_disputes'] === 20.0 && $summary['totals']['net_received'] === 0.0
+        && [count(audits()), count(notices())] === $counts && [payments(), moneyRows(), credits()] === $settled,
+        'A delayed inquiry cannot replace an open dispute, overstate cash or repeat its notice');
+
 }
 
 [$i, $s] = $setup(2000, 20); $deliver($s);

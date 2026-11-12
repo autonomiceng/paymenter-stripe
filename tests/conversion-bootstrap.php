@@ -54,6 +54,9 @@ $logger = new class {
 };
 Illuminate\Support\Facades\Log::swap($logger);
 Illuminate\Support\Facades\Schema::swap(new class {
+    public function create($table, $callback) {
+        if ($table !== 'ae_stripe_locks') throw new RuntimeException('Only the lock schema may be bootstrapped');
+    }
     public function getTableListing($schema = null, $schemaQualified = true) {
         if ($schema !== 'paymenter' || $schemaQualified) throw new RuntimeException('Expected current schema and bare names');
         return ['extensions'];
@@ -80,3 +83,37 @@ if ($status !== 1 || !str_contains($message, 'Conversion failed. Keep writers an
     throw new RuntimeException('Conversion failure must return its status and sanitized record without booting the app');
 }
 echo "PASS: explicit Artisan registration, dry/apply dispatch and sanitized failure without app configuration\n";
+
+// A legacy database has neither the target mutex nor its other new extension tables.
+$capsule = new Illuminate\Database\Capsule\Manager($container);
+$capsule->addConnection(['driver' => 'sqlite', 'database' => ':memory:', 'prefix' => '']);
+Illuminate\Support\Facades\DB::swap($capsule->getDatabaseManager());
+$schema = $capsule->getConnection()->getSchemaBuilder();
+Illuminate\Support\Facades\Schema::swap($schema);
+// SQLite names its in-memory schema main; conversion asks for the current database's bare table names.
+$capsule->getConnection()->setDatabaseName('main');
+$schema->create('extensions', function ($table) {
+    $table->integer('id')->primary(); $table->string('extension'); $table->string('name');
+});
+$schema->create('stripe_saved_payment_fees', function ($table) {
+    $table->string('payment_intent_id')->primary(); $table->string('state');
+});
+Illuminate\Support\Facades\DB::table('extensions')->insert(['id' => 42, 'extension' => 'StripeSaved', 'name' => 'Stripe Saved Methods']);
+Illuminate\Support\Facades\DB::table('stripe_saved_payment_fees')->insert(['payment_intent_id' => 'fixture', 'state' => 'pending']);
+foreach ([[[], 'Dry run'], [['--apply' => true], 'Converted gateway #42'], [[], 'Already converted']] as [$parameters, $expected]) {
+    $output = new Symfony\Component\Console\Output\BufferedOutput;
+    $status = $artisan->call('ae-stripe:convert-from-stripe-saved', $parameters, $output);
+    $message = $output->fetch();
+    if ($status !== 0 || !str_contains($message, $expected)) throw new RuntimeException('Real legacy conversion must support dry run, apply and retry');
+    if ($expected === 'Dry run' && str_contains($message, 'Previous apply was partial')) {
+        throw new RuntimeException('Bootstrapping the mutex must not report a partial earlier conversion');
+    }
+    if (!$schema->hasTable('ae_stripe_locks') || $schema->hasTable('ae_stripe_outbox') || $schema->hasTable('ae_stripe_settlements')) {
+        throw new RuntimeException('Conversion must create only its mutex, without running target migrations');
+    }
+    if (!$parameters && $expected === 'Dry run' && (!$schema->hasTable('stripe_saved_payment_fees')
+        || Illuminate\Support\Facades\DB::table('extensions')->value('extension') !== 'StripeSaved')) throw new RuntimeException('Dry run preserves legacy data');
+}
+if (Illuminate\Support\Facades\DB::table('ae_stripe_payment_fees')->value('state') !== 'pending'
+    || Illuminate\Support\Facades\DB::table('extensions')->value('id') !== 42) throw new RuntimeException('Legacy data and gateway identity must survive');
+echo "PASS: real legacy schema conversion without target migrations\n";

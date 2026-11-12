@@ -372,7 +372,11 @@ check($status($i, 'domains:queue-failure')['state'] === 'refunded' && count($s->
     && $mailRows()->where('state', 'pending')->count() === 1,
     'Queue insertion failure preserves a pending completion email after refund and bell delivery commit');
 beforeWrite('jobs', null); $inboxUp();
+$nativeGateway->update(['enabled' => false]);
+$callsBeforePausedNotices = count($GLOBALS['stripeCalls']);
 $gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+check(count($GLOBALS['stripeCalls']) === $callsBeforePausedNotices, 'Paused collection retries completion mail without provider calls');
+
 check(DB::table('jobs')->count() === 2, 'Repeated recovery can queue duplicate jobs for the same retained mail entry');
 $drainReturnMail();
 check(Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class, fn ($mail) =>
@@ -383,6 +387,7 @@ check(Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class, fn ($mai
     && DB::table('email_logs')->where('user_id', $owner->id)->where('status', 'sent')->whereNotNull('sent_at')->count() === 1
     && count($s->posts) === 1 && count(notices()) === 1,
     'Recovered queue jobs send one customer email for the return without repeating money or the bell item');
+$nativeGateway->update(['enabled' => true]);
 
 Illuminate\Support\Facades\Mail::fake();
 [$i, $s] = $setup(); $deliver($s); $drainReturnMail();
