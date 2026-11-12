@@ -14,7 +14,7 @@
  */
 use App\Models\{Invoice, User};
 use Illuminate\Support\Facades\DB;
-$install = ($argv[1] ?? null) !== 'worker';
+$install = !in_array($argv[1] ?? null, ['worker', 'case'], true);
 require __DIR__ . '/mariadb-app.php';
 $count = 0;
 function check($value, $label) { global $count; if (!$value) throw new RuntimeException($label); ++$count; }
@@ -942,6 +942,37 @@ $cases['receipt-current-enclosing'] = [
         && (int) DB::table('ae_stripe_receipt_returns')->sum('amount_minor') === 6000,
 ];
 
+// Install once, then give each independent concurrency scenario its own process-tree budget.
+if (getenv('PAY_TEST_CGROUP') && !in_array($argv[1] ?? null, ['worker', 'case'], true)) {
+    $failed = [];
+    $php = getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY;
+    foreach (array_keys($cases) as $name) {
+        if (getenv('PAY_MARIADB_CASE') && !in_array($name, explode(',', getenv('PAY_MARIADB_CASE')), true)) continue;
+        $receipt = getenv('PAY_TEST_RECEIPTS') . '/mariadb-' . $name . '.json';
+        $command = ['python3', getenv('PAY_TEST_BUDGET'), '--name', 'mariadb-' . $name,
+            '--test-scope', '--receipt', $receipt, '--', $php, '-d', 'auto_prepend_file=' . __DIR__ . '/entered.php',
+            '-d', 'memory_limit=256M', __FILE__, 'case', $name];
+        $started = microtime(true);
+        $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['redirect', 1]], $pipes);
+        if (!is_resource($process)) { $failed[] = $name; continue; }
+        fclose($pipes[0]);
+        $printed = stream_get_contents($pipes[1]);
+        fclose($pipes[1]);
+        $status = proc_close($process);
+        echo $printed;
+        $resources = is_file($receipt) ? json_decode(file_get_contents($receipt), true, 16, JSON_THROW_ON_ERROR) : null;
+        $passed = preg_match('/PASS: ([0-9]+) MariaDB lock assertions\s*$/', $printed, $match) ? (int) $match[1] : 0;
+        if (!$resources || !$passed) $status = $status ?: 1;
+        echo json_encode(['label' => 'mariadb-' . $name, 'argv' => ['mariadb-case', $name],
+            'exit' => $status, 'seconds' => microtime(true) - $started, 'resources' => $resources]) . "\n";
+        if ($status !== 0) $failed[] = $name;
+        $count += $passed;
+    }
+    if ($failed) throw new RuntimeException('MariaDB cases failed: ' . implode(', ', $failed));
+    echo "PASS: $count MariaDB lock assertions\n";
+    return;
+}
+
 if (($argv[1] ?? null) === 'worker') {
     $case = $cases[$argv[2]];
     if ($argv[3] === 'b' && !empty($case['prepared_b'])) {
@@ -970,6 +1001,7 @@ function workerLine(array $worker, ?callable $stop = null): ?string
 $deadlocks = fn () => (int) DB::selectOne("show global status like 'Innodb_deadlocks'")->Value;
 $php = getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY;
 foreach ($cases as $name => $case) {
+    if (($argv[1] ?? null) === 'case' && $name !== ($argv[2] ?? null)) continue;
     if (getenv('PAY_MARIADB_CASE') && !in_array($name, explode(',', getenv('PAY_MARIADB_CASE')), true)) continue;
     DB::statement('set foreign_key_checks = 0');
     foreach (['ae_stripe_outbox', 'ae_stripe_settlements', 'ae_stripe_locks', 'invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
