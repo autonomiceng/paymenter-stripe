@@ -212,12 +212,12 @@ use Illuminate\Support\Facades\{DB, Http};
                 'payload' => ['metadata' => ['user_id' => $owner->id]]];
             $owner->props->values['ae_stripe_customer_create'] = json_encode($claim);
             $reads = $posts = 0;
-            $GLOBALS['fakeCustomerTime'] = function () use ($expiry, &$reads) { return ++$reads === 1 ? $expiry - 1 : $expiry; };
+            $GLOBALS['fakeCustomerTime'] = function () use ($expiry, &$reads) { return ++$reads <= 2 ? $expiry - 1 : $expiry; };
             Http::$handler = function () use (&$posts) { ++$posts; return ['id' => 'cus_delayed_send']; };
             try {
                 try { $result = invoke($gateway, 'createOrGetStripeCustomer', $owner, false); }
                 catch (\Throwable $error) { $result = $error; }
-                check($result instanceof \Throwable && !$posts
+                check($result instanceof \Throwable && $reads === 3 && !$posts
                     && isset($owner->props->values['ae_stripe_customer_create']) && $owner->props->customer === '',
                     'A request crossing expiry after the recovery decision cannot start its old-key POST: posts=' . $posts);
             } finally { unset($GLOBALS['fakeCustomerTime']); }
