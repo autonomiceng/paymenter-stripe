@@ -90,8 +90,8 @@ class AeStripe extends Gateway
 
     private const API_VERSION = '2025-07-30.basil';
     private const HTTP_TIMEOUT_SECONDS = 5;
-    private const CUSTOMER_CLAIM_SECONDS = 23 * 3600;
-    private const CUSTOMER_RECOVERY_MARGIN_SECONDS = 5;
+    private const CUSTOMER_POST_CUTOFF_SECONDS = 23 * 3600;
+    private const CUSTOMER_RECOVERY_AFTER_SECONDS = 25 * 3600;
 
     private function adminInvoiceUrl(Invoice $invoice): string
     {
@@ -692,8 +692,15 @@ class AeStripe extends Gateway
      */
     private function createOrGetStripeCustomer($user, $includeDetails = true)
     {
-        $previous = ExtensionLocks::transaction('user:' . $user->id,
-            fn () => $this->lockedUserProperty($user, 'stripe_id')?->value);
+        $previous = ExtensionLocks::transaction('user:' . $user->id, function () use ($user) {
+            $stored = $this->lockedUserProperty($user, 'ae_stripe_customer_create');
+            if ($stored) {
+                $age = time() - json_decode($stored->value, true, flags: JSON_THROW_ON_ERROR)['created'];
+                // The quiet interval also excludes provider reads of the previous binding.
+                abort_unless($age < self::CUSTOMER_POST_CUTOFF_SECONDS || $age >= self::CUSTOMER_RECOVERY_AFTER_SECONDS, 409);
+            }
+            return $this->lockedUserProperty($user, 'stripe_id')?->value;
+        });
         if ($previous) {
             try {
                 $customer = $this->request('get', '/customers/' . $previous);
@@ -713,9 +720,10 @@ class AeStripe extends Gateway
         abort_unless($claim['previous'] === $previous, 409);
         $customer = null;
         $age = time() - $claim['created'];
-        if ($age >= self::CUSTOMER_CLAIM_SECONDS) {
-            // An old-key POST may have started just before expiry. Let its timeout and margin elapse before listing.
-            abort_unless($age >= self::CUSTOMER_CLAIM_SECONDS + self::HTTP_TIMEOUT_SECONDS + self::CUSTOMER_RECOVERY_MARGIN_SECONDS, 409);
+        if ($age >= self::CUSTOMER_POST_CUTOFF_SECONDS) {
+            // Stripe can finish a POST after our client timeout. Allow a two-hour gap before recovery;
+            // only Stripe processing delayed beyond two hours could still duplicate a customer.
+            abort_unless($age >= self::CUSTOMER_RECOVERY_AFTER_SECONDS, 409);
             $customer = $this->recoverCustomerCreation($user, $claim);
             $claim = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $previous, $claim, $customer, $includeDetails) {
                 abort_unless($this->lockedUserProperty($user, 'stripe_id')?->value === $previous, 409);
@@ -730,7 +738,7 @@ class AeStripe extends Gateway
         }
         if (!$customer) {
             // Recheck immediately before sending, including when the earlier age check was still before expiry.
-            abort_unless(time() - $claim['created'] < self::CUSTOMER_CLAIM_SECONDS, 409);
+            abort_unless(time() - $claim['created'] < self::CUSTOMER_POST_CUTOFF_SECONDS, 409);
             $customer = $this->request('post', '/customers', $claim['payload'], $claim['key']);
         }
         return ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $previous, $claim, $customer) {

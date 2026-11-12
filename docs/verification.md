@@ -142,10 +142,15 @@ After a resumed payment declines, the form requires a refresh before accepting a
 the refreshed checkout retires the unfunded old payment before preparing a replacement. Card/Link saving consent remains explicit and method-specific.
 The GET payment return compares Stripe's redirect secret before any write. Missing or wrong secrets show read-only status with an invoice link; the webhook, recovery or authenticated payment form can still finish it.
 
-Customer creation commits its immutable payload and retry key before HTTP. No old-key
-POST starts at or after 23 hours. Recovery waits another ten seconds: the five-second
-HTTP timeout plus five seconds of margin, allowing any pre-expiry POST to finish.
-Requests in that interval retain the claim and ask for retry. After that interval,
+Customer creation commits its immutable payload and retry key before HTTP. An old-key
+POST may start only while the claim is younger than `CUSTOMER_POST_CUTOFF_SECONDS`
+(23 hours). The claim counts as expired for listing, binding or replacement only at
+`CUSTOMER_RECOVERY_AFTER_SECONDS` (25 hours). Stripe can keep processing after our
+client timeout: the two-hour gap allows that delayed creation to finish. Residual:
+only a Stripe processing delay above two hours could still duplicate a customer.
+Between 23 and 25 hours, Pay and Add payment method retain the claim and return the
+existing retry message without any provider call, including previous-customer lookup.
+At 25 hours, recovery resumes so abandoned claims do not block forever.
 Pay and Add payment method enumerate all customer-list pages outside database locks,
 matching owner metadata and the new claim's `ae_stripe_customer_claim` marker. A unique
 match is bound; a complete listing with no match permits a fresh claim. An empty search
