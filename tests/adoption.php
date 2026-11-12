@@ -5,7 +5,7 @@ use Paymenter\Extensions\Gateways\AeStripe\Adoption;
 class AdoptionFake
 {
     public array $state;
-    public array $manifests = [], $results = [], $calls = [];
+    public array $manifests = [], $results = [], $calls = [], $redisplayEffects = [];
     public array $accounts = ['acct_fixture', 'acct_fixture'];
     public bool $fail = false, $locked = false, $manifestFail = false, $replaceFail = false;
     public int $sleeps = 0, $writes = 0;
@@ -52,17 +52,19 @@ class AdoptionFake
     public function outcomes($name): array { return $this->results[$name] ?? []; }
     public function saveOutcomes($name, $outcomes): void { $this->results[$name] = $outcomes; }
     public function throttle(): void { ++$this->sleeps; }
-    public function stripe($key, $verb, $path, $data): array
+    public function stripe($key, $verb, $path, $data, ?string $idempotency = null): array
     {
-        $this->calls[] = [$verb, $path, $data];
+        $this->calls[] = [$verb, $path, $data, $idempotency];
         if ($path === '/account' && $verb === 'get') {
             $index = count(array_filter($this->calls, fn ($c) => $c[1] === '/account')) - 1;
             return ['id' => $this->accounts[$index % 2]];
         }
         check(!$this->locked, 'Redisplay HTTP runs outside the transaction');
         check($verb === 'post' && str_starts_with($path, '/payment_methods/') && $data === ['allow_redisplay' => 'always'], 'Only redisplay writes');
+        check(is_string($idempotency) && $idempotency !== '', 'Redisplay requires an idempotency key');
+        $this->redisplayEffects[$idempotency] ??= ['id' => basename($path)];
         if ($this->fail && $path === '/payment_methods/pm_12') throw new RuntimeException('private transport error');
-        return ['id' => basename($path)];
+        return $this->redisplayEffects[$idempotency];
     }
 }
 $f = new AdoptionFake;
@@ -85,6 +87,12 @@ $outcomes = $a->redisplay($plan, 'fixture');
 check($outcomes === ['pm_10' => 'ok', 'pm_12' => 'retry'], 'Redisplay progress survives partial failure; deleted method excluded');
 $f->fail = false;
 check($a->redisplay($plan, 'fixture') === ['pm_10' => 'ok', 'pm_12' => 'ok'], 'Redisplay resumes failed method');
+$methodCalls = array_values(array_filter($f->calls, fn ($call) => $call[1] === '/payment_methods/pm_12'));
+check(count($methodCalls) === 2 && $methodCalls[0][3] === $methodCalls[1][3]
+    && $methodCalls[0][3] === 'redisplay_' . hash('sha256', $plan['digest'] . ':pm_12')
+    && count($f->redisplayEffects) === 2, 'A lost redisplay response reuses the same key without repeating the provider effect');
+check(count(array_filter($f->calls, fn ($call) => $call[1] === '/payment_methods/pm_10')) === 1,
+    'A completed method is skipped while the lost response retries');
 $beforeCalls = count($f->calls);
 $a->redisplay($plan, 'fixture');
 check(count($f->calls) === $beforeCalls + 2 && $f->sleeps === 3, 'Successful methods skipped and attempts rate limited');
