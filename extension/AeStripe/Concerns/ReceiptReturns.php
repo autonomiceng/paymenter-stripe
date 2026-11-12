@@ -387,6 +387,11 @@ trait ReceiptReturns
                     'body' => 'Invoice ' . $this->invoiceLabel($current) . ', payment ' . $id . ': ' . $a['reason']]));
             }
             $this->queuePaymentNotices($audit, $notices);
+            if (!$this->receiptStripeUnavailable && in_array($a['state'], ['refunded', 'credited'], true)) {
+                $this->queuePaymentNotices($audit, [$notices[0]], [
+                    'kind' => 'ae_stripe_return_mail:' . $a['state'], 'source' => $a['key'],
+                ]);
+            }
             $a['notified'] = $notice;
             $this->writeReceipt($user, $id, $receipt, $key);
         });

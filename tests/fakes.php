@@ -549,7 +549,12 @@ namespace Illuminate\Http {
         public function header($name) { return $this->signature; }
     }
 }
+namespace Illuminate\Contracts\Queue { interface ShouldQueue {} }
 namespace Illuminate\Support\Facades {
+    class Queue {
+        public static array $jobs = [];
+        public static function push($job) { self::$jobs[] = $job; }
+    }
     class Route {
         public static $routes = [], $definitions = [], $names = [];
         public static function has($name) { return isset(self::$names[$name]); }

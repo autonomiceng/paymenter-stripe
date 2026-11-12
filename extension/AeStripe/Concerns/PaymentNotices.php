@@ -2,8 +2,12 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
-use App\Models\{Audit, Gateway, Invoice, Notification, Property, User};
-use Illuminate\Support\Facades\{DB, Log};
+use App\Mail\SystemMail;
+use App\Models\{Audit, EmailLog, Gateway, Invoice, Notification, Property, User};
+use Illuminate\Support\Facades\{DB, Log, Mail, Queue};
+use Paymenter\Extensions\Gateways\AeStripe\DeliverReturnMail;
+
+require_once __DIR__ . '/../DeliverReturnMail.php';
 
 trait PaymentNotices
 {
@@ -26,9 +30,9 @@ trait PaymentNotices
     }
 
     // Runs in the transaction recording the event. Delivery acquires only its own outbox row.
-    private function queuePaymentNotices($audit, array $notices): void
+    private function queuePaymentNotices($audit, array $notices, ?array $identity = null): void
     {
-        $identity = $this->noticeIdentity($audit);
+        $identity ??= $this->noticeIdentity($audit);
         $this->storePaymentNotices($identity, $notices);
         DB::afterCommit(function () use ($identity) {
             foreach (DB::table('ae_stripe_outbox')->where('source', $identity['source'])
@@ -55,22 +59,45 @@ trait PaymentNotices
         return $notices;
     }
 
-    private function deliverPaymentNotices(int $id): void
+    // The queued job contains only the durable recipient entry's id, never mail content or credentials.
+    public function deliverReturnMail(int $id): void
+    {
+        $this->deliverPaymentNotices($id, true);
+    }
+
+    private function deliverPaymentNotices(int $id, bool $sendMail = false): void
     {
         try {
-            DB::transaction(function () use ($id) {
+            DB::transaction(function () use ($id, $sendMail) {
                 $row = DB::table('ae_stripe_outbox')->where('id', $id)->lockForUpdate()->first();
                 if (!$row || $row->state !== 'pending' || $row->next_at > time()) return;
                 $notice = json_decode($row->payload, true, flags: JSON_THROW_ON_ERROR);
+                $isMail = str_starts_with($row->kind, 'ae_stripe_return_mail:');
+                if ($isMail && !$sendMail) {
+                    // Acceptance by the queue does not complete delivery. A lost enqueue keeps this entry pending.
+                    DB::afterCommit(fn () => Queue::push(new DeliverReturnMail($id)));
+                    return;
+                }
+                if ($sendMail && !$isMail) return;
                 $live = false;
                 foreach (User::whereIn('id', [$row->recipient_id])->get() as $recipient) $live = true;
+                if ($isMail && config('settings.mail_disable')) $live = false;
                 if (isset($notice['staff_scope'])) {
                     $audience = array_map(fn ($staff) => (int) $staff->id, $this->noticeStaff($notice['staff_scope']));
                     $live = $live && in_array((int) $row->recipient_id, $audience, true);
                 }
                 if ($live) {
                     unset($notice['staff_scope']);
-                    Notification::create($notice);
+                    if ($isMail) {
+                        $mail = new SystemMail(['subject' => $notice['title'], 'body' => '<p>' . e($notice['body'])
+                            . '</p><p><a href="' . e($notice['url']) . '">Open invoice</a></p>']);
+                        $log = EmailLog::create(['user_id' => $recipient->id, 'subject' => $notice['title'],
+                            'to' => $recipient->email, 'body' => $mail->render()]);
+                        $mail->email_log_id = $log->id;
+                        // This already runs in a queued job. Do not create a second deferred mail job.
+                        Mail::to($recipient->email)->send($mail);
+                        $log->update(['status' => 'sent', 'sent_at' => now()]);
+                    } else Notification::create($notice);
                 }
                 DB::table('ae_stripe_outbox')->where('id', $id)->update([
                     'state' => $live ? 'sent' : 'skipped', 'sent_at' => time(), 'last_error' => null,

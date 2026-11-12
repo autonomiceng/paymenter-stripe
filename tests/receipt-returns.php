@@ -312,4 +312,64 @@ try {
 } catch (RuntimeException $e) { check($e->getMessage() === 'Caller rolled back', 'Domains caller controls its transaction'); }
 check($status($i, 'domains:rollback') === null && count($s->posts) === 1, 'A rolled-back caller reservation cannot send a refund');
 
+// Customer completion mail uses a durable recipient entry and a real after-commit database queue.
+config(['settings.mail_disable' => false, 'queue.default' => 'database',
+    'queue.connections.database.connection' => 'sqlite', 'queue.connections.database.after_commit' => true]);
+Illuminate\Support\Facades\Mail::fake();
+$drainReturnMail = function () {
+    foreach (DB::table('jobs')->orderBy('id')->pluck('id') as $id) {
+        $job = Illuminate\Support\Facades\Queue::pop();
+        check($job !== null, 'A retained database job can be consumed');
+        $job->fire(); $job->delete();
+    }
+};
+$mailRows = fn () => DB::table('ae_stripe_outbox')->whereIn('kind',
+    ['ae_stripe_return_mail:refunded:customer', 'ae_stripe_return_mail:credited:customer']);
+[$i, $s] = $setup(2000, 20); $deliver($s);
+DB::table('email_logs')->delete();
+beforeWrite('jobs', function () {
+    check(DB::transactionLevel() === 0, 'The queue refuses insertion after the notice transaction commits');
+    throw new RuntimeException('Queue insertion unavailable');
+});
+$gateway->allocateReceiptReturn($i, 'pi_return', 'domains:queue-failure', 2000);
+check($status($i, 'domains:queue-failure')['state'] === 'refunded' && count($s->posts) === 1
+    && count(notices()) === 1 && DB::table('jobs')->count() === 0
+    && $mailRows()->where('state', 'pending')->count() === 1,
+    'Queue insertion failure preserves a pending completion email after refund and bell delivery commit');
+beforeWrite('jobs', null); $inboxUp();
+$gateway->retryChargeAttempts(); $gateway->retryChargeAttempts();
+check(DB::table('jobs')->count() === 2, 'Repeated recovery can queue duplicate jobs for the same retained mail entry');
+$drainReturnMail();
+check(Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class, fn ($mail) =>
+    $mail->hasTo($owner->email) && str_contains($mail->mail['body'], '20.00 USD')
+    && str_contains($mail->mail['body'], 'original payment method')
+    && str_contains($mail->mail['body'], e(route('invoices.show', $i))))->count() === 1
+    && $mailRows()->where('state', 'sent')->count() === 1
+    && DB::table('email_logs')->where('user_id', $owner->id)->where('status', 'sent')->whereNotNull('sent_at')->count() === 1
+    && count($s->posts) === 1 && count(notices()) === 1,
+    'Recovered queue jobs send one customer email for the return without repeating money or the bell item');
+
+Illuminate\Support\Facades\Mail::fake();
+[$i, $s] = $setup(); $deliver($s); $drainReturnMail();
+check(Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class)->count() === 1,
+    'A completed return sends its first completion email');
+$normal = $GLOBALS['stripeHandler'];
+$GLOBALS['stripeHandler'] = fn () => throw new ConnectionException('Provider temporarily unreachable');
+$gateway->webhook(eventRequest(clone current($s->refunds), type: 'refund.updated'));
+check($status($i)['state'] === 'review', 'A replay during an outage retains the temporary review state');
+$GLOBALS['stripeHandler'] = $normal;
+$gateway->retryReceiptReturns(); $drainReturnMail();
+check($status($i)['state'] === 'refunded' && count($s->posts) === 1
+    && Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class)->count() === 1
+    && $mailRows()->count() === 1,
+    'Replay recovery reuses the completed allocation mail entry without a second completion email');
+current($s->refunds)->status = 'failed';
+$gateway->webhook(eventRequest(clone current($s->refunds), type: 'refund.failed'));
+$drainReturnMail();
+check($status($i)['state'] === 'credited'
+    && Illuminate\Support\Facades\Mail::sent(App\Mail\SystemMail::class)->count() === 2
+    && $mailRows()->count() === 2,
+    'A real later change to account credit sends one different completion email');
+config(['queue.default' => 'sync']);
+
 require __DIR__ . '/receipt-reversals.php';
