@@ -523,9 +523,9 @@ trait CheckoutIntent
 
     private function confirmationMatchesCaller(array $claim, array $params, ?BillingAgreement $agreement, ?int $amount, ?string $currency): bool
     {
-        // Sending splits update fields from confirm fields; compare the original complete instruction.
+        // Recovery supplies stored confirm fields; callers may also supply the complete instruction.
         $frozen = array_replace($claim['params'], array_intersect_key($claim['updates'] ?? [], array_flip(['metadata', 'setup_future_usage'])));
-        return ($claim['agreement'] ?? null) == $agreement?->id && $frozen == $params
+        return ($claim['agreement'] ?? null) == $agreement?->id && ($frozen == $params || $claim['params'] == $params)
             && (!isset($claim['amount'], $amount) || $claim['amount'] === $amount)
             && (!isset($claim['currency'], $currency) || strtolower($claim['currency']) === strtolower($currency));
     }
