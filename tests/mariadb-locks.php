@@ -943,12 +943,13 @@ $cases['receipt-current-enclosing'] = [
 ];
 
 // Install once, then give each independent concurrency scenario its own process-tree budget.
-if (getenv('BECO_TEST_CGROUP') && !in_array($argv[1] ?? null, ['worker', 'case'], true)) {
+if (getenv('PAY_TEST_CGROUP') && !in_array($argv[1] ?? null, ['worker', 'case'], true)) {
     $failed = [];
     $php = getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY;
     foreach (array_keys($cases) as $name) {
-        $receipt = getenv('BECO_TEST_RECEIPTS') . '/mariadb-' . $name . '.json';
-        $command = ['python3', getenv('BECO_TEST_BUDGET'), '--name', 'mariadb-' . $name,
+        if (getenv('PAY_MARIADB_CASE') && !in_array($name, explode(',', getenv('PAY_MARIADB_CASE')), true)) continue;
+        $receipt = getenv('PAY_TEST_RECEIPTS') . '/mariadb-' . $name . '.json';
+        $command = ['python3', getenv('PAY_TEST_BUDGET'), '--name', 'mariadb-' . $name,
             '--test-scope', '--receipt', $receipt, '--', $php, '-d', 'auto_prepend_file=' . __DIR__ . '/entered.php',
             '-d', 'memory_limit=256M', __FILE__, 'case', $name];
         $started = microtime(true);

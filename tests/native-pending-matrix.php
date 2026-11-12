@@ -49,7 +49,7 @@ if ($mode === 'browser') {
     }
 }
 putenv('PAY_PENDING_MATRIX');
-$jobs = (int) (getenv('BECO_TEST_JOBS') ?: 1);
+$jobs = (int) (getenv('PAY_TEST_JOBS') ?: 1);
 if ($jobs < 1 || $jobs > 6) throw new RuntimeException('Native workers must be between one and six.');
 $base = array_diff_key(getenv(), array_fill_keys(['PAY_CHECKOUT_NATIVE', 'PAY_CLEANUP_CASE', 'PAY_BINDING_CASE', 'PAY_NATIVE_SUITE'], true));
 $active = [];
@@ -59,9 +59,9 @@ while ($next < count($runs) || $active) {
     while ($next < count($runs) && count($active) < $jobs) {
         [$label, $environment, $command] = $runs[$next++];
         $receipt = null;
-        if (getenv('BECO_TEST_CGROUP')) {
-            $receipt = getenv('BECO_TEST_RECEIPTS') . '/' . $mode . '-' . $next . '.json';
-            $command = ['python3', getenv('BECO_TEST_BUDGET'), '--name', $label, '--test-scope', '--receipt', $receipt, '--', ...$command];
+        if (getenv('PAY_TEST_CGROUP')) {
+            $receipt = getenv('PAY_TEST_RECEIPTS') . '/' . $mode . '-' . $next . '.json';
+            $command = ['python3', getenv('PAY_TEST_BUDGET'), '--name', $label, '--test-scope', '--receipt', $receipt, '--', ...$command];
         }
         $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['redirect', 1]], $pipes, null, array_replace($base, $environment));
         if (!is_resource($process)) { $failed[] = $label; continue; }
