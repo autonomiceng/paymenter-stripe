@@ -8,22 +8,36 @@ if (!$release || !is_file($release . '/vendor/autoload.php') || file_exists($rel
 require $release . '/vendor/autoload.php';
 require __DIR__ . '/../extension/AeStripe/AeStripe.php';
 
-use Illuminate\Container\Container;
+use Illuminate\Config\Repository;
+use Illuminate\Foundation\Application;
 use Illuminate\Database\Capsule\Manager;
 use Illuminate\Database\Migrations\{DatabaseMigrationRepository, Migrator};
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\{DB, Facade, Schema};
 use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
 
-$container = new Container;
-Container::setInstance($container);
+$container = new Application;
+Application::setInstance($container);
+$container->instance('config', new Repository(['audit' => ['enabled' => false]]));
 $capsule = new Manager($container);
 $capsule->addConnection(['driver' => 'sqlite', 'database' => ':memory:', 'foreign_key_constraints' => true]);
+$capsule->bootEloquent();
 $container->instance('db', $capsule->getDatabaseManager());
 $container->bind('db.schema', fn () => $capsule->getConnection()->getSchemaBuilder());
 Facade::setFacadeApplication($container);
 $schema = $capsule->getConnection()->getSchemaBuilder();
 $schema->create('extensions', function ($table) { $table->id(); $table->string('extension'); });
+// Upgrade also backfills legacy notices through Paymenter's models and the application facade.
+$schema->create('audits', function ($table) {
+    $table->id(); $table->string('auditable_type'); $table->unsignedBigInteger('auditable_id');
+    $table->string('event'); $table->json('new_values');
+});
+$schema->create('properties', function ($table) {
+    $table->id(); $table->string('key'); $table->text('value'); $table->string('model_type'); $table->unsignedBigInteger('model_id');
+});
+DB::table('audits')->insert(['auditable_type' => App\Models\Invoice::class, 'auditable_id' => 12,
+    'event' => 'ae_stripe_payment_refused', 'new_values' => json_encode(['notice_sent' => false, 'notice_source' => 'legacy-storage-fixture',
+        'notices' => [['user_id' => 7, 'title' => 'Fixture', 'body' => 'Fixture', 'url' => '/invoices/12']]])]);
 $schema->create('invoice_transactions', function ($table) {
     $table->id(); $table->unsignedBigInteger('gateway_id'); $table->unsignedBigInteger('invoice_id');
     $table->string('status'); $table->string('transaction_id');
@@ -46,6 +60,7 @@ function verifyNative(bool $condition): void {
 $gateway->installed();
 verifyNative(Schema::hasTable('ae_stripe_transaction_methods'));
 $gateway->upgraded('0.1.0');
+verifyNative(DB::table('ae_stripe_outbox')->where('source', 'legacy-storage-fixture')->where('state', 'pending')->count() === 1);
 verifyNative(DB::table('migrations')->count() === count(glob(__DIR__ . '/../extension/AeStripe/database/migrations/*.php')));
 verifyNative(DB::table('ae_stripe_settlements')->pluck('invoice_id', 'payment_intent_id')->all() === ['pi_existing' => 12]);
 $record = new ReflectionMethod($gateway, 'recordTransactionMethod');
