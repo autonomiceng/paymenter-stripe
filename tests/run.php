@@ -108,7 +108,12 @@ if ($suite = getenv('PAY_OFFLINE_SUITE')) {
         'ci-coverage' => ['native-ci-selection'],
         default => throw new RuntimeException('Unknown offline suite'),
     };
-    if ($suite === 'subscription-listeners') { \App\Models\Gateway::$bundled = false; $gateway->boot(); }
+    if ($suite === 'subscription-listeners') {
+        $bundled = Gateway::$bundled;
+        Gateway::$bundled = false;
+        $gateway->boot();
+        Gateway::$bundled = $bundled;
+    }
     if ($suite === 'adoption') require_once __DIR__ . '/../extension/AeStripe/Adoption.php';
     foreach ($files as $file) require __DIR__ . '/' . $file . '.php';
     echo "PASS: $count $suite assertions\n";

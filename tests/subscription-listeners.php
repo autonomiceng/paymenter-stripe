@@ -6,6 +6,9 @@ use App\Models\{Gateway, Service};
 use Illuminate\Support\Facades\{Event, Http};
 
 $previousHandler = Http::$handler;
+$previousBundled = Gateway::$bundled;
+// These listeners own subscriptions only after bundled Stripe is absent.
+Gateway::$bundled = false;
 Http::$handler = function ($verb, $path) {
     return match ([$verb, $path]) {
         ['delete', '/subscriptions/sub_test'] => ['id' => 'sub_test', 'status' => 'canceled'],
@@ -65,4 +68,5 @@ $dispatchers['Updated']($service);
 check(end(Http::$calls)[0] === 'post' && end(Http::$calls)[1] === '/subscription_items/si_test',
     'Enabled fork still syncs subscription price');
 Http::$handler = $previousHandler;
+Gateway::$bundled = $previousBundled;
 Gateway::$enabled = false;
