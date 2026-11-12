@@ -389,7 +389,7 @@ try {
     await page.getByRole('dialog').waitFor({ state: 'detached' });
     assert.equal(await page.evaluate(() => probe.active + probe.themeListeners), 0);
     assert.deepEqual(errors, [], 'No browser errors across delayed and failed loads');
-    console.log(`PASS: 6 open/decline/close cycles; ${counts.confirms} confirmations; ${counts.destroyed} Elements disposed`);
+    console.log(`PASS: 2 open/decline/close cycles; ${counts.confirms} confirmations; ${counts.destroyed} Elements disposed`);
     console.log('PASS: failed consent retry; fresh script loads after five seconds; stalled fresh script timeout/removal/retry; delayed script close/reopen; failed script removal and retry; missing-global retry; existing script reuse; foreign error and missing-global retry; foreign pending tag timeout/retry; fresh retry preserves already-finished foreign tag; no leaked theme listeners');
 } finally {
     await browser.close();
