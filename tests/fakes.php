@@ -830,6 +830,7 @@ namespace {
 
 namespace {
     class FeeQuery {
+        public static array $readLocks = [];
         public static $beforeRead = null;
         private $filters = [], $locked = false, $limit = 100, $order = [];
         public function where($key, $value) { $this->filters[$key] = $value; return $this; }
@@ -847,6 +848,7 @@ namespace {
         }
         public function first() {
             if ($hook = self::$beforeRead) { self::$beforeRead = null; $hook(); }
+            self::$readLocks[] = [$this->locked, (bool) ($this->get()[0] ?? null)];
             // Under the owner lock a plain read finds the fee row; only a row it found is then locked.
             if (!\Illuminate\Support\Facades\DB::$locked) throw new \RuntimeException('Fee current read lock missing');
             return $this->get()[0] ?? null;

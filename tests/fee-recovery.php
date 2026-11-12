@@ -79,6 +79,19 @@ use Illuminate\Support\Facades\{DB, Http, Schedule};
     DB::$beforeUserLock = $deliver;
     $gateway->retryPaymentFees();
     check(ExtensionHelper::$feeWrites === $writes + 1, 'Webhook wins concurrent task delivery without a duplicate fee');
+    $reset(); $balance['exchange_rate'] = null; $deliver();
+    FeeQuery::$readLocks = [];
+    $notices = count(Notification::$rows); $audits = count(Audit::$rows);
+    DB::$tables['ae_stripe_payment_fees']['pi_recovery']['attempts'] = 23;
+    $deliver();
+    check(array_slice(FeeQuery::$readLocks, 0, 2) === [[false, true], [true, true]],
+        'An existing fee is locked after discovery so gateway recovery cannot race review escalation');
+    $deliver(); $gateway->retryPaymentFees();
+    check(count(Notification::$rows) === $notices + 1 && count(Audit::$rows) === $audits + 1,
+        'Webhook and gateway recovery retain one fee review and notice');
+    $reset(); FeeQuery::$readLocks = [];
+    $deliver();
+    check(!in_array([true, false], FeeQuery::$readLocks, true), 'First fee insertion never takes a missing-key gap lock');
     foreach (['attempts', 'age'] as $limit) {
         $reset(); $balance['exchange_rate'] = null; $deliver();
         DB::$tables['ae_stripe_payment_fees']['pi_recovery'][$limit === 'attempts' ? 'attempts' : 'created_at'] =
