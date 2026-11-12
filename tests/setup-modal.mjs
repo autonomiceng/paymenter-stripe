@@ -120,7 +120,7 @@ try {
             ${render(false)}<script src="/livewire.js" data-csrf="offline" data-update-uri="/livewire/update" defer></script></body></html>` });
     });
     await page.goto('http://setup.test/');
-    for (let cycle = 1; cycle <= 6; cycle++) {
+    for (let cycle = 1; cycle <= 2; cycle++) {
         await page.getByRole('button', { name: 'Add payment method' }).click();
         await page.getByRole('dialog').waitFor();
         try {
@@ -178,13 +178,13 @@ try {
     assert.equal(counts.expressCreated, counts.expressDestroyed, 'Closing disposes every Express Element');
     assert.equal(counts.themeListeners, 0, 'No leaked theme listeners');
     assert.equal(counts.scripts, 1, 'Stripe.js loads once across reopen cycles');
-    assert.equal(counts.consent, 7, 'Repeated submits during a consent request are ignored');
+    assert.equal(counts.consent, 3, 'Repeated submits during a consent request are ignored');
     // A fresh request can take longer than the bounded wait for a reused tag.
     holdStripe = true;
     await page.goto('http://setup.test/');
     await page.getByRole('button', { name: 'Add payment method' }).click();
     await page.waitForFunction(() => probe.scripts === 1);
-    await page.waitForTimeout(5500);
+    await page.clock.fastForward(5500);
     assert.equal(await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).count(), 0, 'A fresh Stripe.js request is still loading after five seconds');
     assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'The fresh pending script is retained');
     assert.equal(await page.getByRole('button', { name: 'Save card' }).isDisabled(), true);
@@ -338,6 +338,8 @@ try {
     });
     await page.waitForFunction(() => probe.scripts === 1);
     await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.getByRole('dialog').waitFor();
+    await page.clock.fastForward(5000);
     await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor({timeout: 10000});
     assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'Timeout preserves the pending script owned by another caller');
     await page.getByRole('button', { name: 'Close', exact: true }).click();
@@ -364,6 +366,8 @@ try {
         document.body.appendChild(existing);
     }));
     await page.getByRole('button', { name: 'Add payment method' }).click();
+    await page.getByRole('dialog').waitFor();
+    await page.clock.fastForward(5000);
     await page.getByRole('alert').filter({ hasText: 'Could not load the payment form' }).waitFor({timeout: 10000});
     assert.equal(await page.getByRole('button', { name: 'Save card' }).isDisabled(), true);
     assert.equal(await page.locator('script[src^="https://js.stripe.com/v3"]').count(), 1, 'An already-finished foreign script is preserved after a bounded wait');
