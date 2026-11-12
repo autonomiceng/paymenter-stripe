@@ -42,7 +42,8 @@ if ($mode === 'browser') {
     foreach (['native-transaction-method.php', 'native-receipt-returns.php', 'native-auto-pay-consent.php'] as $file) {
         $runs[] = [$file, [], [$php, ...$record, '-d', 'memory_limit=256M', __DIR__ . '/' . $file]];
     }
-    $runs[] = ['conversion-bootstrap.php', [], [$php, '-n', ...$record, __DIR__ . '/conversion-bootstrap.php', $app]];
+    // Keep configured PDO/SQLite extensions; the fresh process and unbooted application provide isolation.
+    $runs[] = ['conversion-bootstrap.php', [], [$php, ...$record, __DIR__ . '/conversion-bootstrap.php', $app]];
     foreach (require __DIR__ . '/native-suites.php' as $suite) {
         $runs[] = [$suite, ['PAY_NATIVE_SUITE' => $suite], [$php, ...$record, '-d', 'memory_limit=512M', __DIR__ . '/native-suite.php']];
     }
