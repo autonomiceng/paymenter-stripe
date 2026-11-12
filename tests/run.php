@@ -10,6 +10,10 @@ if (getenv('PAY_MARIADB_CASE')) {
 // Any nonempty mode, even "0", goes to the matrix, which rejects unknown modes before starting a child.
 if (!in_array(getenv('PAY_PENDING_MATRIX'), [false, ''], true)) { require __DIR__ . '/native-pending-matrix.php'; return; }
 if (in_array('--receipt-returns', $argv, true)) putenv('PAY_NATIVE_SUITE=receipt-returns');
+if (getenv('PAY_NATIVE_SUITE') === 'receipt-storage') {
+    require __DIR__ . '/native-receipt-returns.php';
+    return;
+}
 if (getenv('PAY_NATIVE_SUITE') === 'conversion-bootstrap') {
     $argv[1] = getenv('PAYMENTER_TEST_APP');
     require __DIR__ . '/conversion-bootstrap.php';
@@ -97,6 +101,7 @@ Http::$handler = function ($verb, $path, $data) use (&$intent, &$method) {
 if ($suite = getenv('PAY_OFFLINE_SUITE')) {
     $files = match ($suite) {
         'charge-attempts', 'agreement-persistence', 'auto-pay-consent', 'setup-intents', 'webhook-continuity', 'adoption' => [$suite],
+        'subscription-payments' => ['handlers'],
         'payment-fees' => ['fee-recovery', 'fee-recovery-review'],
         'adoption-store' => ['gateway-lifecycle', 'adoption', 'adoption-store'],
         'ci-coverage' => ['native-ci-selection'],

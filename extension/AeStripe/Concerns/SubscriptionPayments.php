@@ -20,6 +20,21 @@ trait SubscriptionPayments
         return $invoices;
     }
 
+    private function finalizeSubscriptionInvoice($stripeInvoice, Service $service): void
+    {
+        ExtensionLocks::provider('subscription:' . $service->user_id, function () use ($stripeInvoice, $service) {
+            if (!$this->bindSubscriptionInvoice($stripeInvoice, $service)) return;
+            $active = ExtensionLocks::transaction('user:' . $service->user_id, function () use ($service) {
+                $fresh = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
+                return $fresh->user_id === $service->user_id && $fresh->subscription_id === $service->subscription_id
+                    && $fresh->subscription_id !== null && $fresh->status !== Service::STATUS_CANCELLED;
+            });
+            if (!$active) return;
+            $this->request('post', '/invoices/' . $stripeInvoice->id . '/finalize', [], 'finalize_' . $stripeInvoice->id);
+            $this->request('post', '/invoices/' . $stripeInvoice->id . '/pay', [], 'pay_' . $stripeInvoice->id);
+        });
+    }
+
     private function bindSubscriptionInvoice($stripeInvoice, Service $service): bool
     {
         $current = $this->request('get', '/invoices/' . $stripeInvoice->id);
@@ -27,6 +42,7 @@ trait SubscriptionPayments
         $claim = ExtensionLocks::transaction('user:' . $service->user_id, function () use ($stripeInvoice, $service, $current, $property) {
             $fresh = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
             abort_unless($fresh->user_id === $service->user_id && $fresh->subscription_id === $service->subscription_id, 409);
+            if (!$fresh->subscription_id || $fresh->status === Service::STATUS_CANCELLED) return null;
             $user = User::findOrFail($service->user_id);
             $stored = $user->properties()->where('key', $property)->first();
             $claim = $stored ? json_decode($stored->value, true, flags: JSON_THROW_ON_ERROR) : null;

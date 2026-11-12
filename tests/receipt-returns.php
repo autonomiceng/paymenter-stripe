@@ -65,6 +65,41 @@ $inboxUp = function () {
     DB::table('ae_stripe_outbox')->where('state', 'pending')->update(['next_at' => 0]);
 };
 
+// A failure event commits while an older successful provider observation is in flight.
+if (!getenv('PAY_PR95_CASE') || str_starts_with(getenv('PAY_PR95_CASE'), 'refund-generation')) {
+    foreach ([false, true] as $alreadyRechecking) {
+        if (getenv('PAY_PR95_CASE') && $alreadyRechecking !== (getenv('PAY_PR95_CASE') === 'refund-generation-set')) continue;
+        [$i, $s] = $setup(); $s->status = 'pending'; $deliver($s);
+        if ($alreadyRechecking) $setReturn('pi_return:excess', ['recheck' => true]);
+        current($s->refunds)->status = 'succeeded';
+        $normal = $GLOBALS['stripeHandler']; $interleaved = false;
+        $GLOBALS['stripeHandler'] = function ($verb, $path, $data, $request) use ($normal, $gateway, $s, &$interleaved) {
+            $answer = $normal($verb, $path, $data, $request);
+            if (!$interleaved && $verb === 'get' && $path === '/refunds') {
+                $interleaved = true; $answer = unserialize(serialize($answer));
+                current($s->refunds)->status = 'failed';
+                beforeWrite('ae_stripe_receipt_returns', function ($values) {
+                    if (empty($values['recheck'])) return;
+                    beforeWrite('ae_stripe_receipt_returns', null);
+                    // The event commits its due work; its processor has not acquired the invoice yet.
+                    beforeLock('invoices', fn () => throw new RuntimeException('Failure processor deferred'));
+                });
+                $gateway->webhook(eventRequest(current($s->refunds), type: 'refund.failed'));
+            }
+            return $answer;
+        };
+        $gateway->retryReceiptReturns();
+        $GLOBALS['stripeHandler'] = $normal;
+        check($interleaved && $status($i)['recheck'] && $status($i)['state'] === 'pending',
+            'An older successful refund read preserves the newer failure recheck, including an already-set flag');
+        $gateway->retryReceiptReturns(); $gateway->retryReceiptReturns();
+        check($status($i)['state'] === 'credited' && credits()['7:usd'] === 10.0 && count($s->posts) === 1
+            && count(payments()) === 2 && moneyRows()['credits'] === ['7:usd' => 1],
+            'The durable failure recheck restores the customer money exactly once without another refund');
+    }
+}
+if (getenv('PAY_PR95_CASE')) return;
+
 [$i, $s] = $setup(); $deliver($s); $deliver($s); $gateway->retryReceiptReturns();
 $a = $status($i);
 check($a['provider_created_at'] === 1793400000, 'Owned refund response supplies its provider creation date');

@@ -46,12 +46,15 @@ verifyReturn($gateway->invoiceReversalHistory($historyInvoice)[0]['provider_crea
 $upgrade = new class extends AeStripe {
     public function upgraded($oldVersion = null) {
         (require __DIR__.'/../extension/AeStripe/database/migrations/2026_11_01_000001_add_receipt_provider_created_at.php')->up();
+        (require __DIR__.'/../extension/AeStripe/database/migrations/2026_11_11_000004_add_receipt_recheck_generation.php')->up();
     }
 };
 (new ReflectionMethod($upgrade, 'ensureReceiptReturnSchema'))->invoke($upgrade);
 $upgrade->upgraded();
 verifyReturn(Schema::hasColumn('ae_stripe_receipt_returns', 'provider_created_at')
     && DB::table('ae_stripe_receipt_returns')->first()->provider_created_at === null, 'Installed table gets the additive nullable column once, retaining old rows');
+verifyReturn(Schema::hasColumn('ae_stripe_receipt_returns', 'recheck_generation')
+    && (int) DB::table('ae_stripe_receipt_returns')->first()->recheck_generation === 0, 'An existing receipt starts with generation zero after repeated additive upgrades');
 DB::table('ae_stripe_receipt_returns')->where('return_key', 'legacy')->delete();
 $gateway = new AeStripe([]);
 $read = new ReflectionMethod($gateway, 'readReceipt'); $write = new ReflectionMethod($gateway, 'writeReceipt');

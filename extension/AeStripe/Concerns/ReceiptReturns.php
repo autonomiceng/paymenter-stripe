@@ -18,7 +18,8 @@ trait ReceiptReturns
     {
         if (self::$receiptReturnSchemaReady) return;
         if (!\Illuminate\Support\Facades\Schema::hasTable('ae_stripe_receipt_returns')
-            || !\Illuminate\Support\Facades\Schema::hasColumn('ae_stripe_receipt_returns', 'provider_created_at')) {
+            || !\Illuminate\Support\Facades\Schema::hasColumn('ae_stripe_receipt_returns', 'provider_created_at')
+            || !\Illuminate\Support\Facades\Schema::hasColumn('ae_stripe_receipt_returns', 'recheck_generation')) {
             // MySQL DDL must never commit an enclosing caller/payment transaction.
             abort_unless(DB::transactionLevel() === 0, 409);
             $this->upgraded();
@@ -82,7 +83,8 @@ trait ReceiptReturns
                 'state' => $row->state, 'refund_id' => $row->refund_id, 'credit_id' => $row->credit_id,
                 'provider_created_at' => $row->provider_created_at ?? null,
                 'key' => $row->return_key, 'sent_at' => $row->sent_at === null ? null : (int) $row->sent_at,
-                'reason' => $row->reason, 'notified' => $row->notified, 'recheck' => (bool) $row->recheck];
+                'reason' => $row->reason, 'notified' => $row->notified, 'recheck' => (bool) $row->recheck,
+                'recheck_generation' => (int) ($row->recheck_generation ?? 0)];
         }
         return $receipt;
     }
@@ -114,6 +116,7 @@ trait ReceiptReturns
             'refund_id' => $a['refund_id'], 'credit_id' => $a['credit_id'] ?? null, 'sent_at' => $a['sent_at'],
             'provider_created_at' => $previous->provider_created_at ?? $a['provider_created_at'] ?? null,
             'reason' => $a['reason'] ?? null, 'notified' => $a['notified'] ?? null, 'recheck' => $a['recheck'] ?? false,
+            'recheck_generation' => $a['recheck_generation'] ?? 0,
             'retry' => !in_array($a['state'], ['refunded', 'credited'], true) || !empty($a['recheck'])
                 || ($a['notified'] ?? null) !== $this->receiptNotice($a), 'updated_at' => time(),
         ]);
@@ -189,6 +192,7 @@ trait ReceiptReturns
             if ($a['state'] === 'credited') return;
             // Commit due work before HTTP, so an outage or worker crash cannot lose this event.
             $a['recheck'] = true;
+            $a['recheck_generation'] = ($a['recheck_generation'] ?? 0) + 1;
             $this->writeReceipt($user, $row->payment_intent_id, $receipt, $row->allocation_key);
             DB::afterCommit(fn () => $this->processReceiptReturns($current, $row->payment_intent_id, $row->allocation_key));
         });
@@ -220,6 +224,8 @@ trait ReceiptReturns
                     $process = function ($user, $current) use ($id, $key, $snapshot, $intent, $invoiceMatches, &$refund) {
                         $receipt = $this->readReceipt($user, $id);
                         $a = &$receipt['allocations'][$key];
+                        // An event committed after the read owns the next observation, even if recheck was already true.
+                        if (($a['recheck_generation'] ?? 0) !== ($snapshot['allocations'][$key]['recheck_generation'] ?? 0)) return false;
                         if ($a['state'] === 'credited' || $a['state'] === 'refunded' && empty($a['recheck'])) return;
                         $payment = $this->lockedTransactions(InvoiceTransaction::where('transaction_id', $id), 'succeeded')[0] ?? null;
                         abort_unless(strtolower($current->currency_code) === $receipt['currency'] && ($receipt['closed_invoice'] || ($payment

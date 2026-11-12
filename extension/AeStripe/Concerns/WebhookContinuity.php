@@ -35,6 +35,13 @@ trait WebhookContinuity
     {
         $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->first();
         if (!$gateway || $gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'ready') return;
+        ExtensionLocks::provider('gateway:' . $gateway->id, fn () => $this->reconcileWebhookSubscriptionsLocked());
+    }
+
+    private function reconcileWebhookSubscriptionsLocked(): void
+    {
+        $gateway = \App\Models\Gateway::where('extension', 'AeStripe')->first();
+        if (!$gateway || $gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'ready') return;
         $claim = ExtensionLocks::transaction('gateway', function () use ($gateway) {
             if ($gateway->settings()->where('key', self::WEBHOOK_EVENTS)->first()?->value === 'ready') return null;
             $stored = $gateway->settings()->where('key', self::WEBHOOK_CLAIM)->first()?->value;
@@ -160,6 +167,12 @@ trait WebhookContinuity
 
     private function updateWebhookContinuity(Extension $gateway): void
     {
+        // A claim check cannot stop an older HTTP write after a replacement claim finishes.
+        ExtensionLocks::provider('gateway:' . $gateway->id, fn () => $this->updateWebhookContinuityLocked($gateway));
+    }
+
+    private function updateWebhookContinuityLocked(Extension $gateway): void
+    {
         // The native edit page retains submitted form data, including after credential restoration.
         $page = \Livewire\Livewire::current();
         if ($page instanceof \App\Admin\Resources\GatewayResource\Pages\EditGateway && $page->getRecord()->id === $gateway->id) {
@@ -191,7 +204,7 @@ trait WebhookContinuity
             }
             if ($pending) {
                 $claim = json_decode($pending, true, flags: JSON_THROW_ON_ERROR);
-                if (($claim['submitted'] ?? null) === $submitted) return $claim;
+                if (($claim['submitted'] ?? null) === $submitted && ($claim['revokePrevious'] ?? false) === $revokePrevious) return $claim;
             }
             return $this->reserveContinuity($gateway, compact('state', 'old', 'credentials', 'submitted', 'revokePrevious') + ['kind' => 'settings']);
         });
@@ -273,11 +286,17 @@ trait WebhookContinuity
             } catch (\Throwable $e) {
                 $failure = $e instanceof DisplayException ? $e->getMessage() : 'Stripe setup could not be verified. The previous credentials were kept. Check the API key permissions and save again.';
             }
-        ExtensionLocks::transaction('gateway', function () use ($gateway, $claim, $credentials, $state, $old, $failure) {
-            if (!$this->ownsContinuity($gateway, $claim)) return;
+        ExtensionLocks::transaction('gateway', function () use ($gateway, $claim, $credentials, $state, $old, &$failure) {
+            if (!$this->ownsContinuity($gateway, $claim)) {
+                $failure = 'Stripe settings changed during verification. Save again.';
+                return;
+            }
             // A later native form save can persist fields before its hook obtains our scope.
             foreach ($claim['submitted'] as $name => $value) {
-                if ((string) ($gateway->settings()->where('key', $name)->first()?->value ?? '') !== $value) return;
+                if ((string) ($gateway->settings()->where('key', $name)->first()?->value ?? '') !== $value) {
+                    $failure = 'Stripe settings changed during verification. Save again.';
+                    return;
+                }
             }
             $values = $failure === null ? $credentials : $old;
             foreach ($values as $name => $value) $gateway->settings()->updateOrCreate(['key' => $name], [

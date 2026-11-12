@@ -632,14 +632,18 @@ class AeStripe extends Gateway
         if (!$service->subscription_id) {
             return;
         }
-        $this->request('delete', '/subscriptions/' . $service->subscription_id);
-
-        // Remove subscription id from service
-        $service->update(['subscription_id' => null]);
-        // Remove has_stripe_subscription property
-        $service->properties()->where('key', 'has_stripe_subscription')->delete();
-
-        return true;
+        return ExtensionLocks::provider('subscription:' . $service->user_id, function () use ($service) {
+            if (!$service->subscription_id) return;
+            $subscription = $service->subscription_id;
+            $this->request('delete', '/subscriptions/' . $subscription);
+            ExtensionLocks::transaction('user:' . $service->user_id, function () use ($service, $subscription) {
+                // Keep cancellation and binding on the same user scope, after the provider guard.
+                if ($service->subscription_id !== $subscription) return;
+                $service->update(['subscription_id' => null]);
+                $service->properties()->where('key', 'has_stripe_subscription')->delete();
+            });
+            return true;
+        });
     }
 
     public function supportsBillingAgreements(): bool

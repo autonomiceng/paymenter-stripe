@@ -506,7 +506,7 @@ $cases = [
     // Both public Pay returns finish preparation before overlapping final card saves.
     'pay-return-card-save' => ['prepared_b' => true, 'seed' => function () {
             foreach (['cache' => false, 'cache_locks' => true] as $table => $locks) {
-                Illuminate\Support\Facades\Schema::create($table, function ($schema) use ($locks) {
+                if (!Illuminate\Support\Facades\Schema::hasTable($table)) Illuminate\Support\Facades\Schema::create($table, function ($schema) use ($locks) {
                     $schema->string('key')->primary();
                     if ($locks) $schema->string('owner'); else $schema->text('value');
                     $schema->integer('expiration');

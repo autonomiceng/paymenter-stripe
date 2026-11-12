@@ -52,6 +52,61 @@ use Paymenter\Extensions\Gateways\AeStripe\AeStripe;
         throw new RuntimeException('Unexpected continuity request');
     };
     try {
+        // Keep each overlap independently selectable for red/green evidence.
+        $baseHandler = Http::$handler;
+        foreach (['revoke', 'url', 'verification'] as $race) {
+            if (getenv('PAY_PR95_CASE') && getenv('PAY_PR95_CASE') !== 'webhook-' . $race) continue;
+            $extension->settingValues->values = $config;
+            $state = ['account' => 'acct_original', 'mode' => 'test', 'endpoint' => 'we_existing',
+                'delivery' => 'endpoint', 'credentials' => $config, 'previous' => []];
+            $extension->settingValues->values['ae_stripe_webhook_continuity'] = json_encode($state);
+            $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_overlap';
+            $endpoint->url = $race === 'url' ? 'https://example.invalid/old' : route('extensions.gateways.ae-stripe.webhook');
+            $endpoint->enabled_events = array_merge($events, $reversalEvents); $endpoints = [$endpoint];
+            $interleaved = false; $nestedFailed = false; $outerFailed = false;
+            $routeName = 'extensions.gateways.ae-stripe.webhook';
+            $oldRoute = \Illuminate\Support\Facades\Route::$names[$routeName];
+            Http::$handler = function ($verb, $path, $data) use ($baseHandler, $race, $gateway, $extension, $routeName, &$interleaved, &$nestedFailed) {
+                $pause = $race === 'url' ? $verb === 'post' && $path === '/webhook_endpoints/we_existing' : $path === '/account';
+                if (!$interleaved && $pause) {
+                    $interleaved = true;
+                    if ($race === 'url') {
+                        \Illuminate\Support\Facades\Route::$names[$routeName] = '/moved/extensions/ae-stripe/webhook';
+                        $extension->settingValues->values['stripe_webhook_secret'] = 'whsec_selected';
+                    }
+                    if ($race === 'revoke') $extension->settingValues->values['stripe_revoke_previous_secrets'] = true;
+                    $outerHandler = Http::$handler;
+                    if ($race === 'verification') Http::$handler = fn () => throw new \Illuminate\Http\Client\ConnectionException('Verification failed');
+                    try { $gateway->updated($extension); }
+                    catch (\App\Exceptions\DisplayException $e) { $nestedFailed = true; }
+                    Http::$handler = $outerHandler;
+                }
+                return $baseHandler($verb, $path, $data);
+            };
+            try { $gateway->updated($extension); }
+            catch (\App\Exceptions\DisplayException $e) { $outerFailed = true; }
+            Http::$handler = $baseHandler;
+            if ($race === 'verification') {
+                check($interleaved && ($outerFailed || $gateway->config('stripe_webhook_secret') === 'whsec_overlap'),
+                    'A successful verification cannot report success after a failed shared verification restored old credentials');
+            } else {
+                // A blocked concurrent save retries after the active operation has released its shared guard.
+                if ($nestedFailed) $gateway->updated($extension);
+                $saved = json_decode($extension->settingValues->values['ae_stripe_webhook_continuity'], true);
+                if ($race === 'revoke') check($interleaved && $saved['previous'] === []
+                    && !$extension->settingValues->values['stripe_revoke_previous_secrets'],
+                    'A concurrent explicit revocation is preserved and removes the outgoing secret');
+                else check($interleaved && $endpoint->url === route($routeName)
+                    && $saved['credentials']['stripe_webhook_secret'] === 'whsec_selected'
+                    && $extension->settingValues->values['ae_stripe_webhook_events'] === 'ready',
+                    'A delayed endpoint write cannot replace the selected URL after a newer save reports ready');
+            }
+            \Illuminate\Support\Facades\Route::$names[$routeName] = $oldRoute;
+        }
+        if (getenv('PAY_PR95_CASE')) return;
+        $extension->settingValues->values = $config; $gateway = new AeStripe($config);
+        $endpoint->url = route('extensions.gateways.ae-stripe.webhook'); $endpoint->enabled_events = $events;
+        $endpoints = [$endpoint]; Http::$calls = [];
         $gateway->upgraded();
         $beforeSettings = $extension->settingValues->values;
         $gateway->retryReceiptReturns();
