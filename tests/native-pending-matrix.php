@@ -49,10 +49,42 @@ if ($mode === 'browser') {
     }
 }
 putenv('PAY_PENDING_MATRIX');
-foreach ($runs as [$label, $environment, $command]) {
-    foreach (['PAY_CHECKOUT_NATIVE', 'PAY_CLEANUP_CASE', 'PAY_BINDING_CASE', 'PAY_NATIVE_SUITE'] as $name) putenv(isset($environment[$name]) ? $name . '=' . $environment[$name] : $name);
-    // Inherit the descriptors: passing STDOUT rewinds a file log, so each child would overwrite the last.
-    $process = proc_open($command, [], $pipes);
-    if (!is_resource($process) || proc_close($process) !== 0) throw new RuntimeException('Native integration failed: ' . $label);
+$jobs = (int) (getenv('BECO_TEST_JOBS') ?: 1);
+if ($jobs < 1 || $jobs > 6) throw new RuntimeException('Native workers must be between one and six.');
+$base = array_diff_key(getenv(), array_fill_keys(['PAY_CHECKOUT_NATIVE', 'PAY_CLEANUP_CASE', 'PAY_BINDING_CASE', 'PAY_NATIVE_SUITE'], true));
+$active = [];
+$next = 0;
+$failed = [];
+while ($next < count($runs) || $active) {
+    while ($next < count($runs) && count($active) < $jobs) {
+        [$label, $environment, $command] = $runs[$next++];
+        $receipt = null;
+        if (getenv('BECO_TEST_CGROUP')) {
+            $receipt = getenv('BECO_TEST_RECEIPTS') . '/' . $mode . '-' . $next . '.json';
+            $command = ['python3', getenv('BECO_TEST_BUDGET'), '--name', $label, '--test-scope', '--receipt', $receipt, '--', ...$command];
+        }
+        $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['redirect', 1]], $pipes, null, array_replace($base, $environment));
+        if (!is_resource($process)) { $failed[] = $label; continue; }
+        fclose($pipes[0]);
+        stream_set_blocking($pipes[1], false);
+        $active[] = ['process' => $process, 'stream' => $pipes[1], 'label' => $label, 'output' => '', 'started' => microtime(true), 'receipt' => $receipt];
+    }
+    $read = array_column($active, 'stream');
+    $write = $except = null;
+    if ($read) stream_select($read, $write, $except, 1);
+    foreach ($active as $index => &$child) {
+        $child['output'] .= stream_get_contents($child['stream']);
+        if (!feof($child['stream'])) continue;
+        fclose($child['stream']);
+        $code = proc_close($child['process']);
+        echo $child['output'];
+        $resources = $child['receipt'] && is_file($child['receipt']) ? json_decode(file_get_contents($child['receipt']), true, 16, JSON_THROW_ON_ERROR) : null;
+        if ($child['receipt'] && !$resources) $code = $code ?: 1;
+        if ($child['receipt']) echo json_encode(['label' => $child['label'], 'argv' => ['native-case', $child['label']], 'seconds' => microtime(true) - $child['started'], 'exit' => $code, 'resources' => $resources]) . "\n";
+        if ($code !== 0) $failed[] = $child['label'];
+        unset($active[$index]);
+    }
+    unset($child);
 }
+if ($failed) throw new RuntimeException('Native integration failed: ' . implode(', ', $failed));
 echo 'PASS: ' . count($runs) . " isolated native runs\n";
