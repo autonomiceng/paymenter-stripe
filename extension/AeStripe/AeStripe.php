@@ -89,6 +89,9 @@ class AeStripe extends Gateway
     use Concerns\PaymentActions, Concerns\PaymentNotices, Concerns\SavedMethodNotices, Concerns\AutoPayInheritance, Concerns\ReversalReview, Concerns\ReceiptReversals, Concerns\RenewalRetry, Concerns\AutoPay, Concerns\InvoicePayments, Concerns\WebhookContinuity, CardDuplicates, Concerns\SavedMethods, Concerns\SavedMethodBindings, PaymentFees, Signature, Checkout, Amounts, SubscriptionAttempt, SubscriptionPayments, CheckoutIntent, ChargeRecovery, SetupConsent, SetupIntent, Webhooks, StripeMetadata, TransactionMethod;
 
     private const API_VERSION = '2025-07-30.basil';
+    private const HTTP_TIMEOUT_SECONDS = 5;
+    private const CUSTOMER_CLAIM_SECONDS = 23 * 3600;
+    private const CUSTOMER_RECOVERY_MARGIN_SECONDS = 5;
 
     private function adminInvoiceUrl(Invoice $invoice): string
     {
@@ -401,7 +404,7 @@ class AeStripe extends Gateway
             'Stripe-Version' => self::API_VERSION,
         ];
         if ($idempotencyKey !== null) $headers['Idempotency-Key'] = $idempotencyKey;
-        return $this->readStripeObject(Http::withHeaders($headers)->asForm()->connectTimeout(2)->timeout(5)->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object());
+        return $this->readStripeObject(Http::withHeaders($headers)->asForm()->connectTimeout(2)->timeout(self::HTTP_TIMEOUT_SECONDS)->$method('https://api.stripe.com/v1' . $url, $data)->throw()->object());
     }
 
     private function setupSubscription($setupIntent)
@@ -709,7 +712,10 @@ class AeStripe extends Gateway
         });
         abort_unless($claim['previous'] === $previous, 409);
         $customer = null;
-        if (time() - $claim['created'] >= 23 * 3600) {
+        $age = time() - $claim['created'];
+        if ($age >= self::CUSTOMER_CLAIM_SECONDS) {
+            // An old-key POST may have started just before expiry. Let its timeout and margin elapse before listing.
+            abort_unless($age >= self::CUSTOMER_CLAIM_SECONDS + self::HTTP_TIMEOUT_SECONDS + self::CUSTOMER_RECOVERY_MARGIN_SECONDS, 409);
             $customer = $this->recoverCustomerCreation($user, $claim);
             $claim = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $previous, $claim, $customer, $includeDetails) {
                 abort_unless($this->lockedUserProperty($user, 'stripe_id')?->value === $previous, 409);
@@ -722,7 +728,11 @@ class AeStripe extends Gateway
                 return $next;
             });
         }
-        $customer ??= $this->request('post', '/customers', $claim['payload'], $claim['key']);
+        if (!$customer) {
+            // Recheck immediately before sending, including when the earlier age check was still before expiry.
+            abort_unless(time() - $claim['created'] < self::CUSTOMER_CLAIM_SECONDS, 409);
+            $customer = $this->request('post', '/customers', $claim['payload'], $claim['key']);
+        }
         return ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $previous, $claim, $customer) {
             $current = $this->lockedUserProperty($user, 'stripe_id')?->value;
             abort_unless(in_array($current, [$previous, $customer->id], true), 409);
