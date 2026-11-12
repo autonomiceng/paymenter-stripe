@@ -18,6 +18,7 @@ trait PaymentFees
     public function upgraded($oldVersion = null)
     {
         app(\Illuminate\Database\Migrations\Migrator::class)->run(base_path('extensions/Gateways/AeStripe/database/migrations'));
+        $this->backfillPaymentNotices();
     }
 
     private static bool $paymentFeeSchemaReady = false;

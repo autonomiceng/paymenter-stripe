@@ -87,9 +87,10 @@ namespace App\Models {
             public function orderBy($key) { return $this; }
             public function orderByRaw($sql, $bindings = []) { $this->rawOrder = Property::$lastRawOrder = [$sql, $bindings]; return $this; }
             public function limit($n) { $this->rowLimit = $n; return $this; }
+            public function chunkById($size, $callback) { foreach (array_chunk($this->get(), $size) as $rows) $callback($rows); }
             public function get() {
                 $result = [];
-                foreach (User::$row->props->values as $key => $value) {
+                foreach (User::$row?->props->values ?? [] as $key => $value) {
                     $record = json_decode($value, true);
                     $selected = str_contains($this->pattern, 'payment_alert')
                         ? str_starts_with($key, 'ae_stripe_payment_alert_') && !($record['sent'] ?? true)
@@ -413,6 +414,7 @@ namespace App\Models {
                 });
                 return $this->maximum === null ? $rows : array_slice($rows, 0, $this->maximum);
             }
+            public function chunkById($size, $callback) { foreach (array_chunk($this->get(), $size) as $rows) $callback($rows); }
             public function firstOrFail() { return $this->first() ?? throw new \RuntimeException('Missing audit'); }
         }; }
         public static function create($row) {
