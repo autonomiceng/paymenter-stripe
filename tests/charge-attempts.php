@@ -114,19 +114,18 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
-        $run('customer-claim-list-window', function () use ($gateway) {
+        $run('customer-claim-list-history', function () use ($gateway) {
             $owner = User::$row;
             foreach ([true, false] as $marked) {
                 $claim = ['previous' => null, 'created' => time() - 26 * 3600, 'payload' => ['metadata' => []]];
                 if ($marked) $claim['payload']['metadata']['ae_stripe_customer_claim'] = 'window';
                 $pages = 0;
-                Http::$handler = function ($verb, $path, $params) use ($owner, $claim, $marked, &$pages) {
+                Http::$handler = function ($verb, $path, $params) use ($owner, &$pages) {
                     check(!DB::$locked && $verb === 'get' && $path === '/customers', 'Claim recovery only lists outside transactions');
-                    check(($params['created'] ?? null) === ($marked ? ['gte' => $claim['created'] - 3600] : null),
-                        'Marked claims bound every page; legacy claims retain historical matching');
+                    check(!isset($params['created']), 'Marked and legacy claims enumerate full history on every page');
                     ++$pages;
                     if ($pages === 1) return ['data' => [(object) ['id' => 'cus_windowpage', 'metadata' => (object) ['user_id' => 8]]], 'has_more' => true];
-                    check(($params['starting_after'] ?? null) === 'cus_windowpage', 'Bounded recovery retains pagination');
+                    check(($params['starting_after'] ?? null) === 'cus_windowpage', 'Historical recovery retains pagination');
                     return ['data' => [(object) ['id' => 'cus_windowmatch', 'metadata' => (object) ['user_id' => $owner->id,
                         'ae_stripe_customer_claim' => 'window']]], 'has_more' => false];
                 };
@@ -134,34 +133,38 @@ use Illuminate\Support\Facades\{DB, Http};
                 check($pages === 2 && $found->id === 'cus_windowmatch', 'Recovery finds one exact claim or legacy owner across pages');
             }
         });
-        $run('customer-claim-fast-local-clock', function () use ($gateway) {
+        $run('customer-claim-clock-independent', function () use ($gateway) {
             $owner = User::$row;
-            $owner->props = new Properties('');
-            $created = time() - 26 * 3600;
-            $claim = ['key' => 'customer_fast_clock', 'previous' => null, 'created' => $created,
-                'payload' => ['metadata' => ['user_id' => $owner->id, 'ae_stripe_customer_claim' => 'customer_fast_clock']]];
-            $owner->props->values['ae_stripe_customer_create'] = json_encode($claim);
-            // At creation the local clock was thirty minutes ahead of Stripe's clock.
-            $customer = (object) ['id' => 'cus_clockmatch', 'created' => $created - 1800,
-                'metadata' => (object) $claim['payload']['metadata']];
-            $lists = $posts = 0;
-            Http::$handler = function ($verb, $path, $data) use ($customer, &$lists, &$posts) {
-                check(!DB::$locked, 'Clock-skew recovery keeps HTTP outside owner transactions');
-                if ($verb === 'get' && $path === '/customers') {
-                    ++$lists;
-                    // Stripe applies this filter to its own creation timestamp, not the local claim time.
-                    return ['data' => $customer->created >= ($data['created']['gte'] ?? 0) ? [$customer] : [], 'has_more' => false];
-                }
-                if ($verb === 'post' && $path === '/customers') {
-                    ++$posts;
-                    return ['id' => 'cus_clockduplicate'];
-                }
-                throw new RuntimeException('Unexpected clock-skew recovery request');
-            };
-            $found = invoke($gateway, 'createOrGetStripeCustomer', $owner, false);
-            check($lists === 1 && $posts === 0 && $found->id === $customer->id && $owner->props->customer === $customer->id
-                && !isset($owner->props->values['ae_stripe_customer_create']),
-                'A fast local clock recovers the exact marked customer without creating a duplicate');
+            // Include the reported ninety-minute offset and large offsets in both directions.
+            foreach ([90 * 60, 365 * 86400, -365 * 86400] as $offset) {
+                $owner->props = new Properties('');
+                $created = time() - 26 * 3600;
+                $claim = ['key' => 'customer_clock', 'previous' => null, 'created' => $created,
+                    'payload' => ['metadata' => ['user_id' => $owner->id, 'ae_stripe_customer_claim' => 'customer_clock']]];
+                $owner->props->values['ae_stripe_customer_create'] = json_encode($claim);
+                $customer = (object) ['id' => 'cus_clockmatch', 'created' => $created - $offset,
+                    'metadata' => (object) $claim['payload']['metadata']];
+                $lists = $posts = 0;
+                Http::$handler = function ($verb, $path, $data) use ($customer, &$lists, &$posts) {
+                    check(!DB::$locked, 'Customer recovery keeps HTTP outside owner transactions');
+                    if ($verb === 'get' && $path === '/customers') {
+                        ++$lists;
+                        // Honor provider timestamps so a local-time filter really excludes the claimed customer.
+                        $included = $customer->created >= ($data['created']['gte'] ?? 0)
+                            && $customer->created <= ($data['created']['lte'] ?? PHP_INT_MAX);
+                        return ['data' => $included ? [$customer] : [], 'has_more' => false];
+                    }
+                    if ($verb === 'post' && $path === '/customers') {
+                        ++$posts;
+                        return ['id' => 'cus_clockduplicate'];
+                    }
+                    throw new RuntimeException('Unexpected clock-independent recovery request');
+                };
+                $found = invoke($gateway, 'createOrGetStripeCustomer', $owner, false);
+                check($lists === 1 && $posts === 0 && $found->id === $customer->id && $owner->props->customer === $customer->id
+                    && !isset($owner->props->values['ae_stripe_customer_create']),
+                    'Recovery finds the exact marked customer without a duplicate regardless of local clock offset');
+            }
         });
         $run('customer-claim-expiry', function () use ($gateway) {
             $owner = User::$row;

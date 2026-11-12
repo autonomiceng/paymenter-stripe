@@ -90,9 +90,8 @@ class AeStripe extends Gateway
 
     private const API_VERSION = '2025-07-30.basil';
     private const HTTP_TIMEOUT_SECONDS = 5;
-    private const CUSTOMER_CLOCK_SKEW_SECONDS = 3600;
-    private const CUSTOMER_POST_CUTOFF_SECONDS = 24 * 3600 - self::CUSTOMER_CLOCK_SKEW_SECONDS;
-    private const CUSTOMER_RECOVERY_AFTER_SECONDS = 24 * 3600 + self::CUSTOMER_CLOCK_SKEW_SECONDS;
+    private const CUSTOMER_POST_CUTOFF_SECONDS = 23 * 3600;
+    private const CUSTOMER_RECOVERY_AFTER_SECONDS = 25 * 3600;
 
     private function adminInvoiceUrl(Invoice $invoice): string
     {
@@ -763,13 +762,10 @@ class AeStripe extends Gateway
 
     private function recoverCustomerCreation($user, array $claim): ?object
     {
-        // Search is eventually consistent. Enumerate the claim window before declaring creation absent.
+        // Search is eventually consistent. Enumerate the entire customer list before declaring creation absent.
         // Old claims lack a marker: only a unique customer with this owner, excluding the old binding, is safe.
         $marker = $claim['payload']['metadata']['ae_stripe_customer_claim'] ?? null;
         $params = ['limit' => 100];
-        // New markers cannot precede the local claim, allowing the same clock skew as the send and recovery cutoffs.
-        // Legacy unmarked claims may match older customers, so they retain the full listing.
-        if ($marker !== null) $params['created'] = ['gte' => max(0, (int) $claim['created'] - self::CUSTOMER_CLOCK_SKEW_SECONDS)];
         $matches = [];
         do {
             $page = $this->request('get', '/customers', $params);
