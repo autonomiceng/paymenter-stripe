@@ -47,22 +47,23 @@ $connection = DB::connection();
 $connection->setQueryGrammar(new class($connection) extends SQLiteGrammar {
     protected function compileLock(Builder $query, $value) { return is_string($value) ? '/* ' . $value . ' */' : ($value ? '/* for update */' : '/* lock in share mode */'); }
 });
-$GLOBALS['nativeLocks'] = [];
+$GLOBALS['nativeLocks'] = []; $GLOBALS['nativeScopes'] = [];
 Illuminate\Support\Facades\Event::listen(Illuminate\Database\Events\TransactionBeginning::class, function () {
-    if (DB::transactionLevel() === 1) $GLOBALS['nativeLocks'] = [];
+    if (DB::transactionLevel() === 1) { $GLOBALS['nativeLocks'] = []; $GLOBALS['nativeScopes'] = []; }
 });
 $GLOBALS['nativeBeforeWrite'] = [];
 $GLOBALS['nativeAfterCommit'] = null;
 DB::listen(function (QueryExecuted $query) {
     if (DB::transactionLevel() > 0 && str_contains($query->sql, '/* for update */') && preg_match('/ from "([a-z_]+)"/', $query->sql, $table)) {
         $GLOBALS['nativeLocks'][$table[1]] = true;
+        if ($table[1] === 'ae_stripe_locks') $GLOBALS['nativeScopes'][$query->bindings[0]] = true;
     }
 });
 Illuminate\Support\Facades\Event::listen(TransactionCommitted::class, function () {
-    if (DB::transactionLevel() === 0) $GLOBALS['nativeLocks'] = [];
+    if (DB::transactionLevel() === 0) { $GLOBALS['nativeLocks'] = []; $GLOBALS['nativeScopes'] = []; }
     if ($hook = $GLOBALS['nativeAfterCommit']) { $GLOBALS['nativeAfterCommit'] = null; $hook(); }
 });
-Illuminate\Support\Facades\Event::listen(TransactionRolledBack::class, function () { if (DB::transactionLevel() === 0) $GLOBALS['nativeLocks'] = []; });
+Illuminate\Support\Facades\Event::listen(TransactionRolledBack::class, function () { if (DB::transactionLevel() === 0) { $GLOBALS['nativeLocks'] = []; $GLOBALS['nativeScopes'] = []; } });
 /** Column values of one INSERT or UPDATE statement, or null for other statements. */
 function nativeWrite(string $sql, array $bindings): ?array
 {
@@ -82,21 +83,30 @@ $connection->beforeExecuting(function ($sql, $bindings) {
     // Guards that MariaDB and the payment design require but SQLite cannot enforce.
     if (str_starts_with($sql, 'insert into "audits"') && $level === 0) throw new RuntimeException('Review record lock missing');
     // A plain review read sees every record only under the owner lock that every review writer holds.
-    if (preg_match('/^select .* from "audits"/', $sql) && $level > 0 && !$locked && !holdsLock('ae_stripe_locks')
-        && !(holdsLock('ae_stripe_locks') && in_array(App\Models\Gateway::class, $bindings, true))) throw new RuntimeException('Review guard needs the owner lock');
-    // A plain settlement read sees every payment only under the owner lock that every payment writer here holds.
-    if (preg_match('/^select .* from "invoice_transactions" where "transaction_id" = \? and "status" = \?/', $sql) && $level > 0 && !$locked && !holdsLock('ae_stripe_locks')) {
-        throw new RuntimeException('Settlement guard needs the owner lock');
+    if (preg_match('/^select .* from "audits"/', $sql) && $level > 0 && !$locked) {
+        $type = nativePredicate($sql, $bindings, 'auditable_type');
+        $id = nativePredicate($sql, $bindings, 'auditable_id');
+        $owner = $type === App\Models\Invoice::class ? DB::table('invoices')->where('id', $id)->value('user_id') : null;
+        if (!($type === App\Models\Gateway::class ? holdsScope('gateway') : holdsOwnerScope($owner))) {
+            throw new RuntimeException('Review guard needs the owner lock');
+        }
+    }
+    // Existing settlements identify their invoice owner; an absent settlement still requires a user scope.
+    if (preg_match('/^select .* from "invoice_transactions" where "transaction_id" = \? and "status" = \?/', $sql) && $level > 0 && !$locked) {
+        $owner = DB::table('invoice_transactions')->join('invoices', 'invoices.id', '=', 'invoice_transactions.invoice_id')
+            ->where('transaction_id', $bindings[0])->value('invoices.user_id');
+        if (!holdsOwnerScope($owner)) throw new RuntimeException('Settlement guard needs the owner lock');
     }
     if (preg_match('/^select .* from "ae_stripe_receipt_returns"/', $sql) && $locked && $level === 0) throw new RuntimeException('Return read needs transaction');
-    if (str_starts_with($sql, 'update "invoice_transactions" set "is_credit_transaction" = ? where "id" = ?') && !holdsLock('ae_stripe_locks')) {
+    if (str_starts_with($sql, 'update "invoice_transactions" set "is_credit_transaction" = ? where "id" = ?') && !holdsOwnerScope(DB::table('invoice_transactions')->join('invoices', 'invoices.id', '=', 'invoice_transactions.invoice_id')
+            ->where('invoice_transactions.id', $bindings[1])->value('invoices.user_id'))) {
         throw new RuntimeException('Classification requires payment locks');
     }
     if (!$write = nativeWrite($sql, $bindings)) return;
     [$table, $values] = $write;
     if ($table === 'ae_stripe_receipt_returns') {
         // Allocation and observation writes carry their owner; queue maintenance updates do not.
-        if (array_key_exists('user_id', $values) && !holdsLock('ae_stripe_locks')) throw new RuntimeException('Return write needs owner lock');
+        if (array_key_exists('user_id', $values) && !holdsOwnerScope($values['user_id'])) throw new RuntimeException('Return write needs owner lock');
         if (strlen((string) ($values['return_key'] ?? '')) > 74) throw new Illuminate\Database\QueryException('sqlite', $sql, $bindings, new PDOException('Data too long for column return_key'));
     }
     foreach ($GLOBALS['nativeBeforeWrite'][$table] ?? [] as $hook) $hook($values, $sql);
@@ -109,6 +119,19 @@ function beforeWrite(string $table, ?callable $hook): void
 }
 /** Whether the open transaction holds a row lock on this table. */
 function holdsLock(string $table): bool { return DB::transactionLevel() > 0 && isset($GLOBALS['nativeLocks'][$table]); }
+/** Value of an equality predicate, accounting for bindings before it. */
+function nativePredicate(string $sql, array $bindings, string $column): mixed
+{
+    $at = strpos($sql, '"' . $column . '" = ?');
+    return $at === false ? null : ($bindings[substr_count(substr($sql, 0, $at), '?')] ?? null);
+}
+function holdsScope(string $scope): bool { return DB::transactionLevel() > 0 && isset($GLOBALS['nativeScopes'][$scope]); }
+function holdsOwnerScope($owner): bool
+{
+    if ($owner !== null) return holdsScope('user:' . $owner);
+    foreach ($GLOBALS['nativeScopes'] as $scope => $held) if (str_starts_with($scope, 'user:') && holdsScope($scope)) return true;
+    return false;
+}
 /** Run once after the next committed transaction, as if its acknowledgement were lost. */
 function afterNextCommit(callable $hook): void { $GLOBALS['nativeAfterCommit'] = $hook; }
 
