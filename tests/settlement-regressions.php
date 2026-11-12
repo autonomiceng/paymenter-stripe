@@ -12,7 +12,7 @@ InvoiceTransaction::saved(function () use (&$applications) { ++$applications; })
 $activations = 0;
 Invoice::updated(function ($invoice) use (&$activations) { if ($invoice->wasChanged('status') && $invoice->status === 'paid') ++$activations; });
 $reset = function () use ($owner) {
-    foreach (['invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices', 'services'] as $table) DB::table($table)->delete();
+    foreach (['ae_stripe_settlements', 'invoice_transactions', 'ae_stripe_receipt_returns', 'audits', 'notifications', 'credits', 'invoice_items', 'invoices', 'services'] as $table) DB::table($table)->delete();
     $owner->properties()->where('key', '!=', 'stripe_id')->delete();
 };
 $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
@@ -89,7 +89,7 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
             ['status' => 'paid', 'amount_paid' => 1250,
                 'payment' => ['type' => 'payment_intent', 'payment_intent' => $intent->id]]]];
         if ($verb === 'get' && $path === '/payment_intents/' . $intent->id) {
-            check(DB::transactionLevel() === 0 || holdsLock('users'), 'Return verification also serializes on the receipt owner');
+            check(DB::transactionLevel() === 0 || holdsLock('ae_stripe_locks'), 'Return verification also serializes on the receipt owner');
             return $intent;
         }
         throw new RuntimeException('Unexpected settlement request: ' . $path);
@@ -141,7 +141,7 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
     check(count($logged) === $warnings + 1 && end($logged) === [
         'AeStripe payment received for paid invoice', ['invoice_id' => $invoice->id]],
         'Late subscription payment logs only the invoice ID');
-    check(array_slice(lockLog(), $locks, 3) === ['users', 'services', 'invoices'],
+    check(array_slice(lockLog(), $locks, 3) === ['ae_stripe_locks', 'services', 'invoices'],
         'Subscription success keeps user-first settlement lock order');
     check(count(array_filter(array_slice($GLOBALS['stripeCalls'], $calls), fn ($call) => $call[0] !== 'get')) === 0,
         'Late subscription success makes no remote changes');
@@ -158,7 +158,7 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
         $records = count(audits());
         $before = $applications;
         $locks = count(lockLog());
-        beforeLock('audits', fn () => check(!holdsLock('users') && !holdsLock('invoices'), 'Staff delivery locks its marker after the owner commits'));
+        beforeLock('audits', fn () => check(!holdsLock('ae_stripe_locks') && !holdsLock('invoices'), 'Staff delivery locks its marker after the owner commits'));
         $deliver();
         $deliver();
         check($applications === $before && count(audits()) === $records + 1,
@@ -170,7 +170,7 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
             && $record->new_values['currency'] === $intent->currency
             && $record->new_values['reason'] === (str_contains($reason, 'currency') ? 'currency mismatch' : 'customer mismatch'),
             'Subscription staff record preserves binding, received units and refusal reason: ' . $reason);
-        check(array_slice(lockLog(), $locks, 3) === ['users', 'services', 'invoices']
+        check(array_slice(lockLog(), $locks, 3) === ['ae_stripe_locks', 'services', 'invoices']
             && count(array_filter(array_slice(lockLog(), $locks), fn ($table) => $table === 'audits')) === 1,
             'Subscription refusal locks the owner and invoice before its separate notice delivery: ' . $reason . ': ' . json_encode(array_slice(lockLog(), $locks)));
         check(!str_contains(json_encode($record->toArray()), 'cus_foreign') && !str_contains(json_encode($record->toArray()), $invoice->user->email),
@@ -387,7 +387,7 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
     });
     $before = $applications;
     try { invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice); } finally { $tracing = false; }
-    check(is_string($first) && str_starts_with($first, 'select * from "users"') && str_ends_with($first, '/* for update */'),
+    check(is_string($first) && str_starts_with($first, 'select * from "ae_stripe_locks"') && str_ends_with($first, '/* for update */'),
         'Subscription settlement locks the customer before its first read, so it sees an attempt committed while it waited');
     check(!$owner->properties()->where('key', 'ae_stripe_checkout_421')->exists()
         && payments()['421:' . $intent->id]['status'] === 'succeeded' && moneyRows()['payments'] === ['421:' . $intent->id => 1]
@@ -450,4 +450,31 @@ $lastAudit = fn () => App\Models\Audit::orderByDesc('id')->first();
     } finally {
         beforeWrite('invoice_transactions', null);
     }
+})();
+
+// Internally nested settlement must not regain range locks that block another customer's first payment insert.
+(function () use ($gateway, $reset) {
+    $reset();
+    $invoice = nativeInvoice(481, 20, 'USD');
+    nativeService('sub_owned', [$invoice]);
+    $intent = (object) ['id' => 'pi_owned', 'status' => 'succeeded', 'amount' => 2000,
+        'amount_received' => 2000, 'currency' => 'usd', 'customer' => 'cus_owner'];
+    $stripeInvoice = (object) ['id' => 'in_owned', 'currency' => 'usd', 'amount_paid' => 2000,
+        'metadata' => (object) ['ae_stripe_invoice_id' => 481],
+        'parent' => (object) ['type' => 'subscription_details', 'subscription_details' => (object) ['subscription' => 'sub_owned']]];
+    $GLOBALS['stripeHandler'] = function ($verb, $path) use ($intent) {
+        if ($verb === 'get' && $path === '/invoice_payments') return ['data' => [
+            ['status' => 'paid', 'amount_paid' => 2000, 'payment' => ['type' => 'payment_intent', 'payment_intent' => 'pi_owned']]]];
+        if ($verb === 'get' && $path === '/payment_intents/pi_owned') return $intent;
+        throw new RuntimeException('Unexpected subscription request: ' . $verb . ' ' . $path);
+    };
+    $recording = true; $rangeLocks = [];
+    DB::listen(function ($query) use (&$recording, &$rangeLocks) {
+        if ($recording && str_contains($query->sql, 'from "invoice_transactions"')
+            && str_contains($query->sql, '/* for update */') && !preg_match('/where (?:"invoice_transactions"\.)?"id" = \?/', $query->sql)) $rangeLocks[] = $query->sql;
+    });
+    try { invoke($gateway, 'recordSubscriptionPayment', $stripeInvoice); }
+    finally { $recording = false; }
+    check(!$rangeLocks && payments()['481:pi_owned']['amount'] === 20.0,
+        'Owned subscription settlement records its payment using only exact payment-row locks');
 })();

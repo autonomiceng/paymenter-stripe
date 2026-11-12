@@ -13,8 +13,8 @@ foreach (['bootstrap/app.php', 'bootstrap/providers.php', 'composer.json'] as $p
 symlink($release . '/themes/default', $root . '/themes/default');
 $themeRoot = getenv('PAY_NOTICE_THEME');
 if ($themeRoot && !is_file($themeRoot . '/views/invoices/show.blade.php')) throw new RuntimeException('Selected native theme is unavailable.');
-$theme = $themeRoot ? 'beco' : 'default';
-if ($themeRoot) symlink($themeRoot, $root . '/themes/beco');
+$theme = $themeRoot ? 'fixture' : 'default';
+if ($themeRoot) symlink($themeRoot, $root . '/themes/fixture');
 foreach (['APP_ENV' => 'testing', 'APP_KEY' => 'base64:' . base64_encode(str_repeat('t', 32)), 'APP_URL' => 'http://stripe-tests.invalid',
     'DB_CONNECTION' => 'sqlite', 'DB_DATABASE' => ':memory:', 'CACHE_STORE' => 'array', 'QUEUE_CONNECTION' => 'database',
     'SESSION_DRIVER' => 'array', 'MAIL_MAILER' => 'array', 'APP_TELEMETRY_ENABLED' => 'false'] as $key => $value) {
@@ -30,6 +30,7 @@ config(['hashing.bcrypt.rounds' => 4, 'audit.enabled' => false, 'settings.mail_d
 if (config('database.default') !== 'sqlite' || config('database.connections.sqlite.database') !== ':memory:') throw new RuntimeException('In-memory fixture required.');
 Illuminate\Support\Facades\Http::preventStrayRequests();
 Illuminate\Support\Facades\Artisan::call('migrate', ['--force' => true]);
+foreach (glob(__DIR__ . '/../extension/AeStripe/database/migrations/*.php') as $migration) (require $migration)->up();
 config(['cache.default' => 'database']);
 foreach (['cache' => false, 'cache_locks' => true] as $table => $locks) Illuminate\Support\Facades\Schema::create($table, function ($schema) use ($locks) {
     $schema->string('key')->primary();

@@ -45,7 +45,7 @@ class AdoptionQuery
     private function matches($row): bool { foreach ($this->filters as $f) if (!$f($row)) return false; return true; }
     public function get(): AdoptionCollection
     {
-        check($this->locked, 'Adapter snapshot requires row locks for ' . $this->table);
+        check(DB::$gatewayLocked, 'Adapter snapshot requires the gateway scope for ' . $this->table);
         DB::$locks[] = $this->table;
         $rows = array_filter(DB::$tables[$this->table], fn ($r) => $this->matches($r));
         foreach ($rows as $row) self::$loadedRows[$this->table][] = $row['id'];
@@ -67,7 +67,7 @@ class AdoptionQuery
 }
 $adoptionStorage = sys_get_temp_dir() . '/stripe-adoption-test-' . bin2hex(random_bytes(6));
 $fixture = new AdoptionFake;
-DB::$tables = ['extensions' => [['id' => 1, 'type' => 'gateway', 'extension' => 'Stripe', 'deleted_at' => null, 'enabled' => true], ['id' => 2, 'type' => 'gateway', 'extension' => 'AeStripe', 'deleted_at' => null, 'enabled' => true]], 'settings' => [],
+DB::$tables = ['ae_stripe_locks' => ['gateway' => ['scope' => 'gateway'], 'user:7' => ['scope' => 'user:7']], 'extensions' => [['id' => 1, 'type' => 'gateway', 'extension' => 'Stripe', 'deleted_at' => null, 'enabled' => true], ['id' => 2, 'type' => 'gateway', 'extension' => 'AeStripe', 'deleted_at' => null, 'enabled' => true]], 'settings' => [],
     'billing_agreements' => $fixture->state['agreements'], 'services' => $fixture->state['services'],
     'properties' => [['id' => 1, 'model_id' => 10, 'model_type' => \App\Models\BillingAgreement::class, 'value' => 'unchanged']]];
 \App\Models\Gateway::$rows = [];

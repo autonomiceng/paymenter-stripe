@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Helpers\ExtensionHelper;
 use App\Exceptions\DisplayException;
 use Illuminate\Http\Client\{ConnectionException, RequestException};
@@ -144,10 +146,7 @@ trait Checkout
         $elements = $this->withPaymentLock($invoice, fn ($user, $current) => $this->isElementsAttempt($this->readPaymentAttempt($user, $current) ?? [], $intent));
         if (($intent->confirmation_method ?? 'automatic') !== 'manual' && !$elements) {
             // An already-open legacy tab must not confirm outside the invoice lock.
-            $this->withPaymentLock($invoice, function () use ($intent) {
-                if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation', 'requires_action'], true)
-                    && ($intent->amount_received ?? 0) === 0) $this->request('post', '/payment_intents/' . $intent->id . '/cancel');
-            });
+            $this->sendPaymentAction($invoice, $intent, 'cancel');
             return response()->json(['message' => 'The payment form changed. Refresh the invoice before paying.'], 409);
         }
         $save = $request->boolean('save');
@@ -191,14 +190,14 @@ trait Checkout
             // retired intent identifies the invoice, while checkoutIntent serializes its replacement.
             if ($request->input('confirmation_token') && in_array($intent->status, ['requires_payment_method', 'canceled'], true)
                 && ($intent->amount_received ?? 0) === 0
-                && InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->exists()) {
+                && $this->hasFailedPayment($invoice, $intent->id)) {
                 $intent = $this->checkoutIntent($invoice, $this->checkoutPaymentData($invoice, (int) $request->input('amount'), $customer), elements: true);
             }
             // A bank check that failed or was cancelled in Stripe.js leaves a definite zero-money refusal: record it
             // now, so the dialog and the invoice say the same thing, and the next card starts a new attempt. The
             // failure webhook can record and retire it before the open dialog asks; the dialog still gets the decline.
             $retired = $intent->status === 'canceled' && ($intent->amount_received ?? 0) === 0
-                && InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->exists();
+                && $this->hasFailedPayment($invoice, $intent->id);
             $refusal = !$request->input('confirmation_token') && ($intent->amount_received ?? 0) === 0
                 && ($retired || $intent->status === 'requires_payment_method' && !empty($intent->last_payment_error))
                 ? ($intent->last_payment_error ?? (object) []) : null;
@@ -317,9 +316,9 @@ trait Checkout
         $invoice = Invoice::findOrFail($intent->metadata->invoice_id);
         $userId = $invoice->user_id;
         if ($prepareMethod) $intent = $this->prepareTransactionMethod($invoice, $intent, $status);
-        DB::transaction(function () use ($intent, $status, $userId, $subscriptionInvoiceId) {
-            $user = User::where('id', $userId)->lockForUpdate()->firstOrFail();
+        ExtensionLocks::transaction('user:' . $userId, function () use ($intent, $status, $userId, $subscriptionInvoiceId) {
             $invoice = Invoice::where('id', $intent->metadata->invoice_id)->lockForUpdate()->firstOrFail();
+            $user = User::where('id', $userId)->firstOrFail();
             $this->bindWebhookAttempt($user, $invoice, $intent);
             if ($this->lockedTransactions(InvoiceTransaction::where('transaction_id', $intent->id), 'succeeded')) {
                 $this->schedulePaymentReviewAlert($invoice, $intent->id);
@@ -335,6 +334,10 @@ trait Checkout
             if (strtolower($invoice->currency_code) !== strtolower($intent->currency ?? '')) {
                 \Illuminate\Support\Facades\Log::warning('AeStripe payment currency mismatch', ['invoice_id' => $invoice->id]);
                 if ($status === 'succeeded') $this->recordPaymentReview($invoice, $intent, 'currency mismatch');
+                return;
+            }
+            if ($status === 'succeeded' && !\Paymenter\Extensions\Gateways\AeStripe\SettlementStore::claim($intent->id, (int) $invoice->id)) {
+                DB::afterCommit(fn () => $this->processReceiptReturns($invoice, $intent->id));
                 return;
             }
             if ($this->readReceipt($user, $intent->id)['closed_invoice'] ?? false) {
@@ -356,7 +359,14 @@ trait Checkout
                 'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',
             };
             $amount = $status === 'succeeded' ? $intent->amount_received : $intent->amount;
-            $transaction = ExtensionHelper::{$helper}($invoice, 'AeStripe', $this->fromMinorUnits($amount, $intent->currency), null, $intent->id);
+            if ($status === 'failed') {
+                $failedId = $this->failedPaymentId($intent, $this->readPaymentAttempt($user, $invoice) ?? []);
+                foreach ($this->lockedTransactions(InvoiceTransaction::where('transaction_id', $intent->id), 'processing') as $pending) {
+                    InvoiceTransaction::whereKey($pending->id)->update(['transaction_id' => $failedId]);
+                }
+            }
+            $transaction = ExtensionHelper::{$helper}($invoice, 'AeStripe', $this->fromMinorUnits($amount, $intent->currency), null,
+                $status === 'failed' ? $this->failedPaymentId($intent, $this->readPaymentAttempt($user, $invoice) ?? []) : $intent->id);
             $this->recordTransactionMethod($transaction, $intent, $status === 'succeeded', $status === 'failed');
             if ($status === 'succeeded') {
                 $attempt = $this->readPaymentAttempt($user, $invoice);
@@ -479,7 +489,7 @@ trait Checkout
     private function methodCustomerMatches($user, $method, bool $current = false): bool
     {
         $property = $user->properties()->where('key', 'stripe_id');
-        $customer = ($current ? $property->lockForUpdate() : $property)->first()?->value;
+        $customer = ($current ? $property : $property)->first()?->value;
         if (!$customer || ($method->customer ?? null) !== $customer) {
             \Illuminate\Support\Facades\Log::warning('AeStripe saved method customer mismatch', ['user_id' => $user->id]);
             return false;

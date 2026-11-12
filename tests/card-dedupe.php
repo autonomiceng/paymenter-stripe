@@ -77,7 +77,7 @@ foreach (['on', 'off'] as $state) {
         $selectedBetweenPhases = false;
         if ($entry === 'selected before detach') {
             afterNextCommit(function () use ($owner, $accountProperty, $accountChoice, &$selectedBetweenPhases) {
-                check(!holdsLock('users'), 'The account choice commits after the first duplicate transaction');
+                check(!holdsLock('ae_stripe_locks'), 'The account choice commits after the first duplicate transaction');
                 $owner->properties()->create(['key' => $accountProperty, 'value' => $accountChoice]);
                 $selectedBetweenPhases = true;
             });

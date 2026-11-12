@@ -79,6 +79,8 @@ if ($scenario === 'all') {
     $service->billing_agreement_id = 33;
     $service->auto_pay = false;
     $serviceBefore = serialize($service);
+    DB::$tables['ae_stripe_locks']['user:7'] = ['scope' => 'user:7'];
+    DB::$tables['ae_stripe_settlements'] ??= [];
     $tablesBefore = DB::$tables;
     $entries = [
         'persistence' => fn () => invoke($gateway, 'persistAgreement', $user, $agreementMethod),
@@ -188,6 +190,9 @@ if ($scenario === 'all') {
         $entries[$entry]();
         check(count(ExtensionHelper::$agreements) === 1, "$entry retries redisplay without a second agreement");
     }
+    $tablesBefore['ae_stripe_settlements']['pi_duplicate'] = [
+        'payment_intent_id' => 'pi_duplicate', 'invoice_id' => 12, 'state' => 'succeeded',
+    ];
     check(serialize($service) === $serviceBefore && DB::$tables === $tablesBefore,
         'All agreement entry points preserve service assignments, Auto Pay and other tables');
     echo "PASS: agreement entry points, ownership and unique recovery\n";

@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Exceptions\DisplayException;
 use App\Models\{BillingAgreement, Credit, Invoice, InvoiceTransaction, User};
 use Illuminate\Http\Client\{ConnectionException, RequestException};
@@ -68,16 +70,24 @@ trait CheckoutIntent
             if (empty($intent->id) || isset($attempt['intent']) && $intent->id !== $attempt['intent']) {
                 $this->holdPaymentAttempt($invoice, $attempt, 'Stripe returned a different payment ID. Link the verified payment before continuing.');
             }
+            if (!empty($attempt['action'])) {
+                try { $this->sendPaymentAction($invoice, $intent, $attempt['action']['kind']); }
+                catch (RequestException | ConnectionException $e) {
+                    $this->paymentStripeUnavailable = true;
+                    $this->paymentPending('We are checking the earlier payment before replacing it.');
+                }
+                continue;
+            }
             if (!empty($attempt['automatic_renewal']) && ($intent->amount_received ?? 0) === 0
                 && $this->paymentAttemptFailed($attempt, $intent)) {
-                $refused = $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intent) {
-                    $stored = $this->readPaymentAttempt($user, $current);
-                    if (($stored['key'] ?? null) !== $attempt['key'] || empty($stored['automatic_renewal'])) return false;
-                    try { $fresh = $this->request('get', '/payment_intents/' . $intent->id); }
+                try { $fresh = $this->request('get', '/payment_intents/' . $intent->id); }
                     catch (RequestException | ConnectionException $e) {
                         $this->paymentStripeUnavailable = true;
                         $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
                     }
+                $refused = $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intent, $fresh) {
+                    $stored = $this->readPaymentAttempt($user, $current);
+                    if (($stored['key'] ?? null) !== $attempt['key'] || empty($stored['automatic_renewal'])) return false;
                     if (($fresh->amount_received ?? 0) !== 0 || !$this->paymentAttemptFailed($stored, $fresh)) return false;
                     $this->keepPreviousFailedAttempt($stored, $fresh);
                     // Keep the claimed confirmation until refusal and renewal policy commit together.
@@ -130,12 +140,8 @@ trait CheckoutIntent
                 || $intent->customer !== $invoice->user->properties()->where('key', 'stripe_id')->first()?->value) {
                 // Retire legacy tabs, failed Elements authentication and changes between native Pay and Elements.
                 try {
-                    $this->withPaymentLock($invoice, function ($user, $current) use ($intent) {
-                        $fresh = $this->request('get', '/payment_intents/' . $intent->id);
-                        if (($fresh->amount_received ?? 0) === 0 && in_array($fresh->status, ['requires_payment_method', 'requires_confirmation', 'requires_action'], true)) {
-                            $this->request('post', '/payment_intents/' . $fresh->id . '/cancel');
-                        }
-                    });
+                    $fresh = $this->request('get', '/payment_intents/' . $intent->id);
+                    $this->sendPaymentAction($invoice, $fresh, 'cancel');
                 }
                 catch (RequestException | ConnectionException $e) {
                     $this->paymentStripeUnavailable = true;
@@ -147,16 +153,8 @@ trait CheckoutIntent
             }
             try {
                 if (isset($intent->amount) && $intent->amount !== $attempt['due_amount']) {
-                    $intent = $this->withPaymentLock($invoice, function ($user, $current) use ($intent) {
-                        $fresh = $this->request('get', '/payment_intents/' . $intent->id);
-                        if (in_array($fresh->status, ['requires_payment_method', 'requires_confirmation'], true) && ($fresh->amount_received ?? 0) === 0) {
-                            return $this->request('post', '/payment_intents/' . $fresh->id, ['amount' => $this->paymentBalance($current)]);
-                        }
-                        if ($fresh->status === 'requires_action' && ($fresh->amount_received ?? 0) === 0) {
-                            return $this->request('post', '/payment_intents/' . $fresh->id . '/cancel');
-                        }
-                        return $fresh;
-                    });
+                    $fresh = $this->request('get', '/payment_intents/' . $intent->id);
+                    $intent = $this->sendPaymentAction($invoice, $fresh, 'amount');
                     if ($intent->status === 'canceled') continue;
                 }
             } catch (RequestException | ConnectionException $e) {
@@ -299,6 +297,26 @@ trait CheckoutIntent
         if ($failed) InvoiceTransaction::whereKey($failed)->update(['transaction_id' => $intent->id . ':' . $charge]);
     }
 
+    private function failedPaymentId($intent, array $attempt): string
+    {
+        $charge = is_object($intent->latest_charge ?? null) ? ($intent->latest_charge->id ?? null) : ($intent->latest_charge ?? null);
+        $source = $charge ?: ($attempt['refusal_key'] ?? $attempt['confirmation']['key'] ?? $attempt['key'] ?? null);
+        return $source ? $intent->id . ':' . $source : $intent->id;
+    }
+
+    private function hasFailedPayment($invoice, string $id): bool
+    {
+        if ($invoice) {
+            foreach ($invoice->transactions()->where('status', 'failed')->get() as $row) {
+                if ($row->transaction_id === $id || str_starts_with($row->transaction_id, $id . ':')) return true;
+            }
+            return false;
+        }
+        $prefix = addcslashes($id, '%_\\') . ':%';
+        return InvoiceTransaction::where('transaction_id', $id)->where('status', 'failed')->exists()
+            || InvoiceTransaction::where('transaction_id', 'like', $prefix)->where('status', 'failed')->exists();
+    }
+
     private function paymentAttemptFailed(array $attempt, $intent): bool
     {
         if ($intent->status !== 'requires_payment_method') return false;
@@ -310,7 +328,7 @@ trait CheckoutIntent
         }
         // Older confirmations have no baseline: honor a known failure rather than risk repeating a failed debit.
         return !empty($intent->last_payment_error)
-            || InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'failed')->exists();
+            || $this->hasFailedPayment(null, $intent->id);
     }
 
     private function newPaymentAttempt($invoice, array $data, int $amount, bool $elements = false): array
@@ -335,33 +353,29 @@ trait CheckoutIntent
     private function retireFailedElementsPayment($invoice, $intent)
     {
         if (($intent->status ?? null) !== 'requires_payment_method' || empty($intent->last_payment_error)) return $intent;
-        return $this->withPaymentLock($invoice, function ($user, $current) use ($intent) {
-            $attempt = $this->readPaymentAttempt($user, $current);
-            if (!$this->isElementsAttempt($attempt ?? [], $intent)) return $intent;
-            $fresh = $this->request('get', '/payment_intents/' . $intent->id);
-            if ($fresh->status === 'requires_payment_method' && !empty($fresh->last_payment_error) && ($fresh->amount_received ?? 0) === 0) {
-                return $this->request('post', '/payment_intents/' . $fresh->id . '/cancel');
-            }
-            return $fresh;
-        });
+        $elements = $this->withPaymentLock($invoice, fn ($user, $current) => $this->isElementsAttempt($this->readPaymentAttempt($user, $current) ?? [], $intent));
+        if (!$elements) return $intent;
+        $fresh = $this->request('get', '/payment_intents/' . $intent->id);
+        return $fresh->status === 'requires_payment_method' && !empty($fresh->last_payment_error)
+            ? $this->sendPaymentAction($invoice, $fresh, 'cancel') : $fresh;
     }
 
     /**
-     * Runs $callback in a transaction holding the owner's user row and the invoice row, and runs it again when MariaDB
+     * Runs $callback under the customer's extension scope and the invoice's exact primary key, and runs it again when MariaDB
      * rolls it back as a deadlock victim. With $rerun, a rolled back transaction runs again only while $rerun() is
      * true: a callback that sends a Stripe write makes it false first, so that write is never sent twice.
      */
     private function withPaymentLock($invoice, callable $callback, ?callable $rerun = null)
     {
         $locked = function () use ($invoice, $callback) {
-            $user = User::where('id', $invoice->user_id)->lockForUpdate()->firstOrFail();
             $current = Invoice::where('id', $invoice->id)->lockForUpdate()->firstOrFail();
+            $user = User::where('id', $invoice->user_id)->firstOrFail();
             abort_unless($current->user_id === $user->id, 403);
             return $callback($user, $current);
         };
-        if (!$rerun) return DB::transaction($locked, self::SETTLEMENT_ATTEMPTS);
+        if (!$rerun) return ExtensionLocks::transaction('user:' . $invoice->user_id, $locked, self::SETTLEMENT_ATTEMPTS);
         for ($attempt = 1; ; ++$attempt) {
-            try { return DB::transaction($locked, 1); }
+            try { return ExtensionLocks::transaction('user:' . $invoice->user_id, $locked, 1); }
             catch (\Throwable $e) {
                 if ($attempt >= self::SETTLEMENT_ATTEMPTS || DB::transactionLevel() > 0 || !$rerun() || !$this->lockConflict($e)) throw $e;
             }
@@ -377,6 +391,7 @@ trait CheckoutIntent
 
     private function paymentBalance($invoice): int
     {
+        if (DB::transactionLevel() > 1) $invoice->setRelation('items', $invoice->items()->lockForUpdate()->get());
         $paid = array_sum(array_map(fn ($row) => $row->amount, $this->lockedTransactions($invoice->transactions(), 'succeeded')));
         return $this->toMinorUnits($invoice->total - $paid, $invoice->currency_code);
     }
@@ -387,45 +402,37 @@ trait CheckoutIntent
         return $stored ? $this->clearFinishedPaymentConstraints(json_decode($stored, true, flags: JSON_THROW_ON_ERROR)) : null;
     }
 
-    /**
-     * One of the user's properties, read under the user row lock. Every writer of these keys holds that lock, so a
-     * plain read sees the latest row, and only a row that exists is then locked. A locking read of a missing key would
-     * lock a gap of the properties index shared with other customers: two customers whose Pay each locks that gap and
-     * then inserts its own key deadlock (SQLSTATE 40001).
-     */
+    /** Read extension properties under the customer's extension scope, without locking shared index gaps. */
     private function lockedUserProperty($user, string $key)
     {
-        if (!$user->properties()->where('key', $key)->first()) return null;
-        return $user->properties()->where('key', $key)->lockForUpdate()->first();
+        return $user->properties()->where('key', $key)->first();
     }
 
-    /**
-     * The user's properties whose keys start with the prefix, read under the user row lock like lockedUserProperty.
-     * Each row is then locked by its exact key: a locking range read would lock every customer's keys in that range and
-     * the gaps between them, so two customers inserting their own keys there deadlock.
-     */
+    /** Read and sort the customer's extension properties without a locking range scan. */
     private function lockedUserProperties($user, string $prefix): array
     {
         $rows = [];
         foreach ($user->properties()->where('key', 'like', $prefix . '%')->get() as $row) {
-            if ($locked = $user->properties()->where('key', $row->key)->lockForUpdate()->first()) $rows[] = $locked;
+            if ($locked = $user->properties()->where('key', $row->key)->first()) $rows[] = $locked;
         }
         return $rows;
     }
 
     /**
-     * Invoice transactions matching the query, with the given status, read under the payment locks. Paymenter writes a
-     * transaction while holding the invoice row lock (ExtensionHelper::addPayment) and this extension also holds the
-     * owner's user row lock, so a plain read sees the latest rows. Only the rows found are then locked, by primary key, in
-     * id order. invoice_transactions has no transaction_id index, so a locking read by transaction_id locks every row
-     * and gap of the table, and a locking read by invoice locks the invoice_id index gap shared with the next invoice.
-     * The payment inserted next waits on either, so two settlements, or a Pay and a settlement, deadlock.
+     * Discover payments after the invoice lock, then lock existing rows by primary key in id order. An enclosing
+     * transaction needs locking discovery because its earlier read view can omit newly committed payments. Fresh
+     * transactions avoid range locks: invoice_transactions has no transaction_id index, and even invoice_id locks
+     * share an index gap with the next invoice, so two settlements that subsequently insert could deadlock.
      */
     private function lockedTransactions($query, ?string $status = null): array
     {
-        $ids = ($status === null ? $query : $query->where('status', $status))->pluck('id')->all();
+        $query = $status === null ? $query : $query->where('status', $status);
+        $ids = ExtensionLocks::currentRead($query)->pluck('id')->all();
         $locked = [];
-        foreach ($ids ? InvoiceTransaction::whereKey($ids)->orderBy('id')->lockForUpdate()->get() : [] as $row) {
+        sort($ids);
+        foreach ($ids as $id) {
+            $row = InvoiceTransaction::whereKey($id)->lockForUpdate()->first();
+            if (!$row) continue;
             if ($status === null || ($row->status->value ?? $row->status) === $status) $locked[] = $row;
         }
         return $locked;
@@ -505,8 +512,7 @@ trait CheckoutIntent
 
     private function confirmAttempt($invoice, string $intentId, array $params, ?BillingAgreement $agreement = null, ?int $expectedAmount = null, ?string $expectedCurrency = null)
     {
-        // Persist the confirmation identity before HTTP. The second transaction keeps credits,
-        // card removal and other callers out until Stripe responds (or the request times out).
+        // Commit the confirmation identity before HTTP. Other extension paths honor this claim until its answer is recorded.
         $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($intentId, $params, $agreement, $expectedAmount, $expectedCurrency) {
             $attempt = $this->readPaymentAttempt($user, $current);
             if (($attempt['intent'] ?? null) !== $intentId) $this->paymentPending('Payment changed. Refresh the invoice to check its status.');
@@ -517,7 +523,8 @@ trait CheckoutIntent
                 if (($attempt['renewal']['state'] ?? null) !== 'active') throw new DisplayException('Auto Pay stopped for this renewal. Open the invoice to pay the amount due.');
                 if (!empty($attempt['confirmation'])) return $attempt; // Resume the claimed instruction, never replace its identity.
             }
-            $attempt['confirmation'] = ['key' => 'confirm_' . bin2hex(random_bytes(16)), 'params' => $params, 'agreement' => $agreement?->id, 'amount' => $expectedAmount, 'currency' => $expectedCurrency, 'previous_charge' => $attempt['latest_charge'] ?? null];
+            if (!empty($attempt['confirmation']) && ($attempt['confirmation']['phase'] ?? null) === 'sending') return $attempt;
+            $attempt['confirmation'] = ['key' => 'confirm_' . bin2hex(random_bytes(16)), 'params' => $params, 'agreement' => $agreement?->id, 'amount' => $expectedAmount, 'currency' => $expectedCurrency, 'previous_charge' => $attempt['latest_charge'] ?? null, 'phase' => 'reserved'];
             // Keep this identity after the confirmation is cleared; another Pay can reuse the checkout attempt.
             $attempt['refusal_key'] = $attempt['confirmation']['key'];
             unset($attempt['agreement_pending']); // The confirmation now owns this instruction.
@@ -539,8 +546,14 @@ trait CheckoutIntent
         $previous = null;
         // Records Stripe's answer: a proven refusal ends this confirmation, and a declined renewal is recorded as failed.
         // The refusal, the failed payment and the renewal policy commit in one owner and invoice transaction, or not at all.
-        $record = function ($outcome) use ($invoice, $attempt, &$previous) {
-            return $this->withPaymentLock($invoice, function () use ($outcome, $invoice, $attempt, $previous) {
+        $record = function ($outcome, bool $oneShot = false) use ($invoice, $attempt, &$previous) {
+            return $this->withPaymentLock($invoice, function ($user, $current) use ($outcome, $invoice, $attempt, $previous) {
+                // A late answer belongs only to its own confirmation, never to a later instruction on the same intent.
+                $stored = $this->readPaymentAttempt($user, $current);
+                if (($stored['confirmation']['key'] ?? null) !== $attempt['confirmation']['key']) {
+                    if (!is_array($outcome) && $outcome->status !== 'requires_payment_method') return $outcome;
+                    return new PaymentPendingException('Payment changed. Refresh the invoice to check its status.');
+                }
                 // Repeat the idempotent re-key if the confirmation transaction rolled back.
                 if ($previous) $this->keepFailedAttempt($previous);
                 if (is_array($outcome)) {
@@ -554,14 +567,20 @@ trait CheckoutIntent
                 if (!empty($attempt['automatic_renewal']) && $outcome->status === 'requires_payment_method'
                     && ($outcome->amount_received ?? 0) === 0 && !empty($outcome->last_payment_error)) $this->recordIntentPayment($outcome, 'failed');
                 return $outcome;
-            });
+            }, $oneShot ? fn () => false : null);
         };
         $outcome = null;
-        $confirm = function ($user, $current) use ($attempt, $intentId, $params, $agreement, $expectedAmount, $expectedCurrency, &$writeStarted, &$outcome, &$previous, $record) {
-            $stored = $this->readPaymentAttempt($user, $current);
-            if (($stored['confirmation']['key'] ?? null) !== $attempt['confirmation']['key']) return null;
-            try {
-                $intent = $this->request('get', '/payment_intents/' . $intentId);
+        $result = null;
+        try {
+            $intent = $this->request('get', '/payment_intents/' . $intentId);
+            $method = $agreement && in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)
+                ? $this->request('get', '/payment_methods/' . $agreement->external_reference) : null;
+            $previous = clone $intent;
+            if (array_key_exists('previous_charge', $attempt['confirmation'])) $previous->latest_charge = $attempt['confirmation']['previous_charge'];
+            $send = $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intent, $params, $agreement, $method, $expectedAmount, $expectedCurrency) {
+                $stored = $this->readPaymentAttempt($user, $current);
+                if (($stored['confirmation']['key'] ?? null) !== $attempt['confirmation']['key']) return null;
+                if (!empty($stored['action'])) return null;
                 if (!in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) return $intent;
                 if (!empty($stored['automatic_renewal']) && (empty($stored['renewal'])
                     || $stored['renewal']['state'] !== 'active' || !$this->renewalStillAuthorized($current, $stored['renewal']))) {
@@ -572,6 +591,9 @@ trait CheckoutIntent
                     return new DisplayException('The Auto Pay card changed. Refresh Payment methods before paying.');
                 }
                 $amount = $this->paymentBalance($current);
+                if (isset($stored['confirmation']['updates']) && ($stored['confirmation']['updates']['amount'] ?? null) !== $amount) {
+                    $this->paymentPending('The amount due changed. We are checking the earlier payment automatically.');
+                }
                 if ($current->status !== 'pending' || $amount <= 0) return new DisplayException('This invoice has no payment due. Refresh the invoice.');
                 if ($expectedCurrency !== null && strtolower($current->currency_code) !== strtolower($expectedCurrency)
                     || strtolower($intent->currency) !== strtolower($current->currency_code) || $expectedAmount !== null && $amount !== $expectedAmount) {
@@ -584,48 +606,49 @@ trait CheckoutIntent
                         || $active->external_reference !== $params['payment_method']) {
                         return new DisplayException('This payment method was removed. Choose another payment method.');
                     }
-                    $method = $this->request('get', '/payment_methods/' . $active->external_reference);
                     if (($method->customer ?? null) !== $intent->customer) return new DisplayException('This payment method is no longer saved. Choose another payment method.');
                 }
                 if ($intent->customer !== $user->properties()->where('key', 'stripe_id')->first()?->value) return new DisplayException('The payment account changed. Refresh the invoice before paying.');
                 if (($intent->confirmation_method ?? null) !== 'manual' && !$this->isElementsAttempt($stored, $intent)) return new DisplayException('The payment form changed. Refresh the invoice before paying.');
                 if (isset($params['confirmation_token']) && (!$this->isElementsAttempt($stored, $intent)
                     || !isset($intent->payment_method_types) || !self::sameMethodTypes($intent->payment_method_types, ['card', 'link']))) return new DisplayException('The payment form changed. Refresh the invoice before paying.');
+                if (isset($stored['confirmation']['updates'])) return $stored['confirmation'];
                 $updates = ['amount' => $amount];
                 foreach (['metadata', 'setup_future_usage'] as $field) {
                     if (array_key_exists($field, $params)) { $updates[$field] = $params[$field]; unset($params[$field]); }
                 }
-                $this->keepFailedAttempt($intent);
-                $previous = clone $intent;
+                $stored['confirmation']['updates'] = $updates;
+                $stored['confirmation']['params'] = $params;
+                $stored['confirmation']['phase'] = 'sending';
+                $this->writePaymentAttempt($user, $current, $stored);
+                return $stored['confirmation'];
+            });
+            if (is_array($send)) {
                 $writeStarted = true;
-                $this->request('post', '/payment_intents/' . $intentId, $updates);
-                $outcome = $this->request('post', '/payment_intents/' . $intentId . '/confirm', $params, $attempt['confirmation']['key']);
-                return $record($outcome);
-            } catch (RequestException | ConnectionException $e) {
-                if ($e instanceof RequestException && $writeStarted && $this->definitePaymentRefusal($e)) {
-                    // Even a 400 may follow a debit. Prove refusal and commit its transition before releasing these locks.
-                    try {
-                        $fresh = $this->request('get', '/payment_intents/' . $intentId);
-                        if (($fresh->amount_received ?? 0) === 0 && in_array($fresh->status, ['requires_payment_method', 'requires_confirmation', 'canceled'], true)) {
-                            return $record($outcome = ['refused' => $fresh, 'error' => $e]);
-                        }
-                        return $fresh;
-                    } catch (RequestException | ConnectionException $readError) { return $readError; }
-                }
-                return $e;
-            }
-        };
-        // A lock conflict reruns the confirmation only before the Stripe update is sent, so no rerun repeats it.
-        try { $result = $this->withPaymentLock($invoice, $confirm, function () use (&$writeStarted) { return !$writeStarted; }); }
-        catch (\Throwable $e) {
-            // Stripe answered, but a lock conflict rolled back its recording: record that answer again without calling Stripe.
-            if ($outcome === null || DB::transactionLevel() > 0 || !$this->lockConflict($e)) throw $e;
-            try { $result = $record($outcome); }
+                $this->request('post', '/payment_intents/' . $intentId, $send['updates'], $send['key'] . '_update');
+                $outcome = $this->request('post', '/payment_intents/' . $intentId . '/confirm', $send['params'], $send['key']);
+            } else $result = $send;
+        } catch (RequestException | ConnectionException $e) {
+            if ($e instanceof RequestException && $writeStarted && $this->definitePaymentRefusal($e)) {
+                try {
+                    $fresh = $this->request('get', '/payment_intents/' . $intentId);
+                    if (($fresh->amount_received ?? 0) === 0 && in_array($fresh->status, ['requires_payment_method', 'requires_confirmation', 'canceled'], true)) {
+                        $outcome = ['refused' => $fresh, 'error' => $e];
+                    } else $result = $fresh;
+                } catch (RequestException | ConnectionException $readError) { $result = $readError; }
+            } else $result = $e;
+        }
+        if ($outcome !== null) {
+            try { $result = $record($outcome, true); }
             catch (\Throwable $e) {
-                // Nothing was recorded and the confirmation stays claimed, so recovery reads Stripe's answer again.
+                // Retry only local recording; the already-sent provider writes are never rerun.
                 if (DB::transactionLevel() > 0 || !$this->lockConflict($e)) throw $e;
-                report($e);
-                $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
+                try { $result = $record($outcome); }
+                catch (\Throwable $e) {
+                    if (DB::transactionLevel() > 0 || !$this->lockConflict($e)) throw $e;
+                    report($e);
+                    $this->paymentPending('We are checking this payment automatically. Refresh the invoice for its status.');
+                }
             }
         }
         if ($result === null || $result instanceof RequestException || $result instanceof ConnectionException) {
@@ -643,7 +666,7 @@ trait CheckoutIntent
             // token must not be replayed; Stripe already holds the authenticated payment method.
             $resumeParams = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id]), 'use_stripe_sdk' => 'true'];
             if ($agreement) $resumeParams['payment_method'] = $agreement->external_reference;
-            $resume = ['key' => $attempt['confirmation']['key'], 'params' => $resumeParams, 'agreement' => $agreement?->id, 'amount' => $expectedAmount ?? $result->amount, 'currency' => $expectedCurrency ?? $result->currency];
+            $resume = ['key' => $attempt['confirmation']['key'], 'params' => $resumeParams, 'agreement' => $agreement?->id, 'amount' => $expectedAmount ?? $result->amount, 'currency' => $expectedCurrency ?? $result->currency, 'phase' => 'observed'];
         }
         $this->storePaymentAttempt($invoice, $attempt, ['retry' => !($result instanceof DisplayException)
             && in_array($result->status, ['succeeded', 'processing', 'requires_capture', 'requires_action'], true), 'confirmation' => $resume, 'agreement_id' => null, 'funds_pending' => !($result instanceof DisplayException)

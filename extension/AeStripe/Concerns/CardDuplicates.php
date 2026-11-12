@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Exceptions\DisplayException;
 use App\Models\{BillingAgreement, Gateway, User};
 use Illuminate\Http\Client\RequestException;
@@ -21,9 +23,9 @@ trait CardDuplicates
     // Only local current reads belong here. The cache lock spans the unlocked HTTP phases.
     private function cleanupSnapshot($user, $gateway): array
     {
-        User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-        $customer = $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value;
-        $rows = [...BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->get()];
+        User::where('id', $user->id)->firstOrFail();
+        $customer = $user->properties()->where('key', 'stripe_id')->first()?->value;
+        $rows = [...BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->get()];
         $state = [];
         foreach ($rows as $row) $state[(string) $row->id] = [$row->external_reference, $row->user_id, $row->gateway_id,
             $row->name, $row->type, (string) $row->expiry, (string) $row->created_at, (string) $row->updated_at];
@@ -49,11 +51,11 @@ trait CardDuplicates
 
     private function duplicateIsBound($user, $incoming, ?callable $report): bool
     {
-        $service = $incoming->services()->lockForUpdate()->first();
+        $service = $incoming->services()->first();
         $bound = $service || $this->autoPayCard($user, lock: true) == $incoming->id;
         if (!$bound) return false;
-        $reservation = json_decode($user->properties()->where('key', 'ae_stripe_duplicate_' . $incoming->external_reference)->lockForUpdate()->first()?->value ?? 'null', true);
-        if (($reservation['customer'] ?? null) === $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value
+        $reservation = json_decode($user->properties()->where('key', 'ae_stripe_duplicate_' . $incoming->external_reference)->first()?->value ?? 'null', true);
+        if (($reservation['customer'] ?? null) === $user->properties()->where('key', 'stripe_id')->first()?->value
             && ($reservation['gateway'] ?? null) == $incoming->gateway_id) throw new DisplayException('Reserved saved card is still bound. Review its cleanup plan.');
         if ($service) {
             Log::info('AeStripe duplicate card kept: agreement is bound to a service', ['agreement_id' => $incoming->id]);
@@ -85,7 +87,7 @@ trait CardDuplicates
             if (!$candidates) {
                 if (($method->customer ?? null) !== $snapshot['customer']) throw new DisplayException('Detached saved card could not be reconciled. Review it manually.');
                 if (!$apply) throw new SavedMethodRetryException('Unused saved card reservation needs cancellation. Run cleanup with --apply.');
-                DB::transaction(function () use ($user, $gateway, $snapshot, $method) {
+                ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $gateway, $snapshot, $method) {
                     $this->cleanupUnchanged($user, $gateway, $snapshot);
                     $user->properties()->where('key', 'ae_stripe_duplicate_' . $method->id)->delete();
                 });
@@ -120,7 +122,7 @@ trait CardDuplicates
     private function cleanupCard($row, $gateway, bool $apply, callable $report): void
     {
         $user = User::where('id', $row->user_id)->firstOrFail();
-        $snapshot = DB::transaction(fn () => $this->cleanupSnapshot($user, $gateway));
+        $snapshot = ExtensionLocks::transaction('user:' . $user->id, fn () => $this->cleanupSnapshot($user, $gateway));
         $incoming = null;
         foreach ($snapshot['rows'] as $current) if ($current->id == $row->id && $current->external_reference === $row->external_reference) $incoming = $current;
         if (!$incoming) return;
@@ -132,7 +134,7 @@ trait CardDuplicates
         if (!$candidate) return;
         [$method, $kept, $remote] = $candidate;
         $detached = ($method->customer ?? null) === null;
-        $bound = DB::transaction(function () use ($user, $gateway, $snapshot, $incoming, $report, $detached) {
+        $bound = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $gateway, $snapshot, $incoming, $report, $detached) {
             $this->cleanupUnchanged($user, $gateway, $snapshot);
             return !$detached && $this->duplicateIsBound($user, $incoming, $report);
         });
@@ -149,7 +151,7 @@ trait CardDuplicates
             || $this->cardIdentity($fresh) !== $this->cardIdentity($method)
             || ($remote->id ?? null) !== $kept->external_reference || ($remote->customer ?? null) !== $snapshot['customer']
             || $this->cardIdentity($remote) !== $this->cardIdentity($method)) throw new SavedMethodRetryException('Saved payment methods changed. Try again.');
-        $reserved = DB::transaction(function () use ($user, $gateway, $snapshot, $incoming, $method, $kept, $report, $detached) {
+        $reserved = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $gateway, $snapshot, $incoming, $method, $kept, $report, $detached) {
             $this->cleanupUnchanged($user, $gateway, $snapshot);
             if (!$detached && $this->duplicateIsBound($user, $incoming, $report)) return null;
             $user->properties()->updateOrCreate(['key' => 'ae_stripe_duplicate_' . $method->id], ['value' => json_encode([
@@ -166,10 +168,10 @@ trait CardDuplicates
         $verified = $this->request('get', '/payment_methods/' . $kept->external_reference);
         if (($verified->id ?? null) !== $kept->external_reference || ($verified->customer ?? null) !== $snapshot['customer']
             || $this->cardIdentity($verified) !== $this->cardIdentity($method)) throw new DisplayException('Detached saved card could not be reconciled. Review it manually.');
-        DB::transaction(function () use ($user, $gateway, $reserved, $incoming, $kept, $method, $report) {
+        ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $gateway, $reserved, $incoming, $kept, $method, $report) {
             $this->cleanupUnchanged($user, $gateway, $reserved, bindings: true);
             $this->reconcileDuplicateBindings($user, $incoming, $kept);
-            foreach ($user->properties()->where('key', 'like', 'ae_stripe_saved_%')->lockForUpdate()->get() as $property) {
+            foreach ($user->properties()->where('key', 'like', 'ae_stripe_saved_%')->get() as $property) {
                 $receipt = json_decode($property->value, true);
                 if (($receipt['reference'] ?? null) !== $method->id || ($receipt['consent']['user_id'] ?? null) != $user->id) continue;
                 $receipt['reference'] = $kept->external_reference;
@@ -183,13 +185,13 @@ trait CardDuplicates
     private function reconcileDuplicateBindings($user, $incoming, $kept): void
     {
         foreach ([self::AUTO_PAY_PROPERTY, self::AUTO_PAY_CARD] as $key) {
-            $record = json_decode($user->properties()->where('key', $key)->lockForUpdate()->first()?->value ?? 'null', true);
+            $record = json_decode($user->properties()->where('key', $key)->first()?->value ?? 'null', true);
             if (($record['agreement_id'] ?? null) != $incoming->id) continue;
             if (($record['user_id'] ?? null) != $user->id) throw new DisplayException('Saved card bindings could not be reconciled. Review them manually.');
             $record['agreement_id'] = (int) $kept->id;
             $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($record, JSON_THROW_ON_ERROR)]);
         }
-        foreach ($incoming->services()->lockForUpdate()->get() as $service) {
+        foreach ($incoming->services()->get() as $service) {
             if ($service->user_id != $user->id) throw new DisplayException('Saved card bindings could not be reconciled. Review them manually.');
             $service->update(['billing_agreement_id' => $kept->id]);
         }

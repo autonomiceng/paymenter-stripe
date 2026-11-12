@@ -23,8 +23,16 @@ $container->instance('db', $capsule->getDatabaseManager());
 $container->bind('db.schema', fn () => $capsule->getConnection()->getSchemaBuilder());
 Facade::setFacadeApplication($container);
 $schema = $capsule->getConnection()->getSchemaBuilder();
-$schema->create('invoice_transactions', fn ($table) => $table->id());
-DB::table('invoice_transactions')->insert([['id' => 1], ['id' => 2]]);
+$schema->create('extensions', function ($table) { $table->id(); $table->string('extension'); });
+$schema->create('invoice_transactions', function ($table) {
+    $table->id(); $table->unsignedBigInteger('gateway_id'); $table->unsignedBigInteger('invoice_id');
+    $table->string('status'); $table->string('transaction_id');
+});
+DB::table('extensions')->insert([['id' => 1, 'extension' => 'AeStripe'], ['id' => 2, 'extension' => 'Other']]);
+DB::table('invoice_transactions')->insert([
+    ['id' => 1, 'gateway_id' => 1, 'invoice_id' => 12, 'status' => 'succeeded', 'transaction_id' => 'pi_existing'],
+    ['id' => 2, 'gateway_id' => 2, 'invoice_id' => 13, 'status' => 'succeeded', 'transaction_id' => 'pi_foreign'],
+]);
 $repository = new DatabaseMigrationRepository($capsule->getDatabaseManager(), 'migrations');
 $repository->createRepository();
 $container->instance(Migrator::class, new Migrator($repository, $capsule->getDatabaseManager(), new Filesystem));
@@ -39,6 +47,7 @@ $gateway->installed();
 verifyNative(Schema::hasTable('ae_stripe_transaction_methods'));
 $gateway->upgraded('0.1.0');
 verifyNative(DB::table('migrations')->count() === count(glob(__DIR__ . '/../extension/AeStripe/database/migrations/*.php')));
+verifyNative(DB::table('ae_stripe_settlements')->pluck('invoice_id', 'payment_intent_id')->all() === ['pi_existing' => 12]);
 $record = new ReflectionMethod($gateway, 'recordTransactionMethod');
 $intent = json_decode('{"latest_charge":{"payment_method_details":{"type":"card","card":{"brand":"visa","last4":"4242","fingerprint":"never-store"}}}}');
 DB::transaction(fn () => $record->invoke($gateway, (object) ['id' => 1, 'invoice_id' => 12], $intent, false));

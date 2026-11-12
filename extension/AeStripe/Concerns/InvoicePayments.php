@@ -6,13 +6,17 @@ use App\Models\InvoiceTransaction;
 
 trait InvoicePayments
 {
-    /** Call under the caller's user/invoice transaction before applying credit. False means funds are in flight. */
-    public function cancelInvoicePayments($invoice): bool
+    /** Retire the provider form before a caller applies credit. Unknown funds keep credit waiting. */
+    public function cancelInvoicePayments($invoice, bool $forCredit = false, ?string $expectedAttemptKey = null): bool
     {
-        return $this->withPaymentLock($invoice, function ($user, $current) {
+        $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($forCredit, $expectedAttemptKey) {
+            if ($forCredit) {
+                abort_unless($current->user_id == \Illuminate\Support\Facades\Auth::id(), 403);
+                if ($current->status !== 'pending') return false;
+            }
             $attempt = $this->readPaymentAttempt($user, $current);
+            if ($expectedAttemptKey !== null && ($attempt['key'] ?? null) !== $expectedAttemptKey) return false;
             if (!$attempt) {
-                // Older asynchronous debits may predate durable attempt properties.
                 foreach ($this->lockedTransactions($current->transactions(), 'processing') as $transaction) {
                     if (($transaction->gateway->extension ?? null) === 'AeStripe') return false;
                 }
@@ -20,9 +24,8 @@ trait InvoicePayments
             }
             if (!empty($attempt['renewal_only'])) {
                 $this->replacePaymentAttempt($current, $attempt, keepWaitingRenewal: true);
-                return true; // Only a waiting schedule remains; there is no payable provider intent.
+                return true;
             }
-            // Persist before HTTP so an outage is retried even for a checkout-only form.
             $attempt['retire'] = true;
             $attempt['retry'] = true;
             $this->writePaymentAttempt($user, $current, $attempt);
@@ -34,35 +37,48 @@ trait InvoicePayments
                     return $this->deferInvoiceRetirement($current, $attempt, 'An older debit may have been sent. Verify its Stripe request before applying credit.');
                 }
                 if (time() - $attempt['created'] >= 23 * 3600) {
-                    // No client secret can have left checkout before its ID was stored.
                     $this->replacePaymentAttempt($current, $attempt, keepWaitingRenewal: true);
                     return true;
                 }
-                $intent = $this->request('post', '/payment_intents', $attempt['params'], $attempt['key']);
-                $attempt['intent'] = $intent->id;
-                $this->writePaymentAttempt($user, $current, $attempt);
             }
-            try { $intent = $this->request('get', '/payment_intents/' . $attempt['intent']); }
+            return $attempt;
+        });
+        if (is_bool($attempt)) return $attempt;
+        // A core transaction cannot be suspended for HTTP. Its committed retirement is completed after commit.
+        if (\Illuminate\Support\Facades\DB::transactionLevel() > 0) {
+            \Illuminate\Support\Facades\DB::afterCommit(fn () => $this->cancelInvoicePayments($invoice));
+            return false;
+        }
+        if (empty($attempt['intent'])) {
+            $created = $this->request('post', '/payment_intents', $attempt['params'], $attempt['key']);
+            if (!$this->rememberPaymentIntent($invoice, $attempt, $created)) return false;
+            $attempt['intent'] = $created->id;
+        }
+        try { $intent = $this->request('get', '/payment_intents/' . $attempt['intent']); }
+        catch (\Illuminate\Http\Client\RequestException $e) {
+            if ($e->response->status() !== 404) throw $e;
+            return $this->deferInvoiceRetirement($invoice, $attempt, $this->missingPaymentReason($attempt));
+        }
+        if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation', 'requires_action'], true)
+            && ($intent->amount_received ?? 0) === 0) {
+            try { $intent = $this->sendPaymentAction($invoice, $intent, 'cancel'); }
             catch (\Illuminate\Http\Client\RequestException $e) {
-                if ($e->response->status() !== 404) throw $e;
-                return $this->deferInvoiceRetirement($current, $attempt, $this->missingPaymentReason($attempt));
+                if ($e->response->status() !== 400) throw $e;
+                $intent = $this->request('get', '/payment_intents/' . $intent->id);
+                if (!in_array($intent->status, ['processing', 'requires_capture', 'succeeded', 'canceled'], true)) throw $e;
             }
-            if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation', 'requires_action'], true)
-                && ($intent->amount_received ?? 0) === 0) {
-                try { $intent = $this->request('post', '/payment_intents/' . $intent->id . '/cancel'); }
-                catch (\Illuminate\Http\Client\RequestException $e) {
-                    if ($e->response->status() !== 400) throw $e;
-                    // Confirmation may have won at Stripe. Re-read; never cancel processing money.
-                    $intent = $this->request('get', '/payment_intents/' . $intent->id);
-                    if (!in_array($intent->status, ['processing', 'requires_capture', 'succeeded', 'canceled'], true)) throw $e;
-                }
+        }
+        if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
+        return $this->withPaymentLock($invoice, function ($user, $current) use ($attempt, $intent, $forCredit) {
+            if ($forCredit) {
+                abort_unless($current->user_id == \Illuminate\Support\Facades\Auth::id(), 403);
+                if ($current->status !== 'pending') return false;
             }
-            if ($intent->status === 'succeeded') $this->recordIntentPayment($intent, 'succeeded');
+            if (($this->readPaymentAttempt($user, $current)['key'] ?? null) !== $attempt['key']) return false;
             if ($intent->status === 'canceled' && ($intent->amount_received ?? 0) === 0
                 || $intent->status === 'succeeded' && (!in_array($current->status, ['pending', 'paid'], true)
                     || InvoiceTransaction::where('transaction_id', $intent->id)->where('status', 'succeeded')->exists())) {
                 $this->replacePaymentAttempt($current, $attempt, keepWaitingRenewal: true);
-                // Settlement/review owns received money now. Credit callers must re-read the balance.
                 return $intent->status === 'canceled';
             }
             if (($intent->amount_received ?? 0) > 0 && !in_array($intent->status, ['processing', 'requires_capture', 'succeeded'], true)) {

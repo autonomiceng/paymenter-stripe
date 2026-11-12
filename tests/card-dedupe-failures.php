@@ -41,7 +41,7 @@ nativeAgreement(20, 'pm_live');
 $otherBefore = agreements()['pm_live'];
 $owner->properties()->create(['key' => 'ae_stripe_auto_pay_default', 'value' => json_encode(['agreement_id' => 19])]);
 $GLOBALS['stripeHandler'] = function ($verb, $path) {
-    check(!holdsLock('users'), 'A missing clicked method is read outside the owner lock');
+    check(!holdsLock('ae_stripe_locks'), 'A missing clicked method is read outside the owner lock');
     if ($verb === 'get' && $path === '/payment_methods/pm_cancel') throw new StripeFixtureError(404, ['error' => ['code' => 'resource_missing']]);
     throw new RuntimeException('A missing clicked method cannot authorize reading or detaching other methods');
 };
@@ -59,7 +59,7 @@ foreach (['row', 'receipt'] as $source) foreach (['missing', 'server', 'connecti
     $detached = [];
     $ownerLocks = [];
     $GLOBALS['stripeHandler'] = function ($verb, $path) use ($failure, &$detached, &$ownerLocks) {
-        $ownerLocks[] = holdsLock('users');
+        $ownerLocks[] = holdsLock('ae_stripe_locks');
         if ($verb === 'get' && $path === '/payment_methods/pm_dead') {
             if ($failure === 'connection') throw new ConnectionException('Synthetic outage');
             throw new StripeFixtureError($failure === 'server' ? 503 : 404, ['error' => ['code' => $failure === 'missing' ? 'resource_missing' : 'unknown']]);

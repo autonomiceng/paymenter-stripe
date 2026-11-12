@@ -242,7 +242,6 @@ if (str_starts_with($case, 'polish-staff')) {
             });
             (new ReflectionMethod($gateway, 'retrySavedMethodNotices'))->invoke($gateway);
         } else {
-            foreach (glob(__DIR__ . '/../extension/AeStripe/database/migrations/*.php') as $migration) (require $migration)->up();
             $body = json_encode(['type' => 'payment_intent.succeeded', 'data' => ['object' => $intent]]);
             $signature = 't=' . time() . ',v1=' . hash_hmac('sha256', time() . '.' . $body, 'whsec_fixture');
             $request = Illuminate\Http\Request::create('/', 'POST', [], [], [], ['HTTP_STRIPE_SIGNATURE' => $signature], $body);

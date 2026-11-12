@@ -92,7 +92,7 @@ trait ReceiptReversals
     private function receiptHasReversalHold(string $id): bool
     {
         // Inquiries take no money, but retain the existing hold while the outcome is unresolved.
-        foreach ($this->receiptRows()->where('payment_intent_id', $id)->lockForUpdate()->get() as $row) {
+        foreach ($this->receiptRows()->where('payment_intent_id', $id)->get() as $row) {
             if (str_starts_with($row->allocation_key, 'stripe:refund:')
                 || str_starts_with($row->allocation_key, 'stripe:dispute:') && !in_array($row->state, ['won', 'cleared'], true)) return true;
         }
@@ -107,7 +107,7 @@ trait ReceiptReversals
             $receipt = $this->readReceipt($user, $paymentIntentId);
             abort_unless(!$receipt || $receipt['invoice_id'] === $current->id, 409);
             $result = [];
-            foreach ($this->receiptRows()->where('payment_intent_id', $paymentIntentId)->lockForUpdate()->get() as $row) {
+            foreach ($this->receiptRows()->where('payment_intent_id', $paymentIntentId)->get() as $row) {
                 if ($this->isReceiptObservation($row->allocation_key)) $result[] = $this->receiptReversalDetails($user, $current, $receipt, $row) + ['next_step' => $row->reason];
             }
             return $result;

@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Models\{BillingAgreement, Service, User};
 use Illuminate\Support\Facades\{Auth, DB, Log};
 
@@ -13,12 +15,12 @@ trait AutoPayInheritance
     {
         if (!$service->isDirty('user_id') && !$service->isDirty('billing_agreement_id')) return;
         // Serialize cancellation before SQL, using the same row order as inheritance.
-        DB::transaction(function () use ($service) {
+        ExtensionLocks::transaction('user:' . $service->getOriginal('user_id'), function () use ($service) {
             $ownerId = $service->getOriginal('user_id');
-            User::where('id', $ownerId)->lockForUpdate()->firstOrFail();
+            User::where('id', $ownerId)->firstOrFail();
             $current = Service::where('id', $service->id)->lockForUpdate()->firstOrFail();
             if ($current->user_id != $ownerId) throw new \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException('Service ownership changed. Refresh and try again.');
-            $property = $service->properties()->where('key', self::AUTO_PAY_PENDING)->lockForUpdate()->first();
+            $property = $service->properties()->where('key', self::AUTO_PAY_PENDING)->first();
             if (!$property) return;
             $pending = json_decode($property->value, true);
             if ($service->isDirty('billing_agreement_id') || ($pending['user_id'] ?? null) == $ownerId) {
@@ -59,11 +61,11 @@ trait AutoPayInheritance
     {
         if ($value === null) return;
         try {
-            $this->withSavedMethodBindingLock($ownerId, fn () => DB::transaction(function () use ($ownerId, $serviceId, $value) {
-                $user = User::where('id', $ownerId)->lockForUpdate()->first();
+            $this->withSavedMethodBindingLock($ownerId, fn () => ExtensionLocks::transaction('user:' . $ownerId, function () use ($ownerId, $serviceId, $value) {
+                $user = User::where('id', $ownerId)->first();
                 $service = Service::where('id', $serviceId)->lockForUpdate()->first();
                 if (!$service || $service->user_id != $ownerId) return;
-                $property = $service->properties()->where('key', self::AUTO_PAY_PENDING)->lockForUpdate()->first();
+                $property = $service->properties()->where('key', self::AUTO_PAY_PENDING)->first();
                 if (!$property || $property->value !== $value) return;
                 $pending = json_decode($property->value, true);
                 $record = $user ? $this->autoPayDefault($user, lock: true) : null;
@@ -86,10 +88,10 @@ trait AutoPayInheritance
             try {
                 if (!$this->gatewayEnabled() || !$this->bundledInactive()) return;
                 // Persist bounded retry state without the busy cache lock; user then service rows still serialize opt-out.
-                DB::transaction(function () use ($ownerId, $serviceId, $value) {
-                    User::where('id', $ownerId)->lockForUpdate()->first();
+                ExtensionLocks::transaction('user:' . $ownerId, function () use ($ownerId, $serviceId, $value) {
+                    User::where('id', $ownerId)->first();
                     $service = Service::where('id', $serviceId)->where('user_id', $ownerId)->lockForUpdate()->first();
-                    $property = $service?->properties()->where('key', self::AUTO_PAY_PENDING)->lockForUpdate()->first();
+                    $property = $service?->properties()->where('key', self::AUTO_PAY_PENDING)->first();
                     if (!$property || $property->value !== $value) return;
                     $pending = json_decode($property->value, true);
                     $count = ($pending['retry']['attempts'] ?? 0) + 1;

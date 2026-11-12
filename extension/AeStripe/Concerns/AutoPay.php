@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Models\{BillingAgreement, Gateway, Invoice, Service, User};
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\{Auth, DB};
@@ -25,7 +27,7 @@ trait AutoPay
         $gateway = Gateway::where('extension', 'AeStripe')->first();
         $query = $gateway ? BillingAgreement::where('id', $record['agreement_id'])
             ->where('user_id', $user->id)->where('gateway_id', $gateway->id) : null;
-        $agreement = $query ? ($lock ? $query->lockForUpdate() : $query)->first() : null;
+        $agreement = $query ? ($lock ? $query : $query)->first() : null;
         return $agreement ? $record : null;
     }
 
@@ -41,7 +43,7 @@ trait AutoPay
         $gateway = Gateway::where('extension', 'AeStripe')->first();
         $query = $gateway ? BillingAgreement::where('id', $record['agreement_id'])->where('user_id', $user->id)
             ->where('gateway_id', $gateway->id) : null;
-        return $query && ($lock ? $query->lockForUpdate() : $query)->first() ? $record['agreement_id'] : null;
+        return $query && ($lock ? $query : $query)->first() ? $record['agreement_id'] : null;
     }
 
     private function rememberAutoPayCard(User $user, int $agreementId): void
@@ -66,13 +68,13 @@ trait AutoPay
             'version' => 'required_if:enabled,true|string',
         ]);
         abort_unless(!$request->boolean('enabled') || $this->gatewayEnabled() && $this->bundledInactive(), 409);
-        $change = fn () => DB::transaction(function () use ($request) {
-            $user = User::where('id', Auth::id())->lockForUpdate()->firstOrFail();
+        $change = fn () => ExtensionLocks::transaction('user:' . Auth::id(), function () use ($request) {
+            $user = User::where('id', Auth::id())->firstOrFail();
             // A picker change alone saves a preference, never enables or disables any service.
             if ($request->input('enabled') === null) {
                 $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
                 $agreement = BillingAgreement::where('id', $request->input('agreement_id'))
-                    ->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
+                    ->where('user_id', $user->id)->where('gateway_id', $gateway->id)->first();
                 abort_unless($agreement, 403);
                 $this->assertSavedMethodBindable($user, $agreement);
                 $this->rememberAutoPayCard($user, (int) $agreement->id);
@@ -106,7 +108,7 @@ trait AutoPay
     {
         $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
         $agreement = BillingAgreement::where('id', $agreementId)
-            ->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
+            ->where('user_id', $user->id)->where('gateway_id', $gateway->id)->first();
         abort_unless($agreement, 403);
         $this->assertSavedMethodBindable($user, $agreement);
         $this->stopWaitingRenewals($user);
@@ -163,8 +165,8 @@ trait AutoPay
             return ['message' => $paid['message'] ?? 'This payment was not completed.'] + $result;
         }
         try {
-            $this->withSavedMethodBindingLock((int) $user->id, fn () => DB::transaction(function () use ($user, $agreement) {
-                $locked = User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+            $this->withSavedMethodBindingLock((int) $user->id, fn () => ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $agreement) {
+                $locked = User::where('id', $user->id)->firstOrFail();
                 return $this->enableAutoPay($locked, (int) $agreement->id);
             }));
         } catch (\Throwable $e) {
@@ -184,7 +186,7 @@ trait AutoPay
     private function autoPayServices(User $user): array
     {
         $services = [];
-        foreach (Service::where('user_id', $user->id)->lockForUpdate()->get() as $service) {
+        foreach (Service::where('user_id', $user->id)->get() as $service) {
             if ($service->user_id == $user->id && !$service->subscription_id) $services[] = $service;
         }
         return $services;

@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Exceptions\DisplayException;
 use App\Helpers\ExtensionHelper;
 use App\Models\{BillingAgreement, Gateway, User};
@@ -82,7 +84,7 @@ trait SavedMethods
         $previous = json_decode($owner->properties()->where('key', $journalKey)->first()?->value ?? 'null', true);
         if (($previous['gateway_id'] ?? null) == $gateway->id && ($previous['user_id'] ?? null) == $owner->id) {
             // Confirmed detach progress remains authorized even when a different planned row was reassigned.
-            DB::transaction(fn () => $this->reconcileRemoval($owner, $gateway, $journalKey, $previous, $agreement->external_reference));
+            ExtensionLocks::transaction('user:' . $owner->id, fn () => $this->reconcileRemoval($owner, $gateway, $journalKey, $previous, $agreement->external_reference));
         }
         if (($previous['gateway_id'] ?? null) == $gateway->id && ($previous['user_id'] ?? null) == $owner->id
             && ($previous['customer'] ?? null) !== $owner->properties()->where('key', 'stripe_id')->first()?->value) {
@@ -96,16 +98,20 @@ trait SavedMethods
             } catch (ConnectionException | RequestException $e) {
                 Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
             }
-            DB::transaction(fn () => $this->reconcileRemoval($owner, $gateway, $journalKey, $previous, ''));
+            ExtensionLocks::transaction('user:' . $owner->id, fn () => $this->reconcileRemoval($owner, $gateway, $journalKey, $previous, ''));
             return false;
         }
-        $snapshot = DB::transaction(function () use ($agreement, $gateway) {
-            $user = User::where('id', $agreement->user_id)->lockForUpdate()->firstOrFail();
-            $current = BillingAgreement::withTrashed()->where('external_reference', $agreement->external_reference)->lockForUpdate()->first();
+        $snapshot = ExtensionLocks::transaction('user:' . $agreement->user_id, function () use ($agreement, $gateway) {
+            $user = User::where('id', $agreement->user_id)->firstOrFail();
+            foreach ($this->lockedUserProperties($user, 'ae_stripe_checkout_') as $property) {
+                $attempt = json_decode($property->value, true);
+                if (in_array($attempt['confirmation']['phase'] ?? null, ['reserved', 'sending'], true)) return null;
+            }
+            $current = BillingAgreement::withTrashed()->where('external_reference', $agreement->external_reference)->first();
             if (!$current || $current->id != $agreement->id || $current->user_id != $user->id || $current->gateway_id != $gateway->id) return null;
-            return [$user, $current, $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value,
-                BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->get(),
-                $user->properties()->where('key', 'like', 'ae_stripe_saved_%')->lockForUpdate()->get()];
+            return [$user, $current, $user->properties()->where('key', 'stripe_id')->first()?->value,
+                BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->get(),
+                $user->properties()->where('key', 'like', 'ae_stripe_saved_%')->get()];
         });
         if (!$snapshot) return false;
         [$user, $current, $customer, $rows, $receipts] = $snapshot;
@@ -157,15 +163,15 @@ trait SavedMethods
                     }
                 }
             }
-            $journal = DB::transaction(function () use ($user, $gateway, $customer, $copies, $matched, $journalKey, $identity) {
-                User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-                if ($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value !== $customer) return false;
+            $journal = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $gateway, $customer, $copies, $matched, $journalKey, $identity) {
+                User::where('id', $user->id)->firstOrFail();
+                if ($user->properties()->where('key', 'stripe_id')->first()?->value !== $customer) return false;
                 foreach ($copies as $reference => $remote) {
-                    $row = BillingAgreement::withTrashed()->where('external_reference', $reference)->lockForUpdate()->first();
+                    $row = BillingAgreement::withTrashed()->where('external_reference', $reference)->first();
                     if ($row && ($row->user_id != $user->id || $row->gateway_id != $gateway->id)) return false;
                 }
                 foreach ($matched as $match) {
-                    $row = BillingAgreement::withTrashed()->where('external_reference', $match->external_reference)->lockForUpdate()->first();
+                    $row = BillingAgreement::withTrashed()->where('external_reference', $match->external_reference)->first();
                     if (!$row || $row->id != $match->id) return false;
                 }
                 $old = json_decode($this->lockedUserProperty($user, $journalKey)?->value ?? 'null', true);
@@ -194,8 +200,8 @@ trait SavedMethods
             foreach ($copies as $reference => $remote) {
                 if (($remote->customer ?? null) === $customer) $this->request('post', '/payment_methods/' . $reference . '/detach');
                 $journal['detached'][$reference] = true;
-                DB::transaction(function () use ($user, $gateway, $customer, $reference, $journalKey, $journal) {
-                    User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+                ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $gateway, $customer, $reference, $journalKey, $journal) {
+                    User::where('id', $user->id)->firstOrFail();
                     $index = $this->savedMethodIndex($user, $reference, $customer, $gateway);
                     unset($index['removing']);
                     $index['removed'] = true;
@@ -205,10 +211,10 @@ trait SavedMethods
             }
         } catch (ConnectionException | RequestException $e) {
             Log::warning('ae_stripe_cancel_method_read_failed', ['error' => get_class($e)]);
-            if (isset($journal) && is_array($journal)) DB::transaction(fn () => $this->reconcileRemoval($user, $gateway, $journalKey, $journal, ''));
+            if (isset($journal) && is_array($journal)) ExtensionLocks::transaction('user:' . $user->id, fn () => $this->reconcileRemoval($user, $gateway, $journalKey, $journal, ''));
             return false;
         }
-        $removed = DB::transaction(fn () => $this->reconcileRemoval($user, $gateway, $journalKey, $journal, $current->external_reference));
+        $removed = ExtensionLocks::transaction('user:' . $user->id, fn () => $this->reconcileRemoval($user, $gateway, $journalKey, $journal, $current->external_reference));
         if ($removed && !$method && $identity === null) {
             $notice = ['type' => 'warning', 'message' => 'This payment method was already gone. We removed its saved entry, but could not verify or remove other copies.'];
             \Illuminate\Support\Facades\Session::flash('notification', $notice);
@@ -225,12 +231,12 @@ trait SavedMethods
     // The journal records the original authorization and proven provider outcomes, independently of stripe_id changes.
     private function reconcileRemoval($user, $gateway, string $key, array $journal, string $clicked): bool
     {
-        User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-        $valid = $user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value === $journal['customer'];
+        User::where('id', $user->id)->firstOrFail();
+        $valid = $user->properties()->where('key', 'stripe_id')->first()?->value === $journal['customer'];
         $owned = [];
         foreach ($journal['copies'] as $reference => $id) {
             if ($id === null) continue;
-            $row = BillingAgreement::withTrashed()->where('external_reference', $reference)->lockForUpdate()->first();
+            $row = BillingAgreement::withTrashed()->where('external_reference', $reference)->first();
             if (!$row || $row->id != $id || $row->user_id != $user->id || $row->gateway_id != $gateway->id) {
                 $valid = false;
                 continue;
@@ -243,7 +249,7 @@ trait SavedMethods
             // Leave core its normal clicked-row deletion only when final validation succeeds.
             if (($reference !== $clicked || !$valid) && !$row->trashed()) $row->delete();
         }
-        foreach ($user->properties()->where('key', 'like', 'ae_stripe_saved_%')->lockForUpdate()->get() as $property) {
+        foreach ($user->properties()->where('key', 'like', 'ae_stripe_saved_%')->get() as $property) {
             $receipt = json_decode($property->value, true);
             if (($receipt['consent']['user_id'] ?? null) != $user->id
                 || (!isset($journal['detached'][$receipt['incoming'] ?? '']) && !isset($journal['detached'][$receipt['reference'] ?? '']))) continue;
@@ -273,23 +279,23 @@ trait SavedMethods
         }
     }
 
-    private function persistSavedMethod($user, $method, array $consent)
+    private function persistSavedMethod($user, $method, array $consent, bool $conflictRetried = false)
     {
         $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
         $incomingId = $method->id;
         $source = $consent['source'] ?? $incomingId;
         $key = 'ae_stripe_saved_' . hash('sha256', $source . ':' . $incomingId);
         // Current reads include saves committed after an earlier REPEATABLE READ snapshot.
-        [$customer, $rows, $receipt, $receipts] = DB::transaction(function () use ($user, $gateway, $key) {
-            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-            return [$user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value,
-                BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->get(),
-                json_decode($user->properties()->where('key', $key)->lockForUpdate()->first()?->value ?? 'null', true),
-                $user->properties()->where('key', 'like', 'ae_stripe_saved_%')->lockForUpdate()->get()];
+        [$customer, $rows, $receipt, $receipts] = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $gateway, $key) {
+            User::where('id', $user->id)->firstOrFail();
+            return [$user->properties()->where('key', 'stripe_id')->first()?->value,
+                BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->get(),
+                json_decode($user->properties()->where('key', $key)->first()?->value ?? 'null', true),
+                $user->properties()->where('key', 'like', 'ae_stripe_saved_%')->get()];
         });
         if (!$customer) return false;
-        $consent = DB::transaction(function () use ($user, $key, $consent, $incomingId, &$receipt) {
-            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+        $consent = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $key, $consent, $incomingId, &$receipt) {
+            User::where('id', $user->id)->firstOrFail();
             if (!$receipt) {
                 $sequenceKey = 'ae_stripe_save_sequence';
                 $sequence = 1 + (int) ($this->lockedUserProperty($user, $sequenceKey)?->value ?? 0);
@@ -361,7 +367,7 @@ trait SavedMethods
                 // The owner lock precedes the first plain read in each validation transaction. Resolve the id without
                 // locking a missing reference's gap, then lock only an existing row and recheck its current identity.
                 $id = BillingAgreement::withTrashed()->where('external_reference', $reference)->first()?->id;
-                $row = $id ? BillingAgreement::withTrashed()->where('id', $id)->where('external_reference', $reference)->lockForUpdate()->first() : null;
+                $row = $id ? BillingAgreement::withTrashed()->where('id', $id)->where('external_reference', $reference)->first() : null;
                 if ($id && !$row) throw new SavedMethodRetryException('Saved payment methods changed. Try again.');
                 if ($row && ($row->user_id != $user->id || $row->gateway_id != $gateway->id)) {
                     throw new DisplayException('This payment method can\'t be used on this account. Add a new payment method.');
@@ -374,7 +380,7 @@ trait SavedMethods
             if (!$checkRows) return;
             $current = [];
             foreach (BillingAgreement::where('user_id', $user->id)->where('gateway_id', $gateway->id)->get() as $candidate) {
-                $row = BillingAgreement::where('id', $candidate->id)->where('external_reference', $candidate->external_reference)->lockForUpdate()->first();
+                $row = BillingAgreement::where('id', $candidate->id)->where('external_reference', $candidate->external_reference)->first();
                 if (!$row || $row->user_id != $user->id || $row->gateway_id != $gateway->id) {
                     throw new SavedMethodRetryException('Saved payment methods changed. Try again.');
                 }
@@ -388,16 +394,16 @@ trait SavedMethods
             };
             if ($references($current) !== $references($rows)) throw new SavedMethodRetryException('Saved payment methods changed. Try again.');
         };
-        DB::transaction(function () use ($user, $customer, $validate) {
-            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-            abort_unless($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value === $customer, 409);
+        ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $customer, $validate) {
+            User::where('id', $user->id)->firstOrFail();
+            abort_unless($user->properties()->where('key', 'stripe_id')->first()?->value === $customer, 409);
             $validate();
         });
         if (isset($receipt['reference'])) {
             // Retries never roll a later expiry or acceptance back to this source's older values.
-            $active = DB::transaction(function () use ($user, $gateway, $receipt) {
-                User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-                return BillingAgreement::where('external_reference', $receipt['reference'])->where('user_id', $user->id)->where('gateway_id', $gateway->id)->lockForUpdate()->first();
+            $active = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $gateway, $receipt) {
+                User::where('id', $user->id)->firstOrFail();
+                return BillingAgreement::where('external_reference', $receipt['reference'])->where('user_id', $user->id)->where('gateway_id', $gateway->id)->first();
             });
             if (!$active) throw new DisplayException('This payment method was removed. Add a new payment method.');
             if ($this->savedMethodUnavailable($user, $active->external_reference, $customer, $gateway)) throw new SavedMethodRetryException(self::BINDING_RETRY);
@@ -423,9 +429,9 @@ trait SavedMethods
                 && $this->savedMethodIdentity($remote) === $identity) $targets[$incoming] = null;
         }
         $references = array_keys($targets);
-        DB::transaction(function () use ($user, $customer, $validate, $references) {
-            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-            abort_unless($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value === $customer, 409);
+        ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $customer, $validate, $references) {
+            User::where('id', $user->id)->firstOrFail();
+            abort_unless($user->properties()->where('key', 'stripe_id')->first()?->value === $customer, 409);
             $validate(true, $references);
         });
         $updates = [];
@@ -447,20 +453,13 @@ trait SavedMethods
         $message = $duplicate ? (($method->type ?? null) === 'card'
             ? 'This card is already saved. We updated its expiry to ' . substr($data['expiry'], 5, 2) . '/' . substr($data['expiry'], 0, 4) . '.'
             : 'This Link account is already saved. We updated it.') : null;
-        return DB::transaction(function () use ($user, $gateway, $customer, $incomingId, $reference, $kept, $rows, $data, $identity, $consent, $key, $message, $validate, $updates, $matches, $receipt, $references) {
-            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
-            abort_unless($user->properties()->where('key', 'stripe_id')->lockForUpdate()->first()?->value === $customer, 409);
+        try { return ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $gateway, $customer, $incomingId, $reference, $kept, $rows, $data, $identity, $consent, $key, $message, $validate, $updates, $matches, $receipt, $references) {
+            User::where('id', $user->id)->firstOrFail();
+            abort_unless($user->properties()->where('key', 'stripe_id')->first()?->value === $customer, 409);
             $validate(true, $references);
             $agreement = $kept;
             if (!$agreement) {
-                try {
-                    $agreement = ExtensionHelper::makeBillingAgreement($user, 'AeStripe', $data['name'], $incomingId, $data['type'], $data['expiry']);
-                } catch (UniqueConstraintViolationException $e) {
-                    $agreement = BillingAgreement::withTrashed()->where('external_reference', $incomingId)->lockForUpdate()->first();
-                    if (!$agreement) throw $e;
-                    // The insert itself found a new row; still recheck its owner, gateway and deletion.
-                    $validate(false, $references);
-                }
+                $agreement = ExtensionHelper::makeBillingAgreement($user, 'AeStripe', $data['name'], $incomingId, $data['type'], $data['expiry']);
             }
             $local = $matches ?: [$agreement];
             foreach ($local as $row) {
@@ -476,6 +475,12 @@ trait SavedMethods
             }
             $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($receipt + ['reference' => $reference, 'message' => $message], JSON_THROW_ON_ERROR)]);
             return $message ? ['message' => $message] : true;
-        });
+        }); } catch (UniqueConstraintViolationException $e) {
+            // A duplicate may have been committed after this transaction's snapshot. Roll back first, then validate
+            // from a fresh snapshot. Never update or acknowledge the row found only by the failed insert.
+            if ($conflictRetried || DB::transactionLevel() > 0
+                || !BillingAgreement::withTrashed()->where('external_reference', $incomingId)->first()) throw $e;
+            return $this->persistSavedMethod($user, $method, $consent, true);
+        }
     }
 }

@@ -2,6 +2,8 @@
 
 namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 
+use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
+
 use App\Models\User;
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 use Illuminate\Support\Facades\DB;
@@ -14,8 +16,8 @@ trait SubscriptionAttempt
         $key = 'sched_' . $setupIntent->id . '_' . $service->id;
         // This transaction commits before any remote schedule creation. Its immutable
         // payload survives later service-write failures and partial multi-service setup.
-        $attempt = DB::transaction(function () use ($user, $property, $key, $data) {
-            $user = User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+        $attempt = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $property, $key, $data) {
+            $user = User::where('id', $user->id)->firstOrFail();
             $stored = $user->properties()->where('key', $property)->first()?->value;
             if ($stored) {
                 $attempt = json_decode($stored, true, flags: JSON_THROW_ON_ERROR);
@@ -37,8 +39,8 @@ trait SubscriptionAttempt
             abort_unless(($subscription->id ?? null) === $attempt['subscription']
                 && is_string($subscription->status ?? null) && $subscription->status !== '', 409);
             $ended = in_array($subscription->status, ['canceled', 'incomplete_expired'], true);
-            $attempt = DB::transaction(function () use ($user, $property, $key, $data, $attempt, $ended, $setupIntent, $subscription) {
-                $user = User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+            $attempt = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $property, $key, $data, $attempt, $ended, $setupIntent, $subscription) {
+                $user = User::where('id', $user->id)->firstOrFail();
                 $stored = $user->properties()->where('key', $property)->first()?->value;
                 // The Stripe read ran without a lock. Refuse if another request changed the attempt.
                 abort_unless($stored && json_decode($stored, true, flags: JSON_THROW_ON_ERROR) === $attempt, 409);
@@ -54,8 +56,8 @@ trait SubscriptionAttempt
         abort_unless(time() - $attempt['created'] < 23 * 3600, 409);
         $schedule = $this->request('post', '/subscription_schedules', $attempt['data'], $attempt['key']);
         $attempt['subscription'] = $schedule->subscription;
-        DB::transaction(function () use ($user, $property, $attempt) {
-            User::where('id', $user->id)->lockForUpdate()->firstOrFail();
+        ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $property, $attempt) {
+            User::where('id', $user->id)->firstOrFail();
             $user->properties()->updateOrCreate(['key' => $property], ['value' => json_encode($attempt, JSON_THROW_ON_ERROR)]);
         });
         return $attempt['subscription'];
