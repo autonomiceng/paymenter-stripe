@@ -153,6 +153,18 @@ check($firstView->getData()['intent']->id !== $secondView->getData()['intent']->
     && $firstView->getData()['intent']->customer === 'cus_owner' && $secondView->getData()['intent']->customer === 'cus_second',
     'Each customer gets a working Pay page with their own intent');
 
+// Payment and credit-return transactions take the invoice before a current user read.
+$paymentLocks = []; $tracePaymentLocks = true;
+DB::connection()->beforeExecuting(function ($sql) use (&$paymentLocks, &$tracePaymentLocks) {
+    if ($tracePaymentLocks && preg_match('/^select .* from "(invoices|users)" /', $sql, $table)) {
+        $paymentLocks[] = [$table[1], str_ends_with($sql, '/* for update */')];
+    }
+});
+try { invoke($gateway, 'withPaymentLock', $first, fn ($user, $current) => $current->id); }
+finally { $tracePaymentLocks = false; }
+check($paymentLocks === [['invoices', true], ['users', true]],
+    'Payment locks take the invoice before the current user row without an earlier plain user read');
+
 // Two first-time customers open Pay at once: each saves its new Stripe customer ID as stripe_id.
 $customer(9, null);
 $customer(10, null);

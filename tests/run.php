@@ -1,6 +1,12 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 require_once __DIR__ . '/entered.php';
+if (getenv('PAY_MARIADB_CASE')) {
+    $php = getenv('PAY_MARIADB_PHP') ?: PHP_BINARY;
+    putenv('PAYMENTER_TEST_PHP=' . $php);
+    $run = proc_open([$php, '-d', 'auto_prepend_file=' . __DIR__ . '/entered.php', __DIR__ . '/mariadb-locks.php'], [], $pipes);
+    exit(proc_close($run));
+}
 // Any nonempty mode, even "0", goes to the matrix, which rejects unknown modes before starting a child.
 if (!in_array(getenv('PAY_PENDING_MATRIX'), [false, ''], true)) { require __DIR__ . '/native-pending-matrix.php'; return; }
 if (in_array('--receipt-returns', $argv, true)) putenv('PAY_NATIVE_SUITE=receipt-returns');
