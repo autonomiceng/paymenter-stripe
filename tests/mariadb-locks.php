@@ -732,19 +732,41 @@ $cases = [
                 ->get(['allocation_key', 'state'])->map(fn ($row) => [$row->allocation_key, $row->state])->all() === [['stripe:refund:re_561', 'refunded']]
             && DB::table('audits')->where('event', 'ae_stripe_receipt_reversal')->count() === 1 && $rows(561) === [[20.0, 'succeeded', false]]],
 ];
-$cases['outbox-confirm-card-removal'] = $cases['outbox-confirm-http'];
-$cases['outbox-confirm-card-removal']['seed'] = function () use ($cases) {
-    $cases['outbox-confirm-http']['seed']();
-    App\Models\BillingAgreement::create(['user_id' => 7, 'gateway_id' => App\Models\Gateway::where('extension', 'AeStripe')->first()->id,
-        'external_reference' => 'pm_401', 'name' => 'Fixture', 'type' => 'card']);
-};
-$cases['outbox-confirm-card-removal']['b'] = function ($gateway) {
-    $GLOBALS['stripeHandler'] = fn () => throw new RuntimeException('A pending confirmation cannot detach or read cards');
-    return invoke($gateway, 'removeSavedMethodCopies', App\Models\BillingAgreement::where('external_reference', 'pm_401')->first());
-};
-$cases['outbox-confirm-card-removal']['check'] = fn ($results) => $results['a']['ok']['levels'] === [0, 0]
-    && $results['b']['ok'] === false && App\Models\BillingAgreement::where('external_reference', 'pm_401')->count() === 1
-    && $rows(401) === [[20.0, 'failed', false]];
+// Removal may read provider identities, but cannot detach the sending method or any verified copy.
+foreach (['card' => 'pm_401', 'duplicate-card' => 'pm_401_copy', 'unrelated-card' => 'pm_other'] as $kind => $reference) {
+    $name = 'outbox-confirm-' . $kind . '-removal';
+    $unrelated = $kind === 'unrelated-card';
+    $cases[$name] = $cases['outbox-confirm-http'];
+    $seed = $cases['outbox-confirm-http']['seed'];
+    $cases[$name]['seed'] = function () use ($seed, $reference) {
+        $seed();
+        foreach (array_unique(['pm_401', $reference]) as $method) App\Models\BillingAgreement::create([
+            'user_id' => 7, 'gateway_id' => App\Models\Gateway::where('extension', 'AeStripe')->first()->id,
+            'external_reference' => $method, 'name' => 'Fixture', 'type' => 'card']);
+    };
+    $cases[$name]['b'] = function ($gateway) use ($reference, $unrelated) {
+        $detached = [];
+        $GLOBALS['stripeHandler'] = function ($verb, $path) use ($reference, $unrelated, &$detached) {
+            $method = basename($path);
+            if ($verb === 'get' && in_array($path, ['/payment_methods/pm_401', '/payment_methods/' . $reference], true)) {
+                return ['id' => $method, 'customer' => 'cus_7', 'type' => 'card',
+                    'card' => ['fingerprint' => $unrelated && $method === $reference ? 'other_card' : 'active_card']];
+            }
+            if ($unrelated && $verb === 'post' && $path === '/payment_methods/' . $reference . '/detach') {
+                $detached[] = $reference;
+                return ['id' => $reference, 'customer' => null];
+            }
+            throw new RuntimeException('A pending confirmation must keep its card and copies attached');
+        };
+        $removed = invoke($gateway, 'removeSavedMethodCopies', App\Models\BillingAgreement::where('external_reference', $reference)->first());
+        return ['removed' => $removed, 'detached' => $detached];
+    };
+    $cases[$name]['check'] = fn ($results) => $results['a']['ok']['levels'] === [0, 0]
+        && $results['a']['ok']['declined'] === 'Insufficient funds. Try a different card, or contact your bank.'
+        && $results['b']['ok'] === ['removed' => $unrelated, 'detached' => $unrelated ? [$reference] : []]
+        && App\Models\BillingAgreement::where('external_reference', 'pm_401')->where('user_id', 7)->count() === 1
+        && $rows(401) === [[20.0, 'failed', false]] && Invoice::find(401)->status === 'pending';
+}
 
 foreach (['role', 'permission', 'fallback'] as $change) {
     $cases['outbox-staff-' . $change] = ['seed' => function () use ($gateway) {
