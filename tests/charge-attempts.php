@@ -114,6 +114,26 @@ use Illuminate\Support\Facades\{DB, Http};
         $test($invoice, $stripe);
     };
     try {
+        $run('customer-claim-list-window', function () use ($gateway) {
+            $owner = User::$row;
+            foreach ([true, false] as $marked) {
+                $claim = ['previous' => null, 'created' => time() - 26 * 3600, 'payload' => ['metadata' => []]];
+                if ($marked) $claim['payload']['metadata']['ae_stripe_customer_claim'] = 'window';
+                $pages = 0;
+                Http::$handler = function ($verb, $path, $params) use ($owner, $claim, $marked, &$pages) {
+                    check(!DB::$locked && $verb === 'get' && $path === '/customers', 'Claim recovery only lists outside transactions');
+                    check(($params['created'] ?? null) === ($marked ? ['gte' => $claim['created'] - 300] : null),
+                        'Marked claims bound every page; legacy claims retain historical matching');
+                    ++$pages;
+                    if ($pages === 1) return ['data' => [(object) ['id' => 'cus_windowpage', 'metadata' => (object) ['user_id' => 8]]], 'has_more' => true];
+                    check(($params['starting_after'] ?? null) === 'cus_windowpage', 'Bounded recovery retains pagination');
+                    return ['data' => [(object) ['id' => 'cus_windowmatch', 'metadata' => (object) ['user_id' => $owner->id,
+                        'ae_stripe_customer_claim' => 'window']]], 'has_more' => false];
+                };
+                $found = invoke($gateway, 'recoverCustomerCreation', $owner, $claim);
+                check($pages === 2 && $found->id === 'cus_windowmatch', 'Recovery finds one exact claim or legacy owner across pages');
+            }
+        });
         $run('customer-claim-expiry', function () use ($gateway) {
             $owner = User::$row;
             $owner->props = new Properties('');
