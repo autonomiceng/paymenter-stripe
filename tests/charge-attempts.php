@@ -911,8 +911,8 @@ use Illuminate\Support\Facades\{DB, Http};
                 'The gateway offers one Link at checkout selector');
             check(($setting['options'] ?? null) === ['above_card' => 'Small Link button below the form',
                 'inside_card' => 'Inside card form', 'stripe_default' => 'Stripe default']
-                && ($setting['default'] ?? null) === 'above_card' && isset($setting['hint']),
-                'Link display has three plain choices, hover help and the above-card default');
+                && ($setting['default'] ?? null) === 'above_card' && ($setting['description'] ?? '') !== '',
+                'Link display has three plain choices, a helper line and the above-card default');
             foreach ([null, '', 'unknown', 'above_card', 'inside_card', 'stripe_default'] as $value) {
                 $configured = new \Paymenter\Extensions\Gateways\AeStripe\AeStripe(array_replace($gateway->config,
                     $value === null ? [] : ['stripe_link_display' => $value]));
