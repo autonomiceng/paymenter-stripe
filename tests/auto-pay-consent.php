@@ -335,6 +335,13 @@ $choice = array_replace($choice, ['agreement_id' => 94]);
 ExtensionHelper::$agreements['pm_elsewhere'] = ['id' => 95, 'user_id' => 7, 'gateway_id' => $gatewayId,
     'external_reference' => 'pm_elsewhere', 'deleted_at' => null];
 check($gateway->autoPayOffered($user) === true, 'The pay dialog offers Auto Pay while it is off');
+$linked = Service::$row; $saved = [$linked->billing_agreement_id, $linked->status, $linked->plan->type, $linked->subscription_id, $linked->user_id];
+[$linked->billing_agreement_id, $linked->status, $linked->plan->type, $linked->subscription_id, $linked->user_id] = [95, 'active', 'recurring', null, 7];
+check($gateway->autoPayOffered($user) === false, 'A renewing service linked to a saved card here counts as Auto Pay on, so no box');
+check($payer->autoPayCoversInvoice($open) === false, 'Services linked one by one still get the invoice reason line');
+$linked->status = Service::STATUS_CANCELLED;
+check($gateway->autoPayOffered($user) === true, 'A cancelled linked service leaves Auto Pay off');
+[$linked->billing_agreement_id, $linked->status, $linked->plan->type, $linked->subscription_id, $linked->user_id] = $saved;
 $gateway->saveAutoPayDefault(new Request($choice));
 check(($gateway->autoPayDefault($user)['version'] ?? null) === 'auto_pay_account_v2' && count($mails()) === $mailCount + 1
     && json_decode($mails()[$mailCount]['payload'], true)['user_id'] === 7, 'The switch stores the v2 record and queues one Auto Pay is on email');

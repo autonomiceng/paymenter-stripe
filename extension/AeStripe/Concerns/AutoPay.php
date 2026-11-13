@@ -42,7 +42,26 @@ trait AutoPay
     /** Whether the pay dialog offers "Turn on Auto Pay": only while it is off and this gateway takes card payments. */
     public function autoPayOffered(User $user): bool
     {
-        return $this->gatewayEnabled() && $this->bundledInactive() && !$this->autoPayDefault($user);
+        return $this->gatewayEnabled() && $this->bundledInactive() && !$this->autoPayOn($user);
+    }
+
+    /**
+     * Auto Pay is on for the account with a default, or while any renewing service is linked to a saved method here.
+     * Turning it on links every service to one card, so it is never offered over services already set one by one.
+     */
+    private function autoPayOn(User $user, bool $lock = false): bool
+    {
+        if ($this->autoPayDefault($user, lock: $lock)) return true;
+        $gateway = Gateway::where('extension', 'AeStripe')->first();
+        if (!$gateway) return false;
+        foreach ($this->autoPayServices($user) as $service) {
+            if (!$service->billing_agreement_id || ($service->plan?->type ?? null) !== 'recurring'
+                || $service->status === Service::STATUS_CANCELLED) continue;
+            $agreement = BillingAgreement::where('id', $service->billing_agreement_id)->where('user_id', $user->id)
+                ->where('gateway_id', $gateway->id)->first();
+            if ($agreement && empty($agreement->deleted_at)) return true;
+        }
+        return false;
     }
 
     /** A saved card or off-session saving consent alone never grants this scope. */
@@ -248,7 +267,8 @@ trait AutoPay
                 $agreement = is_string($receipt['reference'] ?? null) ? BillingAgreement::where('user_id', $userId)
                     ->where('gateway_id', $gateway->id)->where('external_reference', $receipt['reference'])->first() : null;
                 if (!$agreement) return;
-                if (!$this->autoPayDefault($user, lock: true)) {
+                // On elsewhere, by default or service by service, keeps its cards; this payment changes nothing.
+                if (!$this->autoPayOn($user, lock: true)) {
                     $this->enableAutoPay($user, (int) $agreement->id, (int) ($intent->metadata->ae_stripe_auto_pay_at ?? 0) ?: null, $version);
                 }
                 $user->properties()->updateOrCreate(['key' => $marker], ['value' => json_encode([
@@ -356,14 +376,14 @@ trait AutoPay
     }
 
     /**
-     * Whether Auto Pay will pay this open invoice: null while account Auto Pay is off (nothing to say), true while a
+     * Whether Auto Pay will pay this open invoice: null while Auto Pay is off (nothing to say), true while a
      * renewal charge or retry is still planned for it, false otherwise. Auto Pay charges renewal invoices when they
      * are issued, so a new order's first invoice, or a renewal whose retries stopped, is paid by hand. Read only.
      */
     public function autoPayCoversInvoice(Invoice $invoice): ?bool
     {
         $user = $invoice->user;
-        if (!$user || !$this->autoPayDefault($user)) return null;
+        if (!$user || !$this->autoPayOn($user)) return null;
         $value = $user->properties()->where('key', 'ae_stripe_checkout_' . $invoice->id)->first()?->value;
         $attempt = $value ? json_decode((string) $value, true) : null;
         return in_array($attempt['renewal']['state'] ?? null, ['active', 'waiting'], true);
