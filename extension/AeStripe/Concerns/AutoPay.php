@@ -78,7 +78,7 @@ trait AutoPay
 
     /**
      * The pay dialog's Auto Pay consent as PaymentIntent metadata: the words' version, when it was given, and the
-     * choice count then. turnOnPaidAutoPay() honours it only while the count is unchanged.
+     * choice count then. Its paid consent turns Auto Pay on only while the count is unchanged.
      */
     private function autoPayIntentConsent(User $user, bool $autoPay): array
     {
@@ -304,42 +304,46 @@ trait AutoPay
 
     /**
      * The pay dialog's "Turn on Auto Pay" for a new card, once its payment succeeded and the card was saved. Every
-     * path that saves the card calls this (the dialog, the bank return, the webhook), and a marker per payment makes
-     * it happen once, so a later Off is never undone by a late webhook. Auto Pay turned on elsewhere since the dialog
-     * opened keeps its own card. A failure leaves no marker, so the next path tries again; the payment stands.
+     * path that saves the card calls this (the dialog, the bank return, the webhook). The choice is stored first as
+     * that payment's paid consent, under the user lock only, so a busy saved-method lock never loses it; then
+     * enrollPaidAutoPayConsent() and the scheduled sweep finish it like a saved-card turn-on and pay. The consent id
+     * names the payment, so it is stored once and a later Off is never undone by a late webhook. The payment stands.
      */
     private function turnOnPaidAutoPay($intent): void
     {
         $version = $intent->metadata->ae_stripe_auto_pay ?? null;
         if (!in_array($version, self::AUTO_PAY_CONSENTS, true) || ($intent->status ?? null) !== 'succeeded'
-            || !is_string($intent->payment_method ?? null) || !is_string($intent->id ?? null)) return;
+            || !is_string($intent->payment_method ?? null) || !is_string($intent->id ?? null)
+            || !ctype_digit((string) ($intent->metadata->ae_stripe_auto_pay_gen ?? ''))) return;
         $invoice = Invoice::where('id', $intent->metadata->invoice_id ?? null)->first();
-        if (!$invoice || !$this->gatewayEnabled() || !$this->bundledInactive()) return;
+        if (!$invoice) return;
         $userId = (int) $invoice->user_id;
-        $marker = 'ae_stripe_auto_pay_paid_' . $intent->id;
+        $key = self::AUTO_PAY_CONSENT_KEY . $invoice->id;
         try {
-            $this->withSavedMethodBindingLock($userId, fn () => ExtensionLocks::transaction('user:' . $userId, function () use ($intent, $userId, $marker, $version) {
+            ExtensionLocks::transaction('user:' . $userId, function () use ($intent, $invoice, $userId, $key, $version) {
                 $user = User::where('id', $userId)->firstOrFail();
-                if ($this->lockedUserProperty($user, $marker)) return;
+                $stored = json_decode($this->lockedUserProperty($user, $key)?->value ?? 'null', true);
+                // Stored already for this payment, or another consent for this invoice is still open.
+                if (($stored['id'] ?? null) === 'apc_' . $intent->id || in_array($stored['state'] ?? null, ['charging', 'paid'], true)) return;
                 // The save receipt names the card kept for this payment, which is an older copy when it was a duplicate.
                 $receipt = json_decode($user->properties()->where('key', 'ae_stripe_saved_' . hash('sha256', $intent->id . ':' . $intent->payment_method))->first()?->value ?? 'null', true);
                 $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
                 $agreement = is_string($receipt['reference'] ?? null) ? BillingAgreement::where('user_id', $userId)
                     ->where('gateway_id', $gateway->id)->where('external_reference', $receipt['reference'])->first() : null;
                 if (!$agreement) return;
-                // On elsewhere, by default or service by service, keeps its cards, and any On or Off since the dialog
-                // confirmed is newer than this consent; either way this payment changes nothing.
-                $generation = (string) ($intent->metadata->ae_stripe_auto_pay_gen ?? '');
-                if ($generation === (string) $this->autoPayGeneration($user, lock: true) && !$this->autoPayOn($user, lock: true)) {
-                    $this->enableAutoPay($user, (int) $agreement->id, (int) ($intent->metadata->ae_stripe_auto_pay_at ?? 0) ?: null, $version);
-                }
-                $user->properties()->updateOrCreate(['key' => $marker], ['value' => json_encode([
-                    'agreement_id' => (int) $agreement->id, 'at' => time()], JSON_THROW_ON_ERROR)]);
-            }));
+                $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode([
+                    'id' => 'apc_' . $intent->id, 'user_id' => $userId, 'invoice_id' => (int) $invoice->id,
+                    'agreement_id' => (int) $agreement->id, 'version' => $version,
+                    'accepted_at' => (int) ($intent->metadata->ae_stripe_auto_pay_at ?? 0) ?: time(),
+                    'generation' => (int) $intent->metadata->ae_stripe_auto_pay_gen, 'state' => 'paid', 'intent' => $intent->id,
+                ], JSON_THROW_ON_ERROR)]);
+            });
         } catch (\Throwable $e) {
-            if (!$e instanceof \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException) report($e);
+            report($e);
             Log::warning('AeStripe Auto Pay after payment will retry', ['invoice_id' => $invoice->id]);
+            return;
         }
+        $this->enrollPaidAutoPayConsent($userId, $key, intentId: $intent->id);
     }
 
     /**
