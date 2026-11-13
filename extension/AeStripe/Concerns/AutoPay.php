@@ -314,7 +314,7 @@ trait AutoPay
         $version = $intent->metadata->ae_stripe_auto_pay ?? null;
         if (!in_array($version, self::AUTO_PAY_CONSENTS, true) || ($intent->status ?? null) !== 'succeeded'
             || !is_string($intent->payment_method ?? null) || !is_string($intent->id ?? null)
-            || !ctype_digit((string) ($intent->metadata->ae_stripe_auto_pay_gen ?? ''))) return;
+            || !preg_match('/\A\d+\z/', (string) ($intent->metadata->ae_stripe_auto_pay_gen ?? ''))) return;
         $invoice = Invoice::where('id', $intent->metadata->invoice_id ?? null)->first();
         if (!$invoice) return;
         $userId = (int) $invoice->user_id;
