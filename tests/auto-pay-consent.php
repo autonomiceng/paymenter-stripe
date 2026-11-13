@@ -3,9 +3,9 @@
 namespace Paymenter\Extensions\Servers\Domains\Services {
     // The real owner-scoped adapter supplies the domain calendar, not Stripe guesses.
     class NativePresenter {
-        public static $domain = null, $summary = null;
+        public static $domain = null, $summary = null, $summaryCalls = 0;
         public function service($owner, $id) { return self::$domain; }
-        public function domainSummaries($owner, $ids) { return [$ids[0] => self::$summary]; }
+        public function domainSummaries($owner, $ids) { self::$summaryCalls++; return [$ids[0] => self::$summary]; }
     }
 }
 namespace {
@@ -221,6 +221,15 @@ NativePresenter::$domain = (object) ['renewal' => 'On'];
 NativePresenter::$summary = (object) ['renewalIssueAt' => '2026-11-24'];
 $dates = $gateway->autoPayDates($service);
 check($dates['invoice_on'] === '2026-11-24' && $dates['charge_on'] === '2026-11-24', 'Domain opt-ins use actual Domains issue calendar, never hosting offset or due date');
+NativePresenter::$domain->renewalSchedule = ['expiry' => '2026-12-15', 'issue' => '2026-11-26', 'due' => '2026-12-08'];
+$calls = NativePresenter::$summaryCalls;
+$dates = $gateway->autoPayDates($service);
+check($dates['invoice_on'] === '2026-11-26' && $dates['state'] === 'scheduled' && NativePresenter::$summaryCalls === $calls,
+    'A domain whose owner record has its saved calendar skips the slow full summary');
+NativePresenter::$domain->renewalSchedule = [];
+check($gateway->autoPayDates($service)['invoice_on'] === '2026-11-24' && NativePresenter::$summaryCalls === $calls + 1,
+    'An empty saved calendar still reads the summary, which keeps a past issue date');
+unset(NativePresenter::$domain->renewalSchedule);
 NativePresenter::$domain->renewNow = ['invoice' => 'https://paymenter.example.com/invoices/retained'];
 $dates = $gateway->autoPayDates($service);
 check($dates['state'] === 'existing_invoice' && $dates['invoice_url'] === NativePresenter::$domain->renewNow['invoice']

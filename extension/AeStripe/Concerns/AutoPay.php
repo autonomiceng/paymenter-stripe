@@ -361,8 +361,14 @@ trait AutoPay
             if (isset($domain->renewNow['invoice'])) return array_replace($dates, ['state' => 'existing_invoice',
                 'invoice_url' => $domain->renewNow['invoice']]);
             if ($domain->renewal !== 'On') return array_replace($dates, ['state' => $domain->renewal === 'Off' ? 'not_scheduled' : 'missing']);
-            $summary = $adapter->domainSummaries($service->user, [(int) $service->id])[$service->id] ?? null;
-            $issue = $summary?->renewalIssueAt;
+            // The owner record carries the saved calendar's next issue date. The full summary builds the whole domain
+            // card, prices included, and is slow over a long list, so it is read only when the record has no date
+            // (a past issue date, or a Domains release without renewalSchedule).
+            $issue = $domain->renewalSchedule['issue'] ?? null;
+            if (!$issue) {
+                $summary = $adapter->domainSummaries($service->user, [(int) $service->id])[$service->id] ?? null;
+                $issue = $summary?->renewalIssueAt;
+            }
         } else {
             $expiry = $service->expires_at;
             $issue = $expiry ? \DateTimeImmutable::createFromInterface($expiry)
