@@ -11,17 +11,41 @@ use Illuminate\Support\Facades\{Auth, DB};
 trait AutoPay
 {
     // Account scope: every recurring service, current and new. Older new-services-only consent does not carry over.
-    public const AUTO_PAY_CONSENT = 'auto_pay_account_v1';
+    // v2 is the sentence in autoPayConsent(); new turn-ons store it. v1 records, accepted under the same scope with
+    // longer words, stay valid until the customer turns Auto Pay off.
+    public const AUTO_PAY_CONSENT = 'auto_pay_account_v2';
+    private const AUTO_PAY_CONSENTS = ['auto_pay_account_v1', self::AUTO_PAY_CONSENT];
     private const AUTO_PAY_PROPERTY = 'ae_stripe_auto_pay_default';
     private const AUTO_PAY_CARD = 'ae_stripe_auto_pay_card';
 
-    /** A saved card or v1 consent alone never grants this scope. */
+    /**
+     * The one Auto Pay consent, shown word for word wherever Auto Pay can be turned on: the pay dialog here, and any
+     * theme's saved-card box or turn-on dialog. A theme renders `text`, then a `terms_label` link to `terms_url` when
+     * it is set, under a `label` box or button, and sends `version` back with the turn-on.
+     *
+     * @param  string|null  $card  "•••• 4242", "your Link wallet", or null for a card being entered ("this card")
+     * @return array{version: string, label: string, text: string, terms_label: string, terms_url: ?string}
+     */
+    public function autoPayConsent(?string $card = null): array
+    {
+        $terms = trim((string) config('settings.tos', ''));
+        return [
+            'version' => self::AUTO_PAY_CONSENT,
+            'label' => __('Turn on Auto Pay'),
+            'text' => __('Charges :card for every renewal invoice. Turn off any time in Payment methods.',
+                ['card' => $card ?? __('this card')]),
+            'terms_label' => __('Terms'),
+            'terms_url' => $terms === '' ? null : $terms,
+        ];
+    }
+
+    /** A saved card or off-session saving consent alone never grants this scope. */
     public function autoPayDefault(User $user, bool $lock = false): ?array
     {
         $key = self::AUTO_PAY_PROPERTY;
         $value = ($lock ? $this->lockedUserProperty($user, $key) : $user->properties()->where('key', $key)->first())?->value;
         $record = $value ? json_decode($value, true) : null;
-        if (!is_array($record) || ($record['version'] ?? null) !== self::AUTO_PAY_CONSENT
+        if (!is_array($record) || !in_array($record['version'] ?? null, self::AUTO_PAY_CONSENTS, true)
             || ($record['user_id'] ?? null) != $user->id || empty($record['accepted_at'])
             || !is_int($record['agreement_id'] ?? null)) return null;
         $gateway = Gateway::where('extension', 'AeStripe')->first();

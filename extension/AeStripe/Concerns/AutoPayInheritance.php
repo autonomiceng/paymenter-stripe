@@ -118,7 +118,7 @@ trait AutoPayInheritance
             $property = $service->properties()->where('key', self::AUTO_PAY_PENDING)->first();
             if ($service->user_id != Auth::id() || $service->billing_agreement_id || !$property) continue;
             $pending = json_decode($property->value, true);
-            if (!is_array($pending) || ($pending['version'] ?? null) !== self::AUTO_PAY_CONSENT || empty($pending['accepted_at'])
+            if (!is_array($pending) || !in_array($pending['version'] ?? null, self::AUTO_PAY_CONSENTS, true) || empty($pending['accepted_at'])
                 || ($pending['user_id'] ?? null) != Auth::id() || !is_int($pending['agreement_id'] ?? null)
                 || $service->subscription_id || $service->status === Service::STATUS_CANCELLED || ($service->plan?->type ?? null) !== 'recurring') continue;
             $state = ($pending['retry']['state'] ?? null) === 'stopped' ? 'stopped'
