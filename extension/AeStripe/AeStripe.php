@@ -1004,9 +1004,9 @@ class AeStripe extends Gateway
      * A customer's saved-method payment of the amount they accepted. Unlike charge(), which always confirms today's
      * balance, confirmation refuses a different balance under the payment lock, so a raised invoice is never charged.
      */
-    public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $billingAgreement, bool $requireAutoPay = false)
+    public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $billingAgreement, bool $requireAutoPay = false, ?string $autoPayConsent = null)
     {
-        return $this->charge($invoice, $amount, $billingAgreement, $this->toMinorUnits($amount, $invoice->currency_code), $requireAutoPay, strtolower($invoice->currency_code));
+        return $this->charge($invoice, $amount, $billingAgreement, $this->toMinorUnits($amount, $invoice->currency_code), $requireAutoPay, strtolower($invoice->currency_code), $autoPayConsent);
     }
 
     /** Pay the open-invoice offer only while its accepted card is still the account Auto Pay card. */
@@ -1015,7 +1015,8 @@ class AeStripe extends Gateway
         return $this->chargeAccepted($invoice, $amount, $billingAgreement, true);
     }
 
-    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement, ?int $acceptedAmount = null, bool $requireAutoPay = false, ?string $acceptedCurrency = null)
+    /** $autoPayConsent: a turn-on and pay's consent id, sent on the PaymentIntent so settlement can match it. */
+    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement, ?int $acceptedAmount = null, bool $requireAutoPay = false, ?string $acceptedCurrency = null, ?string $autoPayConsent = null)
     {
         $this->paymentRetryReserved = false;
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
@@ -1038,7 +1039,7 @@ class AeStripe extends Gateway
             if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
                 $intent = $this->confirmAttempt($invoice, $intent->id, [
                     'payment_method' => $billingAgreement->external_reference, 'off_session' => 'true',
-                ], $billingAgreement, $acceptedAmount);
+                ] + ($autoPayConsent ? ['metadata' => ['ae_stripe_auto_pay_consent' => $autoPayConsent]] : []), $billingAgreement, $acceptedAmount);
             }
             if ($intent->status === 'succeeded') {
                 try { $this->recordIntentPayment($intent, 'succeeded'); }

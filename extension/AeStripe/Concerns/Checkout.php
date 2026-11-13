@@ -367,8 +367,8 @@ trait Checkout
                 'processing' => 'addProcessingPayment', 'failed' => 'addFailedPayment', default => 'addPayment',
             };
             $amount = $status === 'succeeded' ? $intent->amount_received : $intent->amount;
+            $this->settleAutoPayConsent($user, $invoice, $intent, $status);
             if ($status === 'failed') {
-                $this->dropWaitingAutoPay($user, $intent);
                 $failedId = $this->failedPaymentId($intent, $this->readPaymentAttempt($user, $invoice) ?? []);
                 foreach ($this->lockedTransactions(InvoiceTransaction::where('transaction_id', $intent->id), 'processing') as $pending) {
                     InvoiceTransaction::whereKey($pending->id)->update(['transaction_id' => $failedId]);
@@ -395,7 +395,7 @@ trait Checkout
                 }
             }
         }, self::SETTLEMENT_ATTEMPTS);
-        if ($status === 'succeeded') $this->turnOnWaitingAutoPay($intent);
+        if ($status === 'succeeded') $this->enrollAfterPayment($intent);
     }
 
     private function recordPaymentReview($invoice, $intent, string $reason): void

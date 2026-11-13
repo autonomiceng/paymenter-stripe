@@ -262,14 +262,32 @@ $payer = new class(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key'
     public ?string $declineAutoPay = null;
     public bool $pending = false;
     public $during = null;
-    public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $agreement, bool $requireAutoPay = false)
+    public ?string $consent = null;
+    public ?string $reject = null;
+    public int $intents = 0;
+    // Stripe's answer for a payment of this invoice, recorded the way the bank return and the webhook record it.
+    public function settle(Invoice $invoice, string $status, string $method, ?string $consent, ?string $id = null)
+    {
+        $intent = (object) ['id' => $id ?? 'pi_fake_' . $invoice->id . '_' . ++$this->intents, 'customer' => 'cus_owner', 'status' => $status,
+            'currency' => 'usd', 'amount' => 2000, 'amount_received' => $status === 'succeeded' ? 2000 : 0, 'payment_method' => $method,
+            'latest_charge' => null, 'last_payment_error' => null,
+            'metadata' => (object) (['invoice_id' => $invoice->id, 'ae_stripe_gateway' => '1'] + ($consent ? ['ae_stripe_auto_pay_consent' => $consent] : []))];
+        Invoice::$rows[$invoice->id] = $invoice;
+        \Closure::bind(fn () => $this->recordIntentPayment($intent, $status, false), $this, AeStripe::class)();
+        if ($status === 'succeeded') $invoice->status = 'paid';
+        return $intent;
+    }
+    public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $agreement, bool $requireAutoPay = false, ?string $autoPayConsent = null)
     {
         $this->charges[] = [$invoice->id, $amount, $agreement->id, $requireAutoPay];
-        if ($this->during) { $during = $this->during; $this->during = null; $during(); }
+        $this->consent = $autoPayConsent;
+        if ($this->during) { $during = $this->during; $this->during = null; $during($invoice, $autoPayConsent); }
+        if ($this->reject) throw new \App\Exceptions\DisplayException($this->reject);
         if ($this->decline) throw new \Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException($this->decline);
         if ($this->pending && !$requireAutoPay) throw new \Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException('Processing.');
         if ($this->declineAutoPay && $requireAutoPay) throw new \Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException($this->declineAutoPay);
-        $invoice->status = 'paid';
+        if ($requireAutoPay) { $invoice->status = 'paid'; return true; }
+        $this->settle($invoice, 'succeeded', $agreement->external_reference, $autoPayConsent);
         return true;
     }
     public function chargeAutoPayAccepted(Invoice $invoice, $amount, BillingAgreement $agreement)
@@ -318,22 +336,57 @@ $payer->pending = false;
 check($result['enabled'] === false && $result['invoices'] === [['id' => 40, 'status' => 'processing']]
     && $payer->charges === [[40, '20.00', 94, false]] && $payer->autoPayDefault($user) === null && $existing->billing_agreement_id === 55,
     'A first payment still processing leaves Auto Pay off and charges nothing more');
-$afterWait = fn ($intent) => \Closure::bind(fn () => $this->turnOnWaitingAutoPay($intent), $payer, AeStripe::class)();
-$dropWait = fn ($intent) => \Closure::bind(fn () => $this->dropWaitingAutoPay(\App\Models\User::where('id', 7)->firstOrFail(), $intent), $payer, AeStripe::class)();
-$waitIntent = fn (string $status, string $method = 'pm_turn_on', int $invoice = 40) => (object) ['id' => 'pi_wait_' . $invoice, 'status' => $status,
-    'payment_method' => $method, 'metadata' => (object) ['invoice_id' => $invoice]];
-$afterWait($waitIntent('succeeded', 'pm_other'));
-check($payer->autoPayDefault($user) === null, 'Another card paying that invoice does not turn Auto Pay on');
-$afterWait($waitIntent('processing'));
-check($payer->autoPayDefault($user) === null, 'A payment still processing does not turn Auto Pay on');
-$afterWait($waitIntent('succeeded'));
+$consentKey = fn (int $invoice) => 'ae_stripe_auto_pay_consent_' . $invoice;
+check(json_decode($user->props->values[$consentKey(40)] ?? 'null', true)['state'] === 'charging' && is_string($payer->consent)
+    && json_decode($user->props->values[$consentKey(40)], true)['id'] === $payer->consent, 'The consent is stored before the charge and its id goes with the payment');
+$pendingConsent = $payer->consent;
+$processing = new Invoice($user); $processing->id = 40;
+$payer->settle($processing, 'succeeded', 'pm_other', null);
+check($payer->autoPayDefault($user) === null && !isset($user->props->values[$consentKey(40)]),
+    'Another payment settling the invoice ends the consent and turns nothing on');
+$payer->pending = true; $result = $turnOn(47); $payer->pending = false;
+$processing = new Invoice($user); $processing->id = 47;
+$payer->settle($processing, 'succeeded', 'pm_turn_on', $payer->consent);
 check(($payer->autoPayDefault($user)['agreement_id'] ?? null) === 94 && $existing->billing_agreement_id === 94,
-    'Auto Pay turns on with the card once that processing payment succeeds');
+    'Auto Pay turns on once that exact processing payment succeeds with the card');
 $payer->pending = true; $result = $turnOn(46); $payer->pending = false;
-$dropWait($waitIntent('failed', 'pm_turn_on', 46));
-$afterWait($waitIntent('succeeded', 'pm_turn_on', 46));
+$processing = new Invoice($user); $processing->id = 46;
+$failed = $payer->settle($processing, 'failed', 'pm_turn_on', $payer->consent);
+$payer->settle($processing, 'succeeded', 'pm_turn_on', $payer->consent, $failed->id);
 check($payer->autoPayDefault($user) === null && $existing->billing_agreement_id === 55,
-    'A processing payment that then fails leaves Auto Pay off, even if the invoice is paid later');
+    'A processing payment that fails ends its consent, so a later success of the same payment turns nothing on');
+// Settlement that lands before the charge call returns: the consent already exists, so the webhook decides.
+$gateway->saveAutoPayDefault(new Request(['enabled' => false])); $existing->billing_agreement_id = 55; $payer->charges = [];
+$payer->pending = true;
+$payer->during = function ($invoice, $consent) use ($payer) { $payer->settle($invoice, 'failed', 'pm_turn_on', $consent, 'pi_race_failed'); };
+$early = new Invoice($user); $early->id = 48;
+$result = $payer->turnOnAutoPayAndPay($user, $card, [[$early, '20.00']], AeStripe::AUTO_PAY_CONSENT);
+$payer->pending = false;
+$payer->settle($early, 'succeeded', 'pm_turn_on', $payer->consent, 'pi_race_failed');
+check($result['enabled'] === false && $payer->autoPayDefault($user) === null && $existing->billing_agreement_id === 55
+    && !isset($user->props->values[$consentKey(48)]), 'A failure that settles before the charge returns leaves no consent to reuse');
+$payer->pending = true;
+$payer->during = function ($invoice, $consent) use ($payer) { $payer->settle($invoice, 'succeeded', 'pm_turn_on', $consent); };
+$early = new Invoice($user); $early->id = 49; $after = new Invoice($user); $after->id = 51;
+$result = $payer->turnOnAutoPayAndPay($user, $card, [[$early, '20.00'], [$after, '15.00']], AeStripe::AUTO_PAY_CONSENT);
+$payer->pending = false;
+check($result['enabled'] === true && ($payer->autoPayDefault($user)['agreement_id'] ?? null) === 94 && $existing->billing_agreement_id === 94
+    && !isset($user->props->values[$consentKey(49)]), 'A success that settles before the charge returns turns Auto Pay on once');
+// Another operation pays the invoice first: this charge is refused, and the invoice reads paid.
+$gateway->saveAutoPayDefault(new Request(['enabled' => false])); $existing->billing_agreement_id = 55; $payer->charges = [];
+$taken = new Invoice($user); $taken->id = 53; $later = new Invoice($user); $later->id = 54;
+$payer->during = function ($invoice) use ($payer) { $payer->settle($invoice, 'succeeded', 'pm_elsewhere', null); };
+$payer->reject = 'This invoice has no payment due. Refresh the invoice.';
+$result = $payer->turnOnAutoPayAndPay($user, $card, [[$taken, '20.00'], [$later, '15.00']], AeStripe::AUTO_PAY_CONSENT);
+check($result['enabled'] === false && $result['invoices'] === [['id' => 53, 'status' => 'paid']] && $payer->autoPayDefault($user) === null
+    && $existing->billing_agreement_id === 55 && $payer->charges === [[53, '20.00', 94, false]],
+    'An invoice paid by another payment during this charge never turns Auto Pay on');
+$taken = new Invoice($user); $taken->id = 55;
+$payer->settle($taken, 'succeeded', 'pm_elsewhere', null);
+$result = $payer->turnOnAutoPayAndPay($user, $card, [[$taken, '20.00']], AeStripe::AUTO_PAY_CONSENT);
+$payer->reject = null;
+check($result['enabled'] === false && $payer->autoPayDefault($user) === null && $existing->billing_agreement_id === 55
+    && !isset($user->props->values[$consentKey(55)]), 'An invoice already paid before the dialog was sent never turns Auto Pay on');
 \Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-' . $user->id] = true;
 $result = $turnOn(42);
 unset(\Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-' . $user->id]);

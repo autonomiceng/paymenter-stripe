@@ -41,10 +41,10 @@ trait CardDuplicates
     private function cleanupUnchanged($user, $gateway, array $snapshot, bool $bindings = false): void
     {
         $current = $this->cleanupSnapshot($user, $gateway);
-        // Auto Pay choices made meanwhile (on, off, a wait on a processing payment) only move bindings.
+        // Auto Pay choices made meanwhile (on, off, a consent waiting on its payment) only move bindings.
         if ($bindings) foreach ([...array_keys($current['properties']), ...array_keys($snapshot['properties'])] as $key) {
             if (in_array($key, [self::AUTO_PAY_PROPERTY, self::AUTO_PAY_CARD, self::AUTO_PAY_GENERATION], true)
-                || str_starts_with($key, self::AUTO_PAY_WAIT)) unset($current['properties'][$key], $snapshot['properties'][$key]);
+                || str_starts_with($key, self::AUTO_PAY_CONSENT_KEY)) unset($current['properties'][$key], $snapshot['properties'][$key]);
         }
         foreach (['customer', 'state', 'properties'] as $key) {
             if ($current[$key] !== $snapshot[$key]) throw new SavedMethodRetryException('Saved payment methods changed. Try again.');

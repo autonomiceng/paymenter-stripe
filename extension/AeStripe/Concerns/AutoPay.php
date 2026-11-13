@@ -20,8 +20,8 @@ trait AutoPay
     // Counts every Off and every new turn-on. A consent given before the count moved is older than the customer's
     // latest choice, so a payment that lands later never turns Auto Pay on over it.
     private const AUTO_PAY_GENERATION = 'ae_stripe_auto_pay_gen';
-    // A saved-card turn-on and pay whose first payment is still processing: Auto Pay turns on once it succeeds.
-    private const AUTO_PAY_WAIT = 'ae_stripe_auto_pay_wait_';
+    // A saved-card turn-on and pay's consent, per invoice, bound to one payment before it is charged.
+    private const AUTO_PAY_CONSENT_KEY = 'ae_stripe_auto_pay_consent_';
 
     /**
      * The one Auto Pay consent, shown word for word wherever Auto Pay can be turned on: the pay dialog here, and any
@@ -224,12 +224,13 @@ trait AutoPay
     }
 
     /**
-     * Turn on and pay, from the one consent in the Turn on dialog. The first ticked invoice is charged before anything
-     * is turned on, so a card that declines leaves Auto Pay exactly as it was and the reason goes back to the dialog.
-     * Once that payment succeeds, Auto Pay turns on with the card and the other invoices are paid as Auto Pay
-     * payments, each under the gateway's Auto Pay card check. A payment still processing turns it on only once it
-     * succeeds. Any Auto Pay choice made after the dialog was sent (on elsewhere, or on and off) is kept and nothing
-     * more is charged. The caller checks that each invoice is the customer's own, open, and at the amount shown.
+     * Turn on and pay, from the one consent in the Turn on dialog. The consent is stored before any charge, bound to
+     * this payment: user, invoice, card, words, time, the Auto Pay choice count and a random id that goes on the
+     * PaymentIntent. Only recordIntentPayment() decides what it is worth: a success of that exact intent with that
+     * card marks it paid, and its failure, or another payment of the invoice, ends it. Auto Pay turns on from a paid
+     * consent only (enrollPaidAutoPayConsent), never from the invoice's status. Once it is on, the other invoices
+     * are paid as Auto Pay payments, each under the gateway's Auto Pay card check. The caller checks that each
+     * invoice is the customer's own, open, and at the amount shown.
      *
      * @param  array<int, array{0: Invoice, 1: string}>  $invoices  invoice and accepted amount, oldest first
      * @return array{enabled: bool, invoices: array<int, array{id: int, status: string, message?: string}>, message: ?string}
@@ -243,12 +244,22 @@ trait AutoPay
         if (!$this->gatewayEnabled() || !$this->bundledInactive()) {
             return ['message' => 'Payments are paused. Please check back later.'] + $result;
         }
+        [$first, $amount] = $invoices[0];
+        $key = self::AUTO_PAY_CONSENT_KEY . $first->id;
         // The dialog was offered while Auto Pay was off; a choice made since then is newer than this consent.
-        $generation = $this->autoPayGeneration($user);
-        if ($this->autoPayOn($user)) return ['message' => 'Auto Pay changed. Refresh the invoice before paying.'] + $result;
-        $pay = function (Invoice $invoice, string $amount, bool $autoPay) use ($agreement): array {
+        $consent = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $agreement, $first, $key) {
+            $locked = User::where('id', $user->id)->firstOrFail();
+            if ($this->autoPayOn($locked, lock: true)) return null;
+            $consent = ['id' => 'apc_' . bin2hex(random_bytes(12)), 'user_id' => (int) $locked->id, 'invoice_id' => (int) $first->id,
+                'agreement_id' => (int) $agreement->id, 'version' => self::AUTO_PAY_CONSENT, 'accepted_at' => time(),
+                'generation' => $this->autoPayGeneration($locked, lock: true), 'state' => 'charging', 'intent' => null];
+            $locked->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($consent, JSON_THROW_ON_ERROR)]);
+            return $consent;
+        });
+        if (!$consent) return ['message' => 'Auto Pay changed. Refresh the invoice before paying.'] + $result;
+        $pay = function (Invoice $invoice, string $amount, bool $autoPay, ?string $consentId = null) use ($agreement): array {
             try {
-                $autoPay ? $this->chargeAutoPayAccepted($invoice, $amount, $agreement) : $this->chargeAccepted($invoice, $amount, $agreement);
+                $autoPay ? $this->chargeAutoPayAccepted($invoice, $amount, $agreement) : $this->chargeAccepted($invoice, $amount, $agreement, false, $consentId);
             } catch (\Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException $e) {
                 return ['id' => (int) $invoice->id, 'status' => 'processing'];
             } catch (\App\Exceptions\DisplayException $e) {
@@ -259,42 +270,35 @@ trait AutoPay
             }
             return ['id' => (int) $invoice->id, 'status' => $invoice->fresh()->status];
         };
-        [$first, $amount] = $invoices[0];
-        $paid = $pay($first, $amount, false);
+        $paid = $pay($first, $amount, false, $consent['id']);
         $result['invoices'][] = ['id' => $paid['id'], 'status' => $paid['status']];
-        if (!in_array($paid['status'], ['paid', 'processing'], true)) {
-            return ['message' => $paid['message'] ?? 'This payment was not completed.'] + $result;
-        }
-        $acceptedAt = time();
-        try {
-            $state = $this->withSavedMethodBindingLock((int) $user->id, fn () => ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $agreement, $first, $paid, $generation, $version, $acceptedAt) {
-                $locked = User::where('id', $user->id)->firstOrFail();
-                if ($this->autoPayGeneration($locked, lock: true) !== $generation || $this->autoPayOn($locked, lock: true)) return 'changed';
-                if ($paid['status'] === 'processing') {
-                    $attempt = $this->readPaymentAttempt($locked, $first);
-                    $locked->properties()->updateOrCreate(['key' => self::AUTO_PAY_WAIT . $first->id], ['value' => json_encode([
-                        'agreement_id' => (int) $agreement->id, 'version' => $version, 'accepted_at' => $acceptedAt,
-                        'generation' => $generation, 'intent' => is_string($attempt['intent'] ?? null) ? $attempt['intent'] : null,
-                    ], JSON_THROW_ON_ERROR)]);
-                    return 'waiting';
-                }
-                $this->enableAutoPay($locked, (int) $agreement->id, $acceptedAt, $version);
-                return 'on';
-            }));
-        } catch (\Throwable $e) {
-            if (!$e instanceof \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException
-                && !$e instanceof \Symfony\Component\HttpKernel\Exception\HttpExceptionInterface) report($e);
-            return ['message' => 'The payment went through, but Auto Pay was not turned on. Try turning it on again.'] + $result;
+        // The settlement already acted on this consent; only its record says whether this payment turned Auto Pay on.
+        $this->enrollPaidAutoPayConsent((int) $user->id, $key, $consent['id']);
+        $state = ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $key, $consent, $paid) {
+            $locked = User::where('id', $user->id)->firstOrFail();
+            $stored = json_decode($this->lockedUserProperty($locked, $key)?->value ?? 'null', true);
+            if (($stored['id'] ?? null) !== $consent['id']) return 'ended';
+            if (in_array($stored['state'], ['enrolled', 'changed'], true) || $stored['state'] === 'paid' || $paid['status'] !== 'processing') {
+                $locked->properties()->where('key', $key)->delete();
+            }
+            return $stored['state'];
+        });
+        if ($state === 'enrolled') {
+            $result['enabled'] = true;
+            foreach (array_slice($invoices, 1) as [$invoice, $amount]) {
+                // A later invoice that is not paid keeps its own reason.
+                $result['invoices'][] = array_intersect_key($pay($invoice, $amount, true), array_flip(['id', 'status', 'message']));
+            }
+            return $result;
         }
         if ($state === 'changed') return ['message' => 'The payment went through. Auto Pay was changed in another window, so that choice stays.'] + $result;
-        if ($state === 'waiting') return ['message' => 'The payment is processing. Auto Pay turns on once it goes through.'] + $result;
-        $result['enabled'] = true;
-        foreach (array_slice($invoices, 1) as [$invoice, $amount]) {
-            // A later invoice that is not paid keeps its own reason.
-            $result['invoices'][] = array_intersect_key($pay($invoice, $amount, true), array_flip(['id', 'status', 'message']));
-        }
-        return $result;
+        if ($state === 'paid') return ['message' => 'The payment went through, but Auto Pay was not turned on. Try turning it on again.'] + $result;
+        if ($state === 'charging' && $paid['status'] === 'processing') return ['message' => 'The payment is processing. Auto Pay turns on once it goes through.'] + $result;
+        if (isset($paid['message'])) return ['message' => $paid['message']] + $result;
+        // Ended without this payment: it failed, or another payment paid the invoice first.
+        return ['message' => $paid['status'] === 'paid' ? 'This invoice was already paid, so Auto Pay was not turned on.' : 'This payment was not completed.'] + $result;
     }
+
 
     /**
      * The pay dialog's "Turn on Auto Pay" for a new card, once its payment succeeded and the card was saved. Every
@@ -337,46 +341,64 @@ trait AutoPay
     }
 
     /**
-     * A saved-card turn-on and pay waiting on its first payment: once that payment succeeds with the same card, Auto
-     * Pay turns on, unless the customer chose anything since. Called after a succeeded payment is recorded, by every
-     * path that records it, so a missed try is made again by the next one. The payment stands either way.
+     * Settlement's half of a turn-on and pay, called by recordIntentPayment() under the user and invoice locks for
+     * every payment it records on an invoice. The consent counts only for its own PaymentIntent: a success of that
+     * intent with the consent's card marks it paid; its failure, or a success of any other payment, ends it.
      */
-    private function turnOnWaitingAutoPay($intent): void
+    private function settleAutoPayConsent(User $user, $invoice, $intent, string $status): void
     {
-        if (($intent->status ?? null) !== 'succeeded' || !is_string($intent->payment_method ?? null)) return;
-        $invoice = Invoice::where('id', $intent->metadata->invoice_id ?? null)->first();
-        if (!$invoice || !$this->gatewayEnabled() || !$this->bundledInactive()) return;
-        $userId = (int) $invoice->user_id;
-        $key = self::AUTO_PAY_WAIT . $invoice->id;
-        if (!User::where('id', $userId)->first()?->properties()->where('key', $key)->first()) return;
+        $key = self::AUTO_PAY_CONSENT_KEY . $invoice->id;
+        $consent = json_decode($this->lockedUserProperty($user, $key)?->value ?? 'null', true);
+        if (!is_array($consent) || !in_array($status, ['succeeded', 'failed'], true) || ($consent['state'] ?? null) !== 'charging') return;
+        $own = is_string($consent['id'] ?? null) && ($intent->metadata->ae_stripe_auto_pay_consent ?? null) === $consent['id'];
+        if ($status === 'failed') {
+            if ($own) $user->properties()->where('key', $key)->delete();
+            return;
+        }
+        $agreement = is_int($consent['agreement_id'] ?? null) ? BillingAgreement::where('id', $consent['agreement_id'])
+            ->where('user_id', $user->id)->first() : null;
+        if (!$own || !$agreement || $agreement->external_reference !== ($intent->payment_method ?? null)) {
+            $user->properties()->where('key', $key)->delete();
+            return;
+        }
+        $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode(
+            array_replace($consent, ['state' => 'paid', 'intent' => $intent->id]), JSON_THROW_ON_ERROR)]);
+    }
+
+    /**
+     * Turns Auto Pay on from a paid consent, after its settlement committed: the saved-method lock comes before the
+     * user lock, so it cannot run inside settlement. Unless the choice count moved or Auto Pay is on, it enables the
+     * consent's card; either way the record says what happened. Every later record of the same payment (bank return,
+     * webhook, recovery) calls it again, so a busy lock only delays it. The payment stands either way.
+     */
+    private function enrollPaidAutoPayConsent(int $userId, string $key, ?string $consentId = null, ?string $intentId = null): void
+    {
+        $peek = json_decode(User::where('id', $userId)->first()?->properties()->where('key', $key)->first()?->value ?? 'null', true);
+        if (($peek['state'] ?? null) !== 'paid' || $consentId && $peek['id'] !== $consentId || $intentId && $peek['intent'] !== $intentId) return;
+        if (!$this->gatewayEnabled() || !$this->bundledInactive()) return;
         try {
-            $this->withSavedMethodBindingLock($userId, fn () => ExtensionLocks::transaction('user:' . $userId, function () use ($intent, $userId, $key) {
+            $this->withSavedMethodBindingLock($userId, fn () => ExtensionLocks::transaction('user:' . $userId, function () use ($userId, $key, $peek) {
                 $user = User::where('id', $userId)->firstOrFail();
-                $wait = json_decode($this->lockedUserProperty($user, $key)?->value ?? 'null', true);
-                if (!is_array($wait) || !is_int($wait['agreement_id'] ?? null)) return;
-                if (isset($wait['intent']) && $wait['intent'] !== $intent->id) return;
-                $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
-                $agreement = BillingAgreement::where('id', $wait['agreement_id'])->where('user_id', $userId)
-                    ->where('gateway_id', $gateway->id)->first();
-                if (!$agreement || $agreement->external_reference !== $intent->payment_method) return;
-                $user->properties()->where('key', $key)->delete();
-                if (($wait['generation'] ?? null) !== $this->autoPayGeneration($user, lock: true) || $this->autoPayOn($user, lock: true)) return;
-                $this->enableAutoPay($user, (int) $agreement->id, (int) ($wait['accepted_at'] ?? 0) ?: null,
-                    in_array($wait['version'] ?? null, self::AUTO_PAY_CONSENTS, true) ? $wait['version'] : self::AUTO_PAY_CONSENT);
+                $consent = json_decode($this->lockedUserProperty($user, $key)?->value ?? 'null', true);
+                if (($consent['state'] ?? null) !== 'paid' || $consent['id'] !== $peek['id']) return;
+                $current = $consent['generation'] === $this->autoPayGeneration($user, lock: true) && !$this->autoPayOn($user, lock: true);
+                if ($current) $this->enableAutoPay($user, (int) $consent['agreement_id'], (int) $consent['accepted_at'], $consent['version']);
+                $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode(
+                    array_replace($consent, ['state' => $current ? 'enrolled' : 'changed']), JSON_THROW_ON_ERROR)]);
             }));
         } catch (\Throwable $e) {
             if (!$e instanceof \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException) report($e);
-            Log::warning('AeStripe Auto Pay after a processing payment will retry', ['invoice_id' => $invoice->id]);
+            Log::warning('AeStripe Auto Pay after payment will retry', ['user_id' => $userId]);
         }
     }
 
-    /** A waiting turn-on ends with its payment's failure; paying that invoice later does not turn Auto Pay on. The caller holds the user lock. */
-    private function dropWaitingAutoPay(User $user, $intent): void
+    /** After recordIntentPayment() committed a success: turn on a consent that payment made paid. */
+    private function enrollAfterPayment($intent): void
     {
-        $key = self::AUTO_PAY_WAIT . ($intent->metadata->invoice_id ?? '');
-        $wait = json_decode($this->lockedUserProperty($user, $key)?->value ?? 'null', true);
-        if (is_array($wait) && (!isset($wait['intent']) || $wait['intent'] === $intent->id)) $user->properties()->where('key', $key)->delete();
+        $invoice = Invoice::where('id', $intent->metadata->invoice_id ?? null)->first();
+        if ($invoice) $this->enrollPaidAutoPayConsent((int) $invoice->user_id, self::AUTO_PAY_CONSENT_KEY . $invoice->id, intentId: $intent->id);
     }
+
 
     /**
      * Every turn-on sends one email that confirms it: the card, what is charged and how to stop. It joins the turn-on's
