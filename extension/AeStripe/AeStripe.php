@@ -1015,7 +1015,7 @@ class AeStripe extends Gateway
         return $this->chargeAccepted($invoice, $amount, $billingAgreement, true);
     }
 
-    /** $autoPayConsent: a turn-on and pay's consent id, sent on the PaymentIntent so settlement can match it. */
+    /** $autoPayConsent: a turn-on and pay's consent id. The attempt keeps it and every confirmation puts it on the PaymentIntent. */
     public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement, ?int $acceptedAmount = null, bool $requireAutoPay = false, ?string $acceptedCurrency = null, ?string $autoPayConsent = null)
     {
         $this->paymentRetryReserved = false;
@@ -1031,6 +1031,8 @@ class AeStripe extends Gateway
                 $data['accepted_currency'] = strtolower($acceptedCurrency ?? $invoice->currency_code);
             }
             if ($requireAutoPay) $data['auto_pay_agreement'] = (int) $billingAgreement->id;
+            // Kept with the payment attempt, so every confirmation of it, recovered or not, carries the consent.
+            if ($autoPayConsent) $data['auto_pay_consent'] = $autoPayConsent;
             if (!$this->gatewayEnabled()) {
                 $this->reservePaymentAttempt($invoice, $data);
                 $this->paymentPending('Payments are paused. We will check this payment when payments resume.');
@@ -1039,7 +1041,7 @@ class AeStripe extends Gateway
             if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
                 $intent = $this->confirmAttempt($invoice, $intent->id, [
                     'payment_method' => $billingAgreement->external_reference, 'off_session' => 'true',
-                ] + ($autoPayConsent ? ['metadata' => ['ae_stripe_auto_pay_consent' => $autoPayConsent]] : []), $billingAgreement, $acceptedAmount);
+                ], $billingAgreement, $acceptedAmount);
             }
             if ($intent->status === 'succeeded') {
                 try { $this->recordIntentPayment($intent, 'succeeded'); }
