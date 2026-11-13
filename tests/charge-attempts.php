@@ -798,6 +798,7 @@ use Illuminate\Support\Facades\{DB, Http};
             check(count($stripe->charges) === 1 && ($stored()['state'] ?? null) === 'paid' && $gateway->autoPayDefault(User::$row) === null,
                 'A recovered success that meets a busy lock keeps its paid consent');
             unset(\Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-7']);
+            User::$row->props->values['ae_stripe_auto_pay_consent_920'] = json_encode(array_replace($stored(), ['next_at' => 0])); // Its backoff is over.
             $gateway->retryAutoPayConsents();
             $gateway->retryAutoPayConsents();
             check(($stored()['state'] ?? null) === 'enrolled' && ($gateway->autoPayDefault(User::$row)['agreement_id'] ?? null) === 4

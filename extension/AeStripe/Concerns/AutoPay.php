@@ -279,7 +279,7 @@ trait AutoPay
             $stored = json_decode($this->lockedUserProperty($locked, $key)?->value ?? 'null', true);
             if (($stored['id'] ?? null) !== $consent['id']) return 'ended';
             // A paid consent stays for retryAutoPayConsents() when this enrollment could not finish.
-            if (in_array($stored['state'], ['enrolled', 'changed'], true) || $stored['state'] === 'charging' && $paid['status'] !== 'processing') {
+            if (in_array($stored['state'], ['enrolled', 'changed', 'failed'], true) || $stored['state'] === 'charging' && $paid['status'] !== 'processing') {
                 $locked->properties()->where('key', $key)->delete();
             }
             return $stored['state'];
@@ -294,6 +294,7 @@ trait AutoPay
         }
         if ($state === 'changed') return ['message' => 'The payment went through. Auto Pay was changed in another window, so that choice stays.'] + $result;
         if ($state === 'paid') return ['message' => 'The payment went through. Auto Pay turns on in a few minutes.'] + $result;
+        if ($state === 'failed') return ['message' => 'The payment went through, but this card is no longer saved, so Auto Pay is still off. Add a card in Payment methods to turn it on.'] + $result;
         if ($state === 'charging' && $paid['status'] === 'processing') return ['message' => 'The payment is processing. Auto Pay turns on once it goes through.'] + $result;
         if (isset($paid['message'])) return ['message' => $paid['message']] + $result;
         // Ended without this payment: it failed, or another payment paid the invoice first.
@@ -368,10 +369,14 @@ trait AutoPay
 
     /**
      * Turns Auto Pay on from a paid consent, after its settlement committed: the saved-method lock comes before the
-     * user lock, so it cannot run inside settlement. Unless the choice count moved or Auto Pay is on, it enables the
-     * consent's card; either way the record says what happened. Every later record of the same payment (bank return,
-     * webhook, recovery) calls it again, and retryAutoPayConsents() retries what none of them finished, so a busy
-     * lock or a lost process only delays it. A lasting failure stops after ten tries. The payment stands either way.
+     * user lock, so it cannot run inside settlement. Every later record of the same payment (bank return, webhook,
+     * recovery) calls it again, and retryAutoPayConsents() retries what none of them finished; both act only on a
+     * paid consent and end it the same way:
+     * - enrolled: the consent's card is enabled;
+     * - changed: Auto Pay is on, or the customer made a newer choice (Off) since, so their choice stays;
+     * - failed: the consent's card is no longer saved. The customer gets one email and staff one notice.
+     * Any error leaves it paid and retries with backoff, without a cap; staff get one notice once it keeps failing.
+     * The payment stands either way.
      */
     private function enrollPaidAutoPayConsent(int $userId, string $key, ?string $consentId = null, ?string $intentId = null): void
     {
@@ -383,36 +388,101 @@ trait AutoPay
                 $user = User::where('id', $userId)->firstOrFail();
                 $consent = json_decode($this->lockedUserProperty($user, $key)?->value ?? 'null', true);
                 if (($consent['state'] ?? null) !== 'paid' || $consent['id'] !== $peek['id']) return;
-                $current = $consent['generation'] === $this->autoPayGeneration($user, lock: true) && !$this->autoPayOn($user, lock: true);
-                if ($current) $this->enableAutoPay($user, (int) $consent['agreement_id'], (int) $consent['accepted_at'], $consent['version']);
+                $state = match (true) {
+                    $this->autoPayOn($user, lock: true) => 'changed',
+                    !$this->autoPayConsentCardSaved($user, $consent) => 'failed',
+                    $consent['generation'] !== $this->autoPayGeneration($user, lock: true) => 'changed',
+                    default => 'enrolled',
+                };
+                if ($state === 'enrolled') $this->enableAutoPay($user, (int) $consent['agreement_id'], (int) $consent['accepted_at'], $consent['version']);
+                if ($state === 'failed') $this->queueAutoPayConsentNotices($user, $consent, true);
                 $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode(
-                    array_replace($consent, ['state' => $current ? 'enrolled' : 'changed']), JSON_THROW_ON_ERROR)]);
+                    array_replace($consent, ['state' => $state]), JSON_THROW_ON_ERROR)]);
             }));
         } catch (\Throwable $e) {
-            Log::warning('AeStripe Auto Pay after payment will retry', ['user_id' => $userId]);
-            if ($e instanceof \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException) return;
-            report($e);
-            try {
-                ExtensionLocks::transaction('user:' . $userId, function () use ($userId, $key, $peek) {
-                    $user = User::where('id', $userId)->firstOrFail();
-                    $consent = json_decode($this->lockedUserProperty($user, $key)?->value ?? 'null', true);
-                    if (($consent['state'] ?? null) !== 'paid' || $consent['id'] !== $peek['id']) return;
-                    $tries = ($consent['tries'] ?? 0) + 1;
-                    $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode(
-                        array_replace($consent, ['tries' => $tries], $tries >= 10 ? ['state' => 'stopped'] : []), JSON_THROW_ON_ERROR)]);
-                    if ($tries >= 10) Log::warning('ae_stripe_auto_pay_consent_stopped', ['user_id' => $userId]);
-                });
-            } catch (\Throwable $ignored) {
-                // The paid record is unchanged, so the next pass tries again.
-            }
+            $this->deferAutoPayConsent($userId, $key, $peek['id'], $e);
         }
     }
 
+    /** The consent's card is still a saved card of this gateway. A removal in progress is retried, not final. */
+    private function autoPayConsentCardSaved(User $user, array $consent): bool
+    {
+        $gateway = Gateway::where('extension', 'AeStripe')->first();
+        $agreement = $gateway ? BillingAgreement::where('id', $consent['agreement_id'])->where('user_id', $user->id)
+            ->where('gateway_id', $gateway->id)->first() : null;
+        if (!$agreement || !empty($agreement->deleted_at)) return false;
+        $customer = $user->properties()->where('key', 'stripe_id')->first()?->value;
+        return !($this->savedMethodIndex($user, $agreement->external_reference, $customer, $gateway)['removed'] ?? false);
+    }
+
     /**
-     * The scheduled pass for paid consents whose enrollment did not finish: a busy saved-method lock, or a process
-     * lost between settlement and enrollment. It only runs enrollPaidAutoPayConsent(), with its choice-count and
-     * final On checks under the locks, so it never charges, a repeat changes nothing, and the turn-on email's source
-     * keeps it to one.
+     * A failed enrollment try: deadlocks, lock timeouts and busy locks pass, so the consent stays paid and the sweep
+     * tries again after a backoff that doubles from one minute up to an hour. After ten tries or an hour, staff get
+     * one notice; the retries continue. If this record cannot be written either, the next pass tries again.
+     */
+    private function deferAutoPayConsent(int $userId, string $key, string $consentId, \Throwable $error): void
+    {
+        Log::warning('AeStripe Auto Pay after payment will retry', ['user_id' => $userId, 'error' => get_class($error)]);
+        $first = false;
+        try {
+            ExtensionLocks::transaction('user:' . $userId, function () use ($userId, $key, $consentId, &$first) {
+                $user = User::where('id', $userId)->firstOrFail();
+                $consent = json_decode($this->lockedUserProperty($user, $key)?->value ?? 'null', true);
+                if (($consent['state'] ?? null) !== 'paid' || $consent['id'] !== $consentId) return;
+                $now = time();
+                $tries = ($consent['tries'] ?? 0) + 1;
+                $since = $consent['failing_since'] ?? $now;
+                $first = $tries === 1;
+                $notice = empty($consent['staff_notice']) && ($tries >= 10 || $now - $since >= 3600);
+                if ($notice) $this->queueAutoPayConsentNotices($user, $consent, false);
+                $user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode(array_replace($consent, [
+                    'tries' => $tries, 'failing_since' => $since, 'next_at' => $now + min(60 * 2 ** min($tries - 1, 6), 3600),
+                ], $notice ? ['staff_notice' => true] : []), JSON_THROW_ON_ERROR)]);
+            });
+        } catch (\Throwable $ignored) {
+            // The paid record is unchanged, so the next pass tries again.
+        }
+        if ($first && !$error instanceof \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException) report($error);
+    }
+
+    /**
+     * Notices for a paid consent that did not turn Auto Pay on. Failed: one email to the customer and one staff
+     * notice. Still retrying: one staff notice. Each has a fixed source, so a repeat queues nothing new.
+     */
+    private function queueAutoPayConsentNotices(User $user, array $consent, bool $failed): void
+    {
+        $invoice = Invoice::where('id', $consent['invoice_id'])->first();
+        $label = $invoice ? $this->invoiceLabel($invoice) : '#' . $consent['invoice_id'];
+        $identities = [];
+        if ($failed) {
+            $identities[] = $identity = ['kind' => 'ae_stripe_auto_pay_mail:failed', 'source' => 'consent_' . $consent['id']];
+            $this->storePaymentNotices($identity, [[
+                'user_id' => (int) $user->id, 'title' => __('Auto Pay is not on'),
+                'body' => __('Your payment for invoice :invoice went through, but Auto Pay did not turn on because the card is no longer saved. To turn on Auto Pay, add a card in Payment methods.',
+                    ['invoice' => $label]),
+                'url' => route('account.payment-methods'), 'link_label' => __('Turn on Auto Pay'),
+            ]]);
+        }
+        $identities[] = $identity = ['kind' => 'ae_stripe_auto_pay_consent:' . ($failed ? 'failed' : 'retrying'), 'source' => 'consent_' . $consent['id']];
+        $customer = 'customer #' . $user->id . ($user->email ? ' (' . $user->email . ')' : '');
+        $this->storePaymentNotices($identity, $this->staffPaymentNotices('invoice', [
+            'title' => $failed ? 'Auto Pay did not turn on after payment' : 'Auto Pay after payment keeps failing',
+            'body' => 'Invoice ' . $label . ' was paid by ' . $customer . ' with Pay and turn on Auto Pay. ' . ($failed
+                ? 'Auto Pay did not turn on because the card is no longer saved. The customer was emailed.'
+                : 'Turning on Auto Pay keeps failing and is still retrying. Check the logs for "AeStripe Auto Pay after payment will retry".'),
+            'url' => $invoice ? $this->adminInvoiceUrl($invoice) : url('/admin'),
+        ]));
+        DB::afterCommit(function () use ($identities) {
+            foreach ($identities as $identity) foreach (DB::table('ae_stripe_outbox')->where('source', $identity['source'])
+                ->whereIn('kind', [$identity['kind'] . ':staff', $identity['kind'] . ':customer'])->get() as $row) $this->deliverPaymentNotices($row->id);
+        });
+    }
+
+    /**
+     * The scheduled pass for paid consents whose enrollment did not finish: a busy saved-method lock, a database
+     * error, or a process lost between settlement and enrollment. A consent waits out its backoff. It only runs
+     * enrollPaidAutoPayConsent(), with its checks under the locks, so it never charges, a repeat changes nothing,
+     * and each email's source keeps it to one.
      */
     public function retryAutoPayConsents(): void
     {
@@ -420,6 +490,7 @@ trait AutoPay
             ->orderBy('updated_at')->limit(100)->get() as $property) {
             // The enrollment reads only this user's own record under its lock.
             if (!preg_match('/^' . self::AUTO_PAY_CONSENT_KEY . '[0-9]+$/', $property->key)) continue;
+            if ((json_decode($property->value, true)['next_at'] ?? 0) > time()) continue;
             try { $this->enrollPaidAutoPayConsent((int) $property->model_id, $property->key); } catch (\Throwable $e) { report($e); }
         }
     }

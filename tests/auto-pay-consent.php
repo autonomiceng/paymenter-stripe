@@ -397,11 +397,21 @@ check($result['enabled'] === false && $result['message'] === 'The payment went t
     && $payer->autoPayDefault($user) === null && $existing->billing_agreement_id === 55
     && (json_decode($user->props->values[$consentKey(42)] ?? 'null', true)['state'] ?? null) === 'paid',
     'A paid first invoice whose turn-on meets a busy lock keeps its paid consent, says when Auto Pay turns on and charges nothing more');
+// Time passing: the consent's backoff is over.
+$due = function (int $invoice) use ($user, $consentKey) {
+    $consent = json_decode($user->props->values[$consentKey($invoice)], true);
+    $user->props->values[$consentKey($invoice)] = json_encode(array_replace($consent, ['next_at' => 0]));
+};
 $sweptMails = $onMails();
+$tries = json_decode($user->props->values[$consentKey(42)], true)['tries'];
+$payer->retryAutoPayConsents();
+check($tries >= 1 && json_decode($user->props->values[$consentKey(42)], true)['tries'] === $tries, 'The sweep waits out the backoff after a failed try');
+$due(42);
 $payer->retryAutoPayConsents();
 check($payer->autoPayDefault($user) === null && json_decode($user->props->values[$consentKey(42)] ?? 'null', true)['state'] === 'paid',
     'A sweep while the lock is still busy changes nothing and keeps the paid consent');
 unset(\Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-' . $user->id]);
+$due(42);
 $payer->retryAutoPayConsents();
 check(($payer->autoPayDefault($user)['agreement_id'] ?? null) === 94 && $existing->billing_agreement_id === 94
     && json_decode($user->props->values[$consentKey(42)], true)['state'] === 'enrolled' && $onMails() === $sweptMails + 1
@@ -421,6 +431,49 @@ check(json_decode($user->props->values[$consentKey(56)], true)['state'] === 'cha
     && ($payer->autoPayDefault($user)['agreement_id'] ?? null) === 94 && $existing->billing_agreement_id === 94 && $onMails() === $sweptMails + 1,
     'The sweep enrolls a paid consent left by a lost process, and one from before a newer choice changes nothing');
 unset($user->props->values[$consentKey(56)], $user->props->values[$consentKey(57)]);
+// Recoverable errors never end a paid consent: database deadlocks while enrolling are retried with backoff, past
+// ten tries, with one staff notice, and the next try that works turns Auto Pay on.
+$outbox = fn (string $kind) => count(array_filter(DB::$tables['ae_stripe_outbox'] ?? [], fn ($row) => $row['kind'] === $kind));
+$gateway->saveAutoPayDefault(new Request(['enabled' => false])); $existing->billing_agreement_id = 55; $payer->charges = [];
+$deadlockConsent = array_replace($lost, ['id' => 'apc_deadlock', 'invoice_id' => 58, 'intent' => 'pi_deadlock',
+    'generation' => \Closure::bind(fn () => $this->autoPayGeneration($user), $payer, AeStripe::class)()]);
+$user->props->values[$consentKey(58)] = json_encode($deadlockConsent);
+$sweptMails = $onMails();
+for ($try = 1; $try <= 11; $try++) {
+    DB::$beforeUserLock = fn () => throw new RuntimeException('SQLSTATE[40001]: Deadlock found when trying to get lock');
+    $due(58);
+    $payer->retryAutoPayConsents();
+    DB::$beforeUserLock = null;
+    $stored = json_decode($user->props->values[$consentKey(58)], true);
+    if ($try === 9) check($stored['state'] === 'paid' && $outbox('ae_stripe_auto_pay_consent:retrying:staff') === 0, 'Nine deadlocks keep the consent paid without a staff notice yet');
+    if ($try === 10) check($stored['state'] === 'paid' && $stored['tries'] === 10 && $stored['next_at'] > time()
+        && $outbox('ae_stripe_auto_pay_consent:retrying:staff') === 1, 'The tenth deadlock keeps the consent paid and raises one staff notice');
+}
+check($stored['state'] === 'paid' && $stored['tries'] === 11 && $outbox('ae_stripe_auto_pay_consent:retrying:staff') === 1
+    && $payer->autoPayDefault($user) === null, 'Retries continue past ten without a second staff notice');
+$due(58);
+$payer->retryAutoPayConsents();
+check(json_decode($user->props->values[$consentKey(58)], true)['state'] === 'enrolled' && ($payer->autoPayDefault($user)['agreement_id'] ?? null) === 94
+    && $existing->billing_agreement_id === 94 && $onMails() === $sweptMails + 1 && $payer->charges === [],
+    'Once the deadlocks clear, the sweep enrolls the consent with one email and no charge');
+// A permanent error ends the consent: its card is no longer saved, so it fails with one customer email and one staff notice.
+$gateway->saveAutoPayDefault(new Request(['enabled' => false])); $existing->billing_agreement_id = 55;
+$gone = array_replace($deadlockConsent, ['id' => 'apc_gone', 'invoice_id' => 59, 'intent' => 'pi_gone', 'agreement_id' => 96,
+    'generation' => \Closure::bind(fn () => $this->autoPayGeneration($user), $payer, AeStripe::class)()]);
+$user->props->values[$consentKey(59)] = json_encode($gone);
+$sweptMails = $onMails();
+$payer->retryAutoPayConsents();
+$payer->retryAutoPayConsents();
+\Closure::bind(fn () => $this->enrollPaidAutoPayConsent(7, 'ae_stripe_auto_pay_consent_59', intentId: 'pi_gone'), $payer, AeStripe::class)();
+$failedMail = array_values(array_filter(DB::$tables['ae_stripe_outbox'] ?? [], fn ($row) => $row['kind'] === 'ae_stripe_auto_pay_mail:failed:customer'));
+check(json_decode($user->props->values[$consentKey(59)], true)['state'] === 'failed' && $payer->autoPayDefault($user) === null
+    && $existing->billing_agreement_id === 55 && $onMails() === $sweptMails && $payer->charges === []
+    && count($failedMail) === 1 && $failedMail[0]['recipient_id'] == 7 && $outbox('ae_stripe_auto_pay_consent:failed:staff') === 1,
+    'A consent whose card is gone ends failed with one customer email and one staff notice, and later tries add nothing');
+$failedBody = json_decode($failedMail[0]['payload'], true);
+check(str_contains($failedBody['body'], 'went through') && str_contains($failedBody['body'], 'Auto Pay did not turn on')
+    && $failedBody['link_label'] === 'Turn on Auto Pay', 'The failure email says the payment went through, that Auto Pay is not on, and links to turn it on');
+unset($user->props->values[$consentKey(58)], $user->props->values[$consentKey(59)]);
 $payer->declineAutoPay = 'Insufficient funds. Try a different card, or contact your bank.';
 $result = $turnOn(44);
 $payer->declineAutoPay = null;
