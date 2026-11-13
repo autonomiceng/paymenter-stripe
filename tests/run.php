@@ -376,6 +376,7 @@ foreach (['pending-survivor', 'removed-survivor', 'reserved-survivor', 'bound-re
 foreach (['account-during', 'reserved-account', 'repair-account', 'repair-service', 'lost-detach', 'unreconciled', 'survivor-change', 'missing-identity', 'missing-customer', 'turn-off', 'inherit-during', 're-add'] as $bindingCase) {
     (function () use ($bindingCase) { require __DIR__ . '/cleanup-bindings.php'; })();
 }
+require __DIR__ . '/panel-sync.php';
 require __DIR__ . '/native-ci-selection.php';
 require __DIR__ . '/native-fixture-lifetime.php';
 echo "PASS: $count offline assertions\n";

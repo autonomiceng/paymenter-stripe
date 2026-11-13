@@ -1,0 +1,5 @@
+{{-- Synced from Domains 08c94293c3a93f4afcd4704186dc0cf420dc5ea3 Domains/resources/views/components/panel/fact.blade.php by tools/panel_sync.py. Change it in Domains and run the script again. --}}
+{{-- MIT, Copyright (c) 2026 Autonomic Engineering. One Fact. A skin sets host and code in mono and numbers in tabular figures from data-domains-fact.
+     An instant goes through the moment partial, so the browser shows the viewer's zone; a calendar date stays as written. --}}
+@props(['fact'])
+@if ($fact->instant)<span class="domains-panel-fact" data-piece="fact" data-domains-fact="date" title="{{ $fact->title }}">@include('gateways.ae-stripe::panel.moment', ['at' => $fact->datetime])</span>@elseif ($fact->kind === 'date')<time class="domains-panel-fact" data-piece="fact" data-domains-fact="date" datetime="{{ $fact->datetime }}" @if ($fact->title !== null) title="{{ $fact->title }}" @endif>{{ $fact->text }}</time>@else<span class="domains-panel-fact" data-piece="fact" data-domains-fact="{{ $fact->kind }}">{{ $fact->text }}</span>@endif
