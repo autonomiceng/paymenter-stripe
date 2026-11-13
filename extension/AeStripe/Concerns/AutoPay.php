@@ -373,8 +373,10 @@ trait AutoPay
      * recovery) calls it again, and retryAutoPayConsents() retries what none of them finished; both act only on a
      * paid consent and end it the same way:
      * - enrolled: the consent's card is enabled;
-     * - changed: Auto Pay is on, or the customer made a newer choice (Off) since, so their choice stays;
-     * - failed: the consent's card is no longer saved. The customer gets one email and staff one notice.
+     * - changed: Auto Pay is on, or the customer made a newer choice (Off) since, so their choice stays. This is
+     *   checked first, so a newer choice is never reported as a failure, even when the card is gone too;
+     * - failed: with no newer choice, the consent's card is no longer saved. The customer gets one email and staff
+     *   one notice.
      * Any error leaves it paid and retries with backoff, without a cap; staff get one notice once it keeps failing.
      * The payment stands either way.
      */
@@ -388,10 +390,10 @@ trait AutoPay
                 $user = User::where('id', $userId)->firstOrFail();
                 $consent = json_decode($this->lockedUserProperty($user, $key)?->value ?? 'null', true);
                 if (($consent['state'] ?? null) !== 'paid' || $consent['id'] !== $peek['id']) return;
+                // A newer choice comes first: whatever happened to the card since, the customer's own choice stands.
                 $state = match (true) {
-                    $this->autoPayOn($user, lock: true) => 'changed',
+                    $this->autoPayOn($user, lock: true), $consent['generation'] !== $this->autoPayGeneration($user, lock: true) => 'changed',
                     !$this->autoPayConsentCardSaved($user, $consent) => 'failed',
-                    $consent['generation'] !== $this->autoPayGeneration($user, lock: true) => 'changed',
                     default => 'enrolled',
                 };
                 if ($state === 'enrolled') $this->enableAutoPay($user, (int) $consent['agreement_id'], (int) $consent['accepted_at'], $consent['version']);

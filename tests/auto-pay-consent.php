@@ -473,7 +473,24 @@ check(json_decode($user->props->values[$consentKey(59)], true)['state'] === 'fai
 $failedBody = json_decode($failedMail[0]['payload'], true);
 check(str_contains($failedBody['body'], 'went through') && str_contains($failedBody['body'], 'Auto Pay did not turn on')
     && $failedBody['link_label'] === 'Turn on Auto Pay', 'The failure email says the payment went through, that Auto Pay is not on, and links to turn it on');
-unset($user->props->values[$consentKey(58)], $user->props->values[$consentKey(59)]);
+// A newer choice wins over a failure: the customer turns Auto Pay on elsewhere, then explicitly off, then removes the
+// consent's card. The waiting consent ends changed, with no customer email and no staff notice.
+ExtensionHelper::$agreements['pm_superseded'] = ['id' => 97, 'user_id' => 7, 'gateway_id' => $gatewayId,
+    'external_reference' => 'pm_superseded', 'deleted_at' => null];
+$gateway->saveAutoPayDefault(new Request(['enabled' => false])); $existing->billing_agreement_id = 55;
+$superseded = array_replace($deadlockConsent, ['id' => 'apc_superseded', 'invoice_id' => 60, 'intent' => 'pi_superseded', 'agreement_id' => 97,
+    'generation' => \Closure::bind(fn () => $this->autoPayGeneration($user), $payer, AeStripe::class)()]);
+$user->props->values[$consentKey(60)] = json_encode($superseded);
+$gateway->saveAutoPayDefault(new Request(['agreement_id' => 94]));
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+unset(ExtensionHelper::$agreements['pm_superseded']);
+$quiet = [$onMails(), $outbox('ae_stripe_auto_pay_mail:failed:customer'), $outbox('ae_stripe_auto_pay_consent:failed:staff'), $outbox('ae_stripe_auto_pay_consent:retrying:staff')];
+$payer->retryAutoPayConsents();
+\Closure::bind(fn () => $this->enrollPaidAutoPayConsent(7, 'ae_stripe_auto_pay_consent_60', intentId: 'pi_superseded'), $payer, AeStripe::class)();
+check(json_decode($user->props->values[$consentKey(60)], true)['state'] === 'changed' && $payer->autoPayDefault($user) === null
+    && [$onMails(), $outbox('ae_stripe_auto_pay_mail:failed:customer'), $outbox('ae_stripe_auto_pay_consent:failed:staff'), $outbox('ae_stripe_auto_pay_consent:retrying:staff')] === $quiet,
+    'A newer Off, then removing the consent\'s card, ends the consent changed with no email and no staff notice');
+unset($user->props->values[$consentKey(58)], $user->props->values[$consentKey(59)], $user->props->values[$consentKey(60)]);
 $payer->declineAutoPay = 'Insufficient funds. Try a different card, or contact your bank.';
 $result = $turnOn(44);
 $payer->declineAutoPay = null;
