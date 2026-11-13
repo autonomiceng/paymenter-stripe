@@ -166,8 +166,10 @@ check(str_contains($setupView, '<div id="express-checkout-element" class="shrink
 check(str_contains($elementsView, "layout: 'tabs',") && str_contains($elementsView, 'buttonHeight: 40,'),
     'Card fields show without a panel around them and the Link button keeps its smallest height');
 check(str_contains($payView, "@checked(in_array($" . "intent->status, ['requires_action', 'requires_confirmation']")
-    && str_contains($payView, 'const save = resuming ? savedConsent :') && str_contains($payView, 'amount: @js($intent->amount), save, saved_notice: savedNoticeToken}')
-    && str_contains($payView, 'saveCard.disabled = resuming ||'), '3DS resume visibly preserves its recorded save choice');
+    && str_contains($payView, 'const save = resuming ? savedConsent :') && str_contains($payView, 'const turnOnAutoPay = resuming ? savedAutoPay :')
+    && str_contains($payView, 'amount: @js($intent->amount), save, auto_pay: turnOnAutoPay, saved_notice: savedNoticeToken}')
+    && str_contains($payView, 'const closed = resuming ||') && str_contains($payView, 'saveCard.disabled = closed;'),
+    '3DS resume visibly preserves its recorded save and Auto Pay choices');
 
 check(str_contains($payView, 'if (customerSessionSecret) options.customerSessionClientSecret = customerSessionSecret;'),
     'Checkout only includes a Customer Session secret when available');

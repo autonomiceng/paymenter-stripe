@@ -186,7 +186,7 @@ if (in_array($case, ['pending', 'removed-replay'], true)) {
     check(version_compare($meta['version'], '0.1.1', '>'), 'A schema-changing update advertises a newer extension version');
 } elseif ($case === 'terms') {
     $view = file_get_contents(__DIR__ . '/../extension/AeStripe/resources/views/billing-agreement.blade.php');
-    check(str_contains($view, '>Terms of Service</a>'), 'The Add card agreement names Terms of Service');
+    check(!str_contains($view, 'id="setup-terms"') && !str_contains($view, 'id="setup-consent-note"'), 'Add card shows no consent sentence of its own');
 } elseif ($case === 'notices') {
     $intent = (object) ['id' => 'pi_followup', 'customer' => 'cus_owner', 'payment_method' => 'pm_new', 'status' => 'succeeded',
         'payment_method_options' => (object) ['card' => (object) ['setup_future_usage' => 'off_session']],
