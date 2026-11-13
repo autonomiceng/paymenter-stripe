@@ -326,6 +326,75 @@ check($payer->autoPayCoversInvoice($open) === true, 'A renewal retry still plann
 unset($user->props->values['ae_stripe_checkout_33']);
 $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
 check($payer->autoPayCoversInvoice($open) === null, 'With Auto Pay off there is nothing to say');
+// Every turn-on stores the current consent version and queues one "Auto Pay is on" email; off and a declined
+// turn-on send none. Records accepted under the earlier words stay valid.
+$mails = fn () => array_values(array_filter(DB::$tables['ae_stripe_outbox'] ?? [],
+    fn ($row) => $row['kind'] === 'ae_stripe_auto_pay_mail:on:customer' && $row['recipient_id'] == 7));
+$mailCount = count($mails());
+$choice = array_replace($choice, ['agreement_id' => 94]);
+ExtensionHelper::$agreements['pm_elsewhere'] = ['id' => 95, 'user_id' => 7, 'gateway_id' => $gatewayId,
+    'external_reference' => 'pm_elsewhere', 'deleted_at' => null];
+check($gateway->autoPayOffered($user) === true, 'The pay dialog offers Auto Pay while it is off');
+$gateway->saveAutoPayDefault(new Request($choice));
+check(($gateway->autoPayDefault($user)['version'] ?? null) === 'auto_pay_account_v2' && count($mails()) === $mailCount + 1
+    && json_decode($mails()[$mailCount]['payload'], true)['user_id'] === 7, 'The switch stores the v2 record and queues one Auto Pay is on email');
+check($gateway->autoPayOffered($user) === false, 'The pay dialog offers no Auto Pay box while it is on');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+check(count($mails()) === $mailCount + 1, 'Turning Auto Pay off sends no email');
+$user->props->values['ae_stripe_auto_pay_default'] = json_encode(['version' => 'auto_pay_account_v1', 'user_id' => 7,
+    'accepted_at' => 1794071700, 'agreement_id' => 94]);
+check(($gateway->autoPayDefault($user)['agreement_id'] ?? null) === 94, 'A record accepted under the v1 words stays valid');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+$payer->decline = 'Your bank declined this card. Try a different card, or contact your bank.';
+$declined = new Invoice($user); $declined->id = 52;
+$payer->turnOnAutoPayAndPay($user, $card, [[$declined, '20.00']], AeStripe::AUTO_PAY_CONSENT);
+$payer->decline = null;
+check($payer->autoPayDefault($user) === null && count($mails()) === $mailCount + 1, 'A declined turn-on and pay sends no email');
+$turnOn(50);
+check(count($mails()) === $mailCount + 2, 'A paid turn-on and pay queues one email');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+
+// The pay dialog's box for a new card: Auto Pay turns on only once the payment succeeded and its card was saved, once.
+$paidIntent = fn (string $status, string $id = 'pi_auto_pay') => (object) ['id' => $id, 'status' => $status,
+    'payment_method' => 'pm_turn_on', 'metadata' => (object) ['invoice_id' => 61, 'ae_stripe_gateway' => '1',
+        'ae_stripe_consent' => '1', 'ae_stripe_auto_pay' => AeStripe::AUTO_PAY_CONSENT, 'ae_stripe_auto_pay_at' => '1794071800']];
+$dialogInvoice = new Invoice($user); $dialogInvoice->id = 61; Invoice::$rows[61] = $dialogInvoice;
+$user->props->values['ae_stripe_saved_' . hash('sha256', 'pi_auto_pay:pm_turn_on')] = json_encode(['incoming' => 'pm_turn_on', 'reference' => 'pm_turn_on']);
+$afterPay = fn ($intent) => (fn () => $this->turnOnPaidAutoPay($intent))->call($gateway);
+$afterPay($paidIntent('requires_payment_method'));
+check($gateway->autoPayDefault($user) === null && count($mails()) === $mailCount + 2, 'A payment that did not succeed leaves Auto Pay off');
+$afterPay($paidIntent('succeeded'));
+$record = $gateway->autoPayDefault($user);
+check(($record['agreement_id'] ?? null) === 94 && $record['version'] === AeStripe::AUTO_PAY_CONSENT && $record['accepted_at'] === 1794071800
+    && count($mails()) === $mailCount + 3, 'A succeeded payment turns Auto Pay on with the saved card, the version and time shown, and one email');
+$afterPay($paidIntent('succeeded'));
+check(count($mails()) === $mailCount + 3, 'The bank return and the webhook for the same payment add nothing');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+$afterPay($paidIntent('succeeded'));
+check($gateway->autoPayDefault($user) === null, 'A late webhook never undoes a later Off');
+$gateway->saveAutoPayDefault(new Request(array_replace($choice, ['agreement_id' => 95])));
+$user->props->values['ae_stripe_saved_' . hash('sha256', 'pi_auto_pay_2:pm_turn_on')] = json_encode(['incoming' => 'pm_turn_on', 'reference' => 'pm_turn_on']);
+$mailCount = count($mails());
+$afterPay($paidIntent('succeeded', 'pi_auto_pay_2'));
+check(($gateway->autoPayDefault($user)['agreement_id'] ?? null) === 95 && count($mails()) === $mailCount,
+    'Auto Pay turned on elsewhere since the dialog opened keeps its own card');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+unset(Invoice::$rows[61]);
+// The dialog refuses Auto Pay before any charge when the card is not being saved, or when Auto Pay is already on.
+$confirmIntent = (object) ['id' => 'pi_confirm', 'customer' => 'cus_owner', 'status' => 'requires_payment_method', 'amount' => 2000,
+    'amount_received' => 0, 'currency' => 'usd', 'confirmation_method' => 'automatic', 'metadata' => (object) ['invoice_id' => 12, 'ae_stripe_gateway' => '1']];
+$priorHandler = Http::$handler;
+Http::$handler = fn () => $confirmIntent;
+$confirm = fn (array $extra) => $gateway->confirmPayment(new Request(array_replace(['intent' => 'pi_confirm',
+    'confirmation_token' => 'ctoken_fixture', 'amount' => 2000, 'save' => true, 'auto_pay' => true], $extra)));
+$sent = fn () => count(array_filter(Http::$calls, fn ($call) => $call[0] === 'post' && str_contains($call[1], 'pi_confirm')));
+$calls = $sent();
+check($confirm(['save' => false])['status'] === 409 && $sent() === $calls, 'Auto Pay without saving the card is refused before any charge');
+$gateway->saveAutoPayDefault(new Request($choice));
+check($confirm([])['status'] === 409 && $sent() === $calls, 'Auto Pay already on is refused before any charge');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+Http::$handler = $priorHandler;
+
 ExtensionHelper::$agreements = $oldAgreements;
 BillingAgreement::$snapshot = $oldSnapshot;
 $user->props->values = $oldProperties;

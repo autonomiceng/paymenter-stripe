@@ -78,7 +78,9 @@ trait PaymentNotices
                 $row = DB::table('ae_stripe_outbox')->where('id', $id)->lockForUpdate()->first();
                 if (!$row || $row->state !== 'pending' || $row->next_at > time()) return;
                 $notice = json_decode($row->payload, true, flags: JSON_THROW_ON_ERROR);
-                $isMail = str_starts_with($row->kind, 'ae_stripe_return_mail:');
+                // Account mail (Auto Pay is on) belongs to no invoice; the recipient alone decides delivery.
+                $accountMail = str_starts_with($row->kind, 'ae_stripe_auto_pay_mail:');
+                $isMail = $accountMail || str_starts_with($row->kind, 'ae_stripe_return_mail:');
                 if ($isMail && !$sendMail) {
                     // Acceptance by the queue does not complete delivery. A lost enqueue keeps this entry pending.
                     DB::afterCommit(fn () => Queue::push(new DeliverReturnMail($id)));
@@ -91,13 +93,14 @@ trait PaymentNotices
                 if (isset($notice['staff_scope'])) {
                     $audience = array_map(fn ($staff) => (int) $staff->id, $this->noticeStaff($notice['staff_scope']));
                     $live = $live && in_array((int) $row->recipient_id, $audience, true);
-                } else $live = $live && isset($notice['invoice_id']) && Invoice::where('id', $notice['invoice_id'])
+                } elseif (!$accountMail) $live = $live && isset($notice['invoice_id']) && Invoice::where('id', $notice['invoice_id'])
                     ->where('user_id', $row->recipient_id)->exists();
                 if ($live) {
-                    unset($notice['staff_scope'], $notice['invoice_id']);
+                    $linkLabel = $notice['link_label'] ?? 'Open invoice';
+                    unset($notice['staff_scope'], $notice['invoice_id'], $notice['link_label']);
                     if ($isMail) {
                         $mail = new SystemMail(['subject' => $notice['title'], 'body' => '<p>' . e($notice['body'])
-                            . '</p><p><a href="' . e($notice['url']) . '">Open invoice</a></p>']);
+                            . '</p><p><a href="' . e($notice['url']) . '">' . e($linkLabel) . '</a></p>']);
                         $log = EmailLog::create(['user_id' => $recipient->id, 'subject' => $notice['title'],
                             'to' => $recipient->email, 'body' => $mail->render()]);
                         $mail->email_log_id = $log->id;

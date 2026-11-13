@@ -6,7 +6,7 @@ use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
 
 use App\Models\{BillingAgreement, Gateway, Invoice, Service, User};
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\{Auth, DB};
+use Illuminate\Support\Facades\{Auth, DB, Log};
 
 trait AutoPay
 {
@@ -37,6 +37,12 @@ trait AutoPay
             'terms_label' => __('Terms'),
             'terms_url' => $terms === '' ? null : $terms,
         ];
+    }
+
+    /** Whether the pay dialog offers "Turn on Auto Pay": only while it is off and this gateway takes card payments. */
+    public function autoPayOffered(User $user): bool
+    {
+        return $this->gatewayEnabled() && $this->bundledInactive() && !$this->autoPayDefault($user);
     }
 
     /** A saved card or off-session saving consent alone never grants this scope. */
@@ -127,8 +133,18 @@ trait AutoPay
         }
     }
 
-    /** On with the chosen card: links every recurring service to it. The caller holds the user row lock. */
-    private function enableAutoPay(User $user, int $agreementId): int
+    /** How the consent line and the turn-on email name a saved method: "•••• 4242" or "your Link wallet". */
+    public function autoPayCardLabel(BillingAgreement $agreement): string
+    {
+        if ($agreement->type === 'link') return __('your Link wallet');
+        return preg_match('/\\*{4} ?([0-9]{4})$/', (string) $agreement->name, $last4) ? '•••• ' . $last4[1] : (string) $agreement->name;
+    }
+
+    /**
+     * On with the chosen card: links every recurring service to it, stores the consent record and queues the
+     * "Auto Pay is on" email. The caller holds the user row lock.
+     */
+    private function enableAutoPay(User $user, int $agreementId, ?int $acceptedAt = null, string $version = self::AUTO_PAY_CONSENT): int
     {
         $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
         $agreement = BillingAgreement::where('id', $agreementId)
@@ -137,9 +153,10 @@ trait AutoPay
         $this->assertSavedMethodBindable($user, $agreement);
         $this->stopWaitingRenewals($user);
         $this->rememberAutoPayCard($user, (int) $agreement->id);
-        $record = ['version' => self::AUTO_PAY_CONSENT, 'user_id' => (int) $user->id,
-            'accepted_at' => time(), 'agreement_id' => (int) $agreement->id];
+        $record = ['version' => $version, 'user_id' => (int) $user->id,
+            'accepted_at' => $acceptedAt ?? time(), 'agreement_id' => (int) $agreement->id];
         $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_PROPERTY], ['value' => json_encode($record, JSON_THROW_ON_ERROR)]);
+        $this->queueAutoPayOnMail($user, $agreement);
         $services = 0;
         foreach ($this->autoPayServices($user) as $service) {
             if (($service->plan?->type ?? null) !== 'recurring' || $service->status === Service::STATUS_CANCELLED) continue;
@@ -204,6 +221,62 @@ trait AutoPay
             $result['invoices'][] = array_intersect_key($pay($invoice, $amount, true), array_flip(['id', 'status', 'message']));
         }
         return $result;
+    }
+
+    /**
+     * The pay dialog's "Turn on Auto Pay" for a new card, once its payment succeeded and the card was saved. Every
+     * path that saves the card calls this (the dialog, the bank return, the webhook), and a marker per payment makes
+     * it happen once, so a later Off is never undone by a late webhook. Auto Pay turned on elsewhere since the dialog
+     * opened keeps its own card. A failure leaves no marker, so the next path tries again; the payment stands.
+     */
+    private function turnOnPaidAutoPay($intent): void
+    {
+        $version = $intent->metadata->ae_stripe_auto_pay ?? null;
+        if (!in_array($version, self::AUTO_PAY_CONSENTS, true) || ($intent->status ?? null) !== 'succeeded'
+            || !is_string($intent->payment_method ?? null) || !is_string($intent->id ?? null)) return;
+        $invoice = Invoice::where('id', $intent->metadata->invoice_id ?? null)->first();
+        if (!$invoice || !$this->gatewayEnabled() || !$this->bundledInactive()) return;
+        $userId = (int) $invoice->user_id;
+        $marker = 'ae_stripe_auto_pay_paid_' . $intent->id;
+        try {
+            $this->withSavedMethodBindingLock($userId, fn () => ExtensionLocks::transaction('user:' . $userId, function () use ($intent, $userId, $marker, $version) {
+                $user = User::where('id', $userId)->firstOrFail();
+                if ($this->lockedUserProperty($user, $marker)) return;
+                // The save receipt names the card kept for this payment, which is an older copy when it was a duplicate.
+                $receipt = json_decode($user->properties()->where('key', 'ae_stripe_saved_' . hash('sha256', $intent->id . ':' . $intent->payment_method))->first()?->value ?? 'null', true);
+                $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
+                $agreement = is_string($receipt['reference'] ?? null) ? BillingAgreement::where('user_id', $userId)
+                    ->where('gateway_id', $gateway->id)->where('external_reference', $receipt['reference'])->first() : null;
+                if (!$agreement) return;
+                if (!$this->autoPayDefault($user, lock: true)) {
+                    $this->enableAutoPay($user, (int) $agreement->id, (int) ($intent->metadata->ae_stripe_auto_pay_at ?? 0) ?: null, $version);
+                }
+                $user->properties()->updateOrCreate(['key' => $marker], ['value' => json_encode([
+                    'agreement_id' => (int) $agreement->id, 'at' => time()], JSON_THROW_ON_ERROR)]);
+            }));
+        } catch (\Throwable $e) {
+            if (!$e instanceof \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException) report($e);
+            Log::warning('AeStripe Auto Pay after payment will retry', ['invoice_id' => $invoice->id]);
+        }
+    }
+
+    /**
+     * Every turn-on sends one email that confirms it: the card, what is charged and how to stop. It joins the turn-on's
+     * transaction, so a rolled-back turn-on sends nothing, and delivery retries from the outbox.
+     */
+    private function queueAutoPayOnMail(User $user, BillingAgreement $agreement): void
+    {
+        $identity = ['kind' => 'ae_stripe_auto_pay_mail:on', 'source' => 'user_' . $user->id . '_' . bin2hex(random_bytes(8))];
+        $this->storePaymentNotices($identity, [[
+            'user_id' => (int) $user->id, 'title' => __('Auto Pay is on'),
+            'body' => __('Auto Pay is on. We charge :card for every renewal invoice. To stop, turn off Auto Pay in Payment methods.',
+                ['card' => $this->autoPayCardLabel($agreement)]),
+            'url' => route('account.payment-methods'), 'link_label' => __('Open Payment methods'),
+        ]]);
+        DB::afterCommit(function () use ($identity) {
+            foreach (DB::table('ae_stripe_outbox')->where('source', $identity['source'])
+                ->where('kind', $identity['kind'] . ':customer')->get() as $row) $this->deliverPaymentNotices($row->id);
+        });
     }
 
     /** The user's services under lock, without Stripe subscriptions. Callers hold the user row lock. */

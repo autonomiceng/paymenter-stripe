@@ -8,8 +8,16 @@ const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const views = new URL('../extension/AeStripe/resources/views/', import.meta.url);
 const theme = readFileSync(new URL('stripe-theme.blade.php', views), 'utf8');
-function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hosting', resuming = false, savedConsent = false, amount = 2000, destination = 'https://example.com/return') {
+function render(name, linkDisplay = 'above_card', businessName = 'Fixture Hosting', resuming = false, savedConsent = false, amount = 2000, destination = 'https://example.com/return',
+    {autoPay = false, savedAutoPay = false} = {}) {
     let source = readFileSync(new URL(`${name}.blade.php`, views), 'utf8')
+        .replace(/\{\{--[\s\S]*?--\}\}/g, '')
+        // The Auto Pay box is drawn only while Auto Pay is off for the account.
+        .replace(/@if\(\$autoPay\)([\s\S]*?)@endif/, (_, box) => autoPay ? box : '')
+        .replace(/@include\('gateways\.ae-stripe::auto-pay-line'[^\n]*\)/, '<span id="auto-pay-terms">Fixture line</span>')
+        .replace(/(id="auto-pay"[^\n]*?)@checked\([^\n]+? disabled/, (_, start) => start + (resuming && savedAutoPay ? 'checked disabled' : 'disabled'))
+        .replace("@js(($intent->metadata->ae_stripe_auto_pay ?? '') !== '')", JSON.stringify(savedAutoPay))
+        .replace('@js($saveConsentVersion)', "'off_session_v3'")
         .replace("@include('gateways.ae-stripe::stripe-theme')", theme)
         .replace("@include('gateways.ae-stripe::stripe-elements')", () => readFileSync(new URL('stripe-elements.blade.php', views), 'utf8'))
         .replace("@include('gateways.ae-stripe::stripe-form')", () => readFileSync(new URL('stripe-form.blade.php', views), 'utf8'))
@@ -139,17 +147,17 @@ try {
             assert.equal(options.excludedPaymentMethodTypes, undefined);
             const calls = await page.evaluate(() => elementCalls);
             const payment = calls.find(call => call.type === 'payment').options;
-            assert.equal(payment.defaultValues.billingDetails.email, linkDisplay === 'stripe_default' ? 'Fixture' : undefined,
-                `${linkDisplay}: only Stripe default prefills email`);
+            assert.equal(payment.defaultValues.billingDetails.email, undefined,
+                `${linkDisplay}: Link stays out of the card fields, so no email is prefilled`);
             assert.equal(payment.layout, 'tabs');
             assert.equal(payment.terms, undefined, 'The pay form keeps Stripe card terms');
             assert.deepEqual(calls.filter(call => call.type === 'expressCheckout').map(call => call.options),
-                linkDisplay === 'above_card' ? [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
-                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, buttonHeight: 40, ...(businessName ? {business: {name: businessName}} : {})}] : [],
-                `${linkDisplay}: only the above-card choice mounts Link-only Express Checkout`);
+                [{paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',
+                    amazonPay: 'never', paypal: 'never', klarna: 'never'}, buttonHeight: 40, ...(businessName ? {business: {name: businessName}} : {})}],
+                `${linkDisplay}: the pay form offers Link as its own button, outside Stripe's card fields and their save box`);
         } else {
             await page.evaluate(async ({linkDisplay, businessName}) => {
-                window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf', name: 'Fixture', email: 'Fixture', linkDisplay, businessName });
+                window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentVersion: 'off_session_v3', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf', name: 'Fixture', email: 'Fixture', linkDisplay, businessName });
                 component.$el = document.querySelector('form');
                 await component.init();
             }, {linkDisplay, businessName});
@@ -178,7 +186,7 @@ try {
         assert.deepEqual(await page.evaluate(() => paymentElementOptions.business),
             businessName ? {name: businessName} : undefined, `${name}: the Payment Element names the site, or leaves it to Stripe`);
         assert.deepEqual(await page.evaluate(() => paymentElementOptions.wallets),
-            linkDisplay === 'above_card' ? {link: 'never'} : undefined,
+            linkDisplay === 'above_card' || name === 'pay' ? {link: 'never'} : undefined,
             `${name}: ${linkDisplay} keeps Link only in Express Checkout while other modes keep Stripe's defaults`);
         if (linkDisplay === 'above_card') {
             assert.equal(await page.locator('#payment-element').textContent(), 'Card form', `${name}: above-card always mounts the card form`);
@@ -230,7 +238,7 @@ try {
             const confirmLink = () => page.evaluate(() => elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)}));
             await confirmLink();
             assert.deepEqual(await page.evaluate(() => setupRequests), [{url: '/consent', method: 'POST', csrf: 'fixture-csrf',
-                body: {intent: 'fixture-intent', consent: true, version: 'off_session_v2'}}]);
+                body: {intent: 'fixture-intent', consent: true, version: 'off_session_v3'}}]);
             assert.deepEqual(await page.evaluate(() => setupConfirmParams), {return_url: '/return'});
             assert.equal(await page.locator('[role=alert]').textContent(), 'Your card was declined.');
             assert.deepEqual(await page.evaluate(() => linkFailures), [{reason: 'fail'}], 'Only the decline fails Link');
@@ -308,7 +316,7 @@ try {
                 await page.waitForFunction(() => linkRequests.length === 3);
                 assert.deepEqual((await page.evaluate(() => linkRequests)).map(r => ({...r, body: paymentFields(r.body)})), [false, true, false].map(save => ({
                     url: '/extensions.gateways.ae-stripe.confirm', method: 'POST', csrf: 'fixture-csrf',
-                    body: {intent: 'fixture-intent', confirmation_token: 'ctoken_fixture', amount: 2000, save},
+                    body: {intent: 'fixture-intent', confirmation_token: 'ctoken_fixture', amount: 2000, save, auto_pay: false},
                 })), 'Link uses the same deferred server confirm route and amount; a bank form cannot inherit Link saving');
                 assert.deepEqual(await page.evaluate(() => linkFailures), [{reason: 'fail'}, {reason: 'fail'}],
                     'Server refusal also dismisses the Express payment UI');
@@ -346,8 +354,8 @@ try {
             assert.equal(new Set(requests.map(r => r.saved_notice)).size, 1, 'Authentication keeps the same checkout-tab token');
             assert.deepEqual(actions, [{clientSecret: 'fixture-secret'}]);
             assert.deepEqual(requests.map(paymentFields), [
-                {intent: 'fixture-intent', confirmation_token: 'ctoken_fixture', amount: 2000, save: false},
-                {intent: 'fixture-intent', confirmation_token: null, amount: 2000, save: false},
+                {intent: 'fixture-intent', confirmation_token: 'ctoken_fixture', amount: 2000, save: false, auto_pay: false},
+                {intent: 'fixture-intent', confirmation_token: null, amount: 2000, save: false, auto_pay: false},
             ], `${linkDisplay}: authentication reads the same payment without replaying its token before redirecting`);
         }
         if (name === 'billing-agreement' && expressThrows) {
@@ -411,7 +419,7 @@ try {
         assert.equal(await page.evaluate(() => requests.length), requestCount, 'A second card cannot send another tokenless request');
         assert.equal(await page.evaluate(() => tokens), 0);
         assert.deepEqual((await page.evaluate(() => requests)).map(paymentFields), Array.from({length: requestCount}, () => ({
-            intent: 'fixture-intent', confirmation_token: null, amount: 2000, save: true,
+            intent: 'fixture-intent', confirmation_token: null, amount: 2000, save: true, auto_pay: false,
         })), 'Authentication keeps the resumed intent, amount and consent');
         await page.route('https://example.com/resume', route => route.fulfill({contentType: 'text/html', body: 'Fresh payment checkout'}));
         await page.locator('#refresh-payment').click();
@@ -485,21 +493,18 @@ try {
             window.linkFailures = [];
             window.consentOk = false;
             window.fetch = async (url, options) => { setupRequests.push({url, body: JSON.parse(options.body)}); return {ok: consentOk}; };
-            window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf', name: 'Fixture', email: 'Fixture', linkDisplay: 'above_card', businessName: 'Fixture Hosting' });
+            window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentVersion: 'off_session_v3', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf', name: 'Fixture', email: 'Fixture', linkDisplay: 'above_card', businessName: 'Fixture Hosting' });
             component.$el = document.querySelector('form');
             await component.init();
         });
         const at = `${viewport.width}px`;
-        const terms = page.locator('#setup-terms');
-        assert.match(await terms.textContent(), /By saving with Link or a card, you agree to save it for future charges, including renewals\./, `${at}: one consent line`);
-        assert.match(await terms.textContent(), /Saving does not turn on Auto Pay\./, `${at}: saving stays apart from Auto Pay`);
-        for (const [label, locator] of [['consent line', terms], ['Link choice', page.getByText('Use your Link wallet')],
+        for (const [label, locator] of [['Link choice', page.getByText('Use your Link wallet')],
             ['divider', page.getByText('or add a card')], ['card fields', page.locator('#payment-element')], ['Save card', page.getByRole('button', {name: 'Save card'})]]) {
             assert.equal(await locator.isVisible(), true, `${at}: ${label} shows before any choice`);
         }
-        const boxes = await page.evaluate(() => ['#setup-terms', '#express-checkout', '#payment-element', '#submit']
+        const boxes = await page.evaluate(() => ['#express-checkout', '#payment-element', '#submit']
             .map(selector => document.querySelector(selector).getBoundingClientRect().toJSON()));
-        for (let i = 1; i < boxes.length; i++) assert(boxes[i - 1].bottom <= boxes[i].top, `${at}: consent, Link, card fields and Save read top to bottom`);
+        for (let i = 1; i < boxes.length; i++) assert(boxes[i - 1].bottom <= boxes[i].top, `${at}: Link, card fields and Save read top to bottom`);
         assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${at}: nothing runs off the side`);
         assert.equal(await page.locator('[role=alert]').textContent(), '', `${at}: no error before a choice`);
         for (const choice of ['Link', 'card']) {
@@ -510,10 +515,10 @@ try {
             assert.equal(await page.locator('#submit').isEnabled(), true, `${at}: failed ${choice} consent permits retry`);
         }
         assert.deepEqual(await page.evaluate(() => linkFailures), [{reason: 'fail'}], `${at}: consent failure dismisses Link`);
-        assert.deepEqual(await page.evaluate(() => setupRequests), Array.from({length: 2}, () => ({url: '/consent', body: {intent: 'fixture-intent', consent: true, version: 'off_session_v2'}})));
+        assert.deepEqual(await page.evaluate(() => setupRequests), Array.from({length: 2}, () => ({url: '/consent', body: {intent: 'fixture-intent', consent: true, version: 'off_session_v3'}})));
         await page.evaluate(() => {consentOk = true; setupRequests = []; linkFailures = [];});
         await page.evaluate(() => elementHandlers.expressCheckout.confirm({paymentFailed: value => linkFailures.push(value)}));
-        assert.deepEqual(await page.evaluate(() => setupRequests), [{url: '/consent', body: {intent: 'fixture-intent', consent: true, version: 'off_session_v2'}}],
+        assert.deepEqual(await page.evaluate(() => setupRequests), [{url: '/consent', body: {intent: 'fixture-intent', consent: true, version: 'off_session_v3'}}],
             `${at}: choosing Link records the agreement first`);
         assert.equal(await page.evaluate(() => confirms), 1, `${at}: Link saves at once`);
         assert.deepEqual(await page.evaluate(() => linkFailures), [], `${at}: Link never fails for consent`);
@@ -524,7 +529,9 @@ try {
         assert.equal(await page.locator('[role=alert]').textContent(), '', `${at}: the card saves without an error`);
         await page.close();
     }
-    for (const scenario of ['decline', 'save-card', 'once-card', 'save-link', 'once-link']) {
+    // auto-pay-*: the dialog offers Turn on Auto Pay (Auto Pay is off). Ticking it ticks Save this card, unticking Save
+    // unticks it, and the choice goes to the server, which turns Auto Pay on only once the payment succeeds.
+    for (const scenario of ['decline', 'save-card', 'once-card', 'save-link', 'once-link', 'auto-pay-card', 'auto-pay-link']) {
         const page = activePage = await browser.newPage({viewport: {width: 390, height: 844}});
         const sent = [];
         page.setDefaultTimeout(5000);
@@ -561,11 +568,22 @@ try {
                 },
             });
         }, scenario);
-        await page.setContent(render('pay', 'above_card', 'Fixture Hosting', false, false, 1099));
+        const autoPay = scenario.startsWith('auto-pay');
+        await page.setContent(render('pay', 'above_card', 'Fixture Hosting', false, false, 1099, undefined, {autoPay}));
         await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
         // A filled card reports complete, so Pay goes straight to the saving choice and the token.
         await page.evaluate(() => handlers.payment.change({empty: false, complete: true, value: {type: 'card'}}));
-        await page.locator('#save-card').setChecked(scenario.startsWith('save'));
+        assert.equal(await page.locator('#auto-pay').count(), autoPay ? 1 : 0, 'The Auto Pay box is offered only while Auto Pay is off');
+        if (autoPay) {
+            assert.equal(await page.locator('#save-card').isChecked(), false, 'Save this card starts unticked');
+            assert.equal(await page.locator('#auto-pay').isChecked(), false, 'Turn on Auto Pay starts unticked');
+            await page.locator('#auto-pay').check();
+            assert.equal(await page.locator('#save-card').isChecked(), true, 'Ticking Auto Pay ticks Save this card');
+            await page.locator('#save-card').uncheck();
+            assert.equal(await page.locator('#auto-pay').isChecked(), false, 'Unticking Save this card unticks Auto Pay');
+            assert.equal(await page.locator('#auto-pay').isEnabled(), true, 'Neither box locks the other');
+            await page.locator('#auto-pay').check();
+        } else await page.locator('#save-card').setChecked(scenario.startsWith('save'));
         if (scenario.endsWith('link')) {
             await page.evaluate(() => handlers.expressCheckout.confirm({paymentFailed() {}}));
         } else await page.locator('#submit').click();
@@ -576,8 +594,8 @@ try {
         } else await page.getByText('Payment received', {exact: true}).waitFor();
         assert.equal(sent.length, 1, 'One submit sends one confirmation');
         assert.deepEqual(sent[0].order, ['updated', 'submit', 'token'], 'Card and Link submit only after options apply');
-        const save = scenario.startsWith('save');
-        assert.deepEqual(paymentFields(sent[0].body), {intent: 'fixture-intent', confirmation_token: 'ctoken_newcard', amount: 1099, save});
+        const save = scenario.startsWith('save') || autoPay;
+        assert.deepEqual(paymentFields(sent[0].body), {intent: 'fixture-intent', confirmation_token: 'ctoken_newcard', amount: 1099, save, auto_pay: autoPay});
         assert.deepEqual(sent[0].tokenOptions.paymentMethodTypes, ['card', 'link']);
         assert.deepEqual(sent[0].tokenOptions.paymentMethodOptions, {
             card: {setup_future_usage: save ? 'off_session' : 'none'},
@@ -665,7 +683,7 @@ try {
         await page.setContent(render(name));
         if (name === 'pay') await page.waitForFunction(() => document.querySelector('#submit')?.disabled === false);
         else await page.evaluate(async () => {
-            window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf', name: 'Fixture', email: 'Fixture', linkDisplay: 'above_card', businessName: 'Fixture Hosting' });
+            window.component = setupFactory({ publishableKey: 'fixture-key', clientSecret: 'fixture-secret', intent: 'fixture-intent', consentVersion: 'off_session_v3', consentUrl: '/consent', returnUrl: '/return', csrf: 'fixture-csrf', name: 'Fixture', email: 'Fixture', linkDisplay: 'above_card', businessName: 'Fixture Hosting' });
             component.$el = document.querySelector('form');
             await component.init();
         });

@@ -99,6 +99,7 @@ trait Checkout
             'stripePublishableKey' => $this->config('stripe_publishable_key'),
             'linkDisplay' => $this->stripeLinkDisplay(),
             'businessName' => $this->stripeBusinessName(),
+            'autoPay' => $this->autoPayOffered($invoice->user) ? $this->autoPayConsent() : null,
         ]);
     }
 
@@ -176,9 +177,10 @@ trait Checkout
         $request->validate([
             'intent' => 'required|string|regex:/^pi_[a-zA-Z0-9]+$/|max:255',
             'confirmation_token' => 'nullable|string|regex:/^ctoken_[a-zA-Z0-9]+$/|max:255',
-            'amount' => 'required|integer|min:1', 'save' => 'required|boolean',
+            'amount' => 'required|integer|min:1', 'save' => 'required|boolean', 'auto_pay' => 'sometimes|boolean',
             'saved_notice' => 'nullable|string|regex:/^[a-f0-9]{32}$/',
         ]);
+        $autoPay = $request->boolean('auto_pay');
         try {
             $intent = $this->request('get', '/payment_intents/' . $request->input('intent'));
             $invoice = Invoice::findOrFail($intent->metadata->invoice_id ?? null);
@@ -210,14 +212,22 @@ trait Checkout
             $noticeToken = $request->input('saved_notice');
             $params = ['return_url' => route('extensions.gateways.ae-stripe.payment-return', ['invoice' => $invoice->id, 'saved_notice' => $noticeToken]), 'use_stripe_sdk' => 'true'];
             if ($request->input('confirmation_token')) {
+                // Auto Pay charges a saved card, and is offered only while it is off; checked before any charge.
+                if ($autoPay && !$request->boolean('save')) throw new DisplayException('Save this card to turn on Auto Pay.');
+                if ($autoPay && !$this->autoPayOffered($invoice->user)) throw new DisplayException('Auto Pay changed. Refresh the invoice before paying.');
                 $params += ['confirmation_token' => $request->input('confirmation_token'), 'setup_future_usage' => '',
                     'payment_method_options' => ['card' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : 'none'],
                         'link' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : 'none']],
                     'metadata' => ['ae_stripe_consent' => $request->boolean('save') ? '1' : '0',
-                        'ae_stripe_consent_at' => $request->boolean('save') ? (string) time() : '']];
+                        'ae_stripe_consent_at' => $request->boolean('save') ? (string) time() : '',
+                        'ae_stripe_consent_version' => $request->boolean('save') ? self::SAVE_CONSENT : '',
+                        // The words shown are recorded now; Auto Pay turns on only once this payment succeeds.
+                        'ae_stripe_auto_pay' => $autoPay ? self::AUTO_PAY_CONSENT : '',
+                        'ae_stripe_auto_pay_at' => $autoPay ? (string) time() : '']];
             } else {
                 abort_unless(in_array($intent->status, ['requires_action', 'requires_confirmation', 'processing', 'succeeded'], true), 409);
                 abort_unless($request->boolean('save') === (($intent->metadata->ae_stripe_consent ?? null) === '1'), 409);
+                abort_unless($autoPay === (($intent->metadata->ae_stripe_auto_pay ?? '') !== ''), 409);
                 $agreement = $this->paymentResumeAgreement($invoice);
                 if ($agreement) $params['payment_method'] = $agreement->external_reference;
             }
@@ -462,6 +472,7 @@ trait Checkout
             if ($recoveryNotice) $this->savedNoticeAccessWarning('notice completion unavailable', $recoveryNotice, 'local');
             else $this->noticeWarning('AeStripe saved method notice will retry');
         }
+        if ($saved === true || is_array($saved)) $this->turnOnPaidAutoPay($intent);
         return $saved;
     }
 
@@ -482,8 +493,10 @@ trait Checkout
             return; // The checkout opt-in authorizes saving a card or Link only.
         }
         if (($intent->payment_method_options->{$method->type}->setup_future_usage ?? null) !== 'off_session') return;
+        // Payments confirmed before versions were recorded showed the v1 box.
+        $version = $intent->metadata->ae_stripe_consent_version ?? null;
         $saved = $this->persistAgreement($invoice->user, $method, ['source' => $intent->id,
-            'version' => 'off_session_v1', 'accepted_at' => (int) ($intent->metadata->ae_stripe_consent_at ?? $intent->created ?? time()), 'user_id' => $invoice->user_id]);
+            'version' => in_array($version, self::SAVE_CONSENTS, true) ? $version : 'off_session_v1', 'accepted_at' => (int) ($intent->metadata->ae_stripe_consent_at ?? $intent->created ?? time()), 'user_id' => $invoice->user_id]);
         return $saved;
     }
 
