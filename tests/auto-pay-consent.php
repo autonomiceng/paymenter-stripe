@@ -598,6 +598,25 @@ $user->props->values['ae_stripe_saved_' . hash('sha256', 'pi_late_off:pm_turn_on
 $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
 $afterPay($late);
 check($gateway->autoPayDefault($user) === null, 'An Off accepted while the payment was in flight wins');
+// The saved-method lock is busy when the new card's payment is recorded: the choice is kept as a paid consent, and
+// the scheduled sweep turns Auto Pay on later, without another charge or browser return.
+$busyInvoice = new Invoice($user); $busyInvoice->id = 65; Invoice::$rows[65] = $busyInvoice;
+$busy = $paidIntent('succeeded', 'pi_busy'); $busy->metadata->invoice_id = 65;
+$user->props->values['ae_stripe_saved_' . hash('sha256', 'pi_busy:pm_turn_on')] = json_encode(['incoming' => 'pm_turn_on', 'reference' => 'pm_turn_on']);
+$mailCount = count($mails());
+\Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-' . $user->id] = true;
+$afterPay($busy);
+check($gateway->autoPayDefault($user) === null && (json_decode($user->props->values[$consentKey(65)] ?? 'null', true)['state'] ?? null) === 'paid',
+    'A new-card payment whose turn-on meets a busy lock keeps its Auto Pay choice as a paid consent');
+unset(\Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-' . $user->id]);
+$due(65);
+$gateway->retryAutoPayConsents();
+check(($gateway->autoPayDefault($user)['agreement_id'] ?? null) === 94 && count($mails()) === $mailCount + 1
+    && json_decode($user->props->values[$consentKey(65)], true)['state'] === 'enrolled', 'The sweep then turns Auto Pay on with one email');
+$afterPay($busy);
+check(count($mails()) === $mailCount + 1, 'A later webhook for that payment adds nothing');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+unset(Invoice::$rows[65], $user->props->values[$consentKey(65)]);
 unset(Invoice::$rows[61]);
 // A saved-card turn-on and pay keeps any Auto Pay choice made after its dialog opened.
 $elsewhere = array_replace($choice, ['agreement_id' => 95]);
