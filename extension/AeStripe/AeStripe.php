@@ -136,6 +136,8 @@ class AeStripe extends Gateway
                 ->name('ae-stripe:subscription-cancellations')->everyFiveMinutes());
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryAutoPayInheritance())
                 ->name('ae-stripe:auto-pay-inheritance')->everyMinute()->onOneServer()->withoutOverlapping(5));
+            app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryAutoPayConsents())
+                ->name('ae-stripe:auto-pay-consents')->everyMinute()->onOneServer()->withoutOverlapping(5));
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(function () {
                 $this->retryChargeAttempts();
                 $this->retrySavedMethodNotices();
