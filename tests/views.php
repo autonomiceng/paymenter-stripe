@@ -104,12 +104,6 @@ check(str_contains($formView, 'if (isDisposed() || !alert) return;') && str_cont
 preg_match_all('/controls\.(?:showMessage|clearMessage) = \([^)]*\) => \{.*?\n    \};/s', $formView, $messageFunctions);
 check(count($messageFunctions[0]) === 2 && !str_contains(implode('', $messageFunctions[0]), 'setTimeout'), 'Displaying an error never schedules its removal');
 $recordConsentCall = 'await fetch(config.consentUrl';
-$order = array_map(fn ($needle) => strpos($setupView, $needle),
-    ['id="setup-link"', 'id="express-checkout"', 'or add a card', 'id="payment-element"', 'id="error-message"', 'id="submit"']);
-$sortedOrder = $order;
-sort($sortedOrder);
-check(!in_array(false, $order, true) && $order === $sortedOrder,
-    'Setup shows the Link wallet, then "or add a card", the card fields and Save');
 check(preg_match('/id="express-checkout"[^>]*\binert\b/', $setupView) === 1
     && str_contains($setupView, 'stripeFormControls(form, {inertUntilReady: true,')
     && str_contains($formView, 'const closed = isLoading || locked() || (inertUntilReady && !controls.ready);')

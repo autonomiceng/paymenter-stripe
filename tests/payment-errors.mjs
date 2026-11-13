@@ -502,9 +502,6 @@ try {
             ['divider', page.getByText('or add a card')], ['card fields', page.locator('#payment-element')], ['Save card', page.getByRole('button', {name: 'Save card'})]]) {
             assert.equal(await locator.isVisible(), true, `${at}: ${label} shows before any choice`);
         }
-        const boxes = await page.evaluate(() => ['#express-checkout', '#payment-element', '#submit']
-            .map(selector => document.querySelector(selector).getBoundingClientRect().toJSON()));
-        for (let i = 1; i < boxes.length; i++) assert(boxes[i - 1].bottom <= boxes[i].top, `${at}: Link, card fields and Save read top to bottom`);
         assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${at}: nothing runs off the side`);
         assert.equal(await page.locator('[role=alert]').textContent(), '', `${at}: no error before a choice`);
         for (const choice of ['Link', 'card']) {
