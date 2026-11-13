@@ -847,6 +847,7 @@ class AeStripe extends Gateway
         // Return the client secret to the frontend to complete the setup
         return view('gateways.ae-stripe::billing-agreement', ['intent' => $setupIntent, 'type' => 'setup', 'stripePublishableKey' => $this->config('stripe_publishable_key'),
             'linkDisplay' => $this->stripeLinkDisplay(), 'businessName' => $this->stripeBusinessName(),
+            'saveConsentVersion' => self::SAVE_CONSENT,
             'autoPayConsentVersion' => self::AUTO_PAY_CONSENT, 'autoPayDefault' => $this->autoPayDefault($user)]);
     }
 
@@ -911,7 +912,7 @@ class AeStripe extends Gateway
         ]);
 
         if (($setupIntent->metadata->is_billing_agreement ?? null) !== '1'
-            || !in_array($setupIntent->metadata->ae_stripe_setup_consent ?? null, ['off_session_v1', 'off_session_v2'], true)
+            || !in_array($setupIntent->metadata->ae_stripe_setup_consent ?? null, self::SAVE_CONSENTS, true)
             || empty($setupIntent->metadata->ae_stripe_setup_consent_at)
             || ($setupIntent->metadata->ae_stripe_setup_consent_user ?? null) != ($setupIntent->metadata->user_id ?? null)
             || $setupIntent->status !== 'succeeded') return false;

@@ -83,8 +83,6 @@ check(str_contains($elementsView, 'const business = businessName ? {business: {n
     && str_contains(file_get_contents($views . 'billing-agreement.blade.php'), 'businessName: config.businessName'),
     'Both Payment Elements and the Link button name the site when it has a name');
 $setupView = file_get_contents($views . 'billing-agreement.blade.php');
-check(str_contains($setupView, '<p id="setup-terms">By saving with Link or a card, you agree to save it for future charges, including renewals.')
-    && str_contains($setupView, 'Auto Pay can charge when you are away. Saving does not turn on Auto Pay.'), 'Setup states the future off-session agreement and keeps Auto Pay separate');
 check(!str_contains($setupView, 'id="setup-consent"') && !str_contains($setupView, 'Tick the box'),
     'Setup has no box to tick, so neither choice can fail for a missing tick');
 check(str_contains($formView, "document.querySelector('script[src^=\"https://js.stripe.com/v3\"]')"), 'Both forms reuse an existing Stripe.js script');
@@ -107,19 +105,20 @@ preg_match_all('/controls\.(?:showMessage|clearMessage) = \([^)]*\) => \{.*?\n  
 check(count($messageFunctions[0]) === 2 && !str_contains(implode('', $messageFunctions[0]), 'setTimeout'), 'Displaying an error never schedules its removal');
 $recordConsentCall = 'await fetch(config.consentUrl';
 $order = array_map(fn ($needle) => strpos($setupView, $needle),
-    ['id="setup-terms"', 'id="setup-link"', 'id="express-checkout"', 'or add a card', 'id="payment-element"', 'id="error-message"', 'id="submit"']);
+    ['id="setup-link"', 'id="express-checkout"', 'or add a card', 'id="payment-element"', 'id="error-message"', 'id="submit"']);
 $sortedOrder = $order;
 sort($sortedOrder);
 check(!in_array(false, $order, true) && $order === $sortedOrder,
-    'Setup shows the consent line, then the Link wallet, then "or add a card", the card fields and Save');
+    'Setup shows the Link wallet, then "or add a card", the card fields and Save');
 check(preg_match('/id="express-checkout"[^>]*\binert\b/', $setupView) === 1
     && str_contains($setupView, 'stripeFormControls(form, {inertUntilReady: true,')
     && str_contains($formView, 'const closed = isLoading || locked() || (inertUntilReady && !controls.ready);')
     && str_contains($formView, 'for (const field of fields) field.inert = closed;')
     && str_contains($formView, 'submit.disabled = isLoading || locked() || !controls.ready;'),
     'Link and the card form open together once Stripe is ready and lock together while one saves');
-check(str_contains($setupView, "body: JSON.stringify({intent: config.intent, consent: true, version: 'off_session_v2'}),"),
-    'Choosing Link or Save card records the agreement the line states');
+check(str_contains($setupView, 'body: JSON.stringify({intent: config.intent, consent: true, version: config.consentVersion}),')
+    && str_contains($setupView, 'consentVersion: @js($saveConsentVersion)'),
+    'Choosing Link or Save card records the saving consent version the gateway names');
 check(str_contains($setupView, 'Save card') && !str_contains($setupView, 'Save payment method'), 'Setup button names what it saves');
 check(str_contains($setupView, 'ownTerms: true,') && str_contains($elementsView, "if (ownTerms) paymentOptions.terms = {card: 'never'};"),
     'Setup shows one consent text: Stripe card terms are hidden where the form has its own');

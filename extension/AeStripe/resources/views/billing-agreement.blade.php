@@ -1,16 +1,13 @@
 <form id="payment-form" class="mt-2" x-data="aeStripeSetup({
     publishableKey: @js($stripePublishableKey), clientSecret: @js($intent->client_secret),
-    linkDisplay: @js($linkDisplay), intent: @js($intent->id), consentUrl: @js(route('extensions.gateways.ae-stripe.setup-consent')),
+    linkDisplay: @js($linkDisplay), intent: @js($intent->id), consentVersion: @js($saveConsentVersion), consentUrl: @js(route('extensions.gateways.ae-stripe.setup-consent')),
     returnUrl: @js(route('extensions.gateways.ae-stripe.setup-agreement')), csrf: @js(csrf_token()),
     name: {{ \Illuminate\Support\Js::from(auth()->user()->name) }},
     email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }},
     businessName: @js($businessName)
 })">
-    {{-- One line, shown before either choice, says what saving agrees to. Choosing Link or Save card is the agreement. --}}
-    <p id="setup-terms">By saving with Link or a card, you agree to save it for future charges, including renewals.
-        @if(config('settings.tos'))<a href="{{ config('settings.tos') }}" target="_blank" rel="noopener" class="underline">Terms of Service</a>@endif
-        <span id="setup-consent-note" class="mt-1 block text-sm opacity-75">Auto Pay can charge when you are away. Saving does not turn on Auto Pay.</span>
-    </p>
+    {{-- No agreement sentence: choosing Link or Save card in a dialog titled Add card is the opt-in to save, and the
+         terms say how saved cards are used. Auto Pay has its own consent where it is turned on. --}}
     {{-- Link uses what the customer saved there; the wrapper keeps it above the card fields if a theme reorders the form. --}}
     <div id="setup-link">
         <div id="express-checkout" hidden inert wire:ignore>
@@ -118,8 +115,8 @@ Alpine.data('aeStripeSetup', (config) => {
                             const result = await fetch(config.consentUrl, {
                                 method: 'POST', signal: attempt.signal,
                                 headers: {'Content-Type': 'application/json', 'Accept': 'application/json', 'X-CSRF-TOKEN': config.csrf},
-                                // The customer chose Link or Save card under the agreement line, so the choice is the consent.
-                                body: JSON.stringify({intent: config.intent, consent: true, version: 'off_session_v2'}),
+                                // The customer chose Link or Save card in the Add card dialog, so the choice is the consent.
+                                body: JSON.stringify({intent: config.intent, consent: true, version: config.consentVersion}),
                             });
                             if (!result.ok) {
                                 failSetup('Could not record your agreement. Try again.');
