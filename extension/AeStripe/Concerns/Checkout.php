@@ -217,12 +217,11 @@ trait Checkout
                 $params += ['confirmation_token' => $request->input('confirmation_token'), 'setup_future_usage' => '',
                     'payment_method_options' => ['card' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : 'none'],
                         'link' => ['setup_future_usage' => $request->boolean('save') ? 'off_session' : 'none']],
+                    // The words shown are recorded now; Auto Pay turns on only once this payment succeeds.
                     'metadata' => ['ae_stripe_consent' => $request->boolean('save') ? '1' : '0',
                         'ae_stripe_consent_at' => $request->boolean('save') ? (string) time() : '',
                         'ae_stripe_consent_version' => $request->boolean('save') ? self::SAVE_CONSENT : '',
-                        // The words shown are recorded now; Auto Pay turns on only once this payment succeeds.
-                        'ae_stripe_auto_pay' => $autoPay ? self::AUTO_PAY_CONSENT : '',
-                        'ae_stripe_auto_pay_at' => $autoPay ? (string) time() : '']];
+                    ] + $this->autoPayIntentConsent($invoice->user, $autoPay)];
             } else {
                 abort_unless(in_array($intent->status, ['requires_action', 'requires_confirmation', 'processing', 'succeeded'], true), 409);
                 abort_unless($request->boolean('save') === (($intent->metadata->ae_stripe_consent ?? null) === '1'), 409);
@@ -369,6 +368,7 @@ trait Checkout
             };
             $amount = $status === 'succeeded' ? $intent->amount_received : $intent->amount;
             if ($status === 'failed') {
+                $this->dropWaitingAutoPay($user, $intent);
                 $failedId = $this->failedPaymentId($intent, $this->readPaymentAttempt($user, $invoice) ?? []);
                 foreach ($this->lockedTransactions(InvoiceTransaction::where('transaction_id', $intent->id), 'processing') as $pending) {
                     InvoiceTransaction::whereKey($pending->id)->update(['transaction_id' => $failedId]);
@@ -395,6 +395,7 @@ trait Checkout
                 }
             }
         }, self::SETTLEMENT_ATTEMPTS);
+        if ($status === 'succeeded') $this->turnOnWaitingAutoPay($intent);
     }
 
     private function recordPaymentReview($invoice, $intent, string $reason): void

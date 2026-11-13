@@ -17,6 +17,11 @@ trait AutoPay
     private const AUTO_PAY_CONSENTS = ['auto_pay_account_v1', self::AUTO_PAY_CONSENT];
     private const AUTO_PAY_PROPERTY = 'ae_stripe_auto_pay_default';
     private const AUTO_PAY_CARD = 'ae_stripe_auto_pay_card';
+    // Counts every Off and every new turn-on. A consent given before the count moved is older than the customer's
+    // latest choice, so a payment that lands later never turns Auto Pay on over it.
+    private const AUTO_PAY_GENERATION = 'ae_stripe_auto_pay_gen';
+    // A saved-card turn-on and pay whose first payment is still processing: Auto Pay turns on once it succeeds.
+    private const AUTO_PAY_WAIT = 'ae_stripe_auto_pay_wait_';
 
     /**
      * The one Auto Pay consent, shown word for word wherever Auto Pay can be turned on: the pay dialog here, and any
@@ -62,6 +67,32 @@ trait AutoPay
             if ($agreement && empty($agreement->deleted_at)) return true;
         }
         return false;
+    }
+
+    /** The Auto Pay choice count, read when consent is given and checked again before that consent turns Auto Pay on. */
+    public function autoPayGeneration(User $user, bool $lock = false): int
+    {
+        $key = self::AUTO_PAY_GENERATION;
+        return (int) (($lock ? $this->lockedUserProperty($user, $key) : $user->properties()->where('key', $key)->first())?->value ?? 0);
+    }
+
+    /**
+     * The pay dialog's Auto Pay consent as PaymentIntent metadata: the words' version, when it was given, and the
+     * choice count then. turnOnPaidAutoPay() honours it only while the count is unchanged.
+     */
+    private function autoPayIntentConsent(User $user, bool $autoPay): array
+    {
+        return ['ae_stripe_auto_pay' => $autoPay ? self::AUTO_PAY_CONSENT : '',
+            'ae_stripe_auto_pay_at' => $autoPay ? (string) time() : '',
+            'ae_stripe_auto_pay_gen' => $autoPay ? (string) $this->autoPayGeneration($user) : ''];
+    }
+
+    /** The caller holds the user lock. */
+    private function nextAutoPayGeneration(User $user): int
+    {
+        $next = $this->autoPayGeneration($user, lock: true) + 1;
+        $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_GENERATION], ['value' => (string) $next]);
+        return $next;
     }
 
     /** A saved card or off-session saving consent alone never grants this scope. */
@@ -133,6 +164,8 @@ trait AutoPay
                 $card = $this->autoPayDefault($user, lock: true)['agreement_id'] ?? null;
                 if ($card) $this->rememberAutoPayCard($user, $card);
                 $this->stopWaitingRenewals($user);
+                // Off is the latest word: any consent still waiting on a payment is now older and cannot turn it on.
+                $this->nextAutoPayGeneration($user);
                 $user->properties()->where('key', self::AUTO_PAY_PROPERTY)->delete();
                 foreach ($this->autoPayServices($user) as $service) {
                     $service->properties()->where('key', self::AUTO_PAY_PENDING)->delete();
@@ -161,7 +194,8 @@ trait AutoPay
 
     /**
      * On with the chosen card: links every recurring service to it, stores the consent record and queues the
-     * "Auto Pay is on" email. The caller holds the user row lock.
+     * "Auto Pay is on" email. The same card already on is the same enrollment: services are linked again, the record
+     * and the count stay, and no second email goes out. The caller holds the user row lock.
      */
     private function enableAutoPay(User $user, int $agreementId, ?int $acceptedAt = null, string $version = self::AUTO_PAY_CONSENT): int
     {
@@ -172,10 +206,13 @@ trait AutoPay
         $this->assertSavedMethodBindable($user, $agreement);
         $this->stopWaitingRenewals($user);
         $this->rememberAutoPayCard($user, (int) $agreement->id);
-        $record = ['version' => $version, 'user_id' => (int) $user->id,
-            'accepted_at' => $acceptedAt ?? time(), 'agreement_id' => (int) $agreement->id];
-        $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_PROPERTY], ['value' => json_encode($record, JSON_THROW_ON_ERROR)]);
-        $this->queueAutoPayOnMail($user, $agreement);
+        if (($this->autoPayDefault($user, lock: true)['agreement_id'] ?? null) !== (int) $agreement->id) {
+            $generation = $this->nextAutoPayGeneration($user);
+            $record = ['version' => $version, 'user_id' => (int) $user->id,
+                'accepted_at' => $acceptedAt ?? time(), 'agreement_id' => (int) $agreement->id];
+            $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_PROPERTY], ['value' => json_encode($record, JSON_THROW_ON_ERROR)]);
+            $this->queueAutoPayOnMail($user, $agreement, $generation);
+        }
         $services = 0;
         foreach ($this->autoPayServices($user) as $service) {
             if (($service->plan?->type ?? null) !== 'recurring' || $service->status === Service::STATUS_CANCELLED) continue;
@@ -189,9 +226,10 @@ trait AutoPay
     /**
      * Turn on and pay, from the one consent in the Turn on dialog. The first ticked invoice is charged before anything
      * is turned on, so a card that declines leaves Auto Pay exactly as it was and the reason goes back to the dialog.
-     * Once that payment succeeds or is processing, Auto Pay turns on with the card and the other invoices are paid as
-     * Auto Pay payments, each under the gateway's Auto Pay card check. The caller checks that each invoice is the
-     * customer's own, open, and at the amount the dialog showed.
+     * Once that payment succeeds, Auto Pay turns on with the card and the other invoices are paid as Auto Pay
+     * payments, each under the gateway's Auto Pay card check. A payment still processing turns it on only once it
+     * succeeds. Any Auto Pay choice made after the dialog was sent (on elsewhere, or on and off) is kept and nothing
+     * more is charged. The caller checks that each invoice is the customer's own, open, and at the amount shown.
      *
      * @param  array<int, array{0: Invoice, 1: string}>  $invoices  invoice and accepted amount, oldest first
      * @return array{enabled: bool, invoices: array<int, array{id: int, status: string, message?: string}>, message: ?string}
@@ -205,6 +243,9 @@ trait AutoPay
         if (!$this->gatewayEnabled() || !$this->bundledInactive()) {
             return ['message' => 'Payments are paused. Please check back later.'] + $result;
         }
+        // The dialog was offered while Auto Pay was off; a choice made since then is newer than this consent.
+        $generation = $this->autoPayGeneration($user);
+        if ($this->autoPayOn($user)) return ['message' => 'Auto Pay changed. Refresh the invoice before paying.'] + $result;
         $pay = function (Invoice $invoice, string $amount, bool $autoPay) use ($agreement): array {
             try {
                 $autoPay ? $this->chargeAutoPayAccepted($invoice, $amount, $agreement) : $this->chargeAccepted($invoice, $amount, $agreement);
@@ -224,16 +265,29 @@ trait AutoPay
         if (!in_array($paid['status'], ['paid', 'processing'], true)) {
             return ['message' => $paid['message'] ?? 'This payment was not completed.'] + $result;
         }
+        $acceptedAt = time();
         try {
-            $this->withSavedMethodBindingLock((int) $user->id, fn () => ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $agreement) {
+            $state = $this->withSavedMethodBindingLock((int) $user->id, fn () => ExtensionLocks::transaction('user:' . $user->id, function () use ($user, $agreement, $first, $paid, $generation, $version, $acceptedAt) {
                 $locked = User::where('id', $user->id)->firstOrFail();
-                return $this->enableAutoPay($locked, (int) $agreement->id);
+                if ($this->autoPayGeneration($locked, lock: true) !== $generation || $this->autoPayOn($locked, lock: true)) return 'changed';
+                if ($paid['status'] === 'processing') {
+                    $attempt = $this->readPaymentAttempt($locked, $first);
+                    $locked->properties()->updateOrCreate(['key' => self::AUTO_PAY_WAIT . $first->id], ['value' => json_encode([
+                        'agreement_id' => (int) $agreement->id, 'version' => $version, 'accepted_at' => $acceptedAt,
+                        'generation' => $generation, 'intent' => is_string($attempt['intent'] ?? null) ? $attempt['intent'] : null,
+                    ], JSON_THROW_ON_ERROR)]);
+                    return 'waiting';
+                }
+                $this->enableAutoPay($locked, (int) $agreement->id, $acceptedAt, $version);
+                return 'on';
             }));
         } catch (\Throwable $e) {
             if (!$e instanceof \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException
                 && !$e instanceof \Symfony\Component\HttpKernel\Exception\HttpExceptionInterface) report($e);
             return ['message' => 'The payment went through, but Auto Pay was not turned on. Try turning it on again.'] + $result;
         }
+        if ($state === 'changed') return ['message' => 'The payment went through. Auto Pay was changed in another window, so that choice stays.'] + $result;
+        if ($state === 'waiting') return ['message' => 'The payment is processing. Auto Pay turns on once it goes through.'] + $result;
         $result['enabled'] = true;
         foreach (array_slice($invoices, 1) as [$invoice, $amount]) {
             // A later invoice that is not paid keeps its own reason.
@@ -267,8 +321,10 @@ trait AutoPay
                 $agreement = is_string($receipt['reference'] ?? null) ? BillingAgreement::where('user_id', $userId)
                     ->where('gateway_id', $gateway->id)->where('external_reference', $receipt['reference'])->first() : null;
                 if (!$agreement) return;
-                // On elsewhere, by default or service by service, keeps its cards; this payment changes nothing.
-                if (!$this->autoPayOn($user, lock: true)) {
+                // On elsewhere, by default or service by service, keeps its cards, and any On or Off since the dialog
+                // confirmed is newer than this consent; either way this payment changes nothing.
+                $generation = (string) ($intent->metadata->ae_stripe_auto_pay_gen ?? '');
+                if ($generation === (string) $this->autoPayGeneration($user, lock: true) && !$this->autoPayOn($user, lock: true)) {
                     $this->enableAutoPay($user, (int) $agreement->id, (int) ($intent->metadata->ae_stripe_auto_pay_at ?? 0) ?: null, $version);
                 }
                 $user->properties()->updateOrCreate(['key' => $marker], ['value' => json_encode([
@@ -281,12 +337,55 @@ trait AutoPay
     }
 
     /**
+     * A saved-card turn-on and pay waiting on its first payment: once that payment succeeds with the same card, Auto
+     * Pay turns on, unless the customer chose anything since. Called after a succeeded payment is recorded, by every
+     * path that records it, so a missed try is made again by the next one. The payment stands either way.
+     */
+    private function turnOnWaitingAutoPay($intent): void
+    {
+        if (($intent->status ?? null) !== 'succeeded' || !is_string($intent->payment_method ?? null)) return;
+        $invoice = Invoice::where('id', $intent->metadata->invoice_id ?? null)->first();
+        if (!$invoice || !$this->gatewayEnabled() || !$this->bundledInactive()) return;
+        $userId = (int) $invoice->user_id;
+        $key = self::AUTO_PAY_WAIT . $invoice->id;
+        if (!User::where('id', $userId)->first()?->properties()->where('key', $key)->first()) return;
+        try {
+            $this->withSavedMethodBindingLock($userId, fn () => ExtensionLocks::transaction('user:' . $userId, function () use ($intent, $userId, $key) {
+                $user = User::where('id', $userId)->firstOrFail();
+                $wait = json_decode($this->lockedUserProperty($user, $key)?->value ?? 'null', true);
+                if (!is_array($wait) || !is_int($wait['agreement_id'] ?? null)) return;
+                if (isset($wait['intent']) && $wait['intent'] !== $intent->id) return;
+                $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
+                $agreement = BillingAgreement::where('id', $wait['agreement_id'])->where('user_id', $userId)
+                    ->where('gateway_id', $gateway->id)->first();
+                if (!$agreement || $agreement->external_reference !== $intent->payment_method) return;
+                $user->properties()->where('key', $key)->delete();
+                if (($wait['generation'] ?? null) !== $this->autoPayGeneration($user, lock: true) || $this->autoPayOn($user, lock: true)) return;
+                $this->enableAutoPay($user, (int) $agreement->id, (int) ($wait['accepted_at'] ?? 0) ?: null,
+                    in_array($wait['version'] ?? null, self::AUTO_PAY_CONSENTS, true) ? $wait['version'] : self::AUTO_PAY_CONSENT);
+            }));
+        } catch (\Throwable $e) {
+            if (!$e instanceof \Paymenter\Extensions\Gateways\AeStripe\SavedMethodRetryException) report($e);
+            Log::warning('AeStripe Auto Pay after a processing payment will retry', ['invoice_id' => $invoice->id]);
+        }
+    }
+
+    /** A waiting turn-on ends with its payment's failure; paying that invoice later does not turn Auto Pay on. The caller holds the user lock. */
+    private function dropWaitingAutoPay(User $user, $intent): void
+    {
+        $key = self::AUTO_PAY_WAIT . ($intent->metadata->invoice_id ?? '');
+        $wait = json_decode($this->lockedUserProperty($user, $key)?->value ?? 'null', true);
+        if (is_array($wait) && (!isset($wait['intent']) || $wait['intent'] === $intent->id)) $user->properties()->where('key', $key)->delete();
+    }
+
+    /**
      * Every turn-on sends one email that confirms it: the card, what is charged and how to stop. It joins the turn-on's
      * transaction, so a rolled-back turn-on sends nothing, and delivery retries from the outbox.
      */
-    private function queueAutoPayOnMail(User $user, BillingAgreement $agreement): void
+    private function queueAutoPayOnMail(User $user, BillingAgreement $agreement, int $generation): void
     {
-        $identity = ['kind' => 'ae_stripe_auto_pay_mail:on', 'source' => 'user_' . $user->id . '_' . bin2hex(random_bytes(8))];
+        // One source per Off-to-On transition, so the outbox keeps one email even if the turn-on is retried.
+        $identity = ['kind' => 'ae_stripe_auto_pay_mail:on', 'source' => 'user_' . $user->id . '_on_' . $generation];
         $this->storePaymentNotices($identity, [[
             'user_id' => (int) $user->id, 'title' => __('Auto Pay is on'),
             'body' => __('Auto Pay is on. We charge :card for every renewal invoice. To stop, turn off Auto Pay in Payment methods.',
@@ -329,6 +428,7 @@ trait AutoPay
         $value = $user->properties()->where('key', self::AUTO_PAY_PROPERTY)->first()?->value;
         $record = $value ? json_decode($value, true) : null;
         if (is_array($record) && ($record['agreement_id'] ?? null) === $agreementId) {
+            $this->nextAutoPayGeneration($user);
             $user->properties()->where('key', self::AUTO_PAY_PROPERTY)->delete();
         }
         $choice = $user->properties()->where('key', self::AUTO_PAY_CARD)->first()?->value;

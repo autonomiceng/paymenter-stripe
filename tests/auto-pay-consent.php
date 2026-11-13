@@ -261,9 +261,11 @@ $payer = new class(['stripe_webhook_secret' => 'whsec_test', 'stripe_secret_key'
     public ?string $decline = null;
     public ?string $declineAutoPay = null;
     public bool $pending = false;
+    public $during = null;
     public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $agreement, bool $requireAutoPay = false)
     {
         $this->charges[] = [$invoice->id, $amount, $agreement->id, $requireAutoPay];
+        if ($this->during) { $during = $this->during; $this->during = null; $during(); }
         if ($this->decline) throw new \Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException($this->decline);
         if ($this->pending && !$requireAutoPay) throw new \Paymenter\Extensions\Gateways\AeStripe\PaymentPendingException('Processing.');
         if ($this->declineAutoPay && $requireAutoPay) throw new \Paymenter\Extensions\Gateways\AeStripe\PaymentDeclinedException($this->declineAutoPay);
@@ -307,13 +309,31 @@ $turnOn = function (int $id) use ($payer, $gateway, $user, $card, $existing) {
     $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
     $existing->billing_agreement_id = 55; $payer->charges = [];
     $first = new Invoice($user); $first->id = $id; $second = new Invoice($user); $second->id = $id + 1;
+    Invoice::$rows[$id] = $first;
     return $payer->turnOnAutoPayAndPay($user, $card, [[$first, '20.00'], [$second, '15.00']], AeStripe::AUTO_PAY_CONSENT);
 };
 $payer->pending = true;
 $result = $turnOn(40);
 $payer->pending = false;
-check($result['enabled'] === true && $result['message'] === null && $result['invoices'] === [['id' => 40, 'status' => 'processing'], ['id' => 41, 'status' => 'paid']]
-    && ($payer->autoPayDefault($user)['agreement_id'] ?? null) === 94, 'A first payment still processing turns Auto Pay on and pays the rest');
+check($result['enabled'] === false && $result['invoices'] === [['id' => 40, 'status' => 'processing']]
+    && $payer->charges === [[40, '20.00', 94, false]] && $payer->autoPayDefault($user) === null && $existing->billing_agreement_id === 55,
+    'A first payment still processing leaves Auto Pay off and charges nothing more');
+$afterWait = fn ($intent) => \Closure::bind(fn () => $this->turnOnWaitingAutoPay($intent), $payer, AeStripe::class)();
+$dropWait = fn ($intent) => \Closure::bind(fn () => $this->dropWaitingAutoPay(\App\Models\User::where('id', 7)->firstOrFail(), $intent), $payer, AeStripe::class)();
+$waitIntent = fn (string $status, string $method = 'pm_turn_on', int $invoice = 40) => (object) ['id' => 'pi_wait_' . $invoice, 'status' => $status,
+    'payment_method' => $method, 'metadata' => (object) ['invoice_id' => $invoice]];
+$afterWait($waitIntent('succeeded', 'pm_other'));
+check($payer->autoPayDefault($user) === null, 'Another card paying that invoice does not turn Auto Pay on');
+$afterWait($waitIntent('processing'));
+check($payer->autoPayDefault($user) === null, 'A payment still processing does not turn Auto Pay on');
+$afterWait($waitIntent('succeeded'));
+check(($payer->autoPayDefault($user)['agreement_id'] ?? null) === 94 && $existing->billing_agreement_id === 94,
+    'Auto Pay turns on with the card once that processing payment succeeds');
+$payer->pending = true; $result = $turnOn(46); $payer->pending = false;
+$dropWait($waitIntent('failed', 'pm_turn_on', 46));
+$afterWait($waitIntent('succeeded', 'pm_turn_on', 46));
+check($payer->autoPayDefault($user) === null && $existing->billing_agreement_id === 55,
+    'A processing payment that then fails leaves Auto Pay off, even if the invoice is paid later');
 \Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-' . $user->id] = true;
 $result = $turnOn(42);
 unset(\Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-' . $user->id]);
@@ -371,9 +391,13 @@ check(count($mails()) === $mailCount + 2, 'A paid turn-on and pay queues one ema
 $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
 
 // The pay dialog's box for a new card: Auto Pay turns on only once the payment succeeded and its card was saved, once.
+// The metadata the pay dialog's confirm puts on the PaymentIntent when Auto Pay is ticked.
+$dialogConsent = fn () => \Closure::bind(fn () => $this->autoPayIntentConsent(\App\Models\User::where('id', 7)->firstOrFail(), true), $gateway, AeStripe::class)();
+check($dialogConsent()['ae_stripe_auto_pay'] === AeStripe::AUTO_PAY_CONSENT && \Closure::bind(fn () => $this->autoPayIntentConsent(\App\Models\User::where('id', 7)->firstOrFail(), false), $gateway, AeStripe::class)()
+    === ['ae_stripe_auto_pay' => '', 'ae_stripe_auto_pay_at' => '', 'ae_stripe_auto_pay_gen' => ''], 'The pay dialog records Auto Pay consent only when ticked');
 $paidIntent = fn (string $status, string $id = 'pi_auto_pay') => (object) ['id' => $id, 'status' => $status,
-    'payment_method' => 'pm_turn_on', 'metadata' => (object) ['invoice_id' => 61, 'ae_stripe_gateway' => '1',
-        'ae_stripe_consent' => '1', 'ae_stripe_auto_pay' => AeStripe::AUTO_PAY_CONSENT, 'ae_stripe_auto_pay_at' => '1794071800']];
+    'payment_method' => 'pm_turn_on', 'metadata' => (object) array_replace(['invoice_id' => 61, 'ae_stripe_gateway' => '1',
+        'ae_stripe_consent' => '1'], $dialogConsent(), ['ae_stripe_auto_pay_at' => '1794071800'])];
 $dialogInvoice = new Invoice($user); $dialogInvoice->id = 61; Invoice::$rows[61] = $dialogInvoice;
 $user->props->values['ae_stripe_saved_' . hash('sha256', 'pi_auto_pay:pm_turn_on')] = json_encode(['incoming' => 'pm_turn_on', 'reference' => 'pm_turn_on']);
 $afterPay = fn ($intent) => (fn () => $this->turnOnPaidAutoPay($intent))->call($gateway);
@@ -410,6 +434,56 @@ $gateway->saveAutoPayDefault(new Request($choice));
 check($confirm([])['status'] === 409 && $sent() === $calls, 'Auto Pay already on is refused before any charge');
 $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
 Http::$handler = $priorHandler;
+
+// A first new-card payment confirmed before a later On and Off cannot turn Auto Pay back on when it lands late.
+$dialogInvoice = new Invoice($user); $dialogInvoice->id = 61; Invoice::$rows[61] = $dialogInvoice;
+$user->props->values['ae_stripe_saved_' . hash('sha256', 'pi_late:pm_turn_on')] = json_encode(['incoming' => 'pm_turn_on', 'reference' => 'pm_turn_on']);
+$late = $paidIntent('succeeded', 'pi_late');
+$gateway->saveAutoPayDefault(new Request($choice));
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+$afterPay($late);
+check($gateway->autoPayDefault($user) === null && $existing->billing_agreement_id === null, 'A delayed new-card payment never undoes a later On and Off');
+$late = $paidIntent('succeeded', 'pi_late_off');
+$user->props->values['ae_stripe_saved_' . hash('sha256', 'pi_late_off:pm_turn_on')] = json_encode(['incoming' => 'pm_turn_on', 'reference' => 'pm_turn_on']);
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+$afterPay($late);
+check($gateway->autoPayDefault($user) === null, 'An Off accepted while the payment was in flight wins');
+unset(Invoice::$rows[61]);
+// A saved-card turn-on and pay keeps any Auto Pay choice made after its dialog opened.
+$elsewhere = array_replace($choice, ['agreement_id' => 95]);
+$gateway->saveAutoPayDefault(new Request($elsewhere));
+$payer->charges = []; $existing->billing_agreement_id = 95;
+$stale = new Invoice($user); $stale->id = 70;
+$result = $payer->turnOnAutoPayAndPay($user, $card, [[$stale, '20.00']], AeStripe::AUTO_PAY_CONSENT);
+check($result['enabled'] === false && $payer->charges === [] && ($payer->autoPayDefault($user)['agreement_id'] ?? null) === 95
+    && $existing->billing_agreement_id === 95, 'A turn-on and pay sent after Auto Pay turned on elsewhere is refused before any charge');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+$existing->billing_agreement_id = 55;
+$payer->during = fn () => $gateway->saveAutoPayDefault(new Request($elsewhere));
+$a = new Invoice($user); $a->id = 71; $b = new Invoice($user); $b->id = 72;
+$result = $payer->turnOnAutoPayAndPay($user, $card, [[$a, '20.00'], [$b, '15.00']], AeStripe::AUTO_PAY_CONSENT);
+check($result['enabled'] === false && ($payer->autoPayDefault($user)['agreement_id'] ?? null) === 95 && $existing->billing_agreement_id === 95
+    && $payer->charges === [[71, '20.00', 94, false]], 'Auto Pay turned on with another card during the payment keeps that card');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+$existing->billing_agreement_id = 55; $payer->charges = [];
+$payer->during = function () use ($gateway, $elsewhere) {
+    $gateway->saveAutoPayDefault(new Request($elsewhere));
+    $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+};
+$a->status = 'pending'; $a->id = 73;
+$result = $payer->turnOnAutoPayAndPay($user, $card, [[$a, '20.00']], AeStripe::AUTO_PAY_CONSENT);
+check($result['enabled'] === false && $payer->autoPayDefault($user) === null && $existing->billing_agreement_id === null,
+    'An On then Off during the payment leaves Auto Pay off');
+// One Off-to-On sends one email, even when the switch is sent again.
+$mailCount = count($mails());
+$gateway->saveAutoPayDefault(new Request($choice));
+$gateway->saveAutoPayDefault(new Request($choice));
+check(count($mails()) === $mailCount + 1 && ($gateway->autoPayDefault($user)['agreement_id'] ?? null) === 94,
+    'Sending the same turn-on again sends no second email');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+$gateway->saveAutoPayDefault(new Request($choice));
+check(count($mails()) === $mailCount + 2, 'A new turn-on after Off sends its own email');
+$gateway->saveAutoPayDefault(new Request(['enabled' => false]));
 
 ExtensionHelper::$agreements = $oldAgreements;
 BillingAgreement::$snapshot = $oldSnapshot;
