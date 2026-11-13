@@ -83,6 +83,7 @@ use Illuminate\Support\Facades\{DB, Http};
                     $this->confirms[] = [$key, $data, $intent->amount];
                     // A token confirmation attaches the token's new method and the request's per-method options.
                     if (isset($data['confirmation_token'])) $intent->payment_method = 'pm_paid';
+                    elseif (isset($data['payment_method'])) $intent->payment_method = $data['payment_method']; // Stripe keeps the confirmed method.
                     if (isset($data['payment_method_options'])) $intent->payment_method_options = json_decode(json_encode($data['payment_method_options']));
                     $this->settle($intent, $data);
                     $this->cache[$key] = clone $intent;
@@ -750,6 +751,58 @@ use Illuminate\Support\Facades\{DB, Http};
                 && count(array_filter(Audit::$rows, fn ($audit) => $audit['event'] === 'ae_stripe_payment_refused')) === 2
                 && count($stripe->confirms) === 2 && !$stripe->charges,
                 'Identical refusal text has two durable notices for two confirmations without a debit replay');
+        });
+        $run('auto-pay-consent-recovery', function ($invoice, $stripe) use ($gateway) {
+            // A turn-on and pay whose create response is lost before confirmation: recovery still confirms with the consent.
+            $consent = ['id' => 'apc_fixture', 'user_id' => 7, 'invoice_id' => 920, 'agreement_id' => 4, 'version' => 'auto_pay_account_v2',
+                'accepted_at' => 1794071800, 'generation' => 0, 'state' => 'charging', 'intent' => null];
+            User::$row->props->values['ae_stripe_auto_pay_consent_920'] = json_encode($consent);
+            foreach (ExtensionHelper::$agreements as &$row) $row['gateway_id'] = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+            unset($row);
+            $onMail = fn ($row) => $row['kind'] === 'ae_stripe_auto_pay_mail:on:customer';
+            $mailsBefore = count(array_filter(DB::$tables['ae_stripe_outbox'] ?? [], $onMail));
+            $stripe->loseCreate = true;
+            paymentStops(fn () => $gateway->chargeAccepted($invoice, 20, new BillingAgreement, false, 'apc_fixture'));
+            check(!$stripe->charges && !$stripe->confirms, 'The lost create stopped before any confirmation');
+            $gateway->retryChargeAttempts();
+            $intent = $stripe->intents['pi_test1'] ?? null;
+            check(count($stripe->charges) === 1 && ($intent->metadata->ae_stripe_auto_pay_consent ?? null) === 'apc_fixture',
+                'Recovery confirms the payment with its turn-on and pay consent on it');
+            $stored = json_decode(User::$row->props->values['ae_stripe_auto_pay_consent_920'] ?? 'null', true);
+            check(($stored['state'] ?? null) === 'enrolled' && ($stored['intent'] ?? null) === 'pi_test1'
+                && ($gateway->autoPayDefault(User::$row)['agreement_id'] ?? null) === 4
+                && count(array_filter(DB::$tables['ae_stripe_outbox'] ?? [], $onMail)) === $mailsBefore + 1,
+                'The recovered success is that consent\'s own payment, so Auto Pay turns on with one email');
+            $stripe->status = 'succeeded'; $invoice->status = 'pending';
+            $other = new Invoice(User::$row); $other->id = 922; Invoice::$rows[922] = $other;
+            $gateway->charge($other, 20, new BillingAgreement);
+            $plain = end($stripe->intents);
+            check(!isset($plain->metadata->ae_stripe_auto_pay_consent), 'A plain charge carries no turn-on and pay consent');
+        });
+        $run('auto-pay-consent-recovery-busy', function ($invoice, $stripe) use ($gateway) {
+            // Recovery settles the payment while another saved-card operation holds the lock: the sweep enrolls it later.
+            $consent = ['id' => 'apc_fixture', 'user_id' => 7, 'invoice_id' => 920, 'agreement_id' => 4, 'version' => 'auto_pay_account_v2',
+                'accepted_at' => 1794071800, 'generation' => 5, 'state' => 'charging', 'intent' => null];
+            User::$row->props->values['ae_stripe_auto_pay_consent_920'] = json_encode($consent);
+            User::$row->props->values['ae_stripe_auto_pay_gen'] = '5'; // Its own Off-to-On, so its email is not the earlier case's.
+            if (\App\Models\Service::$row) \App\Models\Service::$row->billing_agreement_id = null; // Auto Pay starts off.
+            foreach (ExtensionHelper::$agreements as &$row) $row['gateway_id'] = Gateway::where('extension', 'AeStripe')->firstOrFail()->id;
+            unset($row);
+            $stripe->loseCreate = true;
+            paymentStops(fn () => $gateway->chargeAccepted($invoice, 20, new BillingAgreement, false, 'apc_fixture'));
+            \Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-7'] = true;
+            $gateway->retryChargeAttempts();
+            $stored = fn () => json_decode(User::$row->props->values['ae_stripe_auto_pay_consent_920'] ?? 'null', true);
+            $mails = fn () => count(array_filter(DB::$tables['ae_stripe_outbox'] ?? [], fn ($row) => $row['kind'] === 'ae_stripe_auto_pay_mail:on:customer'));
+            $mailsBefore = $mails();
+            check(count($stripe->charges) === 1 && ($stored()['state'] ?? null) === 'paid' && $gateway->autoPayDefault(User::$row) === null,
+                'A recovered success that meets a busy lock keeps its paid consent');
+            unset(\Illuminate\Support\Facades\Cache::$locks['ae-stripe-save-method-7']);
+            User::$row->props->values['ae_stripe_auto_pay_consent_920'] = json_encode(array_replace($stored(), ['next_at' => 0])); // Its backoff is over.
+            $gateway->retryAutoPayConsents();
+            $gateway->retryAutoPayConsents();
+            check(($stored()['state'] ?? null) === 'enrolled' && ($gateway->autoPayDefault(User::$row)['agreement_id'] ?? null) === 4
+                && $mails() === $mailsBefore + 1 && count($stripe->charges) === 1, 'Once the lock clears the sweep turns Auto Pay on with one email and no new charge');
         });
         $run('recovery-refusals', function ($invoice, $stripe) use ($gateway) {
             $stripe->loseCreate = true; paymentStops(fn () => $gateway->charge($invoice, 20, new BillingAgreement));

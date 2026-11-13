@@ -136,6 +136,8 @@ class AeStripe extends Gateway
                 ->name('ae-stripe:subscription-cancellations')->everyFiveMinutes());
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryAutoPayInheritance())
                 ->name('ae-stripe:auto-pay-inheritance')->everyMinute()->onOneServer()->withoutOverlapping(5));
+            app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(fn () => $this->retryAutoPayConsents())
+                ->name('ae-stripe:auto-pay-consents')->everyMinute()->onOneServer()->withoutOverlapping(5));
             app()->booted(fn () => \Illuminate\Support\Facades\Schedule::call(function () {
                 $this->retryChargeAttempts();
                 $this->retrySavedMethodNotices();
@@ -847,6 +849,7 @@ class AeStripe extends Gateway
         // Return the client secret to the frontend to complete the setup
         return view('gateways.ae-stripe::billing-agreement', ['intent' => $setupIntent, 'type' => 'setup', 'stripePublishableKey' => $this->config('stripe_publishable_key'),
             'linkDisplay' => $this->stripeLinkDisplay(), 'businessName' => $this->stripeBusinessName(),
+            'saveConsentVersion' => self::SAVE_CONSENT,
             'autoPayConsentVersion' => self::AUTO_PAY_CONSENT, 'autoPayDefault' => $this->autoPayDefault($user)]);
     }
 
@@ -911,7 +914,7 @@ class AeStripe extends Gateway
         ]);
 
         if (($setupIntent->metadata->is_billing_agreement ?? null) !== '1'
-            || !in_array($setupIntent->metadata->ae_stripe_setup_consent ?? null, ['off_session_v1', 'off_session_v2'], true)
+            || !in_array($setupIntent->metadata->ae_stripe_setup_consent ?? null, self::SAVE_CONSENTS, true)
             || empty($setupIntent->metadata->ae_stripe_setup_consent_at)
             || ($setupIntent->metadata->ae_stripe_setup_consent_user ?? null) != ($setupIntent->metadata->user_id ?? null)
             || $setupIntent->status !== 'succeeded') return false;
@@ -1003,9 +1006,9 @@ class AeStripe extends Gateway
      * A customer's saved-method payment of the amount they accepted. Unlike charge(), which always confirms today's
      * balance, confirmation refuses a different balance under the payment lock, so a raised invoice is never charged.
      */
-    public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $billingAgreement, bool $requireAutoPay = false)
+    public function chargeAccepted(Invoice $invoice, $amount, BillingAgreement $billingAgreement, bool $requireAutoPay = false, ?string $autoPayConsent = null)
     {
-        return $this->charge($invoice, $amount, $billingAgreement, $this->toMinorUnits($amount, $invoice->currency_code), $requireAutoPay, strtolower($invoice->currency_code));
+        return $this->charge($invoice, $amount, $billingAgreement, $this->toMinorUnits($amount, $invoice->currency_code), $requireAutoPay, strtolower($invoice->currency_code), $autoPayConsent);
     }
 
     /** Pay the open-invoice offer only while its accepted card is still the account Auto Pay card. */
@@ -1014,7 +1017,8 @@ class AeStripe extends Gateway
         return $this->chargeAccepted($invoice, $amount, $billingAgreement, true);
     }
 
-    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement, ?int $acceptedAmount = null, bool $requireAutoPay = false, ?string $acceptedCurrency = null)
+    /** $autoPayConsent: a turn-on and pay's consent id. The attempt keeps it and every confirmation puts it on the PaymentIntent. */
+    public function charge(Invoice $invoice, $amount, BillingAgreement $billingAgreement, ?int $acceptedAmount = null, bool $requireAutoPay = false, ?string $acceptedCurrency = null, ?string $autoPayConsent = null)
     {
         $this->paymentRetryReserved = false;
         $customer = $invoice->user->properties()->where('key', 'stripe_id')->first()?->value;
@@ -1029,6 +1033,8 @@ class AeStripe extends Gateway
                 $data['accepted_currency'] = strtolower($acceptedCurrency ?? $invoice->currency_code);
             }
             if ($requireAutoPay) $data['auto_pay_agreement'] = (int) $billingAgreement->id;
+            // Kept with the payment attempt, so every confirmation of it, recovered or not, carries the consent.
+            if ($autoPayConsent) $data['auto_pay_consent'] = $autoPayConsent;
             if (!$this->gatewayEnabled()) {
                 $this->reservePaymentAttempt($invoice, $data);
                 $this->paymentPending('Payments are paused. We will check this payment when payments resume.');

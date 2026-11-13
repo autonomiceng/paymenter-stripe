@@ -25,6 +25,14 @@ foreach (['malformed' => 'not-an-amount', 'NaN' => NAN, 'infinity' => INF, 'nega
         check(true, 'InvalidArgumentException rejects ' . $label);
     }
 }
+// The pay button names the amount being authorised: the store's price style in the invoice currency, else its code.
+$priced = (object) ['currency_code' => 'USD', 'currency' => (object) ['prefix' => '$', 'suffix' => '', 'format' => '1,000.00']];
+check(invoke($gateway, 'paymentAmountLabel', (object) ['amount' => 1200000, 'currency' => 'usd'], $priced) === '$12,000.00', 'Pay amount uses the store price style');
+check(invoke($gateway, 'paymentAmountLabel', (object) ['amount' => 12000, 'currency' => 'eur'], $priced) === '120.00 EUR', 'A charge in another currency names its code');
+$priced->currency = (object) ['prefix' => '', 'suffix' => ' kr', 'format' => '1.000,00'];
+$priced->currency_code = 'jpy';
+check(invoke($gateway, 'paymentAmountLabel', (object) ['amount' => 1234567, 'currency' => 'jpy'], $priced) === '1.234.567 kr', 'Zero-decimal charges keep their decimals and separators');
+check(invoke($gateway, 'paymentAmountLabel', (object) ['amount' => 500, 'currency' => 'usd'], (object) ['currency_code' => 'usd']) === '5.00 USD', 'No currency style falls back to the code');
 $previousHandler = Http::$handler;
 Gateway::$enabled = true;
 Http::$handler = function ($verb, $path, $data) {

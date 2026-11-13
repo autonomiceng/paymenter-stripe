@@ -110,7 +110,7 @@ trait ChargeRecovery
                 // No frozen confirmation is replayed, and every saved agreement must still be active.
                 $data = $attempt['params'] ?? $this->checkoutPaymentData($invoice, 0,
                     $invoice->user->properties()->where('key', 'stripe_id')->firstOrFail()->value);
-                foreach (['accepted_amount', 'accepted_currency', 'auto_pay_agreement'] as $key) {
+                foreach (['accepted_amount', 'accepted_currency', 'auto_pay_agreement', 'auto_pay_consent'] as $key) {
                     if (array_key_exists($key, $attempt)) $data[$key] = $attempt[$key];
                 }
                 if (!isset($attempt['intent']) && !empty($attempt['agreement_id'])) $data['agreement_id'] = $attempt['agreement_id'];

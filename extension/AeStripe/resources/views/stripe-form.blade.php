@@ -96,7 +96,8 @@ function stripeFormControls(form, {onRetry, onLoading = () => {}, locked = () =>
         // close button from the ae-stripe:busy event.
         if (submit) {
             submit.disabled = isLoading || locked() || !controls.ready;
-            submit.textContent = isLoading ? busyLabel : submitLabel;
+            // A form can change its label (Pay and turn on Auto Pay) through data-label.
+            submit.textContent = isLoading ? busyLabel : (submit.dataset.label || submitLabel);
             submit.setAttribute('aria-busy', isLoading ? 'true' : 'false');
         }
         if (express) express.style.opacity = isLoading ? '0.5' : '';

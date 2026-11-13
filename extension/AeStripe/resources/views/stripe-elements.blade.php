@@ -1,6 +1,8 @@
 // Both pages share display options; each retains its own confirmation and consent flow.
 // A form with its own saving consent passes ownTerms, so Stripe's card terms do not repeat it.
-function createStripeElements(stripe, options, {linkDisplay, name, email, businessName, allowExpress = true, ownTerms = false, onLinkAvailability}) {
+// linkInCard: false keeps Link out of the card fields, where Stripe adds its own save box, and offers it as the
+// separate Link button instead.
+function createStripeElements(stripe, options, {linkDisplay, name, email, businessName, allowExpress = true, ownTerms = false, linkInCard = true, onLinkAvailability}) {
     // Without a name, Stripe shows the Stripe account's name to the customer.
     const business = businessName ? {business: {name: businessName}} : {};
     // With card as the only tab, Stripe shows the card fields alone, without a tab or panel around them.
@@ -10,13 +12,14 @@ function createStripeElements(stripe, options, {linkDisplay, name, email, busine
         ...business,
     };
     if (ownTerms) paymentOptions.terms = {card: 'never'};
+    const expressLink = allowExpress && (linkDisplay === 'above_card' || !linkInCard);
     // Keep returning Link users in the separate Link button, leaving the card fields visible.
-    if (linkDisplay === 'above_card' && allowExpress) paymentOptions.wallets = {link: 'never'};
-    if (linkDisplay === 'stripe_default') paymentOptions.defaultValues.billingDetails.email = email;
+    if (expressLink || !linkInCard) paymentOptions.wallets = {link: 'never'};
+    if (linkDisplay === 'stripe_default' && linkInCard) paymentOptions.defaultValues.billingDetails.email = email;
     const elements = stripe.elements(options);
     const paymentElement = elements.create('payment', paymentOptions);
     let expressCheckout = null;
-    if (linkDisplay === 'above_card' && allowExpress) {
+    if (expressLink) {
         try {
             expressCheckout = elements.create('expressCheckout', {
                 paymentMethods: {link: 'auto', applePay: 'never', googlePay: 'never',

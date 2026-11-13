@@ -5,9 +5,23 @@
     </div>
     <label class="mt-4 flex items-center gap-2">
         <input type="checkbox" id="save-card" @checked(in_array($intent->status, ['requires_action', 'requires_confirmation'], true) && ($intent->metadata->ae_stripe_consent ?? null) === '1') disabled />
-        Save this card for next time
+        {{ __('Save this card') }}
     </label>
+    {{-- Offered only while Auto Pay is off. Its line is the consent, so it shows before the tick and never moves. --}}
+    @if($autoPay)
+    <div id="auto-pay-choice" class="mt-2">
+        <label class="flex items-center gap-2">
+            <input type="checkbox" id="auto-pay" aria-describedby="auto-pay-terms" @checked(in_array($intent->status, ['requires_action', 'requires_confirmation'], true) && ($intent->metadata->ae_stripe_auto_pay ?? '') !== '') disabled />
+            {{ $autoPay['label'] }}
+        </label>
+        {{-- An inline indent lines the line up under the label in themes built without a padding class for it. --}}
+        @include('gateways.ae-stripe::auto-pay-line', ['consent' => $autoPay, 'id' => 'auto-pay-terms', 'class' => 'mt-1 block text-sm', 'style' => 'padding-inline-start: 1.5rem'])
+    </div>
+    @endif
+    {{-- The button names the commitment: with Auto Pay ticked it says so. --}}
     <button id="submit" disabled
+        data-pay-label="{{ __('Pay :amount', ['amount' => $paymentAmount]) }}"
+        data-auto-pay-label="{{ __('Pay :amount and turn on Auto Pay', ['amount' => $paymentAmount]) }}"
         class="mt-4 bg-secondary-500 text-white hover:bg-secondary py-2 px-4 rounded-md w-full bg-gradient-to-tr from-secondary via-50% via-20% via-secondary to-[#5573FD80] duration-300">
         {{ __('Pay :amount', ['amount' => $paymentAmount]) }}
     </button>
@@ -48,6 +62,7 @@ async function initializePaymentForm() {
     form.addEventListener('submit', (event) => event.preventDefault());
     const resuming = @js(in_array($intent->status, ['requires_action', 'requires_confirmation'], true));
     const savedConsent = @js(($intent->metadata->ae_stripe_consent ?? null) === '1');
+    const savedAutoPay = @js(($intent->metadata->ae_stripe_auto_pay ?? '') !== '');
     let intentId = @js($intent->id);
     const savedNoticeToken = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
     let canSave = resuming && savedConsent;
@@ -62,18 +77,41 @@ async function initializePaymentForm() {
     const refreshPayment = document.getElementById('refresh-payment');
     refreshPayment.addEventListener('click', () => window.location.reload());
     const saveCard = document.getElementById('save-card');
+    // Present only while the account has Auto Pay off.
+    const autoPay = form.querySelector('#auto-pay');
+    const submitButton = form.querySelector('#submit');
     // A reference, so releasing after the modal closes still works.
     const expressRow = form.querySelector('#express-checkout');
+    function updateSubmitLabel() {
+        submitButton.dataset.label = autoPay?.checked ? submitButton.dataset.autoPayLabel : submitButton.dataset.payLabel;
+        if (!controls.loading) submitButton.textContent = submitButton.dataset.label;
+    }
     function updateSaveCard() {
-        saveCard.disabled = resuming || controls.loading || !(canSave || linkAvailable);
-        if (!(canSave || linkAvailable)) saveCard.checked = false;
+        const closed = resuming || controls.loading || !(canSave || linkAvailable);
+        saveCard.disabled = closed;
+        if (autoPay) autoPay.disabled = closed;
+        if (!(canSave || linkAvailable)) {
+            saveCard.checked = false;
+            if (autoPay) autoPay.checked = false;
+        }
+        updateSubmitLabel();
     }
     function updateLinkAvailability(available) {
         linkAvailable = available;
         expressRow.hidden = !linkAvailable;
         updateSaveCard();
     }
-    saveCard.addEventListener('change', clearMessage);
+    // Auto Pay charges a saved card, so ticking it ticks Save, and unticking Save unticks it. Neither box locks the other.
+    saveCard.addEventListener('change', () => {
+        if (!saveCard.checked && autoPay) autoPay.checked = false;
+        updateSubmitLabel();
+        clearMessage();
+    });
+    autoPay?.addEventListener('change', () => {
+        if (autoPay.checked) saveCard.checked = true;
+        updateSubmitLabel();
+        clearMessage();
+    });
     let release = () => {};
     $wire.on('invoice.payment.cancelled', () => release());
 
@@ -121,6 +159,8 @@ async function initializePaymentForm() {
             // The server still checks the invoice balance before confirming.
             const created = createStripeElements(stripe, options, {
                 linkDisplay: @js($linkDisplay),
+                // Saving is this form's own box, so Link's own save box stays out of the card fields.
+                linkInCard: false,
                 name: {{ \Illuminate\Support\Js::from(auth()->user()->name) }},
                 email: {{ \Illuminate\Support\Js::from(auth()->user()->email) }},
                 businessName: @js($businessName),
@@ -166,6 +206,8 @@ async function initializePaymentForm() {
                 }
                 // Link uses the same explicit opt-in, even when another method is selected below it.
                 const save = resuming ? savedConsent : (expressEvent !== null || canSave) && saveCard.checked;
+                // Auto Pay turns on only after this payment succeeds, with the card it saves.
+                const turnOnAutoPay = resuming ? savedAutoPay : save && autoPay?.checked === true;
                 function failPayment(message) {
                     showMessage(message);
                     expressEvent?.paymentFailed({reason: 'fail'});
@@ -219,7 +261,7 @@ async function initializePaymentForm() {
                             headers: {'Content-Type': 'application/json', 'Accept': 'application/json',
                                 'X-CSRF-TOKEN': @js(csrf_token())},
                             body: JSON.stringify({intent: intentId, confirmation_token: token,
-                                amount: @js($intent->amount), save, saved_notice: savedNoticeToken}),
+                                amount: @js($intent->amount), save, auto_pay: turnOnAutoPay, saved_notice: savedNoticeToken}),
                         });
                         const result = await response.json();
                         if (result.intent) intentId = result.intent;

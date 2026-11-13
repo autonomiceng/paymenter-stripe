@@ -19,6 +19,7 @@ let view = readFileSync(`${root}extension/AeStripe/resources/views/billing-agree
     .replace("@include('gateways.ae-stripe::stripe-form')", () => readFileSync(`${root}extension/AeStripe/resources/views/stripe-form.blade.php`, 'utf8'))
     .replace('@js($linkDisplay)', "'above_card'")
     .replace('@js($businessName)', "'Fixture Hosting'")
+    .replace('@js($saveConsentVersion)', "'off_session_v3'")
     .replace(/@if\(config\('settings.tos'\)\)[\s\S]*?@endif/g, '')
     .replace(/@js\(route\('([^']+)'\)\)/g, (_, name) => `'/${name}'`)
     .replace(/@js\(csrf_token\(\)\)/g, "'fixture-csrf'")
@@ -110,7 +111,7 @@ try {
             return route.fulfill({ json: { components, assets: [] } });
         }
         if (url.pathname.endsWith('setup-consent')) {
-            assert.deepEqual(route.request().postDataJSON(), { intent: 'fixture-intent', consent: true, version: 'off_session_v2' });
+            assert.deepEqual(route.request().postDataJSON(), { intent: 'fixture-intent', consent: true, version: 'off_session_v3' });
             const ok = await page.evaluate(() => { probe.consent++; return !probe.failConsent; });
             if (holdConsent) await new Promise((resolve) => pendingConsent.push(resolve));
             return route.fulfill({ status: ok ? 200 : 503, json: { ok } });

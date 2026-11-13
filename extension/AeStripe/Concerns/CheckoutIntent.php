@@ -18,7 +18,7 @@ trait CheckoutIntent
     {
         for ($round = 0; $round < 4; ++$round) {
             $attempt = $this->reservePaymentAttempt($invoice, $data, $elements);
-            foreach (['renewal', 'automatic_renewal', 'customer_payment', 'accepted_amount', 'accepted_currency', 'auto_pay_agreement'] as $key) {
+            foreach (['renewal', 'automatic_renewal', 'customer_payment', 'accepted_amount', 'accepted_currency', 'auto_pay_agreement', 'auto_pay_consent'] as $key) {
                 if (array_key_exists($key, $attempt)) $data[$key] = $attempt[$key];
             }
             if (!empty($attempt['agreement_id'])) $data['agreement_id'] ??= $attempt['agreement_id'];
@@ -120,7 +120,7 @@ trait CheckoutIntent
             }
             if ($intent->status === 'canceled') {
                 // A new checkout can take over only after Stripe proves the earlier payment canceled without funds.
-                if ($elements) unset($data['agreement_id'], $data['accepted_amount'], $data['accepted_currency'], $data['auto_pay_agreement']);
+                if ($elements) unset($data['agreement_id'], $data['accepted_amount'], $data['accepted_currency'], $data['auto_pay_agreement'], $data['auto_pay_consent']);
                 $this->replacePaymentAttempt($invoice, $attempt);
                 continue;
             }
@@ -182,6 +182,10 @@ trait CheckoutIntent
             $attempt = $this->readPaymentAttempt($user, $current);
             if (in_array($attempt['confirmation']['phase'] ?? null, ['reserved', 'sending'], true)) {
                 $claim = $attempt['confirmation'];
+                // A turn-on and pay's consent belongs to its own confirmation; another one's claim cannot carry it.
+                if (isset($data['auto_pay_consent']) && $data['auto_pay_consent'] !== ($attempt['auto_pay_consent'] ?? null)) {
+                    throw new DisplayException('We are checking the earlier payment. Refresh the invoice for its status.');
+                }
                 if (isset($data['agreement_id']) && $data['agreement_id'] != ($claim['agreement'] ?? null)
                     || isset($data['accepted_amount'], $claim['amount']) && $data['accepted_amount'] !== $claim['amount']
                     || isset($data['accepted_currency'], $claim['currency']) && strtolower($data['accepted_currency']) !== strtolower($claim['currency'])) {
@@ -190,8 +194,8 @@ trait CheckoutIntent
                 return $attempt + ['due_amount' => $amount];
             }
             $customerPay = $elements || array_key_exists('renewal_start', $data) && !$data['renewal_start'];
-            $context = array_intersect_key($attempt ?? $data, array_flip(['renewal', 'automatic_renewal', 'customer_payment', 'accepted_amount', 'accepted_currency', 'auto_pay_agreement']));
-            foreach (['accepted_amount', 'accepted_currency', 'auto_pay_agreement'] as $key) {
+            $context = array_intersect_key($attempt ?? $data, array_flip(['renewal', 'automatic_renewal', 'customer_payment', 'accepted_amount', 'accepted_currency', 'auto_pay_agreement', 'auto_pay_consent']));
+            foreach (['accepted_amount', 'accepted_currency', 'auto_pay_agreement', 'auto_pay_consent'] as $key) {
                 if (array_key_exists($key, $data)) $context[$key] = $data[$key];
             }
             // Older accepted quotes already froze their currency in the creation parameters.
@@ -251,7 +255,7 @@ trait CheckoutIntent
                 $attempt['agreement_pending'] = true;
                 $attempt['retry'] = true;
             }
-            $attempt = array_replace($attempt, array_intersect_key($context, array_flip(['accepted_amount', 'accepted_currency', 'auto_pay_agreement'])));
+            $attempt = array_replace($attempt, array_intersect_key($context, array_flip(['accepted_amount', 'accepted_currency', 'auto_pay_agreement', 'auto_pay_consent'])));
             $this->writePaymentAttempt($user, $current, $attempt);
             return $attempt + ['due_amount' => $amount];
         });
@@ -465,7 +469,7 @@ trait CheckoutIntent
     {
         // An ended instruction cannot constrain a later Pay. Unknown confirmations and funds keep their constraints.
         if (empty($attempt['agreement_id']) && empty($attempt['confirmation']) && empty($attempt['funds_pending']) && empty($attempt['state'])) {
-            unset($attempt['accepted_amount'], $attempt['accepted_currency'], $attempt['auto_pay_agreement']);
+            unset($attempt['accepted_amount'], $attempt['accepted_currency'], $attempt['auto_pay_agreement'], $attempt['auto_pay_consent']);
         }
         return $attempt;
     }
@@ -536,6 +540,10 @@ trait CheckoutIntent
         $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($intentId, $params, $agreement, $expectedAmount, $expectedCurrency) {
             $attempt = $this->readPaymentAttempt($user, $current);
             if (($attempt['intent'] ?? null) !== $intentId) $this->paymentPending('Payment changed. Refresh the invoice to check its status.');
+            // The payment's turn-on and pay consent goes on every confirmation of it, including one recovery rebuilds.
+            if (!empty($attempt['auto_pay_consent']) && !isset($params['confirmation_token'])) {
+                $params['metadata'] = array_replace($params['metadata'] ?? [], ['ae_stripe_auto_pay_consent' => $attempt['auto_pay_consent']]);
+            }
             $expectedAmount = $attempt['accepted_amount'] ?? $expectedAmount;
             $expectedCurrency = $attempt['accepted_currency'] ?? $expectedCurrency
                 ?? $attempt['confirmation']['currency'] ?? $attempt['params']['currency'] ?? null;

@@ -57,8 +57,10 @@ check($gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' 
     && $agreementIntent->metadata == $recordedMetadata, 'Legacy authentication resumes without acquiring new consent scope');
 $agreementIntent->status = 'requires_payment_method';
 rejects(fn () => $gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true, 'version' => 'unknown'])), 'HTTP 422');
+$gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true, 'version' => 'off_session_v3']));
+check($agreementIntent->metadata->ae_stripe_setup_consent === 'off_session_v3', 'New setup forms record the v3 version of the Add card dialog');
 $gateway->setupConsent(new Request(['intent' => 'seti_consent', 'consent' => true, 'version' => 'off_session_v2']));
-check($agreementIntent->metadata->ae_stripe_setup_consent === 'off_session_v2', 'New setup forms record v2 authenticated saved-method consent');
+check($agreementIntent->metadata->ae_stripe_setup_consent === 'off_session_v2', 'A form opened before the upgrade still records its v2 version');
 $agreementIntent->status = 'succeeded';
 $gateway->webhook(eventRequest($agreementIntent, type: 'setup_intent.succeeded'));
 $gateway->setupAgreement(new Request(['setup_intent' => 'seti_consent']));

@@ -94,7 +94,9 @@ namespace App\Models {
                     $record = json_decode($value, true);
                     $selected = str_contains($this->pattern, 'payment_alert')
                         ? str_starts_with($key, 'ae_stripe_payment_alert_') && !($record['sent'] ?? true)
-                        : str_starts_with($key, 'ae_stripe_checkout_') && (!$this->filtered || ($record['retry'] ?? false) || ($record['version'] ?? null) !== 2 || !empty($record['agreement_id']));
+                        : (str_starts_with($this->pattern, 'ae_stripe_auto_pay_consent_')
+                        ? str_starts_with($key, 'ae_stripe_auto_pay_consent_') && ($record['state'] ?? null) === 'paid'
+                        : str_starts_with($key, 'ae_stripe_checkout_') && (!$this->filtered || ($record['retry'] ?? false) || ($record['version'] ?? null) !== 2 || !empty($record['agreement_id'])));
                     if ($selected) $result[] = (object) ['key' => $key, 'value' => $value, 'model_type' => User::class, 'model_id' => User::$row->id];
                 }
                 if ($this->rawOrder) {
