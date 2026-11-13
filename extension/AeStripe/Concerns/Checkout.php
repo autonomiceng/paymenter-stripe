@@ -92,8 +92,7 @@ trait Checkout
 
         return view('gateways.ae-stripe::pay', [
             'invoice' => $invoice, 'total' => $total, 'intent' => $intent,
-            'paymentAmount' => number_format($this->fromMinorUnits($intent->amount, $intent->currency),
-                $this->currencyDecimals($intent->currency), '.', '') . ' ' . strtoupper($intent->currency),
+            'paymentAmount' => $this->paymentAmountLabel($intent, $invoice),
             'autoPayDates' => $this->invoiceAutoPayDates($invoice),
             'customerSessionSecret' => $session?->client_secret,
             'stripePublishableKey' => $this->config('stripe_publishable_key'),
@@ -453,6 +452,25 @@ trait Checkout
         ]));
         $alert['sent'] = true; // Delivery is now owned by the outbox, independently of this property.
         $invoice->user->properties()->updateOrCreate(['key' => $key], ['value' => json_encode($alert, JSON_THROW_ON_ERROR)]);
+    }
+
+    /**
+     * The amount being authorised, in the store's own price style ("$120.00") when the charge is in the invoice
+     * currency and that currency has a symbol, otherwise with its code ("120.00 USD").
+     */
+    private function paymentAmountLabel($intent, $invoice): string
+    {
+        $value = $this->fromMinorUnits($intent->amount, $intent->currency);
+        $decimals = $this->currencyDecimals($intent->currency);
+        $currency = strtolower((string) ($invoice->currency_code ?? '')) === strtolower((string) $intent->currency)
+            ? ($invoice->currency ?? null) : null;
+        if (!$currency || ((string) ($currency->prefix ?? '') === '' && (string) ($currency->suffix ?? '') === '')) {
+            return number_format($value, $decimals, '.', '') . ' ' . strtoupper($intent->currency);
+        }
+        [$point, $thousands] = match ($currency->format ?? null) {
+            '1.000,00' => [',', '.'], '1 000,00' => [',', ' '], '1 000.00' => ['.', ' '], default => ['.', ','],
+        };
+        return $currency->prefix . number_format($value, $decimals, $point, $thousands) . $currency->suffix;
     }
 
     private function savePaidMethod($intent, $recoveryNotice = null)
