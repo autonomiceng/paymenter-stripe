@@ -207,12 +207,12 @@ try {
             await page.evaluate(() => window.clearChange);
             assert.equal(await page.locator('[role=alert]').textContent(), expected, `${name}: ${failure}`);
             assert.equal(await page.locator('#submit').isEnabled(), true, `${name}: retry stays available after ${failure}`);
-            // Only a decline of the entered details clears them, so the customer types a different card.
-            assert.equal(await page.evaluate(() => clears) - clearsBefore, failure === 'server-decline' ? 1 : 0, `${name}: ${failure} clears the card form only after a decline`);
+            // Errors retain the entered details so the customer can correct and resubmit them.
+            assert.equal(await page.evaluate(() => clears) - clearsBefore, 0, `${name}: ${failure} retains the card form for retry`);
             if (failure === 'server-decline') {
                 const alert = await page.locator('[role=alert]').boundingBox();
                 assert(alert && alert.y >= 0 && alert.y + alert.height <= 844,
-                    'The decline stays in view at 390px after clearing the card');
+                    'The decline stays in view at 390px after submission');
                 await page.evaluate(() => elementHandlers.payment.change({empty: true, complete: false, value: {type: 'card'}}));
                 assert.equal(await page.locator('[role=alert]').textContent(), expected,
                     'Further empty form updates keep the decline visible');
@@ -472,8 +472,8 @@ try {
         await page.waitForFunction(() => document.querySelector('[role=alert]').textContent.length > 0);
         assert.equal(await page.locator('[role=alert]').textContent(),
             'Your bank did not confirm this payment. You were not charged. Try again or use a different card.', 'A failed bank check shows the decline');
-        assert.deepEqual(await page.evaluate(() => [requests.length, actions, clears, failedEvents]), [2, 1, 1, 1],
-            'The server reads the refusal once, the card is cleared and the page can show the failed row');
+        assert.deepEqual(await page.evaluate(() => [requests.length, actions, clears, failedEvents]), [2, 1, 0, 1],
+            'The server reads the refusal once, retains the card and the page can show the failed row');
         assert.deepEqual(await page.evaluate(() => labels), ['Processing...:disabled', 'Processing...:disabled'], 'Pay stays in place reading Processing...');
         assert.equal((await page.locator('#submit').textContent()).trim(), "'Fixture'", 'Pay reads its amount again');
         assert.equal(await page.locator('#submit').isEnabled(), true, 'The form is ready for another card');
@@ -533,15 +533,23 @@ try {
         const sent = [];
         page.setDefaultTimeout(5000);
         await page.exposeFunction('captureNewCard', request => sent.push(request));
+        const paid = [];
+        await page.exposeFunction('capturePaid', count => paid.push(count));
         await page.route('**/*', route => route.fulfill({contentType: 'text/javascript', body: ''}));
         await page.route('https://example.com/new-card', route => route.fulfill({contentType: 'text/html', body: '<html><body></body></html>'}));
         await page.route('https://example.com/return**', route => route.fulfill({contentType: 'text/html', body: 'Payment received'}));
         await page.goto('https://example.com/new-card');
         await page.evaluate(scenario => {
             window.handlers = {}; window.order = []; window.$wire = {on() {}};
+            window.tokens = 0; window.cardEntered = true; window.paid = 0; window.requestCount = 0;
             window.fetch = async (_, options) => {
+                const declined = scenario === 'decline' && ++requestCount === 1;
                 await captureNewCard({body: JSON.parse(options.body), tokenOptions, order});
-                return {ok: scenario !== 'decline', async json() { return scenario === 'decline'
+                if (scenario === 'decline' && !declined) {
+                    await new Promise(resolve => { window.finishRetry = resolve; });
+                }
+                if (!declined) await capturePaid(++paid);
+                return {ok: !declined, async json() { return declined
                     ? {declined: true, message: 'Your bank declined this card. Try a different card, or contact your bank.'}
                     : {status: 'succeeded'}; }};
             };
@@ -555,13 +563,14 @@ try {
                         create(type) {
                             const events = handlers[type] = {};
                             return {on(name, fn) {events[name] = fn;}, mount() {events.ready?.({availablePaymentMethods: {link: true}});},
-                                clear() {events.change?.({empty: true});}, destroy() {}};
+                                clear() {cardEntered = false; events.change?.({empty: true, complete: false});}, destroy() {}};
                         }};
                 },
                 async createConfirmationToken() {
                     order.push('token');
                     window.tokenOptions = JSON.parse(JSON.stringify(currentOptions));
-                    return {confirmationToken: {id: 'ctoken_newcard'}};
+                    tokens++;
+                    return {confirmationToken: {id: tokens === 1 ? 'ctoken_newcard' : 'ctoken_retry'}};
                 },
             });
         }, scenario);
@@ -599,9 +608,19 @@ try {
             link: {setup_future_usage: save ? 'off_session' : 'none'},
         }, 'The token collects the same saving options the server will confirm');
         if (scenario === 'decline') {
-            await page.route('https://example.com/new-card', route => route.fulfill({contentType: 'text/html', body: 'Fresh payment checkout'}));
-            await page.locator('#refresh-payment').click();
-            await page.getByText('Fresh payment checkout', {exact: true}).waitFor();
+            assert.equal(await page.evaluate(() => cardEntered), true, 'A declined card stays filled inside Elements');
+            assert.deepEqual(paid, [], 'The declined attempt does not charge');
+            await page.locator('#submit').click();
+            await page.waitForFunction(() => typeof finishRetry === 'function');
+            // A second submit while the retry is pending cannot confirm or tokenize again.
+            await page.evaluate(() => document.querySelector('form').dispatchEvent(new Event('submit', {bubbles: true, cancelable: true})));
+            assert.equal(sent.length, 2, 'Only one confirmation request is sent for the retry');
+            assert.deepEqual(paymentFields(sent[1].body), {...paymentFields(sent[0].body), confirmation_token: 'ctoken_retry'},
+                'The unchanged card gets a fresh token with the same one-time payment choice');
+            assert.equal(await page.evaluate(() => tokens), 2, 'The duplicate submit cannot create a third token');
+            await page.evaluate(() => finishRetry());
+            await page.getByText('Payment received', {exact: true}).waitFor();
+            assert.deepEqual(paid, [1], 'The decline and retry produce only one successful payment');
         }
         await page.close();
     }

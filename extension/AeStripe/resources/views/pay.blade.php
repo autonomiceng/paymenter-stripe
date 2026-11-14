@@ -172,19 +172,20 @@ async function initializePaymentForm() {
             expressCheckout = created.expressCheckout;
             let finishOptionsUpdate = null;
             elements.on('update-end', () => finishOptionsUpdate?.());
-            function clearDeclinedPayment() {
-                paymentElement.clear();
-                complete = false;
+            function handleDeclinedPayment() {
+                // Keep the entered card in Elements; the next submit creates a fresh confirmation token.
                 // The theme can show the new failed row without reloading the open dialog.
                 form.dispatchEvent(new CustomEvent('ae-stripe:payment-failed', {bubbles: true}));
                 refreshPayment.hidden = false;
                 if (resuming) {
+                    paymentElement.clear();
+                    complete = false;
                     refreshRequired = true;
                 }
             }
             // https://docs.stripe.com/js/element/events/on_change?type=paymentElement
             paymentElement.on('change', current((event) => {
-                // clear() also reports an empty form after submission has finished.
+                // Clearing a declined resumed payment also reports an empty form.
                 if (!controls.loading && event.empty !== true) clearMessage();
                 complete = event.complete === true;
                 canSave = resuming ? savedConsent : ['card', 'link'].includes(event.value?.type);
@@ -266,9 +267,9 @@ async function initializePaymentForm() {
                         const result = await response.json();
                         if (result.intent) intentId = result.intent;
                         if (!response.ok) {
-                            // A declined card number stays out of the form, so the customer types a different card.
+                            // A resumed payment needs a fresh checkout before it can accept a new card.
                             // After a failed bank check the reason is that check, even when Stripe no longer reports it.
-                            if (result.declined) clearDeclinedPayment();
+                            if (result.declined) handleDeclinedPayment();
                             failPayment(refreshRequired ? 'This payment was declined. Refresh the payment form to try another card.'
                                 : authFailed && result.declined ? 'Your bank did not confirm this payment. You were not charged. Try again or use a different card.'
                                 : result.message || 'Could not confirm your payment. Refresh the invoice for its status.');
@@ -293,14 +294,14 @@ async function initializePaymentForm() {
                             window.location.assign(destination.toString());
                             return;
                         }
-                        clearDeclinedPayment();
+                        handleDeclinedPayment();
                         failPayment(refreshRequired ? 'This payment was declined. Refresh the payment form to try another card.'
                             : 'This payment was declined. Try a different card or payment method.');
                         return;
                     }
                     failPayment('Payment still needs authentication. Refresh the invoice to continue.');
                 } catch (error) {
-                    if (resuming && error?.type === 'card_error') clearDeclinedPayment();
+                    if (resuming && error?.type === 'card_error') handleDeclinedPayment();
                     // Stripe.js already shows a validation error beside its field.
                     if (error?.type === 'validation_error') {
                         expressEvent?.paymentFailed({reason: 'fail'});
