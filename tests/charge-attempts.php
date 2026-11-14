@@ -590,6 +590,30 @@ use Illuminate\Support\Facades\{DB, Http};
             check(str_contains($message, 'changed') && !$stripe->intents && !$stripe->confirms && !$stripe->charges,
                 'An accepted USD quote cannot create or confirm EUR under the invoice lock');
         });
+        $run('accepted-quote-overwritten', function ($invoice, $stripe) use ($gateway) {
+            // Staff A accepted 14.99. Before A's confirmation takes the lock, the invoice is raised and staff B's
+            // submission stores its own 20.00 quote on the shared attempt. A must not confirm B's amount.
+            $invoice->total = 14.99;
+            $hook = function () use (&$hook, $invoice) {
+                if (!in_array('confirmAttempt', array_column(debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS), 'function'), true)) {
+                    DB::$beforeUserLock = $hook;
+                    return;
+                }
+                $invoice->total = 20;
+                $attempt = json_decode(User::$row->props->values['ae_stripe_checkout_920'], true);
+                $attempt['accepted_amount'] = 2000;
+                User::$row->props->values['ae_stripe_checkout_920'] = json_encode($attempt);
+            };
+            DB::$beforeUserLock = $hook;
+            $calls = count(Http::$calls);
+            $message = '';
+            try { $gateway->chargeAccepted(clone $invoice, '14.99', new BillingAgreement); }
+            catch (\App\Exceptions\DisplayException $e) { $message = $e->getMessage(); }
+            DB::$beforeUserLock = null;
+            $updates = array_filter(array_slice(Http::$calls, $calls), fn ($call) => $call[0] === 'post' && preg_match('~/payment_intents/pi_[a-zA-Z0-9]+$~', $call[1]));
+            check(str_contains($message, 'changed') && !$stripe->confirms && !$stripe->charges && !$updates,
+                'A confirmation keeps its own accepted quote and refuses one another payment stored meanwhile');
+        });
         foreach (['recover', 'expired', 'canceled', 'invalid-params', 'legacy-currency'] as $replacement) {
             foreach (['eur', 'jpy'] as $currency) {
                 $run('accepted-currency-'.$replacement.'-'.$currency, function ($invoice, $stripe) use ($gateway, $replacement, $currency) {
