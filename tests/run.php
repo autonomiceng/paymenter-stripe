@@ -1,6 +1,11 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 require_once __DIR__ . '/entered.php';
+// Run the checkout browser regression alone without the native/browser matrix.
+if (getenv('PAY_OFFLINE_SUITE') === 'payment-errors') {
+    $run = proc_open([getenv('PAYMENTER_TEST_NODE') ?: 'node', __DIR__ . '/payment-errors.mjs'], [], $pipes);
+    exit(proc_close($run));
+}
 if (getenv('PAY_MARIADB_CASE')) {
     $php = getenv('PAY_MARIADB_PHP') ?: PHP_BINARY;
     putenv('PAYMENTER_TEST_PHP=' . $php);
