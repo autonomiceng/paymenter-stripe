@@ -207,6 +207,8 @@ trait AutoPay
                 $this->assertSavedMethodBindable($user, $agreement);
                 $current = $this->autoPayDefault($user, lock: true);
                 if (!$current && !$customerAgreed) {
+                    // On through services linked one by one: a saved preference would not move their charges, so ask for consent.
+                    abort_unless(!$this->autoPayOn($user, lock: true), 409, 'Auto Pay is on through linked services; the customer must agree again.');
                     $this->rememberAutoPayCard($user, (int) $agreement->id);
                     return ['enabled' => false, 'turned_on' => false, 'services' => 0];
                 }

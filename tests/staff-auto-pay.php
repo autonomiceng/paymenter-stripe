@@ -72,6 +72,13 @@ check($result['enabled'] === true && $result['turned_on'] === true && $record['a
 check(count($mails('on')) === $onBefore + 1, 'A phone turn-on sends the existing Auto Pay is on email');
 rejects(fn () => $gateway->staffSetAutoPayCard($user, $agreement(83), 6, customerAgreed: true), 'HTTP 403');
 $gateway->saveAutoPayDefault(new Request(['enabled' => false]));
+
+// On through a service linked on its own, with no account record: a card pick without agreement is refused, links stay.
+$service->billing_agreement_id = 81;
+rejects(fn () => $gateway->staffSetAutoPayCard($user, $agreement(82), 5), 'HTTP 409');
+check($service->billing_agreement_id === 81 && $gateway->autoPayDefault($user) === null,
+    'A card pick without agreement never leaves linked services charging the old card unseen');
+$service->billing_agreement_id = null;
 Gateway::$enabled = false;
 rejects(fn () => $gateway->staffSetAutoPayCard($user, $agreement(81), 6, customerAgreed: true), 'HTTP 409');
 check($gateway->autoPayDefault($user) === null, 'Auto Pay cannot be turned on by phone while card payments are paused');
