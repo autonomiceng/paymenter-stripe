@@ -534,19 +534,28 @@ trait CheckoutIntent
             && (!isset($claim['currency'], $currency) || strtolower($claim['currency']) === strtolower($currency));
     }
 
-    private function confirmAttempt($invoice, string $intentId, array $params, ?BillingAgreement $agreement = null, ?int $expectedAmount = null, ?string $expectedCurrency = null)
+    private function confirmAttempt($invoice, string $intentId, array $params, ?BillingAgreement $agreement = null, ?int $expectedAmount = null, ?string $expectedCurrency = null, bool $callerQuote = false)
     {
         // Commit the confirmation identity before HTTP. Other extension paths honor this claim until its answer is recorded.
-        $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($intentId, $params, $agreement, $expectedAmount, $expectedCurrency) {
+        $attempt = $this->withPaymentLock($invoice, function ($user, $current) use ($intentId, $params, $agreement, $expectedAmount, $expectedCurrency, $callerQuote) {
             $attempt = $this->readPaymentAttempt($user, $current);
             if (($attempt['intent'] ?? null) !== $intentId) $this->paymentPending('Payment changed. Refresh the invoice to check its status.');
             // The payment's turn-on and pay consent goes on every confirmation of it, including one recovery rebuilds.
             if (!empty($attempt['auto_pay_consent']) && !isset($params['confirmation_token'])) {
                 $params['metadata'] = array_replace($params['metadata'] ?? [], ['ae_stripe_auto_pay_consent' => $attempt['auto_pay_consent']]);
             }
-            $expectedAmount = $attempt['accepted_amount'] ?? $expectedAmount;
-            $expectedCurrency = $attempt['accepted_currency'] ?? $expectedCurrency
-                ?? $attempt['confirmation']['currency'] ?? $attempt['params']['currency'] ?? null;
+            if ($callerQuote) {
+                // The caller confirms the quote it accepted. Another payment may have stored a different quote on this
+                // shared attempt meanwhile; that one is never confirmed in this caller's name.
+                if (($attempt['accepted_amount'] ?? null) !== $expectedAmount
+                    || strtolower((string) ($attempt['accepted_currency'] ?? '')) !== strtolower((string) $expectedCurrency)) {
+                    throw new DisplayException('The amount due changed. Refresh the invoice before paying.');
+                }
+            } else {
+                $expectedAmount = $attempt['accepted_amount'] ?? $expectedAmount;
+                $expectedCurrency = $attempt['accepted_currency'] ?? $expectedCurrency
+                    ?? $attempt['confirmation']['currency'] ?? $attempt['params']['currency'] ?? null;
+            }
             if (!empty($attempt['confirmation']) && (in_array($attempt['confirmation']['phase'] ?? null, ['reserved', 'sending'], true) || !empty($attempt['automatic_renewal']))
                 && !$this->confirmationMatchesCaller($attempt['confirmation'], $params, $agreement, $expectedAmount, $expectedCurrency)) {
                 $this->paymentPending('We are checking the earlier payment. Refresh the invoice for its status.');

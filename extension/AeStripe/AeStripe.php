@@ -1048,7 +1048,7 @@ class AeStripe extends Gateway
             if (in_array($intent->status, ['requires_payment_method', 'requires_confirmation'], true)) {
                 $intent = $this->confirmAttempt($invoice, $intent->id, [
                     'payment_method' => $billingAgreement->external_reference, 'off_session' => 'true',
-                ], $billingAgreement, $acceptedAmount);
+                ], $billingAgreement, $acceptedAmount, $acceptedAmount === null ? null : $data['accepted_currency'], $acceptedAmount !== null);
             }
             if ($intent->status === 'succeeded') {
                 try { $this->recordIntentPayment($intent, 'succeeded'); }

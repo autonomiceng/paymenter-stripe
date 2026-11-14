@@ -185,6 +185,46 @@ trait AutoPay
         }
     }
 
+    /**
+     * Staff act on a customer's phone call. With Auto Pay on, every renewing service and the consent record move to the
+     * chosen card; the customer's consent stays, the record names the staff member, and the customer gets an email
+     * saying our team changed the card. With it off, only the card choice is saved, unless staff confirm the customer
+     * agreed to Auto Pay on the call: then it turns on with that card, consent recorded as by phone via the staff
+     * member at that time, and the customer gets the "Auto Pay is on" email.
+     *
+     * @return array{enabled: bool, turned_on: bool, services: int}
+     */
+    public function staffSetAutoPayCard(User $user, BillingAgreement $agreement, int $staffId, bool $customerAgreed = false): array
+    {
+        abort_unless(!$customerAgreed || $this->gatewayEnabled() && $this->bundledInactive(), 409);
+        return $this->withSavedMethodBindingLock((int) $user->id, fn () => ExtensionLocks::transaction('user:' . $user->id,
+            function () use ($user, $agreement, $staffId, $customerAgreed) {
+                $user = User::where('id', $user->id)->firstOrFail();
+                $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
+                $agreement = BillingAgreement::where('id', $agreement->id)->where('user_id', $user->id)
+                    ->where('gateway_id', $gateway->id)->first();
+                abort_unless($agreement, 403);
+                $this->assertSavedMethodBindable($user, $agreement);
+                $current = $this->autoPayDefault($user, lock: true);
+                if (!$current && !$customerAgreed) {
+                    // On through services linked one by one: a saved preference would not move their charges, so ask for consent.
+                    abort_unless(!$this->autoPayOn($user, lock: true), 409, 'Auto Pay is on through linked services; the customer must agree again.');
+                    $this->rememberAutoPayCard($user, (int) $agreement->id);
+                    return ['enabled' => false, 'turned_on' => false, 'services' => 0];
+                }
+                if (!$current) {
+                    $services = $this->enableAutoPay($user, (int) $agreement->id, time(), self::AUTO_PAY_CONSENT,
+                        ['consent_via' => 'phone', 'consent_staff' => $staffId]);
+                    return ['enabled' => true, 'turned_on' => true, 'services' => $services];
+                }
+                // Keep everything the consent record already says; only the card and who changed it are new.
+                $kept = array_diff_key($current, array_flip(['version', 'user_id', 'accepted_at', 'agreement_id']));
+                $services = $this->enableAutoPay($user, (int) $agreement->id, (int) $current['accepted_at'], $current['version'],
+                    ['card_set_by' => $staffId, 'card_set_at' => time()] + $kept, cardChange: true);
+                return ['enabled' => true, 'turned_on' => false, 'services' => $services];
+            }));
+    }
+
     /** How the consent line and the turn-on email name a saved method: "•••• 4242" or "your Link wallet". */
     public function autoPayCardLabel(BillingAgreement $agreement): string
     {
@@ -197,7 +237,8 @@ trait AutoPay
      * "Auto Pay is on" email. The same card already on is the same enrollment: services are linked again, the record
      * and the count stay, and no second email goes out. The caller holds the user row lock.
      */
-    private function enableAutoPay(User $user, int $agreementId, ?int $acceptedAt = null, string $version = self::AUTO_PAY_CONSENT): int
+    private function enableAutoPay(User $user, int $agreementId, ?int $acceptedAt = null, string $version = self::AUTO_PAY_CONSENT,
+        array $extra = [], bool $cardChange = false): int
     {
         $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
         $agreement = BillingAgreement::where('id', $agreementId)
@@ -209,9 +250,10 @@ trait AutoPay
         if (($this->autoPayDefault($user, lock: true)['agreement_id'] ?? null) !== (int) $agreement->id) {
             $generation = $this->nextAutoPayGeneration($user);
             $record = ['version' => $version, 'user_id' => (int) $user->id,
-                'accepted_at' => $acceptedAt ?? time(), 'agreement_id' => (int) $agreement->id];
+                'accepted_at' => $acceptedAt ?? time(), 'agreement_id' => (int) $agreement->id] + $extra;
             $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_PROPERTY], ['value' => json_encode($record, JSON_THROW_ON_ERROR)]);
-            $this->queueAutoPayOnMail($user, $agreement, $generation);
+            if ($cardChange) $this->queueAutoPayCardMail($user, $agreement, $generation);
+            else $this->queueAutoPayOnMail($user, $agreement, $generation);
         }
         $services = 0;
         foreach ($this->autoPayServices($user) as $service) {
@@ -516,11 +558,24 @@ trait AutoPay
     private function queueAutoPayOnMail(User $user, BillingAgreement $agreement, int $generation): void
     {
         // One source per Off-to-On transition, so the outbox keeps one email even if the turn-on is retried.
-        $identity = ['kind' => 'ae_stripe_auto_pay_mail:on', 'source' => 'user_' . $user->id . '_on_' . $generation];
+        $this->queueAutoPayMail($user, 'on', $generation, __('Auto Pay is on'),
+            __('Auto Pay is on. We charge :card for every renewal invoice. To stop, turn off Auto Pay in Payment methods.',
+                ['card' => $this->autoPayCardLabel($agreement)]));
+    }
+
+    /** Staff moved Auto Pay to another card on the customer's request. One email per change. */
+    private function queueAutoPayCardMail(User $user, BillingAgreement $agreement, int $generation): void
+    {
+        $this->queueAutoPayMail($user, 'card', $generation, __('Auto Pay card changed'),
+            __('Our team changed your Auto Pay card to :card. We charge it for every renewal invoice. To change it or turn off Auto Pay, open Payment methods.',
+                ['card' => $this->autoPayCardLabel($agreement)]));
+    }
+
+    private function queueAutoPayMail(User $user, string $kind, int $generation, string $title, string $body): void
+    {
+        $identity = ['kind' => 'ae_stripe_auto_pay_mail:' . $kind, 'source' => 'user_' . $user->id . '_' . $kind . '_' . $generation];
         $this->storePaymentNotices($identity, [[
-            'user_id' => (int) $user->id, 'title' => __('Auto Pay is on'),
-            'body' => __('Auto Pay is on. We charge :card for every renewal invoice. To stop, turn off Auto Pay in Payment methods.',
-                ['card' => $this->autoPayCardLabel($agreement)]),
+            'user_id' => (int) $user->id, 'title' => $title, 'body' => $body,
             'url' => route('account.payment-methods'), 'link_label' => __('Open Payment methods'),
         ]]);
         DB::afterCommit(function () use ($identity) {
