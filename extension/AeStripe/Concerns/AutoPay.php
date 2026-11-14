@@ -185,6 +185,38 @@ trait AutoPay
         }
     }
 
+    /**
+     * Staff choose which saved card Auto Pay uses, for example when the customer asks by phone. It never turns Auto Pay
+     * on: that needs the customer's own consent. While it is on, every renewing service and the consent record move to
+     * the card, the customer's consent version and time stay, the record names the staff member, and the customer gets
+     * the "Auto Pay is on" email for the new card. While it is off, only the card choice is saved.
+     *
+     * @return array{enabled: bool, services: int}
+     */
+    public function staffSetAutoPayCard(User $user, BillingAgreement $agreement, int $staffId): array
+    {
+        return $this->withSavedMethodBindingLock((int) $user->id, fn () => ExtensionLocks::transaction('user:' . $user->id,
+            function () use ($user, $agreement, $staffId) {
+                $user = User::where('id', $user->id)->firstOrFail();
+                $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
+                $agreement = BillingAgreement::where('id', $agreement->id)->where('user_id', $user->id)
+                    ->where('gateway_id', $gateway->id)->first();
+                abort_unless($agreement, 403);
+                $this->assertSavedMethodBindable($user, $agreement);
+                $current = $this->autoPayDefault($user, lock: true);
+                if (!$current) {
+                    $this->rememberAutoPayCard($user, (int) $agreement->id);
+                    return ['enabled' => false, 'services' => 0];
+                }
+                $services = $this->enableAutoPay($user, (int) $agreement->id, (int) $current['accepted_at'], $current['version']);
+                if ($current['agreement_id'] !== (int) $agreement->id) {
+                    $record = array_replace($this->autoPayDefault($user, lock: true), ['card_set_by' => $staffId, 'card_set_at' => time()]);
+                    $user->properties()->updateOrCreate(['key' => self::AUTO_PAY_PROPERTY], ['value' => json_encode($record, JSON_THROW_ON_ERROR)]);
+                }
+                return ['enabled' => true, 'services' => $services];
+            }));
+    }
+
     /** How the consent line and the turn-on email name a saved method: "•••• 4242" or "your Link wallet". */
     public function autoPayCardLabel(BillingAgreement $agreement): string
     {

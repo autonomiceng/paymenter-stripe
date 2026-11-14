@@ -349,6 +349,7 @@ require __DIR__ . '/retries.php';
 require __DIR__ . '/subscription-attempts.php';
 require __DIR__ . '/setup-consent.php';
 require __DIR__ . '/auto-pay-consent.php';
+require __DIR__ . '/staff-auto-pay.php';
 require __DIR__ . '/setup-intents.php';
 require __DIR__ . '/ownership.php';
 require __DIR__ . '/checkout-owner.php';
