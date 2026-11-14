@@ -288,7 +288,13 @@ class AeStripe extends Gateway
                 'placeholder' => $savedKey === '' ? 'Enter your restricted API key' : $this->savedSecretPlaceholder($savedKey),
                 'type' => 'password',
                 'encrypted' => true,
-                'description' => 'Find your API keys at https://dashboard.stripe.com/apikeys',
+                // One link for both keys: they sit side by side and come from the same Stripe page. Lazy, like a hint.
+                'description' => fn () => new \Illuminate\Support\HtmlString('Find your API keys in the <a class="domains-link font-medium" style="text-decoration: underline"'
+                    . ' href="https://dashboard.stripe.com/apikeys" target="_blank" rel="noopener noreferrer">Stripe dashboard'
+                    . '<svg aria-hidden="true" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"'
+                    . ' style="display: inline; margin-inline-start: 3px; vertical-align: -1px"><path d="M7 17 17 7M8 7h9v9"/></svg>'
+                    . '<span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap">'
+                    . ' (opens in a new tab)</span></a>.'),
                 // A saved key stays when the field is left blank.
                 'required' => $savedKey === '',
             ],
@@ -297,7 +303,6 @@ class AeStripe extends Gateway
                 'label' => 'Stripe publishable key',
                 'placeholder' => 'Enter your publishable key',
                 'type' => 'text',
-                'description' => 'Find your API keys at https://dashboard.stripe.com/apikeys',
                 'required' => true,
             ],
             [
@@ -314,7 +319,7 @@ class AeStripe extends Gateway
                 'options' => ['above_card' => 'Small Link button below the form', 'inside_card' => 'Inside card form',
                     'stripe_default' => 'Stripe default'],
                 'default' => 'above_card',
-                'hint' => fn () => new \Illuminate\Support\HtmlString('<span tabindex="0" title="Choose where Link appears. Stripe default also prefills the customer email.">?</span>'),
+                'description' => 'Stripe default also prefills the customer email.',
                 // Gateways saved before this setting have no value; they read as the default.
                 'required' => false,
             ],
