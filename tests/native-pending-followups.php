@@ -36,6 +36,7 @@ Http::fake(function ($request) use (&$requests, &$error, &$methodError, $intent,
     throw new RuntimeException('Unexpected fixture HTTP: ' . $path);
 });
 $token = str_repeat('b', 32);
+if (str_starts_with($case, 'final-residual-')) { require __DIR__ . '/native-notice-residuals.php'; return; }
 if (str_starts_with($case, 'final-')) { require __DIR__ . '/native-final-followups.php'; return; }
 if ($case === 'followup-staff-race') {
     $setDefault(); $lock = Cache::lock('ae-stripe-save-method-' . $user->id, 600); $lock->get();
@@ -97,7 +98,8 @@ if ($case === 'followup-staff-race') {
         $fail = match ($case) {
             'followup-queue-local-budget' => str_contains($query->sql, '"invoices"'),
             'followup-queue-save-budget' => in_array('ae_stripe_saved_%', $query->bindings, true),
-            'followup-queue-notice-budget' => DB::transactionLevel() > 0 && in_array('ae_stripe_notice_%', $query->bindings, true),
+            'followup-queue-notice-budget' => DB::transactionLevel() > 0 && str_contains($query->sql, '"properties"."model_id" = ?')
+                && in_array('ae_stripe_notice_%', $query->bindings, true),
             default => false,
         };
         if ($fail) { ++$faults; throw new RuntimeException('Synthetic local recovery outage'); }
@@ -184,15 +186,15 @@ if ($case === 'followup-staff-race') {
     $assert(($value['state'] ?? null) === 'ready', 'Later valid confirmation recovers past missing or ineligible older reservations.');
     $assert(count(array_filter($requests, fn ($p) => str_contains($p, 'payment_intents'))) <= (str_starts_with($case, 'followup-queue-outage-') ? 26 : ($case === 'followup-queue-malformed' ? 3 : 2)), 'Ineligible records do not generate provider reads.');
 } elseif (str_starts_with($case, 'followup-after-commit')) {
-    $setDefault(); $armed = false;
+    $setDefault(); $armed = false; $armedOnce = false;
     $failure = substr($case, strlen('followup-after-commit-'));
     if (in_array($failure, ['state', 'log'], true)) $user->properties()->create(['key' => 'ae_stripe_duplicate_pm_old', 'value' => json_encode(['customer' => 'cus_fixture', 'gateway' => $native->id, 'kept' => 'pm_other'])]);
     $cart = App\Models\Cart::create(['user_id' => $user->id, 'currency_code' => 'USD']);
     $cart->items()->create(['product_id' => $product->id, 'plan_id' => $plan->id, 'quantity' => 1, 'checkout_config' => [], 'config_options' => []]);
     request()->cookies->set('cart', $cart->ulid); Illuminate\Support\Once::flush();
     $page = Livewire::withCookies(['cart' => $cart->ulid])->test(App\Livewire\Cart::class)->set('tos', true);
-    Illuminate\Support\Facades\Event::listen(Illuminate\Database\Events\TransactionCommitting::class, function () use (&$armed) {
-        if (DB::transactionLevel() === 1 && App\Models\Order::exists()) $armed = true;
+    Illuminate\Support\Facades\Event::listen(Illuminate\Database\Events\TransactionCommitting::class, function () use (&$armed, &$armedOnce) {
+        if (!$armedOnce && DB::transactionLevel() === 1 && App\Models\Order::exists()) $armed = $armedOnce = true;
     });
     DB::listen(function ($query) use (&$armed, $failure) {
         if (!$armed) return;

@@ -5,7 +5,7 @@ namespace Paymenter\Extensions\Gateways\AeStripe\Concerns;
 use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
 
 use App\Exceptions\DisplayException;
-use App\Models\{Invoice, Property, User};
+use App\Models\{Gateway, Invoice, Property, User};
 use Illuminate\Support\Facades\{Auth, Cache, DB, Log};
 
 trait SavedMethodNotices
@@ -180,19 +180,22 @@ trait SavedMethodNotices
         try { Log::warning($message, $context); } catch (\Throwable $e) {} // Notice housekeeping cannot fail a settled payment.
     }
 
-    // Keyset rotation makes progress without rewriting young or future-due reservations.
+    // Durable keyset rotation survives cache eviction without rewriting young or future-due reservations.
     private function savedNoticeBatch(string $kind)
     {
-        $key = 'ae-stripe-notice-cursor-' . $kind;
-        $cursor = 0;
-        try { $cursor = (int) Cache::get($key, 0); } catch (\Throwable $e) {}
-        $query = Property::where('key', 'like', 'ae_stripe_notice_%')->where('model_type', (new User)->getMorphClass())
-            ->whereIn('model_id', User::select('id'));
-        if ($kind === 'retry') $query->where('value', 'like', '%"state"%"pending"%');
-        $rows = (clone $query)->where('id', '>', $cursor)->orderBy('id')->limit(200)->get();
-        if ($rows->isEmpty() && $cursor) $rows = $query->orderBy('id')->limit(200)->get();
-        try { Cache::put($key, $rows->last()?->id ?? 0, 3600); } catch (\Throwable $e) {}
-        return $rows;
+        return ExtensionLocks::transaction('notice-batch:' . $kind, function () use ($kind) {
+            $gateway = Gateway::where('extension', 'AeStripe')->firstOrFail();
+            $key = 'ae_stripe_notice_cursor_' . $kind;
+            $cursor = (int) ($gateway->settings()->where('key', $key)->first()?->value ?? 0);
+            $query = Property::where('key', 'like', 'ae_stripe_notice_%')->where('model_type', (new User)->getMorphClass());
+            if ($kind === 'orphans') $query->whereNotIn('model_id', User::select('id'));
+            else $query->whereIn('model_id', User::select('id'));
+            if ($kind === 'retry') $query->where('value', 'like', '%"state"%"pending"%');
+            $rows = (clone $query)->where('id', '>', $cursor)->orderBy('id')->limit(200)->get();
+            if ($rows->isEmpty() && $cursor) $rows = $query->orderBy('id')->limit(200)->get();
+            $gateway->settings()->updateOrCreate(['key' => $key], ['value' => (string) ($rows->last()?->id ?? 0)]);
+            return $rows;
+        });
     }
 
     private function savedNoticeCreatedAt(array $notice, $property): ?int
@@ -229,6 +232,22 @@ trait SavedMethodNotices
                         ['value' => json_encode(array_replace($receipt, ['notice_consumed' => true]), JSON_THROW_ON_ERROR)]);
                 }
                 return null; // Retire only notice metadata; payment and saving receipts remain intact.
+            }); } catch (\Throwable $e) { $this->savedNoticeAccessWarning('retention storage unavailable', $property, 'local'); }
+        }
+        // Missing owners get their own bounded pass so they cannot displace live retention or recovery.
+        foreach ($this->savedNoticeBatch('orphans') as $property) {
+            $notice = json_decode($property->value, true);
+            $created = $this->savedNoticeCreatedAt(is_array($notice) ? $notice : [], $property);
+            if ($created !== null && $created >= now()->timestamp - 30 * 86400) continue;
+            try { ExtensionLocks::transaction('user:' . $property->model_id, function () use ($property, $notice) {
+                if (User::where('id', $property->model_id)->exists()) return;
+                $current = Property::where('id', $property->id)->where('model_type', $property->model_type)
+                    ->where('model_id', $property->model_id)->lockForUpdate()->first();
+                if (!$current || $current->value !== $property->value) return;
+                $created = $this->savedNoticeCreatedAt(is_array($notice) ? $notice : [], $current);
+                if ($created !== null && $created >= now()->timestamp - 30 * 86400) return;
+                if ($created === null) $current->update(['value' => json_encode(array_replace(is_array($notice) ? $notice : [], ['created_at' => now()->timestamp]), JSON_THROW_ON_ERROR)]);
+                else $current->delete(); // Only expired notice metadata; never saving or payment receipts.
             }); } catch (\Throwable $e) { $this->savedNoticeAccessWarning('retention storage unavailable', $property, 'local'); }
         }
     }
