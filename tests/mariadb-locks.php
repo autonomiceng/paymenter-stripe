@@ -1009,7 +1009,7 @@ $cases['ledger-dispute-pages'] = ['seed' => function () use ($ledgerSeed, $ledge
         && $page === $gateway->lostDisputes(0, '', 2) && !$GLOBALS['stripeCalls'];
 }, 'b' => fn () => true, 'check' => fn ($r) => $r['a']['ok'] === true];
 $cases['ledger-schema-healing'] = ['seed' => $ledgerSeed, 'pause' => '/^ledger-schema$/',
-    'a' => function ($gateway) {
+    'a' => function ($gateway, bool $recorded = false) {
         pausePoint('ledger-schema');
         $schema = Illuminate\Support\Facades\Schema::getFacadeRoot();
         $invoice = Invoice::findOrFail(943);
@@ -1031,14 +1031,19 @@ $cases['ledger-schema-healing'] = ['seed' => $ledgerSeed, 'pause' => '/^ledger-s
         $repository = app(Illuminate\Database\Migrations\Migrator::class)->getRepository();
         foreach (glob(__DIR__ . '/../extension/AeStripe/database/migrations/*.php') as $migration) {
             $name = pathinfo($migration, PATHINFO_FILENAME);
-            if (!str_ends_with($name, 'add_receipt_invoice_index')) $repository->log($name, 1);
+            if ($recorded || !str_ends_with($name, 'add_receipt_invoice_index')) $repository->log($name, 1);
         }
         invoke($gateway, 'ensureReceiptReturnSchema');
+        check($schema->hasIndex('ae_stripe_receipt_returns', ['invoice_id']), 'Schema check repairs the invoice index before becoming ready');
         $migration = require __DIR__ . '/../extension/AeStripe/database/migrations/2026_11_15_000001_add_receipt_invoice_index.php';
         $migration->up(); // Repeated upgrades keep one usable index.
         return $noTransaction && $absent && $missingIndex && $noDdlInTransaction && $schema->hasIndex('ae_stripe_receipt_returns', ['invoice_id'])
             && DB::transaction(fn () => $gateway->receiptLedger($invoice)) === [] && !$GLOBALS['stripeCalls'];
     }, 'b' => fn () => true, 'check' => fn ($r) => $r['a']['ok'] === true];
+$schemaHealing = $cases['ledger-schema-healing']['a'];
+$cases['ledger-schema-healing-recorded'] = array_replace($cases['ledger-schema-healing'], [
+    'a' => fn ($gateway) => $schemaHealing($gateway, true),
+]);
 
 // Install once, then give each independent concurrency scenario its own process-tree budget.
 if (getenv('PAY_TEST_CGROUP') && !in_array($argv[1] ?? null, ['worker', 'case'], true)) {
