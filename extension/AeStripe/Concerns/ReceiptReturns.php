@@ -7,11 +7,13 @@ use Paymenter\Extensions\Gateways\AeStripe\ExtensionLocks;
 use App\Helpers\ExtensionHelper;
 use App\Models\{Audit, Credit, Invoice, InvoiceTransaction};
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Http\Client\{ConnectionException, RequestException};
 
 trait ReceiptReturns
 {
     private static bool $receiptReturnSchemaReady = false;
+    private static bool $receiptLedgerIndexReady = false;
     private bool $receiptStripeUnavailable = false;
 
     private function ensureReceiptReturnSchema(): void
@@ -19,7 +21,8 @@ trait ReceiptReturns
         if (self::$receiptReturnSchemaReady) return;
         if (!\Illuminate\Support\Facades\Schema::hasTable('ae_stripe_receipt_returns')
             || !\Illuminate\Support\Facades\Schema::hasColumn('ae_stripe_receipt_returns', 'provider_created_at')
-            || !\Illuminate\Support\Facades\Schema::hasColumn('ae_stripe_receipt_returns', 'recheck_generation')) {
+            || !\Illuminate\Support\Facades\Schema::hasColumn('ae_stripe_receipt_returns', 'recheck_generation')
+            || !Schema::hasIndex('ae_stripe_receipt_returns', ['invoice_id'])) {
             // MySQL DDL must never commit an enclosing caller/payment transaction.
             abort_unless(DB::transactionLevel() === 0, 409);
             $this->upgraded();
@@ -30,6 +33,35 @@ trait ReceiptReturns
     private function receiptRows()
     {
         return DB::table('ae_stripe_receipt_returns');
+    }
+
+    /** Current ledger rows inside the caller's invoice transaction, without gateway scope locks or DDL. */
+    public function receiptLedger(Invoice $invoice): array
+    {
+        abort_unless(DB::transactionLevel() > 0, 409);
+        if (!Schema::hasTable('ae_stripe_receipt_returns')) return [];
+        if (!self::$receiptLedgerIndexReady) {
+            abort_unless(Schema::hasIndex('ae_stripe_receipt_returns', ['invoice_id']), 409);
+            self::$receiptLedgerIndexReady = true;
+        }
+        return $this->receiptRows()->where('invoice_id', $invoice->id)->lockForUpdate()
+            ->get()->map(fn ($row) => (array) $row)->all();
+    }
+
+    /** Stable discovery pages; recent observations remain behind the five-minute cutoff. */
+    public function lostDisputes(int $afterAt, string $afterKey, int $limit): array
+    {
+        abort_unless(DB::transactionLevel() === 0, 409);
+        abort_unless($limit > 0, 409);
+        if (!Schema::hasTable('ae_stripe_receipt_returns')) return [];
+        $key = DB::connection()->getDriverName() === 'sqlite'
+            ? "(payment_intent_id || ':' || allocation_key) COLLATE BINARY" : "BINARY CONCAT(payment_intent_id, ':', allocation_key)";
+        return $this->receiptRows()->where('allocation_key', 'like', 'stripe:dispute:%')->where('state', 'lost')
+            ->where('updated_at', '<=', now()->timestamp - 300)
+            ->where(fn ($q) => $q->where('updated_at', '>', $afterAt)
+                ->orWhere(fn ($q) => $q->where('updated_at', $afterAt)->whereRaw("$key > ?", [$afterKey])))
+            ->orderBy('updated_at')->orderByRaw($key)->limit($limit)
+            ->get()->map(fn ($row) => (array) $row)->all();
     }
 
     public function receiptReturnStatus(Invoice $invoice, string $paymentIntentId, string $allocationKey): ?array

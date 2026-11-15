@@ -888,6 +888,7 @@ namespace Illuminate\Database\Schema {
         public function __call($method, $args) {
             if ($method === 'primary') self::$primary[] = $GLOBALS['feeColumn']; else $GLOBALS['feeColumn'] = $args[0] ?? null;
             if ($this->table && $method === 'unsignedBigInteger') \Illuminate\Support\Facades\Schema::$columns[$this->table][] = $args[0];
+            if ($this->table && $method === 'index' && isset($args[0])) \Illuminate\Support\Facades\Schema::$indexes[$this->table][] = (array) $args[0];
             return $this;
         }
     }
@@ -900,7 +901,8 @@ namespace Illuminate\Support\Facades {
             public function __construct(private $table) { parent::__construct($table); }
             public function renameColumn($from, $to) { foreach (DB::$tables[$this->table] as &$row) { $row[$to] = $row[$from]; unset($row[$from]); } if ($hook = Schema::$afterColumnRename) $hook(); }
         }); }
-        public static $foreignTables = [], $inspectedTables = [], $columns = [];
+        public static $foreignTables = [], $inspectedTables = [], $columns = [], $indexes = [];
+        public static function hasIndex($table, $columns) { return in_array($columns, self::$indexes[$table] ?? [], true); }
         public static function hasColumn($table, $column) { return in_array($column, self::$columns[$table] ?? []) || in_array($column, self::getColumnListing($table)); }
         public static function getTableListing($schema = null, $schemaQualified = true) {
             $schemas = ['paymenter' => DB::$tables] + self::$foreignTables;

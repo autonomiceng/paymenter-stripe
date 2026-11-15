@@ -942,6 +942,104 @@ $cases['receipt-current-enclosing'] = [
         && (int) DB::table('ae_stripe_receipt_returns')->sum('amount_minor') === 6000,
 ];
 
+// Ledger fixtures use only local rows. No settlement, allocation or provider calls are needed.
+$ledgerRow = function (int $invoice, string $payment, string $key, string $state, int $at): void {
+    DB::table('ae_stripe_receipt_returns')->insert(['invoice_id' => $invoice, 'user_id' => Invoice::findOrFail($invoice)->user_id,
+        'payment_intent_id' => $payment, 'allocation_key' => $key, 'currency' => 'usd', 'received_minor' => 10000,
+        'amount_minor' => 1000, 'return_key' => hash('sha256', $payment . ':' . $key), 'state' => $state, 'updated_at' => $at]);
+};
+$ledgerSeed = function () use ($ledgerRow) {
+    customerInvoice(7, 943, 100); customerInvoice(8, 944, 100);
+    $ledgerRow(943, 'pi_ledger', 'allocation', 'reserved', time() - 600);
+    $ledgerRow(944, 'pi_other', 'allocation', 'reserved', time() - 600);
+};
+$domainsLocks = function () {
+    User::whereKey(7)->lockForUpdate()->firstOrFail();
+    App\Models\Credit::where('user_id', 7)->lockForUpdate()->get();
+    return Invoice::whereKey(943)->lockForUpdate()->firstOrFail();
+};
+$cases['ledger-current-snapshot'] = ['seed' => $ledgerSeed, 'pause' => '/^ledger-snapshot$/',
+    'a' => fn ($gateway) => DB::transaction(function () use ($gateway, $domainsLocks) {
+        check(DB::selectOne('select @@tx_isolation as isolation_level')->isolation_level === 'REPEATABLE-READ', 'Ledger snapshot uses repeatable read');
+        $snapshot = DB::table('ae_stripe_receipt_returns')->where('invoice_id', 943)->count();
+        pausePoint('ledger-snapshot');
+        $stillOld = DB::table('ae_stripe_receipt_returns')->where('invoice_id', 943)->count() === $snapshot;
+        $ledger = $gateway->receiptLedger($domainsLocks());
+        return $stillOld && count($ledger) === 2 && count(array_filter($ledger, fn ($r) => $r['state'] === 'lost')) === 1
+            && DB::table('ae_stripe_locks')->count() === 0 && !$GLOBALS['stripeCalls'];
+    }), 'b' => function () use ($ledgerRow) {
+        DB::transaction(function () use ($ledgerRow) {
+            Invoice::whereKey(943)->lockForUpdate()->firstOrFail();
+            $ledgerRow(943, 'pi_ledger', 'stripe:dispute:lost', 'lost', time());
+        });
+        return true;
+    }, 'check' => fn ($r) => $r['a']['ok'] === true && $r['b']['ok'] === true];
+$cases['ledger-other-invoice-update'] = ['seed' => $ledgerSeed, 'pause' => '/^ledger-held$/',
+    'a' => fn ($gateway) => DB::transaction(function () use ($gateway, $domainsLocks) {
+        $ledger = $gateway->receiptLedger($domainsLocks());
+        pausePoint('ledger-held');
+        return count($ledger) === 1 && $ledger[0]['state'] === 'reserved' && !$GLOBALS['stripeCalls'];
+    }), 'b' => fn () => DB::transaction(function () {
+        Invoice::whereKey(944)->lockForUpdate()->firstOrFail();
+        return DB::table('ae_stripe_receipt_returns')->where('invoice_id', 944)->update(['state' => 'review']);
+    }), 'check' => fn ($r) => $r['a']['ok'] === true && $r['b']['ok'] === 1
+        && DB::table('ae_stripe_receipt_returns')->where('invoice_id', 944)->value('state') === 'review'];
+$cases['ledger-dispute-pages'] = ['seed' => function () use ($ledgerSeed, $ledgerRow) {
+    $ledgerSeed();
+    foreach ([['pi_a', 'stripe:dispute:z', 'lost', 600], ['pi_a0', 'stripe:dispute:a', 'lost', 600],
+        ['pi_b', 'stripe:dispute:a', 'lost', 600], ['pi_b', 'stripe:dispute:b', 'lost', 600],
+        ['pi_c', 'stripe:dispute:cutoff', 'lost', 300], ['pi_d', 'stripe:dispute:recent', 'lost', 299],
+        ['pi_e', 'stripe:dispute:won', 'won', 600], ['pi_f', 'stripe:refund:other', 'lost', 600]] as [$payment, $key, $state, $age]) {
+        $ledgerRow(943, $payment, $key, $state, 2000000000 - $age);
+    }
+}, 'pause' => '/^ledger-pages$/', 'a' => function ($gateway) {
+    pausePoint('ledger-pages');
+    Illuminate\Support\Carbon::setTestNow(Illuminate\Support\Carbon::createFromTimestamp(2000000000));
+    $refused = false;
+    try { DB::transaction(fn () => $gateway->lostDisputes(0, '', 2)); }
+    catch (Symfony\Component\HttpKernel\Exception\HttpException $e) { $refused = $e->getStatusCode() === 409; }
+    check($refused, 'Dispute discovery refuses enclosing transactions');
+    $page = $gateway->lostDisputes(0, '', 2);
+    $next = fn ($rows) => $gateway->lostDisputes((int) end($rows)['updated_at'],
+        end($rows)['payment_intent_id'] . ':' . end($rows)['allocation_key'], 2);
+    $second = $next($page); $last = $next($second);
+    return array_column($page, 'payment_intent_id') === ['pi_a0', 'pi_a']
+        && array_column($second, 'allocation_key') === ['stripe:dispute:a', 'stripe:dispute:b']
+        && count($last) === 1 && $last[0]['allocation_key'] === 'stripe:dispute:cutoff' && $next($last) === []
+        && $page === $gateway->lostDisputes(0, '', 2) && !$GLOBALS['stripeCalls'];
+}, 'b' => fn () => true, 'check' => fn ($r) => $r['a']['ok'] === true];
+$cases['ledger-schema-healing'] = ['seed' => $ledgerSeed, 'pause' => '/^ledger-schema$/',
+    'a' => function ($gateway) {
+        pausePoint('ledger-schema');
+        $schema = Illuminate\Support\Facades\Schema::getFacadeRoot();
+        $invoice = Invoice::findOrFail(943);
+        $refuses = function ($read) {
+            try { $read(); } catch (Symfony\Component\HttpKernel\Exception\HttpException $e) { return $e->getStatusCode() === 409; }
+            return false;
+        };
+        $noTransaction = $refuses(fn () => $gateway->receiptLedger($invoice));
+        $schema->drop('ae_stripe_receipt_returns');
+        $absent = DB::transaction(fn () => $gateway->receiptLedger($invoice)) === [] && !$schema->hasTable('ae_stripe_receipt_returns');
+        foreach (glob(__DIR__ . '/../extension/AeStripe/database/migrations/*receipt*.php') as $migration) {
+            if (!str_ends_with($migration, 'add_receipt_invoice_index.php')) (require $migration)->up();
+        }
+        $missingIndex = $refuses(fn () => DB::transaction(fn () => $gateway->receiptLedger($invoice)));
+        $noDdlInTransaction = $refuses(fn () => DB::transaction(fn () => invoke($gateway, 'ensureReceiptReturnSchema')))
+            && !$schema->hasIndex('ae_stripe_receipt_returns', ['invoice_id']);
+        // Supply the actual extension migrations to the real upgrade hook, as an installed extension does.
+        symlink(realpath(__DIR__ . '/../extension/AeStripe'), base_path('extensions/Gateways/AeStripe'));
+        $repository = app(Illuminate\Database\Migrations\Migrator::class)->getRepository();
+        foreach (glob(__DIR__ . '/../extension/AeStripe/database/migrations/*.php') as $migration) {
+            $name = pathinfo($migration, PATHINFO_FILENAME);
+            if (!str_ends_with($name, 'add_receipt_invoice_index')) $repository->log($name, 1);
+        }
+        invoke($gateway, 'ensureReceiptReturnSchema');
+        $migration = require __DIR__ . '/../extension/AeStripe/database/migrations/2026_11_15_000001_add_receipt_invoice_index.php';
+        $migration->up(); // Repeated upgrades keep one usable index.
+        return $noTransaction && $absent && $missingIndex && $noDdlInTransaction && $schema->hasIndex('ae_stripe_receipt_returns', ['invoice_id'])
+            && DB::transaction(fn () => $gateway->receiptLedger($invoice)) === [] && !$GLOBALS['stripeCalls'];
+    }, 'b' => fn () => true, 'check' => fn ($r) => $r['a']['ok'] === true];
+
 // Install once, then give each independent concurrency scenario its own process-tree budget.
 if (getenv('PAY_TEST_CGROUP') && !in_array($argv[1] ?? null, ['worker', 'case'], true)) {
     $failed = [];
