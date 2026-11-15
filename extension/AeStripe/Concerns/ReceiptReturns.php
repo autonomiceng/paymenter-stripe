@@ -26,6 +26,8 @@ trait ReceiptReturns
             // MySQL DDL must never commit an enclosing caller/payment transaction.
             abort_unless(DB::transactionLevel() === 0, 409);
             $this->upgraded();
+            (require __DIR__ . '/../database/migrations/2026_11_15_000001_add_receipt_invoice_index.php')->up();
+            abort_unless(Schema::hasIndex('ae_stripe_receipt_returns', ['invoice_id']), 409);
         }
         self::$receiptReturnSchemaReady = true;
     }
