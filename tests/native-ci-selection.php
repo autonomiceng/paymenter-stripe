@@ -206,7 +206,8 @@ $expectedCases = [
     'final-rotation', 'final-row-400', 'final-row-402', 'final-row-409', 'final-backoff', 'final-diagnostics', 'final-late-notice',
     'final-delay-notice', 'final-replacement', 'final-prune-isolation', 'final-terminal-status', 'final-diagnostics-account', 'final-method-row-400',
     'final-method-row-402', 'final-method-row-409', 'final-logging', 'final-clean-log', 'final-backoff-fresh', 'final-render-pcre',
-    'final-method-401', 'final-method-403', 'final-method-429', 'final-method-503', 'final-method-connection'];
+    'final-method-401', 'final-method-403', 'final-method-429', 'final-method-503', 'final-method-connection',
+    'final-residual-retry', 'final-residual-prune', 'final-residual-orphans'];
 $native = [...array_map(fn ($case) => $row('php', [$case], $prepend . ' -d memory_limit=256M ' . __DIR__ . '/run.php'), $expectedCases), ...$late];
 foreach (['1', '', 'unset'] as $mode) {
     check($selected[$mode] === $native, 'Native matrix mode ' . ($mode === '' ? 'empty' : $mode) . ' runs every expected checkout case once in order, then notice-native, binding-native, '

@@ -103,7 +103,8 @@ if ($case === 'final-transfer-race' || $case === 'final-transfer-order') {
     $key = $notice($token); $logs = [];
     Log::listen(function ($event) use (&$logs) { $logs[] = $event->message; });
     if ($case === 'final-logging') DB::listen(function ($query) {
-        if (DB::transactionLevel() && str_starts_with($query->sql, 'select') && in_array('ae_stripe_notice_%', $query->bindings, true)) throw new RuntimeException('Synthetic notice completion outage');
+        if (DB::transactionLevel() && str_starts_with($query->sql, 'select') && str_contains($query->sql, '"properties"."model_id" = ?')
+            && in_array('ae_stripe_notice_%', $query->bindings, true)) throw new RuntimeException('Synthetic notice completion outage');
     });
     for ($i = 0; $i < ($case === 'final-logging' ? 5 : 1); ++$i) {
         $invoke('retrySavedMethodNotices'); $state = json_decode($user->properties()->where('key', $key)->first()->value, true);

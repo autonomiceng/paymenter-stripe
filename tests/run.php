@@ -1,6 +1,10 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 require_once __DIR__ . '/entered.php';
+if ($directory = getenv('PAY_CI_COVERAGE_DIRECTORY')) {
+    $run = proc_open([PHP_BINARY, '-n', __DIR__ . '/ci-coverage.php', $directory], [], $pipes);
+    exit(proc_close($run));
+}
 // Run the checkout browser regression alone without the native/browser matrix.
 if (getenv('PAY_OFFLINE_SUITE') === 'payment-errors') {
     $run = proc_open([getenv('PAYMENTER_TEST_NODE') ?: 'node', __DIR__ . '/payment-errors.mjs'], [], $pipes);
