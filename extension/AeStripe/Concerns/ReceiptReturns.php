@@ -51,6 +51,7 @@ trait ReceiptReturns
     /** Stable discovery pages; recent observations remain behind the five-minute cutoff. */
     public function lostDisputes(int $afterAt, string $afterKey, int $limit): array
     {
+        abort_unless(DB::transactionLevel() === 0, 409);
         abort_unless($limit > 0, 409);
         if (!Schema::hasTable('ae_stripe_receipt_returns')) return [];
         $key = DB::connection()->getDriverName() === 'sqlite'
@@ -59,7 +60,7 @@ trait ReceiptReturns
             ->where('updated_at', '<=', now()->timestamp - 300)
             ->where(fn ($q) => $q->where('updated_at', '>', $afterAt)
                 ->orWhere(fn ($q) => $q->where('updated_at', $afterAt)->whereRaw("$key > ?", [$afterKey])))
-            ->orderBy('updated_at')->orderByRaw($key)->limit($limit)->lockForUpdate()
+            ->orderBy('updated_at')->orderByRaw($key)->limit($limit)
             ->get()->map(fn ($row) => (array) $row)->all();
     }
 

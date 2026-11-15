@@ -995,6 +995,10 @@ $cases['ledger-dispute-pages'] = ['seed' => function () use ($ledgerSeed, $ledge
 }, 'pause' => '/^ledger-pages$/', 'a' => function ($gateway) {
     pausePoint('ledger-pages');
     Illuminate\Support\Carbon::setTestNow(Illuminate\Support\Carbon::createFromTimestamp(2000000000));
+    $refused = false;
+    try { DB::transaction(fn () => $gateway->lostDisputes(0, '', 2)); }
+    catch (Symfony\Component\HttpKernel\Exception\HttpException $e) { $refused = $e->getStatusCode() === 409; }
+    check($refused, 'Dispute discovery refuses enclosing transactions');
     $page = $gateway->lostDisputes(0, '', 2);
     $next = fn ($rows) => $gateway->lostDisputes((int) end($rows)['updated_at'],
         end($rows)['payment_intent_id'] . ':' . end($rows)['allocation_key'], 2);
