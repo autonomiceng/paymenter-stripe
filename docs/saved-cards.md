@@ -114,8 +114,9 @@ Notice-only maintenance failures do not fail settlement or unrelated inheritance
 The invoice keeps a notice-specific poll until completion/refusal/expiry, including after payment polling stops. Confirmations for intents older than 30 days are not recreated.
 The original tab explains delayed saving once and reduces its notice poll to once a minute.
 Failed notices stop polling but can deliver a later webhook success on an explicit refresh.
-Recovery and retention skip missing users before limiting a batch and rotate by property ID in
-shared cache. Young and future-due records need no owner lock or metadata rewrite. Retention
+Recovery and live-user retention skip missing users before limiting a batch and rotate by property ID using
+durable gateway settings. A separate bounded retention pass removes expired orphan notices while preserving receipts.
+Young and future-due records need no owner lock or metadata rewrite. Retention
 uses property timestamps for malformed dates; an entirely unknown age starts one safe retention
 period. Exact row identity and value are rechecked under the owner lock before any mutation.
 Legacy notices keep their original delivery state; new confirmations use a separate intent-bound token.

@@ -24,6 +24,7 @@ foreach (['401', '403', '429', '503', 'connection'] as $error) $cases[] = 'follo
 foreach (['transfer-race', 'transfer-order', 'method-404', 'orphans', 'retention', 'rotation', 'row-400', 'row-402', 'row-409', 'backoff', 'diagnostics', 'late-notice', 'delay-notice',
     'replacement', 'prune-isolation', 'terminal-status', 'diagnostics-account', 'method-row-400', 'method-row-402', 'method-row-409', 'logging', 'clean-log', 'backoff-fresh', 'render-pcre'] as $suffix) $cases[] = 'final-' . $suffix;
 foreach (['401', '403', '429', '503', 'connection'] as $error) $cases[] = 'final-method-' . $error;
+foreach (['retry', 'prune', 'orphans'] as $suffix) $cases[] = 'final-residual-' . $suffix;
 // Every PHP child records the test files it loads (tests/entered.php) when CI asks for the evidence.
 $php = getenv('PAYMENTER_TEST_PHP') ?: PHP_BINARY;
 $record = ['-d', 'auto_prepend_file=' . __DIR__ . '/entered.php'];

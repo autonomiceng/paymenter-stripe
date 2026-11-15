@@ -36,6 +36,7 @@ Http::fake(function ($request) use (&$requests, &$error, &$methodError, $intent,
     throw new RuntimeException('Unexpected fixture HTTP: ' . $path);
 });
 $token = str_repeat('b', 32);
+if (str_starts_with($case, 'final-residual-')) { require __DIR__ . '/native-notice-residuals.php'; return; }
 if (str_starts_with($case, 'final-')) { require __DIR__ . '/native-final-followups.php'; return; }
 if ($case === 'followup-staff-race') {
     $setDefault(); $lock = Cache::lock('ae-stripe-save-method-' . $user->id, 600); $lock->get();
