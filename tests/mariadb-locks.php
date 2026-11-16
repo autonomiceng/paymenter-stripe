@@ -944,9 +944,12 @@ $cases['receipt-current-enclosing'] = [
 
 // A competing extension takes the customer before the invoice. AeStripe keeps invoice before customer.
 // Ballast makes the other session the heavier transaction, so InnoDB must choose AeStripe as victim.
-$victimSeed = function () {
-    customerInvoice(7, 945)->user->properties()->create(['key' => 'ae_stripe_checkout_945',
+$victimSeed = function (bool $webhook) {
+    $invoice = customerInvoice(7, 945);
+    $invoice->user->properties()->create(['key' => 'ae_stripe_checkout_945',
         'value' => json_encode(['version' => 2, 'key' => 'checkout_fixture', 'created' => time(), 'retry' => true])]);
+    // An earlier native $5 makes part of the Stripe payment excess, so settlement also writes a receipt return.
+    if ($webhook) App\Helpers\ExtensionHelper::addPayment($invoice, 'Other', 5, null, 'native_prior');
     DB::statement('create table if not exists lock_ballast (id int primary key)');
     DB::table('lock_ballast')->truncate();
 };
@@ -956,71 +959,88 @@ $customerFirstWinner = function () {
         User::whereKey(7)->lockForUpdate()->firstOrFail()->update(['first_name' => 'Winner']);
         DB::table('lock_ballast')->insert(array_map(fn ($id) => ['id' => $id], range(10, 209)));
         $invoice = Invoice::whereKey(945)->lockForUpdate()->firstOrFail();
-        // The victim has lost its invoice lock. Its tentative row and every money effect must be gone.
+        // The victim has lost its invoice lock. Its tentative row and every AeStripe money effect must be gone.
         check(!DB::table('lock_ballast')->where('id', 1)->exists() && $invoice->status === 'pending'
-            && DB::table('invoice_transactions')->count() === 0 && DB::table('credits')->count() === 0
-            && DB::table('ae_stripe_settlements')->count() === 0 && DB::table('ae_stripe_receipt_returns')->count() === 0,
+            && DB::table('invoice_transactions')->pluck('transaction_id')->diff(['native_prior'])->isEmpty()
+            && DB::table('credits')->count() === 0 && DB::table('ae_stripe_settlements')->count() === 0
+            && DB::table('ae_stripe_receipt_returns')->count() === 0,
             'The winning session sees the whole victim transaction rolled back before its retry');
         App\Helpers\ExtensionHelper::addPayment($invoice, 'Other', 8, null, 'native_partial');
         return 'committed';
     });
 };
-$runPaymentVictim = function ($gateway, bool $webhook) {
-    check(DB::transactionLevel() === 0 && (int) DB::selectOne('select @@session.innodb_lock_wait_timeout as seconds')->seconds === 1,
-        'AeStripe owns the transaction and uses a one-second lock timeout');
+// Each victim attempt writes a tentative row and queues an after-commit callback; only the committed attempt keeps them.
+$tentative = function (int &$rounds, int &$commits) {
+    check(!DB::table('lock_ballast')->where('id', 1)->exists(), 'Each victim attempt starts without the rolled-back tentative write');
+    DB::table('lock_ballast')->insert(['id' => 1]);
+    DB::afterCommit(function () use (&$commits) { ++$commits; });
+    if (++$rounds === 1) pausePoint('victim-customer-lock');
+};
+$victimStart = fn () => check(DB::transactionLevel() === 0 && (int) DB::selectOne('select @@session.innodb_lock_wait_timeout as seconds')->seconds === 1,
+    'AeStripe owns the transaction and uses a one-second lock timeout');
+// withPaymentLock takes the invoice, then the customer. The winner holds the customer, so that lock closes the cycle.
+$runPaymentVictim = function ($gateway) use ($tentative, $victimStart) {
+    $victimStart();
     $rounds = $commits = $completions = 0;
-    $active = true;
-    DB::connection()->beforeExecuting(function ($sql) use (&$rounds, &$commits, &$active) {
-        if (!$active || !preg_match('/^select .* from `users`.*for update$/', $sql)) return;
-        ++$rounds;
-        check(DB::transactionLevel() === 1 && !DB::table('lock_ballast')->where('id', 1)->exists(),
-            'Each payment-lock attempt starts without the rolled-back tentative write');
-        DB::table('lock_ballast')->insert(['id' => 1]);
-        DB::afterCommit(function () use (&$commits) { ++$commits; });
-        if ($rounds === 1) pausePoint('victim-customer-lock');
-        else $active = false; // Later receipt-return transactions are separate work, not binding retries.
+    DB::connection()->beforeExecuting(function ($sql) use (&$rounds, &$commits, $tentative) {
+        if ($rounds >= 2 || !preg_match('/^select .* from `users`.*for update$/', $sql)) return;
+        check(DB::transactionLevel() === 1, 'The customer lock runs inside the payment lock transaction');
+        $tentative($rounds, $commits);
     });
-    if ($webhook) {
-        $body = json_encode(['type' => 'payment_intent.succeeded', 'request' => ['idempotency_key' => 'checkout_fixture'],
-            'data' => ['object' => intentOf(945, 'succeeded', 2000)]], JSON_THROW_ON_ERROR);
-        $time = time();
-        $request = Illuminate\Http\Request::create('/', 'POST', [], [], [], ['HTTP_STRIPE_SIGNATURE' =>
-            't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.' . $body, 'whsec_test')], $body);
-        check($gateway->webhook($request)->getStatusCode() === 200, 'The victim webhook completes after its own in-process retry');
-        // Stripe may redeliver even after a successful response. Payment, return and credit must stay unique.
-        check($gateway->webhook($request)->getStatusCode() === 200, 'A replay acknowledges the already settled payment');
-    } else {
-        $due = invoke($gateway, 'withPaymentLock', Invoice::findOrFail(945), function ($user, $invoice) use ($gateway, &$completions) {
-            ++$completions;
-            $due = invoke($gateway, 'paymentBalance', $invoice);
-            App\Helpers\ExtensionHelper::addPayment($invoice, 'AeStripe', $due / 100, null, 'synthetic_payment');
-            return $due;
-        });
-        check($due === 1200 && $completions === 1, 'Payment completion rereads the winning payment and runs exactly once');
-    }
+    $due = invoke($gateway, 'withPaymentLock', Invoice::findOrFail(945), function ($user, $invoice) use ($gateway, &$completions) {
+        ++$completions;
+        $due = invoke($gateway, 'paymentBalance', $invoice);
+        App\Helpers\ExtensionHelper::addPayment($invoice, 'AeStripe', $due / 100, null, 'synthetic_payment');
+        return $due;
+    });
+    check($due === 1200 && $completions === 1, 'Payment completion rereads the winning payment and runs exactly once');
     check($rounds === 2 && $commits === 1 && DB::transactionLevel() === 0,
-        'AeStripe retries its victim transaction once and discards the rolled-back after-commit callback');
+        'The payment lock retries its victim transaction once and discards the rolled-back after-commit callback');
+    return ['attempts' => $rounds, 'commits' => $commits];
+};
+// Settlement claims the payment, reserves the excess and inserts the payment row, then core announces the payment
+// inside the same transaction. Another extension's listener then locks the customer, after AeStripe's invoice lock,
+// so the settlement transaction itself is the victim after writing its money rows.
+$runWebhookVictim = function ($gateway) use ($tentative, $victimStart) {
+    $victimStart();
+    $rounds = $commits = 0;
+    Illuminate\Support\Facades\Event::listen(App\Events\InvoiceTransaction\Created::class, function ($event) use (&$rounds, &$commits, $tentative) {
+        if ($rounds >= 2) return; // The later receipt-return credit is separate work, not a settlement retry.
+        check(DB::transactionLevel() > 1 && DB::table('ae_stripe_settlements')->where('payment_intent_id', 'pi_945')->count() === 1
+            && DB::table('invoice_transactions')->where('transaction_id', 'pi_945')->count() === 1
+            && (int) DB::table('ae_stripe_receipt_returns')->where('payment_intent_id', 'pi_945')->where('allocation_key', 'excess')
+                ->value('amount_minor') === ($rounds === 0 ? 500 : 1300),
+            'Each settlement attempt has written its claim, receipt return and payment from a fresh balance');
+        $tentative($rounds, $commits);
+        User::whereKey($event->invoiceTransaction->invoice->user_id)->lockForUpdate()->firstOrFail();
+    });
+    $body = json_encode(['type' => 'payment_intent.succeeded', 'request' => ['idempotency_key' => 'checkout_fixture'],
+        'data' => ['object' => intentOf(945, 'succeeded', 2000)]], JSON_THROW_ON_ERROR);
+    $time = time();
+    $request = Illuminate\Http\Request::create('/', 'POST', [], [], [], ['HTTP_STRIPE_SIGNATURE' =>
+        't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.' . $body, 'whsec_test')], $body);
+    check($gateway->webhook($request)->getStatusCode() === 200, 'The victim webhook completes after its own in-process retry');
+    // Stripe may redeliver even after a successful response. Payment, return and credit must stay unique.
+    check($gateway->webhook($request)->getStatusCode() === 200, 'A replay acknowledges the already settled payment');
+    check($rounds === 2 && $commits === 1 && DB::transactionLevel() === 0,
+        'Settlement retries its victim transaction once and discards the rolled-back after-commit callback');
     return ['attempts' => $rounds, 'commits' => $commits, 'refunds' => count(array_filter($GLOBALS['stripeCalls'],
         fn ($call) => $call === ['post', '/refunds']))];
 };
-foreach ([false, true] as $webhook) {
-    $cases[$webhook ? 'webhook-customer-first-victim' : 'payment-customer-first-victim'] = [
-        'seed' => $victimSeed, 'timeout' => 1, 'waits' => true, 'deadlocks' => 1,
-        'blocked_sql' => '/^select .* from `invoices`.*for update$/', 'pause' => '/^victim-customer-lock$/',
-        'a' => fn ($gateway) => $runPaymentVictim($gateway, $webhook), 'b' => $customerFirstWinner,
-        'check' => fn ($r) => $r['a']['ok'] === ['attempts' => 2, 'commits' => 1, 'refunds' => $webhook ? 1 : 0]
-            && $r['b']['ok'] === 'committed' && User::findOrFail(7)->first_name === 'Winner'
-            && DB::table('lock_ballast')->count() === 201 && Invoice::findOrFail(945)->status === 'paid'
-            && $rows(945) === ($webhook ? [[8.0, 'succeeded', false], [20.0, 'succeeded', false], [-8.0, 'succeeded', true]]
-                : [[8.0, 'succeeded', false], [12.0, 'succeeded', false]])
-            && DB::table('credits')->count() === ($webhook ? 1 : 0)
-            && (float) DB::table('credits')->sum('amount') === ($webhook ? 8.0 : 0.0)
-            && DB::table('ae_stripe_settlements')->count() === ($webhook ? 1 : 0)
-            && DB::table('ae_stripe_receipt_returns')->count() === ($webhook ? 1 : 0)
-            && (!$webhook || DB::table('ae_stripe_receipt_returns')->where('state', 'credited')->where('amount_minor', 800)->count() === 1
-                && !User::findOrFail(7)->properties()->where('key', 'ae_stripe_checkout_945')->exists()),
-    ];
-}
+$victimCase = fn (bool $webhook, callable $check) => ['seed' => fn () => $victimSeed($webhook), 'timeout' => 1, 'waits' => true,
+    'deadlocks' => 1, 'blocked_sql' => '/^select .* from `invoices`.*for update$/', 'pause' => '/^victim-customer-lock$/',
+    'a' => $webhook ? $runWebhookVictim : $runPaymentVictim, 'b' => $customerFirstWinner,
+    'check' => fn ($r) => $r['b']['ok'] === 'committed' && User::findOrFail(7)->first_name === 'Winner'
+        && DB::table('lock_ballast')->count() === 201 && Invoice::findOrFail(945)->status === 'paid' && $check($r)];
+$cases['payment-customer-first-victim'] = $victimCase(false, fn ($r) => $r['a']['ok'] === ['attempts' => 2, 'commits' => 1]
+    && $rows(945) === [[8.0, 'succeeded', false], [12.0, 'succeeded', false]] && DB::table('credits')->count() === 0
+    && DB::table('ae_stripe_settlements')->count() === 0 && DB::table('ae_stripe_receipt_returns')->count() === 0);
+$cases['webhook-customer-first-victim'] = $victimCase(true, fn ($r) => $r['a']['ok'] === ['attempts' => 2, 'commits' => 1, 'refunds' => 1]
+    && $rows(945) === [[5.0, 'succeeded', false], [8.0, 'succeeded', false], [20.0, 'succeeded', false], [-13.0, 'succeeded', true]]
+    && DB::table('credits')->count() === 1 && (float) DB::table('credits')->sum('amount') === 13.0
+    && DB::table('ae_stripe_settlements')->count() === 1 && DB::table('ae_stripe_receipt_returns')->count() === 1
+    && DB::table('ae_stripe_receipt_returns')->where('state', 'credited')->where('amount_minor', 1300)->count() === 1
+    && !User::findOrFail(7)->properties()->where('key', 'ae_stripe_checkout_945')->exists());
 
 // Core upgrade holds Service before User. With the retained subscription order, settlement waits on Service
 // without holding User, so the zero-cost product change and its payment both commit without a deadlock.
