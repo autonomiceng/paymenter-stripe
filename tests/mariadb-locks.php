@@ -1,7 +1,7 @@
 <?php
 // Copyright (c) 2026 Autonomic Engineering. MIT; see LICENSE.
 // Real sessions with normal model and console auditing. A pauses before a statement while B finishes or waits.
-// Check the declared wait, deadlock count, both results and exact final rows. Only rollback-retry creates a deadlock.
+// Check the declared wait, deadlock count, both results and exact final rows, including deliberate victim retries.
 // Usage: PAY_MARIADB_PORT=... PAY_MARIADB_PASSWORD=... php tests/mariadb-locks.php
 /* Fail-first cases: deleted-notice-recipients, refusal-events, notice-retry-paused, notice-retry-owner,
  * notice-retry-scope, notice-retry-fairness, staff-reversals, staff-attempt-review, staff-reversal-notice-retry,
@@ -942,6 +942,116 @@ $cases['receipt-current-enclosing'] = [
         && (int) DB::table('ae_stripe_receipt_returns')->sum('amount_minor') === 6000,
 ];
 
+// A competing extension takes the customer before the invoice. AeStripe keeps invoice before customer.
+// Ballast makes the other session the heavier transaction, so InnoDB must choose AeStripe as victim.
+$victimSeed = function () {
+    customerInvoice(7, 945)->user->properties()->create(['key' => 'ae_stripe_checkout_945',
+        'value' => json_encode(['version' => 2, 'key' => 'checkout_fixture', 'created' => time(), 'retry' => true])]);
+    DB::statement('create table if not exists lock_ballast (id int primary key)');
+    DB::table('lock_ballast')->truncate();
+};
+$customerFirstWinner = function () {
+    check((int) DB::selectOne('select @@session.innodb_lock_wait_timeout as seconds')->seconds === 1, 'Winner uses a one-second lock timeout');
+    return DB::transaction(function () {
+        User::whereKey(7)->lockForUpdate()->firstOrFail()->update(['first_name' => 'Winner']);
+        DB::table('lock_ballast')->insert(array_map(fn ($id) => ['id' => $id], range(10, 209)));
+        $invoice = Invoice::whereKey(945)->lockForUpdate()->firstOrFail();
+        // The victim has lost its invoice lock. Its tentative row and every money effect must be gone.
+        check(!DB::table('lock_ballast')->where('id', 1)->exists() && $invoice->status === 'pending'
+            && DB::table('invoice_transactions')->count() === 0 && DB::table('credits')->count() === 0
+            && DB::table('ae_stripe_settlements')->count() === 0 && DB::table('ae_stripe_receipt_returns')->count() === 0,
+            'The winning session sees the whole victim transaction rolled back before its retry');
+        App\Helpers\ExtensionHelper::addPayment($invoice, 'Other', 8, null, 'native_partial');
+        return 'committed';
+    });
+};
+$runPaymentVictim = function ($gateway, bool $webhook) {
+    check(DB::transactionLevel() === 0 && (int) DB::selectOne('select @@session.innodb_lock_wait_timeout as seconds')->seconds === 1,
+        'AeStripe owns the transaction and uses a one-second lock timeout');
+    $rounds = $commits = $completions = 0;
+    $active = true;
+    DB::connection()->beforeExecuting(function ($sql) use (&$rounds, &$commits, &$active) {
+        if (!$active || !preg_match('/^select .* from `users`.*for update$/', $sql)) return;
+        ++$rounds;
+        check(DB::transactionLevel() === 1 && !DB::table('lock_ballast')->where('id', 1)->exists(),
+            'Each payment-lock attempt starts without the rolled-back tentative write');
+        DB::table('lock_ballast')->insert(['id' => 1]);
+        DB::afterCommit(function () use (&$commits) { ++$commits; });
+        if ($rounds === 1) pausePoint('victim-customer-lock');
+        else $active = false; // Later receipt-return transactions are separate work, not binding retries.
+    });
+    if ($webhook) {
+        $body = json_encode(['type' => 'payment_intent.succeeded', 'request' => ['idempotency_key' => 'checkout_fixture'],
+            'data' => ['object' => intentOf(945, 'succeeded', 2000)]], JSON_THROW_ON_ERROR);
+        $time = time();
+        $request = Illuminate\Http\Request::create('/', 'POST', [], [], [], ['HTTP_STRIPE_SIGNATURE' =>
+            't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.' . $body, 'whsec_test')], $body);
+        check($gateway->webhook($request)->getStatusCode() === 200, 'The victim webhook completes after its own in-process retry');
+        // Stripe may redeliver even after a successful response. Payment, return and credit must stay unique.
+        check($gateway->webhook($request)->getStatusCode() === 200, 'A replay acknowledges the already settled payment');
+    } else {
+        $due = invoke($gateway, 'withPaymentLock', Invoice::findOrFail(945), function ($user, $invoice) use ($gateway, &$completions) {
+            ++$completions;
+            $due = invoke($gateway, 'paymentBalance', $invoice);
+            App\Helpers\ExtensionHelper::addPayment($invoice, 'AeStripe', $due / 100, null, 'synthetic_payment');
+            return $due;
+        });
+        check($due === 1200 && $completions === 1, 'Payment completion rereads the winning payment and runs exactly once');
+    }
+    check($rounds === 2 && $commits === 1 && DB::transactionLevel() === 0,
+        'AeStripe retries its victim transaction once and discards the rolled-back after-commit callback');
+    return ['attempts' => $rounds, 'commits' => $commits, 'refunds' => count(array_filter($GLOBALS['stripeCalls'],
+        fn ($call) => $call === ['post', '/refunds']))];
+};
+foreach ([false, true] as $webhook) {
+    $cases[$webhook ? 'webhook-customer-first-victim' : 'payment-customer-first-victim'] = [
+        'seed' => $victimSeed, 'timeout' => 1, 'waits' => true, 'deadlocks' => 1,
+        'blocked_sql' => '/^select .* from `invoices`.*for update$/', 'pause' => '/^victim-customer-lock$/',
+        'a' => fn ($gateway) => $runPaymentVictim($gateway, $webhook), 'b' => $customerFirstWinner,
+        'check' => fn ($r) => $r['a']['ok'] === ['attempts' => 2, 'commits' => 1, 'refunds' => $webhook ? 1 : 0]
+            && $r['b']['ok'] === 'committed' && User::findOrFail(7)->first_name === 'Winner'
+            && DB::table('lock_ballast')->count() === 201 && Invoice::findOrFail(945)->status === 'paid'
+            && $rows(945) === ($webhook ? [[8.0, 'succeeded', false], [20.0, 'succeeded', false], [-8.0, 'succeeded', true]]
+                : [[8.0, 'succeeded', false], [12.0, 'succeeded', false]])
+            && DB::table('credits')->count() === ($webhook ? 1 : 0)
+            && (float) DB::table('credits')->sum('amount') === ($webhook ? 8.0 : 0.0)
+            && DB::table('ae_stripe_settlements')->count() === ($webhook ? 1 : 0)
+            && DB::table('ae_stripe_receipt_returns')->count() === ($webhook ? 1 : 0)
+            && (!$webhook || DB::table('ae_stripe_receipt_returns')->where('state', 'credited')->where('amount_minor', 800)->count() === 1
+                && !User::findOrFail(7)->properties()->where('key', 'ae_stripe_checkout_945')->exists()),
+    ];
+}
+
+// Core upgrade holds Service before User. With the retained subscription order, settlement waits on Service
+// without holding User, so the zero-cost product change and its payment both commit without a deadlock.
+$cases['subscription-core-upgrade'] = [
+    'seed' => function () {
+        subscriptionInvoice(7, 946);
+        $service = App\Models\Service::firstOrFail();
+        $service->update(['expires_at' => now()->addMonth()]);
+        $target = App\Models\Product::create(['category_id' => $service->product->category_id, 'name' => 'Upgrade', 'slug' => 'upgrade']);
+        $plan = $target->plans()->create(['name' => 'Monthly', 'type' => 'recurring', 'billing_unit' => 'month', 'billing_period' => 1]);
+        foreach ([$service->plan, $plan] as $priced) $priced->prices()->create(['currency_code' => 'USD', 'price' => 20, 'setup_fee' => 0]);
+        $service->product->upgrades()->attach($target);
+    }, 'timeout' => 1, 'waits' => true, 'blocked_sql' => '/^select .* from `services`.*for update$/',
+    'pause' => '/^select .* from `users`.*for update$/',
+    'a' => function () {
+        auth()->login(User::findOrFail(7));
+        $upgrade = new App\Livewire\Services\Upgrade;
+        $upgrade->service = App\Models\Service::firstOrFail();
+        $upgrade->upgradeProduct = App\Models\Product::where('slug', 'upgrade')->firstOrFail();
+        $upgrade->doUpgrade();
+        check(DB::transactionLevel() === 0, 'Core service upgrade ends its own transaction');
+        return 'upgraded';
+    }, 'b' => fn ($gateway) => invoke($gateway, 'recordSubscriptionPayment', paidSubscription(946)) ?? 'settled',
+    'check' => fn ($r) => $r['a']['ok'] === 'upgraded' && $r['b']['ok'] === 'settled'
+        && App\Models\Service::firstOrFail()->product->slug === 'upgrade'
+        && App\Models\ServiceUpgrade::where('status', 'completed')->count() === 1
+        && $rows(946) === [[20.0, 'succeeded', false]] && Invoice::findOrFail(946)->status === 'paid'
+        && DB::table('credits')->count() === 1 && (float) DB::table('credits')->sum('amount') === 0.0
+        && DB::table('ae_stripe_settlements')->count() === 1 && DB::table('ae_stripe_receipt_returns')->count() === 0,
+];
+
 // Ledger fixtures use only local rows. No settlement, allocation or provider calls are needed.
 $ledgerRow = function (int $invoice, string $payment, string $key, string $state, int $at): void {
     DB::table('ae_stripe_receipt_returns')->insert(['invoice_id' => $invoice, 'user_id' => Invoice::findOrFail($invoice)->user_id,
@@ -1078,6 +1188,7 @@ if (getenv('PAY_TEST_CGROUP') && !in_array($argv[1] ?? null, ['worker', 'case'],
 
 if (($argv[1] ?? null) === 'worker') {
     $case = $cases[$argv[2]];
+    if (isset($case['timeout'])) DB::statement('set session innodb_lock_wait_timeout = ' . (int) $case['timeout']);
     if ($argv[3] === 'b' && !empty($case['prepared_b'])) {
         pauseBefore('/^final-save$/');
         $userLocks = 0;
@@ -1108,7 +1219,7 @@ foreach ($cases as $name => $case) {
     if (getenv('PAY_MARIADB_CASE') && !in_array($name, explode(',', getenv('PAY_MARIADB_CASE')), true)) continue;
     DB::statement('set foreign_key_checks = 0');
     foreach (['ae_stripe_outbox', 'ae_stripe_settlements', 'ae_stripe_locks', 'invoice_transactions', 'ae_stripe_transaction_methods', 'ae_stripe_receipt_returns', 'ae_stripe_payment_fees', 'credits', 'audits', 'notifications',
-        'billing_agreements', 'properties', 'invoice_items', 'invoices', 'services', 'plans', 'products', 'categories', 'users', 'roles'] as $table) { if (in_array($table, ['ae_stripe_locks', 'ae_stripe_settlements', 'ae_stripe_outbox'], true) && !Illuminate\Support\Facades\Schema::hasTable($table)) continue; DB::table($table)->truncate(); }
+        'billing_agreements', 'properties', 'invoice_items', 'invoices', 'service_upgrades', 'services', 'prices', 'plans', 'product_upgrades', 'products', 'categories', 'users', 'roles'] as $table) { if (in_array($table, ['ae_stripe_locks', 'ae_stripe_settlements', 'ae_stripe_outbox'], true) && !Illuminate\Support\Facades\Schema::hasTable($table)) continue; DB::table($table)->truncate(); }
     DB::statement('set foreign_key_checks = 1');
     DB::table('settings')->where('key', 'ae_stripe_webhook_continuity')->delete();
     DB::table('settings')->where('key', 'ae_stripe_webhook_events')->update(['value' => 'ready']);
@@ -1123,8 +1234,10 @@ foreach ($cases as $name => $case) {
         if ($role === 'b' && !empty($case['prepared_b'])) check(workerLine($workers['b']) === 'paused', $name . ': B prepares consent before its final save locks');
         if ($role === 'a') check(($line = workerLine($workers['a'])) === 'paused', $name . ': request A reaches its pause point: ' . $line);
     }
-    // B runs until it finishes or waits on a lock that A holds. The InnoDB transaction list can leave out a session waiting to insert, so a statement still running after 1.5 seconds on this small database also counts as a lock wait.
+    // B runs until it finishes or waits on a lock that A holds. InnoDB can omit a waiting session. One-second
+    // cases identify the exact locking statement on A's row; older cases also allow a statement running for 1.5s.
     $waiting = fn () => (bool) DB::selectOne("select count(*) as n from information_schema.innodb_trx where trx_mysql_thread_id = ? and trx_state = 'LOCK WAIT'", [$workers['b'][3]])->n
+        || (!empty($case['blocked_sql']) && preg_match($case['blocked_sql'], DB::selectOne('select info from information_schema.processlist where id = ?', [$workers['b'][3]])?->info ?? ''))
         || (bool) DB::selectOne("select count(*) as n from information_schema.processlist where id = ? and command in ('Query', 'Execute') and time_ms > 1500", [$workers['b'][3]])->n;
     if (!empty($case['prepared_b'])) fwrite($workers['b'][1], "go\n");
     $early = workerLine($workers['b'], $waiting);
