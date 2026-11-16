@@ -1042,6 +1042,69 @@ $cases['webhook-customer-first-victim'] = $victimCase(true, fn ($r) => $r['a']['
     && DB::table('ae_stripe_receipt_returns')->where('state', 'credited')->where('amount_minor', 1300)->count() === 1
     && !User::findOrFail(7)->properties()->where('key', 'ae_stripe_checkout_945')->exists());
 
+$cases['webhook-retry-exhaustion'] = ['seed' => fn () => $victimSeed(true), 'timeout' => 1, 'waits' => true,
+    'deadlocks' => 3, 'rounds' => 3, 'blocked_sql' => '/^select .* from `invoices`.*for update$/',
+    'pause' => '/^victim-customer-lock$/', 'a' => function ($gateway) use ($victimStart, $tentative, $rows) {
+        $victimStart();
+        $rounds = $commits = 0;
+        $armed = true;
+        Illuminate\Support\Facades\Event::listen(App\Events\InvoiceTransaction\Created::class,
+            function ($event) use (&$armed, &$rounds, &$commits, $tentative) {
+                if (!$armed) return;
+                check(DB::transactionLevel() > 1 && DB::table('ae_stripe_settlements')->count() === 1
+                    && DB::table('invoice_transactions')->where('transaction_id', 'pi_945')->count() === 1
+                    && (int) DB::table('ae_stripe_receipt_returns')->value('amount_minor') === 500,
+                    'Each failing settlement has tentatively written the payment, claim and excess receipt');
+                if ($rounds > 0) pauseBefore('/^victim-customer-lock$/');
+                $tentative($rounds, $commits);
+                if ($rounds > 1) pausePoint('victim-customer-lock');
+                User::whereKey($event->invoiceTransaction->invoice->user_id)->lockForUpdate()->firstOrFail();
+            });
+        $body = json_encode(['type' => 'payment_intent.succeeded', 'request' => ['idempotency_key' => 'checkout_fixture'],
+            'data' => ['object' => intentOf(945, 'succeeded', 2000)]], JSON_THROW_ON_ERROR);
+        $time = time();
+        $request = Illuminate\Http\Request::create('/extensions/ae-stripe/webhook', 'POST', [], [], [], [
+            'HTTP_ACCEPT' => 'application/json', 'HTTP_STRIPE_SIGNATURE' =>
+                't=' . $time . ',v1=' . hash_hmac('sha256', $time . '.' . $body, 'whsec_test')], $body);
+        Illuminate\Support\Facades\Route::post('/extensions/ae-stripe/webhook', fn (Illuminate\Http\Request $request) => $gateway->webhook($request));
+        $kernel = app(Illuminate\Contracts\Http\Kernel::class);
+        $response = $kernel->handle($request);
+        check($rounds === 3 && $commits === 0 && DB::transactionLevel() === 0,
+            'All three settlement attempts fail and discard their after-commit callbacks');
+        check($response->getStatusCode() === 500, 'Exhausted settlement retries return an HTTP error for Stripe to redeliver');
+        check($rows(945) === [[5.0, 'succeeded', false]] && Invoice::findOrFail(945)->status === 'pending'
+            && DB::table('ae_stripe_settlements')->count() === 0 && DB::table('ae_stripe_receipt_returns')->count() === 0
+            && DB::table('credits')->count() === 0 && DB::table('ae_stripe_transaction_methods')->count() === 0
+            && DB::table('ae_stripe_payment_fees')->count() === 0 && !DB::table('lock_ballast')->where('id', 1)->exists()
+            && !$GLOBALS['stripeCalls'], 'An exhausted delivery changes no money and runs no provider work');
+        $armed = false;
+        check($kernel->handle($request)->getStatusCode() === 200, 'A later redelivery settles after the lock conflict ends');
+        check($kernel->handle($request)->getStatusCode() === 200, 'A duplicate redelivery acknowledges the settled payment');
+        return ['attempts' => $rounds, 'commits' => $commits, 'refunds' => count(array_filter($GLOBALS['stripeCalls'],
+            fn ($call) => $call === ['post', '/refunds']))];
+    }, 'b' => function () {
+        for ($round = 0; $round < 3; ++$round) {
+            if ($round > 0) { pauseBefore('/^exhaustion-next$/'); pausePoint('exhaustion-next'); }
+            DB::transaction(function () use ($round) {
+                User::whereKey(7)->lockForUpdate()->firstOrFail()->update(['first_name' => 'Winner']);
+                DB::table('lock_ballast')->insert(array_map(fn ($id) => ['id' => $id], range(10 + 200 * $round, 209 + 200 * $round)));
+                $invoice = Invoice::whereKey(945)->lockForUpdate()->firstOrFail();
+                check($invoice->status === 'pending' && !DB::table('lock_ballast')->where('id', 1)->exists()
+                    && DB::table('invoice_transactions')->pluck('transaction_id')->all() === ['native_prior']
+                    && DB::table('ae_stripe_settlements')->count() === 0 && DB::table('ae_stripe_receipt_returns')->count() === 0
+                    && DB::table('credits')->count() === 0, 'Each winning transaction sees every victim money write rolled back');
+            });
+        }
+        return 'committed';
+    }, 'check' => fn ($r) => $r['b']['ok'] === 'committed'
+        && $r['a']['ok'] === ['attempts' => 3, 'commits' => 0, 'refunds' => 1]
+        && DB::table('lock_ballast')->count() === 600 && Invoice::findOrFail(945)->status === 'paid'
+        && $rows(945) === [[5.0, 'succeeded', false], [20.0, 'succeeded', false], [-5.0, 'succeeded', true]]
+        && DB::table('ae_stripe_settlements')->count() === 1 && DB::table('ae_stripe_receipt_returns')->count() === 1
+        && DB::table('ae_stripe_receipt_returns')->where('state', 'credited')->where('amount_minor', 500)->count() === 1
+        && DB::table('credits')->count() === 1 && (float) DB::table('credits')->sum('amount') === 5.0
+        && !User::findOrFail(7)->properties()->where('key', 'ae_stripe_checkout_945')->exists()];
+
 // Core upgrade holds Service before User. With the retained subscription order, settlement waits on Service
 // without holding User, so the zero-cost product change and its payment both commit without a deadlock.
 $cases['subscription-core-upgrade'] = [
@@ -1262,6 +1325,13 @@ foreach ($cases as $name => $case) {
     if (!empty($case['prepared_b'])) fwrite($workers['b'][1], "go\n");
     $early = workerLine($workers['b'], $waiting);
     fwrite($workers['a'][1], "go\n");
+    for ($round = 1; $round < ($case['rounds'] ?? 1); ++$round) {
+        check(workerLine($workers['b']) === 'paused', $name . ': winner waits for the next settlement attempt');
+        check(workerLine($workers['a']) === 'paused', $name . ': the next settlement attempt holds the invoice');
+        fwrite($workers['b'][1], "go\n");
+        check(workerLine($workers['b'], $waiting) === null, $name . ': winner waits on the next victim invoice lock');
+        fwrite($workers['a'][1], "go\n");
+    }
     $results = ['a' => json_decode(substr(workerLine($workers['a']), 5), true), 'b' => json_decode(substr($early ?? workerLine($workers['b']), 5), true)];
     foreach ($workers as $worker) { fclose($worker[1]); fclose($worker[2]); proc_close($worker[0]); }
     echo $name . ': B ' . ($early === null ? 'waited on A' : 'finished while A was paused') . "\n";
